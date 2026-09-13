@@ -71,8 +71,14 @@ jobs:
           cp "target/${{ matrix.target }}/release/witr-rs" "$staging/"
           cp README.md README.en.md LICENSE "$staging/"
           tar czf "witr-rs-${{ matrix.target }}.tar.gz" "$staging"
-          sha256sum "witr-rs-${{ matrix.target }}.tar.gz" \
-            > "witr-rs-${{ matrix.target }}.tar.gz.sha256"
+          # linux has sha256sum, macOS only ships shasum -a 256
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "witr-rs-${{ matrix.target }}.tar.gz" \
+              > "witr-rs-${{ matrix.target }}.tar.gz.sha256"
+          else
+            shasum -a 256 "witr-rs-${{ matrix.target }}.tar.gz" \
+              > "witr-rs-${{ matrix.target }}.tar.gz.sha256"
+          fi
 
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
