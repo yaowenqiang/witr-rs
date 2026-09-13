@@ -1,5 +1,7 @@
 # witr-rs
 
+[English](README.en.md) | **简体中文**
+
 **Why is this running?** — 给出进程名、PID、端口或文件，一路追溯它是被谁、以何种方式拉起来的。
 
 Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go，Apache-2.0）同类工具，平台采集策略与其对齐。
@@ -79,7 +81,7 @@ witr-rs --file /var/log/x.log # 谁打开着这个文件
 witr-rs nginx --tree          # 祖先树 + 子进程
 witr-rs nginx --short         # 单行输出（脚本友好）
 witr-rs --port 8080 --json    # 机器可读 JSON
-witr-rs nginx --env           # 顺带收集环境变量（仅 Linux）
+witr-rs nginx --env           # 顺带收集环境变量（Linux 全量；macOS 同用户进程）
 witr-rs nginx --pid 1         # 多目标混用
 ```
 
