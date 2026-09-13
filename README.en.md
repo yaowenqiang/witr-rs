@@ -58,7 +58,19 @@ Details of the selected process refresh 500ms after the cursor stops moving (deb
 
 External commands required: Linux — none strictly (systemctl/docker optional); macOS — `ps`/`lsof` (built in); Windows — `powershell`/`netstat`/`tasklist` (built in).
 
-## Build
+## Install
+
+Grab the archive for your platform from [GitHub Releases](https://github.com/yaowenqiang/witr-rs/releases) (sha256 checksum files included). Pushing a `v*` tag makes CI build every target automatically:
+
+| File | Platform |
+|---|---|
+| `witr-rs-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 (static) |
+| `witr-rs-aarch64-unknown-linux-musl.tar.gz` | Linux ARM64 (static) |
+| `witr-rs-x86_64-apple-darwin.tar.gz` | macOS Intel |
+| `witr-rs-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+| `witr-rs-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
+
+Or build from source:
 
 ```bash
 cargo build --release          # host platform

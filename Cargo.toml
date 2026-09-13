@@ -1,6 +1,6 @@
 [package]
 name = "witr-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Why is this running? — trace processes, ports and files back to what started them (Rust, inspired by pranshuparmar/witr)"
 license = "Apache-2.0"

@@ -58,7 +58,19 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 依赖的外部命令：Linux 无强依赖（systemctl/docker 可选）；macOS 需要 `ps`/`lsof`（系统自带）；Windows 需要 `powershell`/`netstat`/`tasklist`（系统自带）。
 
-## 构建
+## 安装
+
+从 [GitHub Releases](https://github.com/yaowenqiang/witr-rs/releases) 下载对应平台的压缩包（含 sha256 校验文件），解开即用。打 `v*` 标签时 CI 会自动构建全部平台：
+
+| 文件 | 平台 |
+|---|---|
+| `witr-rs-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64（静态链接） |
+| `witr-rs-aarch64-unknown-linux-musl.tar.gz` | Linux ARM64（静态链接） |
+| `witr-rs-x86_64-apple-darwin.tar.gz` | macOS Intel |
+| `witr-rs-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+| `witr-rs-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
+
+或从源码构建：
 
 ```bash
 cargo build --release          # 本机平台
