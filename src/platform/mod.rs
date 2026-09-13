@@ -127,6 +127,13 @@ pub trait Platform {
         Vec::new()
     }
 
+    /// Files (and a socket/pipe summary) the process currently has open,
+    /// as display lines. Empty when not readable (other user, unsupported).
+    fn open_files(&self, pid: Pid) -> Vec<String> {
+        let _ = pid;
+        Vec::new()
+    }
+
     /// PIDs holding `path` open.
     fn file_to_pids(&self, path: &str) -> PlatResult<Vec<Pid>>;
 

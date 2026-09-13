@@ -22,12 +22,22 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | `p` `n` `u` `c` `m` `t` | 按 PID / 名称 / 用户 / CPU / 内存 / 启动时间排序，重复按切换升降序 |
 | `x` | 杀掉选中进程（y/n 确认） |
 | `r` | 立即刷新 |
-| 详情页内 | `j/k` 滚动、`d/u` 半页、`g/G` 顶部/底部、`b/f` 翻页、`Tab` 切换详情/环境面板、`Esc/q` 返回 |
+| 详情页内 | `j/k` 滚动、`d/u` 半页、`g/G` 顶部/底部、`b/f` 翻页、`Tab` 切换面板、`c` 复制当前面板、`Esc/q` 返回 |
 | `q` / `Esc` | 退出 |
 
 选中进程的详情在光标停止移动 500ms 后自动刷新（防抖，按住 j 快速滚动不会连发查询），与原版 `selectionDebounce` 一致。
 
 **端口详情页**：在 Ports 页选中某个端口按 `Enter`，可以看到该端口当前的全部 socket——LISTEN 监听项加上**正在发生的请求**（每条 ESTABLISHED 连接的对端地址、状态、归属 PID/进程，端口详情打开瞬间的快照），下方 Owner 面板显示监听进程的完整溯源（归因 + 祖先链 + 告警）。`Tab` 在 Connections / Owner 两个面板间切换焦点，`j/k/d/u/g/G/b-f` 滚动，`Esc` 返回列表。
+
+**进程详情页**：左侧溯源面板（身份信息、Started by 归因、Ancestry Tree、Open Files、风险评分、告警），右侧环境变量面板；`c` 键把当前面板纯文本复制到剪贴板。
+
+**风险评分**：每个进程聚合 0–10 分风险信号——临时目录下的二进制、运行中二进制被删除、`curl | sh` 类管道下载、LD_PRELOAD/DYLD 注入、对公网地址的 ESTABLISHED 连接。CLI 输出 `risk N/10: 信号列表`，TUI 详情页同样显示。
+
+**崩溃重启检测**（TUI）：同一进程身份换新 pid 即记一次重启，`Rst` 列显示总次数，5 分钟内 ≥2 次时详情页黄色告警——crash loop 一眼可见。
+
+**瞬时 CPU + Trend sparkline**（TUI）：按累计 CPU 时间的刷新间差值计算真实瞬时占用（非生命周期均值），表格 Trend 列以 8 级 sparkline 展示最近 8 次采样，`c` 排序键按瞬时值排序。
+
+**`--export`**：`witr-rs --pid <N> --export` 输出可直接贴进 issue 的纯文本排查报告（含环境变量值与打开文件列表）。
 
 **Containers 页**：通过 PATH 上的运行时 CLI（docker / podman / nerdctl）枚举容器，显示 Runtime / ID / State / Status / Image / Name；`/` 按 名称/镜像/ID/运行时/状态 过滤。枚举在后台线程执行（运行时 CLI 挂起不会卡住界面），每 3 秒自动刷新；刷新期间保留旧表格不闪烁，首次加载才显示 loading。**`Enter` 打开容器详情页**：左侧容器属性（Name/Runtime/ID/Image/State/Status/Ports），右侧容器内进程列表（Linux 通过 cgroup 匹配；macOS/Windows 容器进程在 VM 内不可见，显示说明）。
 

@@ -262,6 +262,8 @@ impl Platform for Linux {
                     0.0
                 }
             });
+            let cpu_time_ms = (!kernel_thread && cpu_ticks > 0)
+                .then_some((cpu_ticks as f64 * 1000.0 / CLK_TCK) as u64);
             let mem_kb = (rss_pages > 0).then(|| rss_pages as u64 * 4); // 4 KiB pages
             let _ = state;
             procs.push(Process {
@@ -274,6 +276,7 @@ impl Platform for Linux {
                 kernel_thread,
                 cpu: cpu.filter(|c| *c > 0.05),
                 mem_kb: mem_kb.filter(|m| *m > 0),
+                cpu_time_ms,
                 ..Default::default()
             });
         }
@@ -367,6 +370,44 @@ impl Platform for Linux {
                     .unwrap_or(false)
             })
             .collect()
+    }
+
+    fn open_files(&self, pid: Pid) -> Vec<String> {
+        let mut files: Vec<String> = Vec::new();
+        let mut sockets = 0usize;
+        let mut pipes = 0usize;
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", pid)) else {
+            return files; // other user's process without root
+        };
+        for fd in fds.flatten() {
+            if let Some(target) = readlink_ok(&fd.path()) {
+                if target.starts_with("socket:[") {
+                    sockets += 1;
+                } else if target.starts_with("pipe:") {
+                    pipes += 1;
+                } else if target.starts_with("anon_inode:") {
+                    continue;
+                } else {
+                    let (p, deleted) = strip_deleted_suffix(&target);
+                    let line = if deleted {
+                        format!("{} (deleted)", p)
+                    } else {
+                        p.to_string()
+                    };
+                    if !files.contains(&line) {
+                        files.push(line);
+                    }
+                }
+            }
+        }
+        if sockets > 0 {
+            files.push(format!("[{} socket(s) — see Ports tab]", sockets));
+        }
+        if pipes > 0 {
+            files.push(format!("[{} pipe(s)]", pipes));
+        }
+        files.truncate(200);
+        files
     }
 
     fn file_to_pids(&self, path: &str) -> PlatResult<Vec<Pid>> {

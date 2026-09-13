@@ -141,6 +141,10 @@ struct TuiApp {
     /// table visible instead of flashing the loading placeholder
     containers_loaded: bool,
     containers_rx: Option<std::sync::mpsc::Receiver<Vec<Container>>>,
+    /// sampling history: instantaneous cpu, sparklines, restart detection
+    hist: crate::history::History,
+    /// open files fetched when the full detail page opens
+    open_files: Option<Vec<String>>,
     last_refresh: Instant,
     status: String,
     confirm_kill: Option<Pid>,
@@ -223,6 +227,8 @@ impl TuiApp {
             containers_loading: false,
             containers_loaded: false,
             containers_rx: None,
+            hist: crate::history::History::new(),
+            open_files: None,
             last_refresh: Instant::now() - REFRESH, // force first refresh
             status: String::new(),
             confirm_kill: None,
@@ -254,6 +260,7 @@ impl TuiApp {
     fn refresh(&mut self) {
         if let Ok(p) = self.platform.list_processes() {
             self.procs = p;
+            self.hist.update(&self.procs);
         }
         if self.tab == Tab::Ports {
             self.sockets = self.platform.list_sockets().unwrap_or_default();
@@ -354,6 +361,12 @@ impl TuiApp {
 
         let key = self.sort_key;
         let desc = self.sort_desc;
+        // snapshot the display-cpu (instantaneous with lifetime fallback)
+        // so the sort comparator doesn't fight the borrow checker
+        let cpu_disp: HashMap<Pid, f64> = procs
+            .iter()
+            .map(|p| (p.pid, self.hist.display_cpu(p).unwrap_or(-1.0)))
+            .collect();
         idx.sort_by(|&a, &b| {
             let (x, y) = (&procs[a], &procs[b]);
             let ord = match key {
@@ -364,10 +377,11 @@ impl TuiApp {
                     .as_deref()
                     .unwrap_or("~")
                     .cmp(y.user.as_deref().unwrap_or("~")),
-                SortKey::Cpu => x
-                    .cpu
+                SortKey::Cpu => cpu_disp
+                    .get(&x.pid)
+                    .copied()
                     .unwrap_or(-1.0)
-                    .partial_cmp(&y.cpu.unwrap_or(-1.0))
+                    .partial_cmp(&cpu_disp.get(&y.pid).copied().unwrap_or(-1.0))
                     .unwrap_or(std::cmp::Ordering::Equal),
                 SortKey::Mem => x.mem_kb.unwrap_or(0).cmp(&y.mem_kb.unwrap_or(0)),
                 SortKey::Started => x
@@ -418,7 +432,11 @@ impl TuiApp {
         .into_iter()
         .next();
         self.detail_lines = match report {
-            Some(r) if r.found => detail_lines(&r),
+            Some(r) if r.found => {
+                let mut lines = detail_lines(&r);
+                push_history_lines(&mut lines, &self.hist, pid);
+                lines
+            }
             Some(r) => vec![Line::from(
                 Span::styled(r.error.unwrap_or_else(|| "unavailable".into()), Style::new().fg(MID)),
             )],
@@ -453,10 +471,33 @@ impl TuiApp {
                 // rebuild the pane content for THIS process (detail_lines is
                 // shared with the browse side panel, which may still hold the
                 // previously selected process)
-                self.detail_lines = detail_lines(&r);
+                let mut lines = detail_lines(&r);
+                push_history_lines(&mut lines, &self.hist, pid);
+                self.open_files = Some(self.platform.open_files(pid));
+                if let Some(files) = &self.open_files {
+                    lines.push(Line::from(""));
+                    if files.is_empty() {
+                        lines.push(Line::from(styled(
+                            Style::new().fg(MID),
+                            "open files: none readable (belongs to another user?)",
+                        )));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            format!("Open Files ({}):", files.len()),
+                            Style::new().bold(),
+                        )));
+                        for f in files.iter().take(30) {
+                            lines.push(Line::from(format!("  {f}")));
+                        }
+                        if files.len() > 30 {
+                            lines.push(Line::from(format!("  … {} more", files.len() - 30)));
+                        }
+                    }
+                }
                 // provisional count (logical lines); refined to the wrapped
                 // count on the next render
-                self.detail_line_count = self.detail_lines.len() as u16;
+                self.detail_line_count = lines.len() as u16;
+                self.detail_lines = lines;
                 self.detail_report = Some(r);
                 self.detail_pid = Some(pid);
                 self.detail_scroll = 0;
@@ -603,9 +644,25 @@ impl TuiApp {
         ]
     }
 
+    /// Plain text of the focused pane (for the clipboard).
+    fn focused_pane_text(&self) -> String {
+        let lines: Vec<Line<'static>> = match self.page {
+            Page::Detail if self.detail_pane => self.detail_lines.clone(),
+            Page::Detail => self.env_lines(),
+            Page::PortDetail if self.port_pane_conn => self.port_connection_lines(),
+            Page::PortDetail => match &self.port_detail_report {
+                Some(r) => detail_lines(r),
+                None => vec![Line::from("no owning process visible")],
+            },
+            Page::ContainerDetail if self.cd_pane_info => self.container_info_lines(),
+            Page::ContainerDetail => self.container_proc_lines(),
+            Page::Browse => Vec::new(),
+        };
+        lines.iter().map(line_to_string).collect::<Vec<_>>().join("\n")
+    }
+
     /// Lines for the in-container process pane.
-    fn container_proc_lines(&self) -> Vec<Line<'static>> {
-        if self.container_procs.is_empty() {
+    fn container_proc_lines(&self) -> Vec<Line<'static>> {        if self.container_procs.is_empty() {
             let note = if self.platform.name() == "linux" {
                 "no processes matched this container's cgroup"
             } else {
@@ -773,6 +830,29 @@ fn styled(kind: Style, s: impl Into<String>) -> Span<'static> {
     Span::styled(s.into(), kind)
 }
 
+fn line_to_string(l: &Line<'_>) -> String {
+    l.spans.iter().map(|s| s.content.clone()).collect()
+}
+
+/// Crash-loop signal appended to detail panes from the sampling history.
+fn push_history_lines(lines: &mut Vec<Line<'static>>, hist: &crate::history::History, pid: Pid) {
+    if let Some(n) = hist.recent_restarts(pid) {
+        if n >= 2 {
+            lines.push(Line::from(styled(
+                Style::new().fg(Color::Yellow),
+                format!("⚠ restarted {n}× in the last 5 min"),
+            )));
+        }
+    }
+    let total = hist.total_restarts(pid);
+    if total >= 2 {
+        lines.push(Line::from(styled(
+            Style::new().fg(MID),
+            format!("total {total} restarts since TUI start"),
+        )));
+    }
+}
+
 /// Right-hand details panel: identity + ancestry tree + warnings.
 fn detail_lines(r: &crate::model::TargetReport) -> Vec<Line<'static>> {
     let m = &r.matches[0];
@@ -833,6 +913,15 @@ fn detail_lines(r: &crate::model::TargetReport) -> Vec<Line<'static>> {
                 spans.push(Span::raw(name));
             }
             v.push(Line::from(spans));
+        }
+    }
+    if let Some(risk) = &r.risk {
+        if risk.score > 0 {
+            v.push(Line::from(""));
+            v.push(Line::from(styled(
+                Style::new().fg(Color::Yellow),
+                format!("⚠ risk {}/10: {}", risk.score, risk.signals.join("; ")),
+            )));
         }
     }
     if !r.warnings.is_empty() {
@@ -926,8 +1015,10 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
         Cell::from(format!("User{}", arrow(k, SortKey::User, d))),
         Cell::from(format!("Name{}", arrow(k, SortKey::Name, d))),
         Cell::from(format!("CPU%{}", arrow(k, SortKey::Cpu, d))),
+        Cell::from("Trend"),
         Cell::from(format!("Mem{}", arrow(k, SortKey::Mem, d))),
-        Cell::from(format!("Started{}", arrow(k, SortKey::Started, d))),
+        Cell::from("Rst"),
+        Cell::from(format!("Age{}", arrow(k, SortKey::Started, d))),
     ])
     .style(Style::new().fg(ACCENT).bold());
 
@@ -936,12 +1027,16 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
         .iter()
         .filter_map(|&i| app.procs.get(i))
         .map(|p| {
+            let cpu = app.hist.display_cpu(p);
+            let rst = app.hist.total_restarts(p.pid);
             Row::new([
                 Cell::from(p.pid.to_string()),
                 Cell::from(p.user.clone().unwrap_or_else(|| "-".into())),
                 Cell::from(p.name.clone()),
-                Cell::from(p.cpu.map(|c| format!("{:.1}", c)).unwrap_or_else(|| "-".into())),
+                Cell::from(cpu.map(|c| format!("{:.1}", c)).unwrap_or_else(|| "-".into())),
+                Cell::from(app.hist.spark(p.pid).unwrap_or("").to_string()),
                 Cell::from(fmt_mem(p.mem_kb)),
+                Cell::from(if rst > 0 { rst.to_string() } else { String::new() }),
                 Cell::from(fmt_age_short(p.started)),
             ])
         })
@@ -950,10 +1045,12 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
     let widths = [
         Constraint::Length(7),
         Constraint::Length(12),
-        Constraint::Min(20),
+        Constraint::Min(18),
         Constraint::Length(6),
         Constraint::Length(8),
-        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Length(4),
+        Constraint::Length(9),
     ];
     let table = Table::new(rows, widths)
         .header(header)
@@ -1181,11 +1278,12 @@ fn ui_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
         e_inner,
     );
 
+    let mut footer = "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | Esc/q: Back | c: Copy".to_string();
+    if !app.status.is_empty() {
+        footer.push_str(&format!("  ·  {}", app.status));
+    }
     f.render_widget(
-        Paragraph::new(Line::from(styled(
-            Style::new().fg(MID),
-            "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | Esc/q: Back",
-        ))),
+        Paragraph::new(Line::from(styled(Style::new().fg(MID), footer))),
         v[3],
     );
 }
@@ -1294,11 +1392,12 @@ fn ui_port_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
         o_inner,
     );
 
+    let mut footer = "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | Esc/q: Back | c: Copy".to_string();
+    if !app.status.is_empty() {
+        footer.push_str(&format!("  ·  {}", app.status));
+    }
     f.render_widget(
-        Paragraph::new(Line::from(styled(
-            Style::new().fg(MID),
-            "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | Esc/q: Back",
-        ))),
+        Paragraph::new(Line::from(styled(Style::new().fg(MID), footer))),
         v[4],
     );
 }
@@ -1401,11 +1500,12 @@ fn ui_container_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
         p_inner,
     );
 
+    let mut footer = "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | Esc/q: Back | c: Copy".to_string();
+    if !app.status.is_empty() {
+        footer.push_str(&format!("  ·  {}", app.status));
+    }
     f.render_widget(
-        Paragraph::new(Line::from(styled(
-            Style::new().fg(MID),
-            "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | Esc/q: Back",
-        ))),
+        Paragraph::new(Line::from(styled(Style::new().fg(MID), footer))),
         v[3],
     );
 }
@@ -1583,10 +1683,18 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
 
     // Full-page views (process detail / port detail) share a keymap that
     // mirrors handleDetailKey in the Go witr: Esc/q/Backspace back, Tab
-    // focus, vim scroll on the focused pane.
+    // focus, vim scroll on the focused pane, c copy.
     if app.page != Page::Browse {
         if matches!(key, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace) {
             app.page = Page::Browse;
+            return true;
+        }
+        if key == KeyCode::Char('c') {
+            let text = app.focused_pane_text();
+            app.status = match crate::util::clipboard_copy(&text) {
+                Ok(n) => format!("copied {n} chars to clipboard"),
+                Err(e) => format!("clipboard: {e}"),
+            };
             return true;
         }
         if key == KeyCode::Tab {

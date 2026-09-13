@@ -3,6 +3,42 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Copy text to the system clipboard using whatever CLI tool exists
+/// (pbcopy on macOS, wl-copy/xclip on Linux, clip on Windows).
+pub fn clipboard_copy(text: &str) -> Result<usize, String> {
+    #[cfg(target_os = "macos")]
+    let candidates: &[&[&str]] = &[&["pbcopy"]];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let candidates: &[&[&str]] = &[&["wl-copy"], &["xclip", "-selection", "clipboard"]];
+    #[cfg(windows)]
+    let candidates: &[&[&str]] = &[&["clip"]];
+
+    for tool in candidates {
+        let (cmd, args) = tool.split_first().unwrap();
+        let Ok(mut child) = Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue; // not installed — try the next one
+        };
+        use std::io::Write as _;
+        let written = child
+            .stdin
+            .as_mut()
+            .and_then(|s| s.write_all(text.as_bytes()).ok())
+            .is_some();
+        child.stdin.take(); // close stdin so the tool exits
+        let _ = child.wait();
+        if written {
+            return Ok(text.len());
+        }
+    }
+    Err("no clipboard tool found (pbcopy / wl-copy / xclip / clip)".into())
+}
+
 /// Run an external command, capture stdout, enforce a timeout.
 /// Stdout is drained on a separate thread so big outputs can't deadlock
 /// the wait; timed-out children are killed best-effort.

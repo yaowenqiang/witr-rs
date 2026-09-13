@@ -59,4 +59,9 @@ pub struct Cli {
     /// Force the static process listing even on a terminal (no args = TUI)
     #[arg(long = "list")]
     pub list: bool,
+
+    /// Plain-text diagnostic report (identity, source, chain, env values,
+    /// open files) — combine with any target
+    #[arg(long = "export")]
+    pub export: bool,
 }

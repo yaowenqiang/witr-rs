@@ -25,6 +25,9 @@ pub struct Process {
     pub cpu: Option<f64>,
     /// Resident set size in KiB.
     pub mem_kb: Option<u64>,
+    /// Cumulative CPU time in milliseconds — the sampling history uses the
+    /// delta between refreshes for a true instantaneous percent.
+    pub cpu_time_ms: Option<u64>,
 }
 
 impl Process {
@@ -117,6 +120,9 @@ pub struct TargetReport {
     pub source: Option<Source>,
     pub sockets: Vec<Socket>,
     pub warnings: Vec<String>,
+    /// Aggregated risk signals for the (first) matched process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk: Option<crate::risk::Risk>,
 }
 
 impl TargetReport {
@@ -131,6 +137,7 @@ impl TargetReport {
             source: None,
             sockets: Vec::new(),
             warnings: Vec::new(),
+            risk: None,
         }
     }
 }

@@ -1,9 +1,11 @@
 mod ancestry;
 mod cli;
+mod history;
 mod model;
 mod pipeline;
 mod platform;
 mod render;
+mod risk;
 mod tui;
 mod util;
 
@@ -88,8 +90,31 @@ fn main() {
     }
 
     let platform = platform::get();
-    let opts = pipeline::Options { want_env: cli.env, ..Default::default() };
+    let want_env = cli.export || cli.env;
+    let opts = pipeline::Options { want_env, ..Default::default() };
     let reports = pipeline::run(platform.as_ref(), specs, &opts);
+
+    // --export: paste-ready diagnostic reports
+    if cli.export {
+        let files: Vec<(i32, Vec<String>)> = reports
+            .iter()
+            .filter(|r| r.found)
+            .filter_map(|r| {
+                r.matches
+                    .first()
+                    .map(|m| (m.pid, platform.open_files(m.pid)))
+            })
+            .collect();
+        write_out(&render::render_export(&reports, &files));
+        let exit = if reports.iter().any(|r| !r.found) {
+            2
+        } else if reports.iter().any(|r| !r.warnings.is_empty()) {
+            1
+        } else {
+            0
+        };
+        std::process::exit(exit);
+    }
 
     let format = if cli.json {
         render::Format::Json

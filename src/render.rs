@@ -351,6 +351,18 @@ fn render_standard(r: &TargetReport, p: &Painter) -> String {
         }
     }
 
+    if let Some(risk) = &r.risk {
+        if risk.score > 0 {
+            let _ = writeln!(
+                out,
+                "  {} risk {}/10: {}",
+                p.yellow("⚠"),
+                risk.score,
+                risk.signals.join("; ")
+            );
+        }
+    }
+
     if !r.warnings.is_empty() {
         let _ = writeln!(out);
         let _ = writeln!(out, "  {}", p.yellow("warnings:"));
@@ -359,6 +371,121 @@ fn render_standard(r: &TargetReport, p: &Painter) -> String {
         }
     }
     out.trim_end().to_string() + "\n"
+}
+
+/// Plain-text diagnostic report (the `--export` flag): everything the TUI
+/// detail page shows, including env values and open files, for pasting
+/// into issues.
+pub fn render_export(reports: &[TargetReport], files: &[(crate::model::Pid, Vec<String>)]) -> String {
+    let mut out = String::new();
+    for r in reports {
+        let _ = writeln!(out, "== witr-rs report: {} ==", r.target.describe());
+        if !r.found {
+            let _ = writeln!(
+                out,
+                "  {}",
+                r.error.as_deref().unwrap_or("no process matched")
+            );
+            out.push('\n');
+            continue;
+        }
+        let m = &r.matches[0];
+        fn kv(out: &mut String, k: &str, v: String) {
+            let _ = writeln!(out, "{:<10}{}", format!("{k}:"), v);
+        }
+        kv(&mut out, "pid", m.pid.to_string());
+        if let Some(pp) = m.ppid {
+            kv(&mut out, "ppid", pp.to_string());
+        }
+        if let Some(u) = &m.user {
+            kv(&mut out, "user", u.clone());
+        }
+        if let Some(t) = m.started {
+            kv(&mut out, "started", fmt_started_line(t));
+        }
+        if let Some(cwd) = &m.cwd {
+            kv(&mut out, "cwd", cwd.clone());
+        }
+        if let Some(exe) = &m.exe {
+            let mut line = exe.clone();
+            if m.exe_deleted {
+                line.push_str("  [deleted from disk]");
+            }
+            kv(&mut out, "exe", line);
+        }
+        if !m.cmdline.is_empty() {
+            kv(&mut out, "cmd", m.command_line());
+        }
+        if let Some(s) = &r.source {
+            let mut line = format!("{} {}", s.kind, s.label.clone().unwrap_or_default());
+            if let Some(d) = &s.detail {
+                line.push_str(&format!(" — {d}"));
+            }
+            kv(&mut out, "started by", line.trim_end().to_string());
+        }
+        if r.ancestry.len() > 1 {
+            kv(&mut out, "chain", "root → this".to_string());
+            let last = r.ancestry.len() - 1;
+            for (i, a) in r.ancestry.iter().enumerate() {
+                let branch = if i == 0 {
+                    String::new()
+                } else {
+                    format!("{}└─ ", "   ".repeat(i - 1))
+                };
+                let marker = if i == last { "  ← this" } else { "" };
+                let _ = writeln!(
+                    out,
+                    "  {}{} (pid {}){}",
+                    branch,
+                    a.name,
+                    a.pid,
+                    marker
+                );
+            }
+        }
+        if !r.sockets.is_empty() {
+            kv(&mut out, "sockets", format!("{} (see below)", r.sockets.len()));
+        }
+        if let Some(risk) = &r.risk {
+            if risk.score > 0 {
+                kv(
+                    &mut out,
+                    "risk",
+                    format!("{}/10 — {}", risk.score, risk.signals.join("; ")),
+                );
+            }
+        }
+        if !r.warnings.is_empty() {
+            kv(&mut out, "warnings", String::new());
+            for w in &r.warnings {
+                let _ = writeln!(out, "  ⚠ {w}");
+            }
+        }
+        if let Some(env) = &m.env {
+            if !env.is_empty() {
+                kv(&mut out, "environment", format!("{} variables", env.len()));
+                for (k, v) in env.iter().take(60) {
+                    let _ = writeln!(out, "  {k}={v}");
+                }
+                if env.len() > 60 {
+                    let _ = writeln!(out, "  … {} more", env.len() - 60);
+                }
+            }
+        }
+        if let Some((_, fs)) = files.iter().find(|(pid, _)| Some(*pid) == Some(m.pid)) {
+            if !fs.is_empty() {
+                kv(&mut out, "open files", format!("{}", fs.len()));
+                for f in fs.iter().take(50) {
+                    let _ = writeln!(out, "  {f}");
+                }
+                if fs.len() > 50 {
+                    let _ = writeln!(out, "  … {} more", fs.len() - 50);
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn fmt_started_line(t: i64) -> String {

@@ -77,6 +77,7 @@ fn analyze(
 
         let detailed = platform.detail(brief, want_env);
         inspect_risks(&detailed, &sockets, &mut warnings);
+        let risk = crate::risk::assess(&detailed, &sockets);
 
         let source = detect_source(platform, &chain);
         let children = ancestry::direct_children(map, pid);
@@ -95,6 +96,7 @@ fn analyze(
             source,
             sockets: sockets.clone(),
             warnings,
+            risk: Some(risk),
         });
     }
     reports

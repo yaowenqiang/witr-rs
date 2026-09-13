@@ -20,9 +20,9 @@ impl MacOs {
     }
 }
 
-/// `ps -axo pid=,ppid=,uid=,etime=,pcpu=,rss=,comm=` — comm is the last
-/// column and may contain spaces, so the first six whitespace tokens are
-/// fixed and the rest is the executable path.
+/// `ps -axo pid=,ppid=,uid=,etime=,time=,pcpu=,rss=,comm=` — comm is the
+/// last column and may contain spaces, so the first seven whitespace
+/// tokens are fixed and the rest is the executable path.
 fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
     let line = line.trim();
     if line.is_empty() {
@@ -30,8 +30,8 @@ fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
     }
     let bytes = line.as_bytes();
     let mut idx = 0usize;
-    // skip leading whitespace, then consume six fixed fields
-    let mut fixed: [Option<&str>; 6] = [None; 6];
+    // skip leading whitespace, then consume seven fixed fields
+    let mut fixed: [Option<&str>; 7] = [None; 7];
     for slot in fixed.iter_mut() {
         while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
             idx += 1;
@@ -51,8 +51,9 @@ fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
     let ppid: Pid = fixed[1]?.parse().ok()?;
     let uid: u32 = fixed[2]?.parse().ok()?;
     let started = parse_etime_to_secs(fixed[3]?).map(|age| now_unix() - age);
-    let cpu = fixed[4]?.parse::<f64>().ok().filter(|c| *c > 0.05);
-    let mem_kb = fixed[5]?.parse::<u64>().ok().filter(|m| *m > 0);
+    let cpu_time_ms = parse_cpu_time_to_ms(fixed[4]?);
+    let cpu = fixed[5]?.parse::<f64>().ok().filter(|c| *c > 0.05);
+    let mem_kb = fixed[6]?.parse::<u64>().ok().filter(|m| *m > 0);
     Some(Process {
         pid,
         ppid: Some(ppid),
@@ -63,6 +64,7 @@ fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
         started,
         cpu,
         mem_kb,
+        cpu_time_ms,
         ..Default::default()
     })
 }
@@ -193,11 +195,53 @@ impl Platform for MacOs {
     fn list_processes(&self) -> PlatResult<Vec<Process>> {
         let out = run_ok(
             "ps",
-            &["-axo", "pid=,ppid=,uid=,etime=,pcpu=,rss=,comm="],
+            &[
+                "-axo",
+                "pid=,ppid=,uid=,etime=,time=,pcpu=,rss=,comm=",
+            ],
             CMD_TIMEOUT,
         )
         .ok_or_else(|| PlatError::Failed("ps failed".into()))?;
         Ok(out.lines().filter_map(|l| parse_ps_list_line(l, &self.users)).collect())
+    }
+
+    fn open_files(&self, pid: Pid) -> Vec<String> {
+        // lsof -F tn emits alternating t<type> / n<name> lines
+        let Some(out) = run_ok(
+            "lsof",
+            &["-a", "-w", "-p", &pid.to_string(), "-F", "tn"],
+            LSOF_TIMEOUT,
+        ) else {
+            return Vec::new();
+        };
+        let mut files: Vec<String> = Vec::new();
+        let mut sockets = 0usize;
+        let mut pipes = 0usize;
+        let mut last_type = String::new();
+        for line in out.lines() {
+            if let Some(t) = line.strip_prefix('t') {
+                last_type = t.to_string();
+            } else if let Some(n) = line.strip_prefix('n') {
+                match last_type.as_str() {
+                    "VREG" | "VDIR" => {
+                        if !n.starts_with("/dev/") && !files.iter().any(|f| f == n) {
+                            files.push(n.to_string());
+                        }
+                    }
+                    "IPv4" | "IPv6" | "TCP" | "UDP" => sockets += 1,
+                    "UNIX" | "PIPE" | "PSHM" => pipes += 1,
+                    _ => {} // txt/cwd/KQUEUE/... already shown elsewhere
+                }
+            }
+        }
+        if sockets > 0 {
+            files.push(format!("[{} network socket(s) — see Ports tab]", sockets));
+        }
+        if pipes > 0 {
+            files.push(format!("[{} pipe(s)]", pipes));
+        }
+        files.truncate(200);
+        files
     }
 
     fn list_sockets(&self) -> PlatResult<Vec<Socket>> {
@@ -403,6 +447,21 @@ impl Platform for MacOs {
     }
 }
 
+/// `ps time` = cumulative CPU time: "0:00.42", "12:03.5", "1:02:03.4".
+fn parse_cpu_time_to_ms(s: &str) -> Option<u64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut total: f64 = parts.last()?.parse().ok()?;
+    let mut mult = 60f64;
+    for p in parts.iter().rev().skip(1) {
+        total += p.parse::<f64>().ok()? * mult;
+        mult *= 60.0;
+    }
+    Some((total * 1000.0) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,7 +499,7 @@ mod tests {
     #[test]
     fn ps_list_line() {
         let p = parse_ps_list_line(
-            "  350   1   501 2-03:10:31  1.2  45600 /opt/homebrew/bin/nginx",
+            "  350   1   501 2-03:10:31 0:05.00  1.2  45600 /opt/homebrew/bin/nginx",
             &Users::load(),
         )
         .unwrap();
@@ -448,6 +507,7 @@ mod tests {
         assert_eq!(p.ppid, Some(1));
         assert_eq!(p.uid, Some(501));
         assert_eq!(p.started, Some(now_unix() - 184_231));
+        assert_eq!(p.cpu_time_ms, Some(5_000));
         assert_eq!(p.cpu, Some(1.2));
         assert_eq!(p.mem_kb, Some(45600));
         assert_eq!(p.name, "nginx");
@@ -457,12 +517,21 @@ mod tests {
     #[test]
     fn ps_list_line_with_spaces_in_path() {
         let p = parse_ps_list_line(
-            "  999   1   0  42  0.0   1024 /Applications/My App/Helper --flag",
+            "  999   1   0  42 1:02:03.4  0.0   1024 /Applications/My App/Helper --flag",
             &Users::load(),
         )
         .unwrap();
         assert_eq!(p.exe.as_deref(), Some("/Applications/My App/Helper --flag"));
         assert_eq!(p.name, "Helper --flag");
+        assert_eq!(p.cpu_time_ms, Some(3_723_400));
+    }
+
+    #[test]
+    fn cpu_time_formats() {
+        assert_eq!(parse_cpu_time_to_ms("0:00.42"), Some(420));
+        assert_eq!(parse_cpu_time_to_ms("12:03.5"), Some(723_500));
+        assert_eq!(parse_cpu_time_to_ms("1:02:03.4"), Some(3_723_400));
+        assert_eq!(parse_cpu_time_to_ms("junk"), None);
     }
 
     #[test]
