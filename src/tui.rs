@@ -107,6 +107,12 @@ struct TuiApp {
     detail_line_count: u16,
     env_scroll: u16,
     env_line_count: u16,
+    /// Environment-pane filter on the process detail page (/ to enter):
+    /// matches KEY=VALUE substrings, case-insensitive
+    env_search: String,
+    env_search_mode: bool,
+    /// tmux-style zoom (z): the focused pane temporarily fills the whole row
+    detail_zoom: bool,
     /// Ports-tab detail page (Enter on a port): every socket touching that
     /// port (LISTEN + ESTABLISHED requests) plus the owning process report
     port_detail_port: u16,
@@ -206,6 +212,9 @@ impl TuiApp {
             detail_line_count: 1,
             env_scroll: 0,
             env_line_count: 1,
+            env_search: String::new(),
+            env_search_mode: false,
+            detail_zoom: false,
             port_detail_port: 0,
             port_detail_sockets: Vec::new(),
             port_detail_report: None,
@@ -502,6 +511,9 @@ impl TuiApp {
                 self.detail_pid = Some(pid);
                 self.detail_scroll = 0;
                 self.env_scroll = 0;
+                self.env_search.clear();
+                self.env_search_mode = false;
+                self.detail_zoom = false;
                 self.detail_pane = true;
                 self.page = Page::Detail;
             }
@@ -697,8 +709,23 @@ impl TuiApp {
             if env.is_empty() {
                 return vec![Line::from("(empty environment)".fg(MID))];
             }
-            return env
+            let needle = self.env_search.to_lowercase();
+            let vars: Vec<_> = env
                 .iter()
+                .filter(|(k, v)| {
+                    needle.is_empty()
+                        || k.to_lowercase().contains(&needle)
+                        || v.to_lowercase().contains(&needle)
+                })
+                .collect();
+            if vars.is_empty() {
+                return vec![Line::from(styled(
+                    Style::new().fg(MID),
+                    format!("no environment matches \"{}\"", self.env_search),
+                ))];
+            }
+            return vars
+                .into_iter()
                 .map(|(k, v)| {
                     Line::from(vec![
                         Span::styled(k.clone(), Style::new().fg(ACCENT)),
@@ -1199,10 +1226,17 @@ fn ui_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
     ])
     .split(inner);
 
+    // zoom collapses the split to just the focused pane (tmux-style z)
+    let (dl, dr) = if app.detail_zoom {
+        if app.detail_pane { (100, 0) } else { (0, 100) }
+    } else {
+        (70, 30)
+    };
+
     // pane content sizes first: indicators need the wrapped row counts
     let env = app.env_lines();
-    app.detail_line_count = wrapped_count(&app.detail_lines, pane_inner_width(v[2].width, 70));
-    app.env_line_count = wrapped_count(&env, pane_inner_width(v[2].width, 30));
+    app.detail_line_count = wrapped_count(&app.detail_lines, pane_inner_width(v[2].width, dl));
+    app.env_line_count = wrapped_count(&env, pane_inner_width(v[2].width, dr));
 
     let header = Line::from(vec![
         styled(Style::new().bg(PURPLE).fg(Color::White).bold(), " witr-rs "),
@@ -1216,13 +1250,39 @@ fn ui_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
     ]);
     f.render_widget(Paragraph::new(header), v[0]);
 
-    let cols = Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)])
+    // environment search line (occupies the spacer row while active)
+    if app.env_search_mode || !app.env_search.is_empty() {
+        let shown = app.env_lines().len();
+        let total = app
+            .detail_report
+            .as_ref()
+            .and_then(|r| r.matches[0].env.as_ref())
+            .map(|e| e.len())
+            .unwrap_or(0);
+        let mut spans = vec![
+            styled(Style::new().fg(ACCENT).bold(), "  / "),
+            Span::raw(app.env_search.clone()),
+        ];
+        if app.env_search_mode {
+            spans.push(styled(Style::new().fg(ACCENT), "▏"));
+        }
+        if !app.env_search.is_empty() {
+            spans.push(styled(
+                Style::new().fg(MID),
+                format!("  {} of {} vars", shown, total),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), v[1]);
+    }
+
+    let cols = Layout::horizontal([Constraint::Percentage(dl), Constraint::Percentage(dr)])
         .split(v[2]);
 
     // left: process detail
     let d_active = app.detail_pane;
     let d_title = format!(
-        "Process Detail{}",
+        "Process Detail{}{}",
+        if app.detail_zoom && d_active { " [zoom]" } else { "" },
         TuiApp::scroll_indicator(app.detail_scroll, app.detail_line_count, app.detail_height)
     );
     let d_block = Block::bordered()
@@ -1252,7 +1312,8 @@ fn ui_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
 
     // right: environment variables
     let e_title = format!(
-        "Environment Variables{}",
+        "Environment Variables{}{}",
+        if app.detail_zoom && !d_active { " [zoom]" } else { "" },
         TuiApp::scroll_indicator(app.env_scroll, app.env_line_count, app.detail_height)
     );
     let e_block = Block::bordered()
@@ -1278,7 +1339,12 @@ fn ui_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
         e_inner,
     );
 
-    let mut footer = "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | Esc/q: Back | c: Copy".to_string();
+    let mut footer = if app.env_search_mode {
+        "Search env: Enter: apply — Esc: cancel".to_string()
+    } else {
+        "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | z: Zoom | /: Search Env | Esc/q: Back | c: Copy"
+            .to_string()
+    };
     if !app.status.is_empty() {
         footer.push_str(&format!("  ·  {}", app.status));
     }
@@ -1685,7 +1751,29 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
     // mirrors handleDetailKey in the Go witr: Esc/q/Backspace back, Tab
     // focus, vim scroll on the focused pane, c copy.
     if app.page != Page::Browse {
+        // Environment-pane search on the process detail page (/ to enter)
+        if app.env_search_mode {
+            match key {
+                KeyCode::Char(c) => {
+                    app.env_search.push(c);
+                    app.env_scroll = 0;
+                }
+                KeyCode::Backspace => {
+                    app.env_search.pop();
+                    app.env_scroll = 0;
+                }
+                KeyCode::Enter | KeyCode::Esc => app.env_search_mode = false,
+                _ => {}
+            }
+            return true;
+        }
         if matches!(key, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace) {
+            // first Esc clears the env filter, only then does it leave the page
+            if !app.env_search.is_empty() {
+                app.env_search.clear();
+                app.env_scroll = 0;
+                return true;
+            }
             app.page = Page::Browse;
             return true;
         }
@@ -1704,6 +1792,15 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                 Page::ContainerDetail => app.cd_pane_info = !app.cd_pane_info,
                 Page::Browse => {}
             }
+            return true;
+        }
+        if key == KeyCode::Char('/') && app.page == Page::Detail {
+            app.env_search_mode = true;
+            return true;
+        }
+        // tmux-style zoom: the focused pane takes the whole row until z again
+        if key == KeyCode::Char('z') && app.page == Page::Detail {
+            app.detail_zoom = !app.detail_zoom;
             return true;
         }
         let h = app.detail_height.max(app.port_pane_height);
@@ -2205,6 +2302,86 @@ mod tests {
         on_key(&mut app, KeyCode::Esc);
         assert_eq!(app.page, Page::Browse);
         assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn detail_zoom_toggles_and_resets() {
+        let mut app = TuiApp::new(crate::platform::get());
+        on_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.page, Page::Detail);
+        assert!(!app.detail_zoom);
+
+        // z toggles zoom on and off
+        on_key(&mut app, KeyCode::Char('z'));
+        assert!(app.detail_zoom);
+        on_key(&mut app, KeyCode::Char('z'));
+        assert!(!app.detail_zoom);
+
+        // zoomed: Tab moves focus and the env pane becomes the zoomed one
+        on_key(&mut app, KeyCode::Char('z'));
+        on_key(&mut app, KeyCode::Tab);
+        assert!(app.detail_zoom);
+        assert!(!app.detail_pane);
+
+        // scrolling still works while zoomed (env pane)
+        on_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.env_scroll, 1);
+
+        // leaving the page works from the zoomed state…
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Browse);
+
+        // …and reopening starts unzoomed
+        on_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.page, Page::Detail);
+        assert!(!app.detail_zoom);
+        assert!(app.detail_pane);
+    }
+
+    #[test]
+    fn detail_env_search_filters_and_esc_clears() {
+        let mut app = TuiApp::new(crate::platform::get());
+        let pid = app.selected_pid().unwrap();
+        on_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.page, Page::Detail);
+
+        // only test filtering on platforms that actually collect env
+        if app.detail_report.as_ref().unwrap().matches[0].env.is_none() {
+            return;
+        }
+
+        // '/' enters env search mode
+        on_key(&mut app, KeyCode::Char('/'));
+        assert!(app.env_search_mode);
+
+        // typing filters the env pane
+        on_key(&mut app, KeyCode::Char('Z'));
+        on_key(&mut app, KeyCode::Char('Z'));
+        assert_eq!(app.env_search, "ZZ");
+        let total = app.detail_report.as_ref().unwrap().matches[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .len();
+        // an env var containing "zz" is unlikely; the pane shows a no-match note
+        assert!(app.env_lines().len() <= 1);
+
+        // Enter applies (leaves search mode, keeps the filter)
+        on_key(&mut app, KeyCode::Enter);
+        assert!(!app.env_search_mode);
+        assert_eq!(app.env_search, "ZZ");
+        assert!(app.env_lines().len() <= 1);
+
+        // first Esc clears the filter instead of leaving the page
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Detail);
+        assert!(app.env_search.is_empty());
+        assert_eq!(app.env_lines().len(), total);
+
+        // now Esc leaves the page
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Browse);
+        assert_eq!(app.detail_report.as_ref().unwrap().matches[0].pid, pid);
     }
 
     #[test]
