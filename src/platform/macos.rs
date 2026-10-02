@@ -215,7 +215,6 @@ impl Platform for MacOs {
             return Vec::new();
         };
         let mut files: Vec<String> = Vec::new();
-        let mut sockets = 0usize;
         let mut pipes = 0usize;
         let mut last_type = String::new();
         for line in out.lines() {
@@ -228,17 +227,21 @@ impl Platform for MacOs {
                             files.push(n.to_string());
                         }
                     }
-                    "IPv4" | "IPv6" | "TCP" | "UDP" => sockets += 1,
+                    "IPv4" | "IPv6" | "TCP" | "UDP" => {
+                        // the name already carries the endpoints, e.g.
+                        // "127.0.0.1:5432->10.0.0.1:443" or "*:8080"
+                        let l = format!("socket {} {}", last_type.to_lowercase(), n);
+                        if !files.contains(&l) {
+                            files.push(l);
+                        }
+                    }
                     "UNIX" | "PIPE" | "PSHM" => pipes += 1,
                     _ => {} // txt/cwd/KQUEUE/... already shown elsewhere
                 }
             }
         }
-        if sockets > 0 {
-            files.push(format!("[{} network socket(s) — see Ports tab]", sockets));
-        }
         if pipes > 0 {
-            files.push(format!("[{} pipe(s)]", pipes));
+            files.push(format!("[{} pipe/unix-socket(s)]", pipes));
         }
         files.truncate(200);
         files

@@ -374,15 +374,44 @@ impl Platform for Linux {
 
     fn open_files(&self, pid: Pid) -> Vec<String> {
         let mut files: Vec<String> = Vec::new();
-        let mut sockets = 0usize;
+        let mut unknown_socks = 0usize;
         let mut pipes = 0usize;
+        // inode -> "tcp 127.0.0.1:5432 -> 10.0.0.1:443 (ESTABLISHED)" from
+        // the kernel tables, so socket fds show their endpoints instead of
+        // a bare socket:[inode] (a few file reads, no /proc scan)
+        let mut sock_info: HashMap<u64, String> = HashMap::new();
+        let no_owners = HashMap::new();
+        for proto in ["tcp", "tcp6", "udp", "udp6"] {
+            for (addr, port, rem, state, inode) in read_socket_table(proto) {
+                let s = build_socket(proto, addr, port, rem, state, inode, &no_owners);
+                let line = match (s.peer_addr, s.peer_port) {
+                    (Some(pa), Some(pp)) => format!(
+                        "{} {}:{} -> {}:{} ({})",
+                        s.proto, s.local_addr, s.local_port, pa, pp, s.state
+                    ),
+                    _ => format!("{} {}:{} ({})", s.proto, s.local_addr, s.local_port, s.state),
+                };
+                sock_info.entry(inode).or_insert(line);
+            }
+        }
         let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", pid)) else {
             return files; // other user's process without root
         };
         for fd in fds.flatten() {
             if let Some(target) = readlink_ok(&fd.path()) {
-                if target.starts_with("socket:[") {
-                    sockets += 1;
+                if let Some(rest) = target
+                    .strip_prefix("socket:[")
+                    .and_then(|s| s.strip_suffix(']'))
+                {
+                    match rest.parse::<u64>().ok().and_then(|i| sock_info.get(&i)) {
+                        Some(line) => {
+                            let l = format!("socket {line}");
+                            if !files.contains(&l) {
+                                files.push(l);
+                            }
+                        }
+                        None => unknown_socks += 1, // unix / netlink socket
+                    }
                 } else if target.starts_with("pipe:") {
                     pipes += 1;
                 } else if target.starts_with("anon_inode:") {
@@ -400,8 +429,8 @@ impl Platform for Linux {
                 }
             }
         }
-        if sockets > 0 {
-            files.push(format!("[{} socket(s) — see Ports tab]", sockets));
+        if unknown_socks > 0 {
+            files.push(format!("[{} unix/netlink socket(s)]", unknown_socks));
         }
         if pipes > 0 {
             files.push(format!("[{} pipe(s)]", pipes));
