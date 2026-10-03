@@ -65,7 +65,7 @@ enum SortKey {
     Started,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Focus {
     Table,
     Details,
@@ -113,6 +113,8 @@ struct TuiApp {
     env_search_mode: bool,
     /// tmux-style zoom (z): the focused pane temporarily fills the whole row
     detail_zoom: bool,
+    /// same zoom for the Processes tab (table <-> details panel)
+    browse_zoom: bool,
     /// Ports-tab detail page (Enter on a port): every socket touching that
     /// port (LISTEN + ESTABLISHED requests) plus the owning process report
     port_detail_port: u16,
@@ -215,6 +217,7 @@ impl TuiApp {
             env_search: String::new(),
             env_search_mode: false,
             detail_zoom: false,
+            browse_zoom: false,
             port_detail_port: 0,
             port_detail_sockets: Vec::new(),
             port_detail_report: None,
@@ -994,10 +997,22 @@ fn mode_line(app: &TuiApp) -> Line<'static> {
     if app.search_mode {
         return Line::from(styled(Style::new().fg(ACCENT), "  Mode: Search (Enter: apply — Esc: cancel)"));
     }
-    match app.focus {
-        Focus::Details => Line::from(styled(Style::new().fg(ACCENT), "  Mode: Detail (Tab to go back)")),
-        Focus::Table => Line::from(styled(Style::new().fg(MID), "  Mode: Navigation (Press / to search)")),
-    }
+    let (text, style) = match app.focus {
+        Focus::Details => (
+            "  Mode: Detail (Tab to go back)".to_string(),
+            Style::new().fg(ACCENT),
+        ),
+        Focus::Table => (
+            "  Mode: Navigation (Press / to search)".to_string(),
+            Style::new().fg(MID),
+        ),
+    };
+    let text = if app.browse_zoom {
+        format!("{text} — zoomed (z to restore)")
+    } else {
+        text
+    };
+    Line::from(styled(style, text))
 }
 
 fn search_line(app: &TuiApp) -> Line<'static> {
@@ -1616,38 +1631,51 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
 
     match app.tab {
         Tab::Processes => {
+            // tmux-style zoom (z): the focused pane temporarily takes the row
+            let (tw, dw) = if app.browse_zoom {
+                if app.focus == Focus::Table { (100, 0) } else { (0, 100) }
+            } else {
+                (58, 42)
+            };
             let cols = Layout::horizontal([
-                Constraint::Percentage(58),
+                Constraint::Percentage(tw),
                 Constraint::Length(1),
-                Constraint::Percentage(42),
+                Constraint::Percentage(dw),
             ])
             .split(v[6]);
-            processes_table(app, cols[0], f);
-            let divider = Block::bordered().border_set(border::Set {
-                top_left: "│",
-                top_right: "│",
-                bottom_left: "│",
-                bottom_right: "│",
-                vertical_left: "│",
-                vertical_right: "│",
-                horizontal_top: " ",
-                horizontal_bottom: " ",
-                ..border::PLAIN
-            });
-            f.render_widget(divider, cols[1]);
+            if tw > 0 {
+                processes_table(app, cols[0], f);
+            }
+            if dw > 0 {
+                let divider = Block::bordered().border_set(border::Set {
+                    top_left: "│",
+                    top_right: "│",
+                    bottom_left: "│",
+                    bottom_right: "│",
+                    vertical_left: "│",
+                    vertical_right: "│",
+                    horizontal_top: " ",
+                    horizontal_bottom: " ",
+                    ..border::PLAIN
+                });
+                f.render_widget(divider, cols[1]);
 
-            let block = Block::bordered()
-                .title(Line::from(styled(Style::new().fg(MID).bold(), " Details ")))
-                .border_style(Style::new().fg(GRAY));
-            let inner = block.inner(cols[2]);
-            app.detail_height = inner.height;
-            f.render_widget(block, cols[2]);
-            f.render_widget(
-                Paragraph::new(app.detail_lines.clone())
-                    .wrap(Wrap { trim: false })
-                    .scroll((app.detail_scroll, 0)),
-                inner,
-            );
+                let block = Block::bordered()
+                    .title(Line::from(styled(
+                        Style::new().fg(MID).bold(),
+                        if app.browse_zoom { " Details [zoom] " } else { " Details " },
+                    )))
+                    .border_style(Style::new().fg(GRAY));
+                let inner = block.inner(cols[2]);
+                app.detail_height = inner.height;
+                f.render_widget(block, cols[2]);
+                f.render_widget(
+                    Paragraph::new(app.detail_lines.clone())
+                        .wrap(Wrap { trim: false })
+                        .scroll((app.detail_scroll, 0)),
+                    inner,
+                );
+            }
         }
         // Ports tab: no detail pane — the table gets the full width
         Tab::Ports => ports_table(app, v[6], f),
@@ -1699,7 +1727,7 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
     };
     let mut footer = match app.tab {
         Tab::Processes | Tab::Ports => format!(
-            "Total: {} | Enter: Detail | /: Search | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
+            "Total: {} | Enter: Detail | /: Search | z: Zoom | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
             total
         ),
         _ => format!("Total: {} | q: Quit", total),
@@ -1888,6 +1916,8 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         KeyCode::Esc => {
             if app.focus == Focus::Details {
                 app.focus = Focus::Table;
+            } else if app.browse_zoom {
+                app.browse_zoom = false;
             } else if app.tab == Tab::Ports && !app.port_search.is_empty() {
                 app.port_search.clear();
                 app.rebuild_socket_view();
@@ -1909,6 +1939,10 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         }
         KeyCode::Char('/') => {
             app.search_mode = true;
+        }
+        // tmux-style zoom on the Processes tab: focused pane takes the row
+        KeyCode::Char('z') if app.tab == Tab::Processes => {
+            app.browse_zoom = !app.browse_zoom;
         }
 
         // ---- cursor movement ----
@@ -2302,6 +2336,43 @@ mod tests {
         on_key(&mut app, KeyCode::Esc);
         assert_eq!(app.page, Page::Browse);
         assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn browse_zoom_toggles_and_esc_unzooms() {
+        let mut app = TuiApp::new(crate::platform::get());
+        assert_eq!(app.page, Page::Browse);
+        assert!(!app.browse_zoom);
+
+        // table focused: z zooms the table over the details panel
+        on_key(&mut app, KeyCode::Char('z'));
+        assert!(app.browse_zoom);
+        assert_eq!(app.focus, Focus::Table);
+
+        // Tab moves focus; the zoom follows it (details pane becomes zoomed)
+        on_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, Focus::Details);
+        assert!(app.browse_zoom);
+
+        // z again unzooms
+        on_key(&mut app, KeyCode::Char('z'));
+        assert!(!app.browse_zoom);
+
+        // Esc from the zoomed details pane returns to the table first,
+        // zoom stays on (focus went to Details after the unzoom above)
+        on_key(&mut app, KeyCode::Tab);
+        on_key(&mut app, KeyCode::Char('z'));
+        on_key(&mut app, KeyCode::Tab);
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, Focus::Table);
+        assert!(app.browse_zoom);
+
+        // …then Esc unzooms instead of quitting…
+        on_key(&mut app, KeyCode::Esc);
+        assert!(!app.browse_zoom);
+
+        // …and the next Esc finally quits
+        assert!(!on_key(&mut app, KeyCode::Esc));
     }
 
     #[test]
