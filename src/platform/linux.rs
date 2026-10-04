@@ -286,6 +286,21 @@ impl Platform for Linux {
     fn detail(&self, brief: &Process, want_env: bool) -> Process {
         let mut p = brief.clone();
         let base = Path::new("/proc").join(brief.pid.to_string());
+        // lifetime-average CPU, unfiltered (the listing drops 0.0% rows to
+        // cut table noise, but in the detail pane 0.0% is meaningful)
+        if !p.kernel_thread {
+            if let (Some(stat), Some(btime)) = (read_ok(&base.join("stat")), self.boot_time()) {
+                if let Some((_, _, _, starttime, ticks, _)) = parse_stat(&stat) {
+                    let started_at = btime + (starttime as f64 / CLK_TCK).round() as i64;
+                    let elapsed = now_unix() - started_at;
+                    p.cpu = Some(if elapsed > 0 {
+                        (ticks as f64 / CLK_TCK) / elapsed as f64 * 100.0
+                    } else {
+                        0.0
+                    });
+                }
+            }
+        }
         if let Some(exe) = readlink_ok(&base.join("exe")) {
             let (path, deleted) = strip_deleted_suffix(&exe);
             p.exe = Some(path.to_string());
@@ -318,6 +333,45 @@ impl Platform for Linux {
                 }
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => { /* leave None */ }
                 Err(_) => { /* leave None */ }
+            }
+        }
+        // memory / threads from status; a fresh VmRSS beats the statm
+        // snapshot the brief listing took
+        if let Some(status) = read_ok(&base.join("status")) {
+            let mut vm_kb = None;
+            let mut rss_kb = None;
+            let mut private_kb = None;
+            let mut threads = None;
+            for line in status.lines() {
+                let mut it = line.split_whitespace();
+                match it.next().unwrap_or("") {
+                    "VmSize:" => vm_kb = it.next().and_then(|v| v.parse().ok()),
+                    "VmRSS:" => rss_kb = it.next().and_then(|v| v.parse().ok()),
+                    "RssAnon:" => private_kb = it.next().and_then(|v| v.parse().ok()),
+                    "Threads:" => threads = it.next().and_then(|v| v.parse().ok()),
+                    _ => {}
+                }
+            }
+            p.vm_kb = vm_kb;
+            p.private_kb = private_kb;
+            p.threads = threads;
+            if let Some(kb) = rss_kb {
+                p.mem_kb = Some(kb).filter(|m| *m > 0);
+            }
+        }
+        // disk I/O (same-user only; kernel threads and other users -> None)
+        if let Ok(io) = std::fs::read_to_string(base.join("io")) {
+            for line in io.lines() {
+                if let Some((k, v)) = line.split_once(": ") {
+                    let val = v.trim().parse().ok();
+                    match k {
+                        "read_bytes" => p.io_read_bytes = val,
+                        "syscr" => p.io_read_ops = val,
+                        "write_bytes" => p.io_write_bytes = val,
+                        "syscw" => p.io_write_ops = val,
+                        _ => {}
+                    }
+                }
             }
         }
         p

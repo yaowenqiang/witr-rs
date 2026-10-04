@@ -20,8 +20,8 @@ impl MacOs {
     }
 }
 
-/// `ps -axo pid=,ppid=,uid=,etime=,time=,pcpu=,rss=,comm=` — comm is the
-/// last column and may contain spaces, so the first seven whitespace
+/// `ps -axo pid=,ppid=,uid=,etime=,time=,pcpu=,rss=,vsz=,comm=` — comm is the
+/// last column and may contain spaces, so the first eight whitespace
 /// tokens are fixed and the rest is the executable path.
 fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
     let line = line.trim();
@@ -30,8 +30,8 @@ fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
     }
     let bytes = line.as_bytes();
     let mut idx = 0usize;
-    // skip leading whitespace, then consume seven fixed fields
-    let mut fixed: [Option<&str>; 7] = [None; 7];
+    // skip leading whitespace, then consume eight fixed fields
+    let mut fixed: [Option<&str>; 8] = [None; 8];
     for slot in fixed.iter_mut() {
         while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
             idx += 1;
@@ -54,6 +54,7 @@ fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
     let cpu_time_ms = parse_cpu_time_to_ms(fixed[4]?);
     let cpu = fixed[5]?.parse::<f64>().ok().filter(|c| *c > 0.05);
     let mem_kb = fixed[6]?.parse::<u64>().ok().filter(|m| *m > 0);
+    let vm_kb = fixed[7]?.parse::<u64>().ok().filter(|m| *m > 0);
     Some(Process {
         pid,
         ppid: Some(ppid),
@@ -64,17 +65,20 @@ fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
         started,
         cpu,
         mem_kb,
+        vm_kb,
         cpu_time_ms,
         ..Default::default()
     })
 }
 
-/// `ps -wwO pid=,command= -p N` → (pid, full command line as one string).
-fn parse_ps_detail_line(line: &str) -> Option<(Pid, String)> {
+/// `ps -wwO pid=,pcpu=,command= -p N` → (pid, lifetime-avg cpu %, command).
+fn parse_ps_detail_line(line: &str) -> Option<(Pid, Option<f64>, String)> {
     let line = line.trim_start();
     let (pid_str, rest) = line.split_once(' ')?;
     let pid: Pid = pid_str.parse().ok()?;
-    Some((pid, rest.trim().to_string()))
+    let rest = rest.trim_start();
+    let (cpu_str, cmd) = rest.split_once(' ')?;
+    Some((pid, cpu_str.parse::<f64>().ok(), cmd.trim().to_string()))
 }
 
 /// Parse one data row of `lsof -nP -i :PORT`.
@@ -197,7 +201,7 @@ impl Platform for MacOs {
             "ps",
             &[
                 "-axo",
-                "pid=,ppid=,uid=,etime=,time=,pcpu=,rss=,comm=",
+                "pid=,ppid=,uid=,etime=,time=,pcpu=,rss=,vsz=,comm=",
             ],
             CMD_TIMEOUT,
         )
@@ -284,16 +288,29 @@ impl Platform for MacOs {
         let mut p = brief.clone();
         if let Some(out) = run_ok(
             "ps",
-            &["-ww", "-o", "pid=,command=", "-p", &brief.pid.to_string()],
+            &["-ww", "-o", "pid=,pcpu=,command=", "-p", &brief.pid.to_string()],
             CMD_TIMEOUT,
         ) {
             for line in out.lines() {
-                if let Some((_, cmd)) = parse_ps_detail_line(line) {
+                if let Some((_, cpu, cmd)) = parse_ps_detail_line(line) {
+                    // unfiltered lifetime average — 0.0% is meaningful here
+                    p.cpu = cpu;
                     if !cmd.is_empty() {
                         p.cmdline = vec![cmd];
                     }
                     break;
                 }
+            }
+        }
+        // thread count: ps -M prints one line per thread (+ header)
+        if let Some(out) = run_ok(
+            "ps",
+            &["-M", "-p", &brief.pid.to_string()],
+            CMD_TIMEOUT,
+        ) {
+            let n = out.lines().count().saturating_sub(1);
+            if n > 0 {
+                p.threads = Some(n as u32);
             }
         }
         // environment: ps -E appends KEY=VALUE after the command for
@@ -502,7 +519,7 @@ mod tests {
     #[test]
     fn ps_list_line() {
         let p = parse_ps_list_line(
-            "  350   1   501 2-03:10:31 0:05.00  1.2  45600 /opt/homebrew/bin/nginx",
+            "  350   1   501 2-03:10:31 0:05.00  1.2  45600 456780 /opt/homebrew/bin/nginx",
             &Users::load(),
         )
         .unwrap();
@@ -513,6 +530,7 @@ mod tests {
         assert_eq!(p.cpu_time_ms, Some(5_000));
         assert_eq!(p.cpu, Some(1.2));
         assert_eq!(p.mem_kb, Some(45600));
+        assert_eq!(p.vm_kb, Some(456780));
         assert_eq!(p.name, "nginx");
         assert_eq!(p.exe.as_deref(), Some("/opt/homebrew/bin/nginx"));
     }
@@ -520,7 +538,7 @@ mod tests {
     #[test]
     fn ps_list_line_with_spaces_in_path() {
         let p = parse_ps_list_line(
-            "  999   1   0  42 1:02:03.4  0.0   1024 /Applications/My App/Helper --flag",
+            "  999   1   0  42 1:02:03.4  0.0   1024   2048 /Applications/My App/Helper --flag",
             &Users::load(),
         )
         .unwrap();
@@ -539,8 +557,9 @@ mod tests {
 
     #[test]
     fn ps_detail_line() {
-        let (pid, cmd) = parse_ps_detail_line("  1234 nginx: worker process").unwrap();
+        let (pid, cpu, cmd) = parse_ps_detail_line("  1234 0.7 nginx: worker process").unwrap();
         assert_eq!(pid, 1234);
+        assert_eq!(cpu, Some(0.7));
         assert_eq!(cmd, "nginx: worker process");
     }
 

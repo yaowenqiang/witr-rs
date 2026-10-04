@@ -25,6 +25,17 @@ pub struct Process {
     pub cpu: Option<f64>,
     /// Resident set size in KiB.
     pub mem_kb: Option<u64>,
+    /// Virtual memory size in KiB (macOS ps vsz / Linux VmSize).
+    pub vm_kb: Option<u64>,
+    /// Anonymous (private) resident memory in KiB (Linux RssAnon).
+    pub private_kb: Option<u64>,
+    /// OS thread count, when the platform exposes it.
+    pub threads: Option<u32>,
+    /// Cumulative disk I/O: bytes + syscall ops (Linux /proc/<pid>/io).
+    pub io_read_bytes: Option<u64>,
+    pub io_read_ops: Option<u64>,
+    pub io_write_bytes: Option<u64>,
+    pub io_write_ops: Option<u64>,
     /// Cumulative CPU time in milliseconds — the sampling history uses the
     /// delta between refreshes for a true instantaneous percent.
     pub cpu_time_ms: Option<u64>,

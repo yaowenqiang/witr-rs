@@ -445,7 +445,7 @@ impl TuiApp {
         .next();
         self.detail_lines = match report {
             Some(r) if r.found => {
-                let mut lines = detail_lines(&r);
+                let mut lines = detail_lines(&r, &[], &[]);
                 push_history_lines(&mut lines, &self.hist, pid);
                 lines
             }
@@ -482,8 +482,27 @@ impl TuiApp {
             Some(r) if r.found => {
                 // rebuild the pane content for THIS process (detail_lines is
                 // shared with the browse side panel, which may still hold the
-                // previously selected process)
-                let mut lines = detail_lines(&r);
+                // previously selected process); also fetch the process's live
+                // sockets and (Linux) file locks — the Go witr shows both
+                let (socks, locks) = {
+                    let socks: Vec<Socket> = self
+                        .platform
+                        .list_sockets()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|s| s.pid == Some(pid))
+                        .collect();
+                    let locks = if self.locks_supported {
+                        read_locks_linux()
+                            .into_iter()
+                            .filter(|l| l.pid == Some(pid))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    (socks, locks)
+                };
+                let mut lines = detail_lines(&r, &socks, &locks);
                 push_history_lines(&mut lines, &self.hist, pid);
                 self.open_files = Some(self.platform.open_files(pid));
                 if let Some(files) = &self.open_files {
@@ -666,7 +685,16 @@ impl TuiApp {
             Page::Detail => self.env_lines(),
             Page::PortDetail if self.port_pane_conn => self.port_connection_lines(),
             Page::PortDetail => match &self.port_detail_report {
-                Some(r) => detail_lines(r),
+                Some(r) => {
+                    let pid = r.matches[0].pid;
+                    let own: Vec<Socket> = r
+                        .sockets
+                        .iter()
+                        .filter(|s| s.pid == Some(pid))
+                        .cloned()
+                        .collect();
+                    detail_lines(r, &own, &[])
+                }
                 None => vec![Line::from("no owning process visible")],
             },
             Page::ContainerDetail if self.cd_pane_info => self.container_info_lines(),
@@ -883,34 +911,132 @@ fn push_history_lines(lines: &mut Vec<Line<'static>>, hist: &crate::history::His
     }
 }
 
-/// Right-hand details panel: identity + ancestry tree + warnings.
-fn detail_lines(r: &crate::model::TargetReport) -> Vec<Line<'static>> {
+/// "Key      value" line in the detail panes.
+fn push_kv(v: &mut Vec<Line<'static>>, k: &str, val: String) {
+    v.push(Line::from(vec![
+        styled(Style::new().fg(MID), format!("{:<8}", k)),
+        Span::raw(val),
+    ]));
+}
+
+/// Indented sub-entry under a bold section header ("Virtual 436.5G").
+fn push_sub(v: &mut Vec<Line<'static>>, k: &str, val: String) {
+    v.push(Line::from(vec![
+        styled(Style::new().fg(MID), format!("  {:<9}", format!("{}:", k))),
+        Span::raw(val),
+    ]));
+}
+
+/// Right-hand details panel: identity + resources + ancestry tree + warnings.
+/// `sockets`/`locks` are the live per-process entries (empty on the browse
+/// side panel, which does not pay for the fetch).
+fn detail_lines(
+    r: &crate::model::TargetReport,
+    sockets: &[Socket],
+    locks: &[LockEntry],
+) -> Vec<Line<'static>> {
     let m = &r.matches[0];
     let mut v: Vec<Line<'static>> = Vec::new();
-    let mut kv = |k: &str, val: String| {
-        v.push(Line::from(vec![
-            styled(Style::new().fg(MID), format!("{:<8}", k)),
-            Span::raw(val),
-        ]));
-    };
-    kv("PID", m.pid.to_string());
+    push_kv(&mut v, "PID", m.pid.to_string());
     if let Some(u) = &m.user {
-        kv("User", u.clone());
+        push_kv(&mut v, "User", u.clone());
     }
     if let Some(t) = m.started {
-        kv(
+        push_kv(
+            &mut v,
             "Started",
             format!("{} ({} ago)", crate::util::fmt_time(t), crate::util::fmt_age(crate::util::now_unix() - t)),
         );
     }
     if let Some(c) = &m.cwd {
-        kv("Cwd", c.clone());
+        push_kv(&mut v, "Cwd", c.clone());
     }
     if let Some(e) = &m.exe {
-        kv("Exe", e.clone());
+        push_kv(&mut v, "Exe", e.clone());
     }
     if !m.cmdline.is_empty() {
-        kv("Cmd", m.command_line());
+        push_kv(&mut v, "Cmd", m.command_line());
+    }
+
+    // resource usage (mirrors the Go witr's CPU/Memory/I/O/Threads block)
+    if m.cpu.is_some() || m.cpu_time_ms.is_some() {
+        v.push(Line::from(Span::styled("CPU:", Style::new().bold())));
+        if let Some(cpu) = m.cpu {
+            push_sub(&mut v, "Average", format!("{cpu:.1}% (lifetime avg)"));
+        }
+        if let Some(ms) = m.cpu_time_ms {
+            push_sub(&mut v, "Time", crate::util::fmt_age((ms / 1000) as i64));
+        }
+    }
+    if m.vm_kb.is_some() || m.mem_kb.is_some() || m.private_kb.is_some() {
+        v.push(Line::from(Span::styled("Memory:", Style::new().bold())));
+        if m.vm_kb.is_some() {
+            push_sub(&mut v, "Virtual", fmt_mem(m.vm_kb));
+        }
+        if m.mem_kb.is_some() {
+            push_sub(&mut v, "Resident", fmt_mem(m.mem_kb));
+        }
+        if m.private_kb.is_some() {
+            push_sub(&mut v, "Private", fmt_mem(m.private_kb));
+        }
+    }
+    if m.io_read_bytes.is_some() || m.io_write_bytes.is_some() {
+        v.push(Line::from(Span::styled("I/O Statistics:", Style::new().bold())));
+        let fbytes = |b: u64| -> String {
+            if b >= 1024 * 1024 * 1024 {
+                format!("{:.1} GB", b as f64 / 1024.0 / 1024.0 / 1024.0)
+            } else if b >= 1024 * 1024 {
+                format!("{:.1} MB", b as f64 / 1024.0 / 1024.0)
+            } else if b >= 1024 {
+                format!("{:.1} KB", b as f64 / 1024.0)
+            } else {
+                format!("{b} B")
+            }
+        };
+        if let Some(b) = m.io_read_bytes {
+            push_sub(
+                &mut v,
+                "Read",
+                match m.io_read_ops {
+                    Some(ops) => format!("{} ({} ops)", fbytes(b), ops),
+                    None => fbytes(b),
+                },
+            );
+        }
+        if let Some(b) = m.io_write_bytes {
+            push_sub(
+                &mut v,
+                "Write",
+                match m.io_write_ops {
+                    Some(ops) => format!("{} ({} ops)", fbytes(b), ops),
+                    None => fbytes(b),
+                },
+            );
+        }
+    }
+    if let Some(t) = m.threads {
+        push_kv(&mut v, "Threads", t.to_string());
+    }
+    if !sockets.is_empty() {
+        v.push(Line::from(""));
+        v.push(Line::from(Span::styled("Sockets:", Style::new().bold())));
+        for s in sockets {
+            // "127.0.0.1:18789 (TCP | LISTENING)", with the peer for
+            // established connections
+            let mut text = format!("  {}:{} ({}", s.local_addr, s.local_port, s.proto.to_uppercase());
+            if let (Some(pa), Some(pp)) = (&s.peer_addr, &s.peer_port) {
+                text.push_str(&format!(" -> {}:{}", pa, pp));
+            }
+            text.push_str(&format!(" | {})", s.state));
+            v.push(Line::from(text));
+        }
+    }
+    if !locks.is_empty() {
+        v.push(Line::from(""));
+        v.push(Line::from(Span::styled("Locks:", Style::new().bold())));
+        for l in locks {
+            v.push(Line::from(format!("  {} {} ({})", l.kind, l.mode, l.owner)));
+        }
     }
     if let Some(s) = &r.source {
         v.push(Line::from(""));
@@ -1438,7 +1564,16 @@ fn ui_port_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
 
     // owner pane
     let owner_lines = match &app.port_detail_report {
-        Some(r) => detail_lines(r),
+        Some(r) => {
+            let pid = r.matches[0].pid;
+            let own: Vec<Socket> = r
+                .sockets
+                .iter()
+                .filter(|s| s.pid == Some(pid))
+                .cloned()
+                .collect();
+            detail_lines(r, &own, &[])
+        }
         None => vec![Line::from(styled(
             Style::new().fg(MID),
             "no owning process visible (kernel-held socket, or permission needed — try sudo)",
@@ -2100,6 +2235,7 @@ fn settle_details(app: &mut TuiApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TargetReport;
 
     #[test]
     fn wrapped_count_ceil() {
@@ -2336,6 +2472,80 @@ mod tests {
         on_key(&mut app, KeyCode::Esc);
         assert_eq!(app.page, Page::Browse);
         assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn detail_lines_show_resources_sockets_locks() {
+        let mut r = TargetReport::not_found(TargetSpec::Pid { pid: 42 }, String::new());
+        r.found = true;
+        r.matches = vec![Process {
+            pid: 42,
+            name: "node".into(),
+            cpu: Some(0.1),
+            cpu_time_ms: Some(3_723_400),
+            mem_kb: Some(1_153_433),
+            vm_kb: Some(457_703_424),
+            private_kb: Some(1_153_433),
+            threads: Some(13),
+            io_read_bytes: Some(56_275_619_676),
+            io_read_ops: Some(0),
+            io_write_bytes: Some(53_164_675_379),
+            io_write_ops: Some(1_234),
+            ..Default::default()
+        }];
+        let sockets = vec![Socket {
+            proto: "tcp".into(),
+            local_addr: "127.0.0.1".into(),
+            local_port: 18789,
+            peer_addr: None,
+            peer_port: None,
+            state: "LISTEN".into(),
+            pid: Some(42),
+        }];
+        let locks = vec![LockEntry {
+            id: "1".into(),
+            kind: "POSIX".into(),
+            mode: "WRITE".into(),
+            pid: Some(42),
+            owner: "fd:00:123".into(),
+        }];
+        let text: Vec<String> = detail_lines(&r, &sockets, &locks)
+            .iter()
+            .map(line_to_string)
+            .collect();
+        assert!(text.iter().any(|l| l == "CPU:"));
+        assert!(text.iter().any(|l| l.contains("Average") && l.contains("0.1%")));
+        assert!(text.iter().any(|l| l.contains("Time") && l.ends_with("1h 2m")));
+        assert!(text.iter().any(|l| l == "Memory:"));
+        assert!(text.iter().any(|l| l.contains("Virtual") && l.ends_with("436.5G")));
+        assert!(text.iter().any(|l| l.contains("Resident") && l.ends_with("1.1G")));
+        assert!(text.iter().any(|l| l.contains("Private") && l.ends_with("1.1G")));
+        assert!(text.iter().any(|l| l == "I/O Statistics:"));
+        assert!(text.iter().any(|l| l.contains("Read") && l.contains("52.4 GB")));
+        assert!(text.iter().any(|l| l.contains("Write") && l.contains("(1234 ops)")));
+        assert!(text.iter().any(|l| l.starts_with("Threads") && l.ends_with("13")));
+        assert!(text.iter().any(|l| l.contains("127.0.0.1:18789 (TCP | LISTEN)")));
+        assert!(text.iter().any(|l| l.contains("POSIX WRITE (fd:00:123)")));
+
+        // established socket renders the peer
+        let with_peer = vec![Socket {
+            peer_addr: Some("10.0.0.5".into()),
+            peer_port: Some(5000),
+            ..sockets[0].clone()
+        }];
+        let text2: Vec<String> = detail_lines(&r, &with_peer, &[])
+            .iter()
+            .map(line_to_string)
+            .collect();
+        assert!(text2.iter().any(|l| l.contains("-> 10.0.0.5:5000")));
+
+        // no sockets/locks -> no sections
+        let text3: Vec<String> = detail_lines(&r, &[], &[])
+            .iter()
+            .map(line_to_string)
+            .collect();
+        assert!(!text3.iter().any(|l| l.starts_with("Sockets:")));
+        assert!(!text3.iter().any(|l| l.starts_with("Locks:")));
     }
 
     #[test]
