@@ -113,6 +113,9 @@ struct TuiApp {
     env_search_mode: bool,
     /// tmux-style zoom (z): the focused pane temporarily fills the whole row
     detail_zoom: bool,
+    /// Actions bar on the process detail page (a): [k]ill [t]erm [p]ause
+    /// [r]esume [n]ice — mirrors the Go witr's action bar
+    actions_open: bool,
     /// same zoom for the Processes tab (table <-> details panel)
     browse_zoom: bool,
     /// Ports-tab detail page (Enter on a port): every socket touching that
@@ -217,6 +220,7 @@ impl TuiApp {
             env_search: String::new(),
             env_search_mode: false,
             detail_zoom: false,
+            actions_open: false,
             browse_zoom: false,
             port_detail_port: 0,
             port_detail_sockets: Vec::new(),
@@ -458,7 +462,7 @@ impl TuiApp {
 
     fn kill_selected(&mut self) {
         let Some(pid) = self.selected_pid() else { return };
-        let res = kill_pid(pid);
+        let res = send_signal(pid, "TERM");
         self.status = match res {
             Ok(()) => format!("SIGTERM sent to pid {}", pid),
             Err(e) => format!("kill {}: {}", pid, e),
@@ -786,18 +790,75 @@ impl TuiApp {
     }
 }
 
-fn kill_pid(pid: Pid) -> std::io::Result<()> {
+/// Send a POSIX signal via the kill utility (TERM/KILL/STOP/CONT...).
+/// Windows only supports graceful (/PID) and forced (/F) taskkill.
+fn send_signal(pid: Pid, sig: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        std::process::Command::new("kill").arg(pid.to_string()).output()?;
+        let out = std::process::Command::new("kill")
+            .args(["-s", sig, &pid.to_string()])
+            .output()?;
+        if !out.status.success() {
+            let msg = String::from_utf8_lossy(&out.stderr);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                msg.trim().to_string(),
+            ));
+        }
+        Ok(())
     }
     #[cfg(windows)]
     {
-        std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string()])
-            .output()?;
+        match sig {
+            "TERM" => {
+                std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string()])
+                    .output()?;
+                Ok(())
+            }
+            "KILL" => {
+                std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .output()?;
+                Ok(())
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("signal {sig} is not supported on windows"),
+            )),
+        }
     }
-    Ok(())
+}
+
+/// renice the process (action-bar [n]ice); returns the tool's message.
+fn renice_pid(pid: Pid, value: i32) -> std::io::Result<String> {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("renice")
+            .args([value.to_string(), "-p".to_string(), pid.to_string()])
+            .output()?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if out.status.success() {
+            Ok(text.trim().to_string())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                text.trim().to_string(),
+            ))
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = (pid, value);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "renice is not supported on windows",
+        ))
+    }
 }
 
 /// /proc/locks for the Locks tab (Linux only).
@@ -1480,10 +1541,12 @@ fn ui_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
         e_inner,
     );
 
-    let mut footer = if app.env_search_mode {
+    let mut footer = if app.actions_open {
+        "Esc/q: cancel | Actions: [k]ill [t]erm [p]ause [r]esume [n]ice".to_string()
+    } else if app.env_search_mode {
         "Search env: Enter: apply — Esc: cancel".to_string()
     } else {
-        "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | z: Zoom | /: Search Env | Esc/q: Back | c: Copy"
+        "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | z: Zoom | /: Search Env | a: Actions | Esc/q: Back | c: Copy"
             .to_string()
     };
     if !app.status.is_empty() {
@@ -1930,6 +1993,38 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
             }
             return true;
         }
+        // Actions bar: one-key signals on this process (Go witr parity)
+        if app.actions_open {
+            let Some(pid) = app.detail_pid else {
+                app.actions_open = false;
+                return true;
+            };
+            app.actions_open = false;
+            match key {
+                KeyCode::Char('k') => app.status = match send_signal(pid, "KILL") {
+                    Ok(()) => format!("SIGKILL sent to pid {pid}"),
+                    Err(e) => e.to_string(),
+                },
+                KeyCode::Char('t') => app.status = match send_signal(pid, "TERM") {
+                    Ok(()) => format!("SIGTERM sent to pid {pid}"),
+                    Err(e) => e.to_string(),
+                },
+                KeyCode::Char('p') => app.status = match send_signal(pid, "STOP") {
+                    Ok(()) => format!("SIGSTOP sent to pid {pid} (paused)"),
+                    Err(e) => e.to_string(),
+                },
+                KeyCode::Char('r') => app.status = match send_signal(pid, "CONT") {
+                    Ok(()) => format!("SIGCONT sent to pid {pid} (resumed)"),
+                    Err(e) => e.to_string(),
+                },
+                KeyCode::Char('n') => app.status = match renice_pid(pid, 10) {
+                    Ok(msg) => format!("renice pid {pid}: {msg}"),
+                    Err(e) => e.to_string(),
+                },
+                _ => return true, // any other key just closes the bar
+            }
+            return true;
+        }
         if matches!(key, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace) {
             // first Esc clears the env filter, only then does it leave the page
             if !app.env_search.is_empty() {
@@ -1938,6 +2033,7 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                 return true;
             }
             app.page = Page::Browse;
+            app.actions_open = false;
             return true;
         }
         if key == KeyCode::Char('c') {
@@ -1959,6 +2055,10 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         }
         if key == KeyCode::Char('/') && app.page == Page::Detail {
             app.env_search_mode = true;
+            return true;
+        }
+        if key == KeyCode::Char('a') && app.page == Page::Detail {
+            app.actions_open = true;
             return true;
         }
         // tmux-style zoom: the focused pane takes the whole row until z again
@@ -2472,6 +2572,44 @@ mod tests {
         on_key(&mut app, KeyCode::Esc);
         assert_eq!(app.page, Page::Browse);
         assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn detail_actions_bar_keymap() {
+        let mut app = TuiApp::new(crate::platform::get());
+        on_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.page, Page::Detail);
+        assert!(!app.actions_open);
+
+        // a opens the bar; Esc cancels without leaving the page
+        on_key(&mut app, KeyCode::Char('a'));
+        assert!(app.actions_open);
+        on_key(&mut app, KeyCode::Esc);
+        assert!(!app.actions_open);
+        assert_eq!(app.page, Page::Detail);
+
+        // an action key on a dead pid reports the failure and closes the bar
+        app.detail_pid = Some(4_000_000); // nothing there
+        on_key(&mut app, KeyCode::Char('a'));
+        on_key(&mut app, KeyCode::Char('t'));
+        assert!(!app.actions_open);
+        assert!(app.status.contains("4000000"), "status: {}", app.status);
+
+        // other keys inside the bar just close it without acting
+        on_key(&mut app, KeyCode::Char('a'));
+        on_key(&mut app, KeyCode::Char('x'));
+        assert!(!app.actions_open);
+
+        // q inside the bar cancels instead of leaving the page
+        on_key(&mut app, KeyCode::Char('a'));
+        on_key(&mut app, KeyCode::Char('q'));
+        assert!(!app.actions_open);
+        assert_eq!(app.page, Page::Detail);
+
+        // leaving the page resets the bar
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Browse);
+        assert!(!app.actions_open);
     }
 
     #[test]
