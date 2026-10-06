@@ -81,6 +81,27 @@ pub struct Container {
     pub ports: String,  // published ports, e.g. "0.0.0.0:8088->8088/tcp"
 }
 
+/// One file lock, for the Locks tab and the detail page's Locks section.
+/// On Linux this comes from /proc/locks (paths resolved through the
+/// holder's fd table); on macOS from `lsof` lock flags plus a
+/// `.lock`/`.pid` filename heuristic (the kernel doesn't export lock
+/// tables there — see platform::macos::list_locks).
+#[derive(Debug, Clone, Serialize)]
+pub struct LockEntry {
+    /// /proc/locks id, or the lsof fd token (e.g. "3uW") on macOS.
+    pub id: String,
+    /// POSIX / FLOCK / MAND (Linux); always "FLOCK" on macOS.
+    pub kind: String,
+    /// READ / WRITE / RW.
+    pub mode: String,
+    pub pid: Option<Pid>,
+    /// Holder's process name.
+    pub owner: String,
+    /// Resolved file path; falls back to the device:inode literal on Linux
+    /// when the holder's fd table isn't readable.
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Source {
     /// systemd | launchd | windows-service | cron | container | tmux | screen | ssh | shell | init

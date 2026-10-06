@@ -214,10 +214,95 @@ fn inode_owner_map() -> HashMap<u64, Pid> {
     map
 }
 
+/// One /proc/locks row:
+/// `1: FLOCK ADVISORY WRITE 4242 00:1f:12345 0 EOF` →
+/// (id, kind, mode, pid, device:inode).
+fn parse_proc_lock_line(line: &str) -> Option<(String, String, String, Pid, String)> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.len() < 6 {
+        return None;
+    }
+    Some((
+        f[0].trim_end_matches(':').to_string(),
+        f[1].to_string(),
+        f[3].to_string(),
+        f[4].parse().ok()?,
+        f[5].to_string(),
+    ))
+}
+
+fn comm_of(pid: Pid) -> String {
+    read_ok(Path::new(&format!("/proc/{}/comm", pid)))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// inode -> path map for one pid's fd table, cached per scan. /proc/locks
+/// emits device:inode but its device numbering doesn't always match what
+/// userspace stat returns, so matching is on the inode alone (collisions
+/// across filesystems are vanishingly rare).
+fn fd_inode_paths(
+    pid: Pid,
+    cache: &mut HashMap<Pid, HashMap<String, String>>,
+) -> &HashMap<String, String> {
+    cache.entry(pid).or_insert_with(|| {
+        let mut m = HashMap::new();
+        if let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", pid)) {
+            for fd in fds.flatten() {
+                if let Some(target) = readlink_ok(&fd.path()) {
+                    if let Ok(meta) = std::fs::metadata(&target) {
+                        use std::os::unix::fs::MetadataExt;
+                        m.insert(meta.ino().to_string(), target);
+                    }
+                }
+            }
+        }
+        m
+    })
+}
+
 impl Platform for Linux {
     fn name(&self) -> &'static str {
         "linux"
     }
+
+    fn list_locks(&self, pid: Option<Pid>) -> Vec<crate::model::LockEntry> {
+        use crate::model::LockEntry;
+        let Some(text) = read_ok(Path::new("/proc/locks")) else {
+            return Vec::new();
+        };
+        let mut fd_cache: HashMap<Pid, HashMap<String, String>> = HashMap::new();
+        let mut comm_cache: HashMap<Pid, String> = HashMap::new();
+        text.lines()
+            .filter_map(|line| {
+                let (id, kind, mode, holder, dev_inode) = parse_proc_lock_line(line)?;
+                if let Some(want) = pid {
+                    if holder != want {
+                        return None;
+                    }
+                }
+                // resolve the holder's fd table only for the locks we keep
+                let inode = dev_inode.rsplit(':').next().unwrap_or(&dev_inode);
+                let path = fd_inode_paths(holder, &mut fd_cache)
+                    .get(inode)
+                    .cloned()
+                    .unwrap_or(dev_inode);
+                let owner = comm_cache
+                    .entry(holder)
+                    .or_insert_with(|| comm_of(holder))
+                    .clone();
+                Some(LockEntry {
+                    id,
+                    kind,
+                    mode,
+                    pid: Some(holder),
+                    owner,
+                    path,
+                })
+            })
+            .collect()
+    }
+
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -679,6 +764,20 @@ mod tests {
         // ::1 in /proc/net/tcp6 layout
         assert_eq!(hex_v6("00000000000000000000000001000000").unwrap(), "::1");
         assert_eq!(hex_v4("0100007F").unwrap(), "127.0.0.1");
+    }
+
+    #[test]
+    fn proc_lock_line() {
+        let (id, kind, mode, pid, dev) =
+            parse_proc_lock_line("1: FLOCK ADVISORY WRITE 4242 00:1f:12345 0 EOF").unwrap();
+        assert_eq!(id, "1");
+        assert_eq!(kind, "FLOCK");
+        assert_eq!(mode, "WRITE");
+        assert_eq!(pid, 4242);
+        assert_eq!(dev, "00:1f:12345");
+        // too short / bad pid -> None
+        assert!(parse_proc_lock_line("1: POSIX ADVISORY READ 42").is_none());
+        assert!(parse_proc_lock_line("1: POSIX ADVISORY READ x 00:1f:1 0 EOF").is_none());
     }
 
     #[test]

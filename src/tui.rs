@@ -16,7 +16,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::model::{Container, Pid, Process, Socket, TargetSpec};
+use crate::model::{Container, LockEntry, Pid, Process, Socket, TargetSpec};
 use crate::pipeline;
 use crate::platform::Platform;
 
@@ -69,14 +69,6 @@ enum SortKey {
 enum Focus {
     Table,
     Details,
-}
-
-struct LockEntry {
-    id: String,
-    kind: String,
-    mode: String,
-    pid: Option<Pid>,
-    owner: String,
 }
 
 struct TuiApp {
@@ -192,7 +184,7 @@ impl Tab {
 
 impl TuiApp {
     fn new(platform: Box<dyn Platform>) -> Self {
-        let locks_supported = platform.name() == "linux";
+        let locks_supported = matches!(platform.name(), "linux" | "macos");
         let mut app = TuiApp {
             platform,
             tab: Tab::Processes,
@@ -265,7 +257,7 @@ impl TuiApp {
             self.request_containers();
         }
         if tab == Tab::Locks && self.locks_supported {
-            self.locks = read_locks_linux();
+            self.locks = self.platform.list_locks(None);
         }
         if tab == Tab::Processes {
             self.rebuild_view();
@@ -285,8 +277,11 @@ impl TuiApp {
         if self.tab == Tab::Containers {
             self.request_containers();
         }
-        if self.tab == Tab::Locks && self.locks_supported {
-            self.locks = read_locks_linux();
+        // Locks: Linux re-reads /proc/locks every cycle (a cheap file
+        // read); macOS would re-run a full `lsof` scan (1-2s), so its
+        // snapshot only refreshes on tab switch.
+        if self.tab == Tab::Locks && self.platform.name() == "linux" {
+            self.locks = self.platform.list_locks(None);
         }
         self.rebuild_view();
         self.last_refresh = Instant::now();
@@ -487,7 +482,7 @@ impl TuiApp {
                 // rebuild the pane content for THIS process (detail_lines is
                 // shared with the browse side panel, which may still hold the
                 // previously selected process); also fetch the process's live
-                // sockets and (Linux) file locks — the Go witr shows both
+                // sockets and file locks — the Go witr shows both
                 let (socks, locks) = {
                     let socks: Vec<Socket> = self
                         .platform
@@ -496,14 +491,7 @@ impl TuiApp {
                         .into_iter()
                         .filter(|s| s.pid == Some(pid))
                         .collect();
-                    let locks = if self.locks_supported {
-                        read_locks_linux()
-                            .into_iter()
-                            .filter(|l| l.pid == Some(pid))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let locks = self.platform.list_locks(Some(pid));
                     (socks, locks)
                 };
                 let mut lines = detail_lines(&r, &socks, &locks);
@@ -861,28 +849,6 @@ fn renice_pid(pid: Pid, value: i32) -> std::io::Result<String> {
     }
 }
 
-/// /proc/locks for the Locks tab (Linux only).
-fn read_locks_linux() -> Vec<LockEntry> {
-    let Ok(text) = std::fs::read_to_string("/proc/locks") else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split_whitespace().collect();
-            if f.len() < 5 {
-                return None;
-            }
-            Some(LockEntry {
-                id: f[0].trim_end_matches(':').to_string(),
-                kind: f[1].to_string(),
-                mode: f[3].to_string(),
-                pid: f.get(4).and_then(|s| s.parse().ok()),
-                owner: f.get(5).unwrap_or(&"").to_string(),
-            })
-        })
-        .collect()
-}
-
 /// Filter sockets for the Ports tab: substring match over port, pid,
 /// process name, address, proto and state.
 fn filter_sockets(
@@ -1096,7 +1062,10 @@ fn detail_lines(
         v.push(Line::from(""));
         v.push(Line::from(Span::styled("Locks:", Style::new().bold())));
         for l in locks {
-            v.push(Line::from(format!("  {} {} ({})", l.kind, l.mode, l.owner)));
+            v.push(Line::from(format!(
+                "  {} {} {} ({})",
+                l.kind, l.mode, l.path, l.owner
+            )));
         }
     }
     if let Some(s) = &r.source {
@@ -1360,7 +1329,7 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
 
 fn locks_table(app: &TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
     let header =
-        Row::new(["#", "Kind", "Mode", "PID", "Owner"]).style(Style::new().fg(ACCENT).bold());
+        Row::new(["#", "Kind", "Mode", "PID", "Process", "Path"]).style(Style::new().fg(ACCENT).bold());
     let rows: Vec<Row> = app
         .locks
         .iter()
@@ -1371,15 +1340,17 @@ fn locks_table(app: &TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
                 Cell::from(l.mode.clone()),
                 Cell::from(l.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
                 Cell::from(l.owner.clone()),
+                Cell::from(l.path.clone()),
             ])
         })
         .collect();
     let widths = [
         Constraint::Length(5),
-        Constraint::Length(6),
-        Constraint::Length(9),
+        Constraint::Length(7),
+        Constraint::Length(7),
         Constraint::Length(8),
-        Constraint::Min(20),
+        Constraint::Length(16),
+        Constraint::Min(30),
     ];
     let table = Table::new(rows, widths)
         .header(header)
@@ -1894,7 +1865,7 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
             if app.locks_supported {
                 locks_table(app, v[6], f);
             } else {
-                placeholder(v[6], f, "  file locks are only collected on Linux");
+                placeholder(v[6], f, "  file locks are not collected on this platform");
             }
         }
     }
@@ -2645,7 +2616,8 @@ mod tests {
             kind: "POSIX".into(),
             mode: "WRITE".into(),
             pid: Some(42),
-            owner: "fd:00:123".into(),
+            owner: "node".into(),
+            path: "/tmp/data.lock".into(),
         }];
         let text: Vec<String> = detail_lines(&r, &sockets, &locks)
             .iter()
@@ -2663,7 +2635,9 @@ mod tests {
         assert!(text.iter().any(|l| l.contains("Write") && l.contains("(1234 ops)")));
         assert!(text.iter().any(|l| l.starts_with("Threads") && l.ends_with("13")));
         assert!(text.iter().any(|l| l.contains("127.0.0.1:18789 (TCP | LISTEN)")));
-        assert!(text.iter().any(|l| l.contains("POSIX WRITE (fd:00:123)")));
+        assert!(text
+            .iter()
+            .any(|l| l.contains("POSIX WRITE /tmp/data.lock (node)")));
 
         // established socket renders the peer
         let with_peer = vec![Socket {

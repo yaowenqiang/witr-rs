@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crate::model::{Pid, Process, Socket, Source};
+use crate::model::{LockEntry, Pid, Process, Socket, Source};
 use crate::platform::{Capabilities, PlatError, PlatResult, Platform, Users};
 use crate::util::{basename, now_unix, parse_etime_to_secs, run_ok, split_host_port};
 
@@ -155,6 +155,76 @@ fn parse_ps_env(output: &str) -> Vec<(String, String)> {
         }
     }
     env
+}
+
+/// FD column → access mode ("3w" → WRITE). lsof appends the access-mode
+/// char (r/w/u) after the fd number, optionally followed by a lock char.
+fn lsof_fd_access(fd: &str) -> Option<&'static str> {
+    let last = fd.chars().rev().find(|c| c.is_ascii_alphabetic())?;
+    match last {
+        'r' => Some("READ"),
+        'w' => Some("WRITE"),
+        'u' => Some("RW"),
+        _ => None,
+    }
+}
+
+/// FD column → lock mode. The lock char comes AFTER the access char
+/// (lsof(8): W/w = write lock, R/r = read lock, u = read+write lock, N =
+/// unknown), so only a fd with two trailing alpha chars carries a lock —
+/// plain "5u" is just an unlocked read/write fd.
+fn lsof_fd_lock(fd: &str) -> Option<&'static str> {
+    let alphas: Vec<char> = fd.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    if alphas.len() < 2 {
+        return None;
+    }
+    match alphas[alphas.len() - 1] {
+        'W' | 'w' => Some("WRITE"),
+        'R' | 'r' => Some("READ"),
+        'u' => Some("RW"),
+        _ => None,
+    }
+}
+
+/// Paths that are almost certainly lock artifacts a user recognizes:
+/// daemon lock/pid files. macOS's kernel exports no lock table (no
+/// /proc/locks), so lsof lock flags rarely appear; this heuristic is what
+/// surfaces the lock file a daemon holds open.
+fn looks_like_lock_file(p: &str) -> bool {
+    p.ends_with(".lock") || p.ends_with(".pid") || p.contains("/lock")
+}
+
+/// Parse one data row of `lsof -l -n -P`:
+/// COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME.
+/// Rows with an explicit lock flag become FLOCK entries; regular files
+/// whose path looks like a lock file are surfaced too (mode = fd access).
+fn parse_lsof_lock_line(line: &str) -> Option<LockEntry> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.len() < 9 {
+        return None;
+    }
+    let pid: Pid = f[1].parse().ok()?;
+    if pid <= 0 {
+        return None;
+    }
+    let fd = f[3];
+    let ty = f[4];
+    let path = f[8..].join(" ");
+    let (kind, mode) = if let Some(mode) = lsof_fd_lock(fd) {
+        ("FLOCK", mode)
+    } else if ty == "REG" && looks_like_lock_file(&path) {
+        ("FLOCK", lsof_fd_access(fd)?)
+    } else {
+        return None;
+    };
+    Some(LockEntry {
+        id: fd.to_string(),
+        kind: kind.to_string(),
+        mode: mode.to_string(),
+        pid: Some(pid),
+        owner: f[0].to_string(),
+        path,
+    })
 }
 
 fn find_plist(label: &str) -> Option<String> {
@@ -370,6 +440,10 @@ impl Platform for MacOs {
                         .lines()
                         .skip(1) // header
                         .filter_map(parse_lsof_net_line)
+                        // `lsof -i :PORT` also matches the client side of
+                        // connections TO that port; the contract is local
+                        // ports only
+                        .filter(|s| s.local_port == port)
                         .collect();
                     // Same socket may appear once per owning fd; dedup.
                     sockets.dedup_by(|a, b| {
@@ -418,6 +492,25 @@ impl Platform for MacOs {
             .filter_map(|l| l.split_whitespace().nth(1)?.parse().ok())
             .collect();
         Ok(pids)
+    }
+
+    fn list_locks(&self, pid: Option<Pid>) -> Vec<LockEntry> {
+        let mut args: Vec<String> = vec!["-l".into(), "-n".into(), "-P".into(), "-w".into()];
+        if let Some(p) = pid {
+            args.push("-p".into());
+            args.push(p.to_string());
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        // lsof exits non-zero when it can't read some process while still
+        // emitting valid rows — salvage stdout instead of failing outright
+        let Ok(out) = std::process::Command::new("lsof").args(&args).output() else {
+            return Vec::new();
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut out: Vec<LockEntry> = text.lines().filter_map(parse_lsof_lock_line).collect();
+        // same lock file can appear once per holding fd
+        out.dedup_by(|a, b| a.pid == b.pid && a.path == b.path);
+        out
     }
 
     fn container_of(&self, _pid: Pid) -> Option<Source> {
@@ -591,6 +684,71 @@ mod tests {
     }
 
     #[test]
+    fn lsof_fd_modes() {
+        // access mode only (single trailing alpha) — not a lock
+        assert_eq!(lsof_fd_lock("5u"), None);
+        assert_eq!(lsof_fd_lock("3r"), None);
+        assert_eq!(lsof_fd_lock("4w"), None);
+        assert_eq!(lsof_fd_access("5u"), Some("RW"));
+        assert_eq!(lsof_fd_access("3r"), Some("READ"));
+        assert_eq!(lsof_fd_access("4w"), Some("WRITE"));
+        // real lock flags ride after the access char
+        assert_eq!(lsof_fd_lock("5uW"), Some("WRITE"));
+        assert_eq!(lsof_fd_lock("10uw"), Some("WRITE"));
+        assert_eq!(lsof_fd_lock("5ur"), Some("READ"));
+        assert_eq!(lsof_fd_lock("5uR"), Some("READ"));
+        assert_eq!(lsof_fd_lock("5uu"), Some("RW"));
+        // special fd names never look like locks
+        assert_eq!(lsof_fd_lock("cwd"), None);
+        assert_eq!(lsof_fd_lock("txt"), None);
+        assert_eq!(lsof_fd_lock("KQUEUE"), None);
+    }
+
+    #[test]
+    fn lsof_lock_flag_line() {
+        let l = parse_lsof_lock_line(
+            "pg 1234 501 3uW REG 1,4 0 154117320 /private/tmp/witr_lock_test.lock",
+        )
+        .unwrap();
+        assert_eq!(l.pid, Some(1234));
+        assert_eq!(l.kind, "FLOCK");
+        assert_eq!(l.mode, "WRITE");
+        assert_eq!(l.owner, "pg");
+        assert_eq!(l.id, "3uW");
+        assert_eq!(l.path, "/private/tmp/witr_lock_test.lock");
+    }
+
+    #[test]
+    fn lsof_lock_file_heuristic() {
+        // opened for write, path looks like a lock file -> surfaced
+        let l = parse_lsof_lock_line(
+            "openclaw 87370 501 4u REG 1,14 0 154117389 /Users/me/.openclaw/tmp/gateway.eabed588.lock",
+        )
+        .unwrap();
+        assert_eq!(l.mode, "RW");
+        assert_eq!(l.path, "/Users/me/.openclaw/tmp/gateway.eabed588.lock");
+        // .pid files too
+        assert!(parse_lsof_lock_line(
+            "nginx 350 501 5w REG 1,4 6 999 /var/run/nginx.pid"
+        )
+        .is_some());
+        // regular file without lock-ish name -> dropped
+        assert!(parse_lsof_lock_line(
+            "nginx 350 501 5u REG 1,4 0 99 /var/log/access.log"
+        )
+        .is_none());
+        // non-REG types never pass the heuristic (only real flags do)
+        assert!(parse_lsof_lock_line(
+            "nginx 350 501 1u CHR 1,2 0t0 1234 /dev/null"
+        )
+        .is_none());
+        assert!(parse_lsof_lock_line(
+            "foo 350 501 0u KQUEUE 0,0 0 0 (not listed)"
+        )
+        .is_none());
+    }
+
+    #[test]
     fn launchctl_line() {
         let (pid, label) = parse_launchctl_pid_label("350\t0\torg.example.nginx").unwrap();
         assert_eq!(pid, 350);
@@ -598,3 +756,4 @@ mod tests {
         assert!(parse_launchctl_pid_label("-\t0\tnot.running").is_none());
     }
 }
+

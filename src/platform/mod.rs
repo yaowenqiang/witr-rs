@@ -8,7 +8,7 @@ pub mod macos;
 #[allow(dead_code)]
 pub mod windows;
 
-use crate::model::{Container, Pid, Process, Socket, Source};
+use crate::model::{Container, LockEntry, Pid, Process, Socket, Source};
 use crate::util::Users;
 
 #[derive(Debug)]
@@ -130,6 +130,15 @@ pub trait Platform {
     /// Files (and a socket/pipe summary) the process currently has open,
     /// as display lines. Empty when not readable (other user, unsupported).
     fn open_files(&self, pid: Pid) -> Vec<String> {
+        let _ = pid;
+        Vec::new()
+    }
+
+    /// File locks: system-wide when `pid` is None, else one process's.
+    /// Linux parses /proc/locks; macOS reads lock flags out of `lsof`
+    /// (plus a lock-file name heuristic — the kernel exports no lock
+    /// table there). Default: none.
+    fn list_locks(&self, pid: Option<Pid>) -> Vec<LockEntry> {
         let _ = pid;
         Vec::new()
     }
