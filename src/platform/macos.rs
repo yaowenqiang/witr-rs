@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crate::model::{LockEntry, Pid, Process, Socket, Source};
+use crate::model::{FileOverview, LockEntry, Pid, Process, Socket, Source};
 use crate::platform::{Capabilities, PlatError, PlatResult, Platform, Users};
 use crate::util::{basename, now_unix, parse_etime_to_secs, run_ok, split_host_port};
 
@@ -17,6 +17,18 @@ pub struct MacOs {
 impl MacOs {
     pub fn new(users: Users) -> Self {
         MacOs { users }
+    }
+
+    /// One `lsof` run, stdout salvaged (it exits non-zero when it can't
+    /// read some process while still emitting valid rows).
+    fn lsof_rows(&self, args: &[&str]) -> Vec<String> {
+        match std::process::Command::new("lsof").args(args).output() {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            Err(_) => Vec::new(),
+        }
     }
 }
 
@@ -227,6 +239,70 @@ fn parse_lsof_lock_line(line: &str) -> Option<LockEntry> {
     })
 }
 
+/// Parse `lsof -l -n -P [-p PID]` table output into (open-file display
+/// lines, lock entries). One scan feeds both the open-files panel and the
+/// locks view.
+fn parse_lsof_files_and_locks(rows: &[String]) -> (Vec<String>, Vec<LockEntry>) {
+    let mut files: Vec<String> = Vec::new();
+    let mut pipes = 0usize;
+    let mut locks: Vec<LockEntry> = Vec::new();
+    for line in rows {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        // header / malformed rows: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+        if f.len() < 9 || f[1].parse::<Pid>().map(|p| p <= 0).unwrap_or(true) {
+            continue;
+        }
+        if let Some(l) = parse_lsof_lock_line(line) {
+            // same lock file can appear once per holding fd
+            if !locks.iter().any(|x| x.pid == l.pid && x.path == l.path) {
+                locks.push(l);
+            }
+        }
+        let (fd, ty) = (f[3], f[4]);
+        let path = f[8..].join(" ");
+        match ty {
+            "REG" | "VREG" | "DIR" | "VDIR" => {
+                let _ = fd;
+                if !path.starts_with("/dev/") && !files.contains(&path) {
+                    files.push(path.to_string());
+                }
+            }
+            "IPv4" | "IPv6" | "TCP" | "UDP" => {
+                // table rows append the state: strip a trailing " (...)"
+                let name = match path.rfind(" (") {
+                    Some(i) if path.ends_with(')') => &path[..i],
+                    _ => path.as_str(),
+                };
+                let l = format!("socket {} {}", ty.to_lowercase(), name);
+                if !files.contains(&l) {
+                    files.push(l);
+                }
+            }
+            "UNIX" | "unix" | "PIPE" | "PSHM" => pipes += 1,
+            _ => {} // txt/cwd/KQUEUE/... shown elsewhere
+        }
+    }
+    if pipes > 0 {
+        files.push(format!("[{} pipe/unix-socket(s)]", pipes));
+    }
+    files.truncate(200);
+    (files, locks)
+}
+
+/// Soft max-open-files limit as launchd reports it (`launchctl limit
+/// maxfiles` → "maxfiles <soft> <hard>"). "unlimited" or a failed run →
+/// None — the per-process NOFILE limit can differ per session, so this is
+/// explicitly a heuristic.
+fn maxfiles_soft() -> Option<u64> {
+    let out = run_ok("launchctl", &["limit", "maxfiles"], CMD_TIMEOUT)?;
+    parse_launchctl_maxfiles(&out)
+}
+
+/// "maxfiles  256  unlimited" → 256 (the soft limit, field 1).
+fn parse_launchctl_maxfiles(out: &str) -> Option<u64> {
+    out.split_whitespace().nth(1)?.parse().ok()
+}
+
 fn find_plist(label: &str) -> Option<String> {
     let dirs = [
         "~/Library/LaunchAgents",
@@ -280,45 +356,7 @@ impl Platform for MacOs {
     }
 
     fn open_files(&self, pid: Pid) -> Vec<String> {
-        // lsof -F tn emits alternating t<type> / n<name> lines
-        let Some(out) = run_ok(
-            "lsof",
-            &["-a", "-w", "-p", &pid.to_string(), "-F", "tn"],
-            LSOF_TIMEOUT,
-        ) else {
-            return Vec::new();
-        };
-        let mut files: Vec<String> = Vec::new();
-        let mut pipes = 0usize;
-        let mut last_type = String::new();
-        for line in out.lines() {
-            if let Some(t) = line.strip_prefix('t') {
-                last_type = t.to_string();
-            } else if let Some(n) = line.strip_prefix('n') {
-                match last_type.as_str() {
-                    "VREG" | "VDIR" => {
-                        if !n.starts_with("/dev/") && !files.iter().any(|f| f == n) {
-                            files.push(n.to_string());
-                        }
-                    }
-                    "IPv4" | "IPv6" | "TCP" | "UDP" => {
-                        // the name already carries the endpoints, e.g.
-                        // "127.0.0.1:5432->10.0.0.1:443" or "*:8080"
-                        let l = format!("socket {} {}", last_type.to_lowercase(), n);
-                        if !files.contains(&l) {
-                            files.push(l);
-                        }
-                    }
-                    "UNIX" | "PIPE" | "PSHM" => pipes += 1,
-                    _ => {} // txt/cwd/KQUEUE/... already shown elsewhere
-                }
-            }
-        }
-        if pipes > 0 {
-            files.push(format!("[{} pipe/unix-socket(s)]", pipes));
-        }
-        files.truncate(200);
-        files
+        self.file_overview(pid).files
     }
 
     fn list_sockets(&self) -> PlatResult<Vec<Socket>> {
@@ -494,23 +532,30 @@ impl Platform for MacOs {
         Ok(pids)
     }
 
-    fn list_locks(&self, pid: Option<Pid>) -> Vec<LockEntry> {
-        let mut args: Vec<String> = vec!["-l".into(), "-n".into(), "-P".into(), "-w".into()];
-        if let Some(p) = pid {
-            args.push("-p".into());
-            args.push(p.to_string());
-        }
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        // lsof exits non-zero when it can't read some process while still
-        // emitting valid rows — salvage stdout instead of failing outright
-        let Ok(out) = std::process::Command::new("lsof").args(&args).output() else {
-            return Vec::new();
+    fn file_overview(&self, pid: Pid) -> FileOverview {
+        // a single scan serves the open-files panel, the locks section AND
+        // the fd count — each lsof run costs hundreds of ms
+        let rows = self.lsof_rows(&["-l", "-n", "-P", "-w", "-p", &pid.to_string()]);
+        let (files, locks) = parse_lsof_files_and_locks(&rows);
+        // rows include the header; every data row is one open fd
+        let used = rows.len().saturating_sub(1) as u64;
+        let fd_usage = if used > 0 {
+            maxfiles_soft().map(|limit| (used, limit))
+        } else {
+            None // unreadable (other user) — no honest count
         };
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut out: Vec<LockEntry> = text.lines().filter_map(parse_lsof_lock_line).collect();
-        // same lock file can appear once per holding fd
-        out.dedup_by(|a, b| a.pid == b.pid && a.path == b.path);
-        out
+        FileOverview { files, locks, fd_usage }
+    }
+
+    fn list_locks(&self, pid: Option<Pid>) -> Vec<LockEntry> {
+        let mut args = vec!["-l", "-n", "-P", "-w"];
+        let pid_arg;
+        if let Some(p) = pid {
+            pid_arg = p.to_string();
+            args.push("-p");
+            args.push(&pid_arg);
+        }
+        parse_lsof_files_and_locks(&self.lsof_rows(&args)).1
     }
 
     fn container_of(&self, _pid: Pid) -> Option<Source> {
@@ -746,6 +791,54 @@ mod tests {
             "foo 350 501 0u KQUEUE 0,0 0 0 (not listed)"
         )
         .is_none());
+    }
+
+    #[test]
+    fn launchctl_maxfiles_parse() {
+        assert_eq!(parse_launchctl_maxfiles("maxfiles    256    unlimited"), Some(256));
+        // unlimited soft limit → no usable number
+        assert_eq!(parse_launchctl_maxfiles("maxfiles    unlimited    unlimited"), None);
+        assert_eq!(parse_launchctl_maxfiles(""), None);
+    }
+
+    #[test]
+    fn lsof_files_and_locks_parse() {
+        let rows: Vec<String> = [
+            "COMMAND   PID    USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME",
+            "pg       1234     501  3uW   REG                1,4        0  100 /tmp/witr_lock_test.lock",
+            "nginx     350     501  5u    REG                1,4      123  101 /var/log/access.log",
+            "nginx     350     501  6u    REG                1,4      123  101 /var/log/access.log",
+            "curl     4321     501  7u   IPv6  0x7130f663bb98979a      0t0  TCP [2001:db8::1]:54321->[2001:db8::2]:443 (ESTABLISHED)",
+            "nginx     350     501  8u   IPv4  0x402a7cce126c4085      0t0  TCP *:8080 (LISTEN)",
+            "foo      9999     501  0u    CHR                1,2      0t0  102 /dev/null",
+            "bar      9998     501  1u   PIPE  0xdeadbeef              0    103 ->0xcafebabe",
+            "baz      9997     501  2u   unix 0xfeedface              0    104 /tmp/x.sock",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (files, locks) = parse_lsof_files_and_locks(&rows);
+        // regular files kept, deduped, /dev and CHR dropped
+        assert!(files.iter().any(|f| f == "/tmp/witr_lock_test.lock"));
+        assert_eq!(
+            files.iter().filter(|f| *f == "/var/log/access.log").count(),
+            1,
+            "same file via two fds appears once"
+        );
+        assert!(!files.iter().any(|f| f.contains("/dev/null")));
+        // sockets keep endpoints, state suffix stripped
+        assert!(files
+            .iter()
+            .any(|f| f == "socket ipv6 [2001:db8::1]:54321->[2001:db8::2]:443"));
+        assert!(files.iter().any(|f| f == "socket ipv4 *:8080"));
+        // pipe + unix socket summarized
+        assert!(files
+            .iter()
+            .any(|f| f == "[2 pipe/unix-socket(s)]"));
+        // locks: real flag + .lock heuristic, deduped
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].mode, "WRITE");
+        assert_eq!(locks[0].path, "/tmp/witr_lock_test.lock");
     }
 
     #[test]

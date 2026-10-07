@@ -136,6 +136,17 @@ impl TargetSpec {
     }
 }
 
+/// What one `file_overview` probe yields for a process: open-file display
+/// lines, file locks, and fd-table usage when the platform can read it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FileOverview {
+    pub files: Vec<String>,
+    pub locks: Vec<LockEntry>,
+    /// (open fds, soft "Max open files" limit). None when either side is
+    /// unreadable or unlimited.
+    pub fd_usage: Option<(u64, u64)>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TargetReport {
     pub target: TargetSpec,
@@ -152,6 +163,16 @@ pub struct TargetReport {
     pub source: Option<Source>,
     pub sockets: Vec<Socket>,
     pub warnings: Vec<String>,
+    /// File locks held by the matched process. Only collected when the
+    /// caller asks for deep file data (CLI / TUI detail page).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub locks: Vec<LockEntry>,
+    /// Open-file display lines, same collection gate as `locks`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_files: Option<Vec<String>>,
+    /// (open fds, soft limit) for the matched process, when readable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fd_usage: Option<(u64, u64)>,
     /// Aggregated risk signals for the (first) matched process.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub risk: Option<crate::risk::Risk>,
@@ -169,6 +190,9 @@ impl TargetReport {
             source: None,
             sockets: Vec::new(),
             warnings: Vec::new(),
+            locks: Vec::new(),
+            open_files: None,
+            fd_usage: None,
             risk: None,
         }
     }

@@ -6,13 +6,17 @@ use crate::platform::{Capabilities, Platform};
 
 pub struct Options {
     pub want_env: bool,
+    /// Also collect open files / locks / fd usage per matched process.
+    /// Expensive on macOS (one lsof scan per pid), so the TUI only sets it
+    /// for the full detail page, never the browse panel.
+    pub deep_files: bool,
     /// cap for fuzzy name matches before we warn about truncation
     pub max_name_matches: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { want_env: false, max_name_matches: 20 }
+        Options { want_env: false, deep_files: false, max_name_matches: 20 }
     }
 }
 
@@ -77,7 +81,16 @@ fn analyze(
 
         let detailed = platform.detail(brief, want_env);
         inspect_risks(&detailed, &sockets, &mut warnings);
-        let risk = crate::risk::assess(&detailed, &sockets);
+        let overview = if opts.deep_files {
+            Some(platform.file_overview(pid))
+        } else {
+            None
+        };
+        let risk = crate::risk::assess(
+            &detailed,
+            &sockets,
+            overview.as_ref().and_then(|o| o.fd_usage),
+        );
 
         let source = detect_source(platform, &chain);
         let children = ancestry::direct_children(map, pid);
@@ -96,6 +109,9 @@ fn analyze(
             source,
             sockets: sockets.clone(),
             warnings,
+            locks: overview.as_ref().map(|o| o.locks.clone()).unwrap_or_default(),
+            fd_usage: overview.as_ref().and_then(|o| o.fd_usage),
+            open_files: overview.map(|o| o.files),
             risk: Some(risk),
         });
     }

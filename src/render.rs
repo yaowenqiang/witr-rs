@@ -349,6 +349,21 @@ fn render_standard(r: &TargetReport, p: &Painter) -> String {
                 let _ = writeln!(out, "    pid {:<7} {}", c.pid, c.name);
             }
         }
+
+        if !r.locks.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "  {} ({}):", p.dim("locks"), r.locks.len());
+            for l in r.locks.iter().take(10) {
+                let _ = writeln!(
+                    out,
+                    "    {} {} {} ({})",
+                    l.kind, l.mode, l.path, l.owner
+                );
+            }
+            if r.locks.len() > 10 {
+                let _ = writeln!(out, "    … {} more", r.locks.len() - 10);
+            }
+        }
     }
 
     if let Some(risk) = &r.risk {
@@ -374,9 +389,9 @@ fn render_standard(r: &TargetReport, p: &Painter) -> String {
 }
 
 /// Plain-text diagnostic report (the `--export` flag): everything the TUI
-/// detail page shows, including env values and open files, for pasting
-/// into issues.
-pub fn render_export(reports: &[TargetReport], files: &[(crate::model::Pid, Vec<String>)]) -> String {
+/// detail page shows, including env values, open files and locks, for
+/// pasting into issues.
+pub fn render_export(reports: &[TargetReport]) -> String {
     let mut out = String::new();
     for r in reports {
         let _ = writeln!(out, "== witr-rs report: {} ==", r.target.describe());
@@ -472,7 +487,19 @@ pub fn render_export(reports: &[TargetReport], files: &[(crate::model::Pid, Vec<
                 }
             }
         }
-        if let Some((_, fs)) = files.iter().find(|(pid, _)| Some(*pid) == Some(m.pid)) {
+        if let Some((used, limit)) = r.fd_usage {
+            kv(&mut out, "fds", format!("{used}/{limit}"));
+        }
+        if !r.locks.is_empty() {
+            kv(&mut out, "locks", format!("{}", r.locks.len()));
+            for l in r.locks.iter().take(20) {
+                let _ = writeln!(out, "  {} {} {} ({})", l.kind, l.mode, l.path, l.owner);
+            }
+            if r.locks.len() > 20 {
+                let _ = writeln!(out, "  … {} more", r.locks.len() - 20);
+            }
+        }
+        if let Some(fs) = &r.open_files {
             if !fs.is_empty() {
                 kv(&mut out, "open files", format!("{}", fs.len()));
                 for f in fs.iter().take(50) {

@@ -91,21 +91,12 @@ fn main() {
 
     let platform = platform::get();
     let want_env = cli.export || cli.env;
-    let opts = pipeline::Options { want_env, ..Default::default() };
+    let opts = pipeline::Options { want_env, deep_files: true, ..Default::default() };
     let reports = pipeline::run(platform.as_ref(), specs, &opts);
 
     // --export: paste-ready diagnostic reports
     if cli.export {
-        let files: Vec<(i32, Vec<String>)> = reports
-            .iter()
-            .filter(|r| r.found)
-            .filter_map(|r| {
-                r.matches
-                    .first()
-                    .map(|m| (m.pid, platform.open_files(m.pid)))
-            })
-            .collect();
-        write_out(&render::render_export(&reports, &files));
+        write_out(&render::render_export(&reports));
         let exit = if reports.iter().any(|r| !r.found) {
             2
         } else if reports.iter().any(|r| !r.warnings.is_empty()) {

@@ -6,7 +6,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::model::{Pid, Process, Socket, Source};
+use crate::model::{FileOverview, Pid, Process, Socket, Source};
 use crate::util::{now_unix, run_ok, strip_deleted_suffix};
 use crate::platform::{Capabilities, PlatError, PlatResult, Platform, Users};
 
@@ -237,6 +237,22 @@ fn comm_of(pid: Pid) -> String {
         .unwrap_or_default()
 }
 
+/// (open fds, soft "Max open files" limit) from procfs. None when either
+/// file is unreadable (other user's process without root).
+fn fd_usage(pid: Pid) -> Option<(u64, u64)> {
+    let used = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?.count() as u64;
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).ok()?;
+    let soft = parse_max_open_files(&limits)?;
+    Some((used, soft))
+}
+
+/// Soft limit from a /proc/<pid>/limits "Max open files" row:
+/// `Max open files  1024  4096  1048576` → fields[3].
+fn parse_max_open_files(limits: &str) -> Option<u64> {
+    let line = limits.lines().find(|l| l.starts_with("Max open files"))?;
+    line.split_whitespace().nth(3)?.parse().ok()
+}
+
 /// inode -> path map for one pid's fd table, cached per scan. /proc/locks
 /// emits device:inode but its device numbering doesn't always match what
 /// userspace stat returns, so matching is on the inode alone (collisions
@@ -264,6 +280,14 @@ fn fd_inode_paths(
 impl Platform for Linux {
     fn name(&self) -> &'static str {
         "linux"
+    }
+
+    fn file_overview(&self, pid: Pid) -> FileOverview {
+        FileOverview {
+            files: self.open_files(pid),
+            locks: self.list_locks(Some(pid)),
+            fd_usage: fd_usage(pid),
+        }
     }
 
     fn list_locks(&self, pid: Option<Pid>) -> Vec<crate::model::LockEntry> {
@@ -778,6 +802,16 @@ mod tests {
         // too short / bad pid -> None
         assert!(parse_proc_lock_line("1: POSIX ADVISORY READ 42").is_none());
         assert!(parse_proc_lock_line("1: POSIX ADVISORY READ x 00:1f:1 0 EOF").is_none());
+    }
+
+    #[test]
+    fn max_open_files_parse() {
+        let limits = "Limit                     Soft Limit           Hard Limit           Units\n\
+                      Max open files            1024                 4096                 files\n\
+                      Max locked memory         65536                65536                bytes";
+        assert_eq!(parse_max_open_files(limits), Some(1024));
+        assert_eq!(parse_max_open_files("Max stack size 8388608 unlimited"), None);
+        assert_eq!(parse_max_open_files(""), None);
     }
 
     #[test]

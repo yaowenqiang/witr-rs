@@ -8,7 +8,7 @@ pub mod macos;
 #[allow(dead_code)]
 pub mod windows;
 
-use crate::model::{Container, LockEntry, Pid, Process, Socket, Source};
+use crate::model::{Container, FileOverview, LockEntry, Pid, Process, Socket, Source};
 use crate::util::Users;
 
 #[derive(Debug)]
@@ -132,6 +132,18 @@ pub trait Platform {
     fn open_files(&self, pid: Pid) -> Vec<String> {
         let _ = pid;
         Vec::new()
+    }
+
+    /// Open files + file locks + fd usage in one pass. Platforms whose
+    /// probes are expensive (macOS: every lookup is an lsof scan) override
+    /// this so the detail page costs one scan instead of two. Default: the
+    /// two individual methods, no fd usage.
+    fn file_overview(&self, pid: Pid) -> FileOverview {
+        FileOverview {
+            files: self.open_files(pid),
+            locks: self.list_locks(Some(pid)),
+            fd_usage: None,
+        }
     }
 
     /// File locks: system-wide when `pid` is None, else one process's.

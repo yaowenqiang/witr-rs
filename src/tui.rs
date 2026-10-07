@@ -141,6 +141,8 @@ struct TuiApp {
     lock_search: String,
     /// indices into `locks` after the filter
     lock_view: Vec<usize>,
+    /// selection state for the Locks table (j/k + Enter opens the holder)
+    lock_state: TableState,
     /// container enumeration runs on a background thread (a hung runtime
     /// CLI must not freeze the UI); results arrive via this channel
     containers_loading: bool,
@@ -238,6 +240,7 @@ impl TuiApp {
             container_view: Vec::new(),
             lock_search: String::new(),
             lock_view: Vec::new(),
+            lock_state: TableState::default(),
             containers_loading: false,
             containers_loaded: false,
             containers_rx: None,
@@ -362,10 +365,27 @@ impl TuiApp {
         }
     }
 
-    /// Apply the Locks-tab filter (kind / mode / pid / process / path).
+    /// Apply the Locks-tab filter (kind / mode / pid / process / path),
+    /// keeping the selection in range.
     fn rebuild_lock_view(&mut self) {
         let needle = self.lock_search.to_lowercase();
         self.lock_view = filter_locks(&self.locks, &needle);
+        if self.lock_view.is_empty() {
+            self.lock_state.select(None);
+        } else {
+            let cur = self
+                .lock_state
+                .selected()
+                .unwrap_or(0)
+                .min(self.lock_view.len() - 1);
+            self.lock_state.select(Some(cur));
+        }
+    }
+
+    /// Pid of the lock row the Locks-tab cursor is on.
+    fn selected_lock_pid(&self) -> Option<Pid> {
+        let i = self.lock_state.selected()?;
+        self.lock_view.get(i).and_then(|&li| self.locks[li].pid)
     }
 
     /// Apply search filter + sort, keeping the selection in range.
@@ -484,10 +504,16 @@ impl TuiApp {
     /// platform allows it.
     fn open_detail_page(&mut self) {
         let Some(pid) = self.selected_pid() else { return };
+        self.open_detail_page_for(pid);
+    }
+
+    fn open_detail_page_for(&mut self, pid: Pid) {
         let report = pipeline::run(
             self.platform.as_ref(),
             vec![TargetSpec::Pid { pid }],
-            &pipeline::Options { want_env: true, ..Default::default() },
+            // deep_files: the report then carries open files + locks + fd
+            // usage from one platform probe (one lsof scan on macOS)
+            &pipeline::Options { want_env: true, deep_files: true, ..Default::default() },
         )
         .into_iter()
         .next();
@@ -495,22 +521,19 @@ impl TuiApp {
             Some(r) if r.found => {
                 // rebuild the pane content for THIS process (detail_lines is
                 // shared with the browse side panel, which may still hold the
-                // previously selected process); also fetch the process's live
-                // sockets and file locks — the Go witr shows both
-                let (socks, locks) = {
-                    let socks: Vec<Socket> = self
-                        .platform
-                        .list_sockets()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|s| s.pid == Some(pid))
-                        .collect();
-                    let locks = self.platform.list_locks(Some(pid));
-                    (socks, locks)
-                };
+                // previously selected process); the live socket list is not
+                // part of a Pid report, so filter a fresh snapshot
+                let socks: Vec<Socket> = self
+                    .platform
+                    .list_sockets()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| s.pid == Some(pid))
+                    .collect();
+                let locks = r.locks.clone();
                 let mut lines = detail_lines(&r, &socks, &locks);
                 push_history_lines(&mut lines, &self.hist, pid);
-                self.open_files = Some(self.platform.open_files(pid));
+                self.open_files = r.open_files.clone();
                 if let Some(files) = &self.open_files {
                     lines.push(Line::from(""));
                     if files.is_empty() {
@@ -1366,9 +1389,10 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-fn locks_table(app: &TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
-    let header =
-        Row::new(["#", "Kind", "Mode", "PID", "Process", "Path"]).style(Style::new().fg(ACCENT).bold());
+/// The Locks table (live selection — j/k moves, Enter jumps to the holder).
+fn locks_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
+    let header = Row::new(["#", "Kind", "Mode", "PID", "Process", "Path"])
+        .style(Style::new().fg(ACCENT).bold());
     let rows: Vec<Row> = app
         .lock_view
         .iter()
@@ -1396,8 +1420,7 @@ fn locks_table(app: &TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
         .header(header)
         .column_spacing(2)
         .row_highlight_style(Style::new().bg(PURPLE).fg(Color::White).bold());
-    let mut state = TableState::default();
-    f.render_stateful_widget(table, area, &mut state);
+    f.render_stateful_widget(table, area, &mut app.lock_state);
 }
 
 /// Full-page process detail (the Go witr's stateDetail): header with the
@@ -1945,7 +1968,10 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
             "Total: {} | Enter: Detail | /: Search | z: Zoom | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
             total
         ),
-        Tab::Locks => format!("Total: {} | /: Search | h-l: Tab | q: Quit", total),
+        Tab::Locks => format!(
+            "Total: {} | Enter: Detail | /: Search | j-k/g-G: Move | h-l: Tab | q: Quit",
+            total
+        ),
         _ => format!("Total: {} | q: Quit", total),
     };
     if !app.status.is_empty() {
@@ -1955,6 +1981,19 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
 }
 
 fn move_selection(app: &mut TuiApp, delta: i32) {
+    if app.tab == Tab::Locks {
+        // the Locks table keeps its own cursor over lock_view
+        if app.lock_view.is_empty() {
+            return;
+        }
+        let len = app.lock_view.len() as i32;
+        let cur = app.lock_state.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, len - 1);
+        if next != cur {
+            app.lock_state.select(Some(next as usize));
+        }
+        return;
+    }
     if app.view.is_empty() {
         return;
     }
@@ -1970,6 +2009,14 @@ fn move_selection(app: &mut TuiApp, delta: i32) {
 }
 
 fn select_edge(app: &mut TuiApp, first: bool) {
+    if app.tab == Tab::Locks {
+        if app.lock_view.is_empty() {
+            return;
+        }
+        let next = if first { 0 } else { app.lock_view.len() - 1 };
+        app.lock_state.select(Some(next));
+        return;
+    }
     if app.view.is_empty() {
         return;
     }
@@ -2274,7 +2321,13 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
             Tab::Processes => app.open_detail_page(),
             Tab::Ports => app.open_port_detail_page(),
             Tab::Containers => app.open_container_detail_page(),
-            _ => app.focus = Focus::Details,
+            // "from the lock back to the process": jump straight into the
+            // holder's detail page
+            Tab::Locks => {
+                if let Some(pid) = app.selected_lock_pid() {
+                    app.open_detail_page_for(pid);
+                }
+            }
         },
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('x') => {
@@ -2413,6 +2466,53 @@ mod tests {
         assert_eq!(app.tab, Tab::Processes);
         on_key(&mut app, KeyCode::Char('l'));
         assert_eq!(app.tab, Tab::Ports);
+    }
+
+    #[test]
+    fn locks_tab_selection_and_enter_opens_detail() {
+        let mut app = TuiApp::new(crate::platform::get());
+        on_key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.tab, Tab::Locks);
+        if !app.locks_supported {
+            return; // nothing to navigate on platforms without lock data
+        }
+        // anchor the jumps to a process that definitely exists
+        let pid = app.procs[0].pid;
+        app.locks = vec![
+            LockEntry {
+                id: "1".into(),
+                kind: "POSIX".into(),
+                mode: "WRITE".into(),
+                pid: Some(42),
+                owner: "node".into(),
+                path: "/tmp/data.lock".into(),
+            },
+            LockEntry {
+                id: "2".into(),
+                kind: "FLOCK".into(),
+                mode: "READ".into(),
+                pid: Some(pid),
+                owner: "nginx".into(),
+                path: "/var/run/nginx.pid".into(),
+            },
+        ];
+        app.rebuild_lock_view();
+        assert_eq!(app.lock_state.selected(), Some(0));
+        on_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.lock_state.selected(), Some(1));
+        on_key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.lock_state.selected(), Some(0));
+        on_key(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.lock_state.selected(), Some(1));
+        on_key(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.lock_state.selected(), Some(0));
+        // Enter opens the holding process's detail page
+        on_key(&mut app, KeyCode::Char('G'));
+        on_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.page, Page::Detail);
+        assert_eq!(app.detail_pid, Some(pid));
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Browse);
     }
 
     #[test]
