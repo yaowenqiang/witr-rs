@@ -137,6 +137,10 @@ struct TuiApp {
     container_search: String,
     /// indices into `containers` after the filter
     container_view: Vec<usize>,
+    /// Locks-tab filter (kind / mode / pid / process / path)
+    lock_search: String,
+    /// indices into `locks` after the filter
+    lock_view: Vec<usize>,
     /// container enumeration runs on a background thread (a hung runtime
     /// CLI must not freeze the UI); results arrive via this channel
     containers_loading: bool,
@@ -232,6 +236,8 @@ impl TuiApp {
             containers: Vec::new(),
             container_search: String::new(),
             container_view: Vec::new(),
+            lock_search: String::new(),
+            lock_view: Vec::new(),
             containers_loading: false,
             containers_loaded: false,
             containers_rx: None,
@@ -258,6 +264,7 @@ impl TuiApp {
         }
         if tab == Tab::Locks && self.locks_supported {
             self.locks = self.platform.list_locks(None);
+            self.rebuild_lock_view();
         }
         if tab == Tab::Processes {
             self.rebuild_view();
@@ -282,6 +289,7 @@ impl TuiApp {
         // snapshot only refreshes on tab switch.
         if self.tab == Tab::Locks && self.platform.name() == "linux" {
             self.locks = self.platform.list_locks(None);
+            self.rebuild_lock_view();
         }
         self.rebuild_view();
         self.last_refresh = Instant::now();
@@ -352,6 +360,12 @@ impl TuiApp {
                 .min(self.socket_view.len() - 1);
             self.table_state.select(Some(cur));
         }
+    }
+
+    /// Apply the Locks-tab filter (kind / mode / pid / process / path).
+    fn rebuild_lock_view(&mut self) {
+        let needle = self.lock_search.to_lowercase();
+        self.lock_view = filter_locks(&self.locks, &needle);
     }
 
     /// Apply search filter + sort, keeping the selection in range.
@@ -876,6 +890,26 @@ fn filter_sockets(
         .collect()
 }
 
+/// Filter locks: substring match over kind, mode, pid, process and path.
+fn filter_locks(locks: &[LockEntry], needle: &str) -> Vec<usize> {
+    if needle.is_empty() {
+        return (0..locks.len()).collect();
+    }
+    locks
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| {
+            l.kind.to_lowercase().contains(needle)
+                || l.mode.to_lowercase().contains(needle)
+                || l.owner.to_lowercase().contains(needle)
+                || l.path.to_lowercase().contains(needle)
+                || l.id.to_lowercase().contains(needle)
+                || l.pid.map(|p| p.to_string()).unwrap_or_default().contains(needle)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Filter containers: substring match over name, image, id, runtime, state.
 fn filter_containers(containers: &[Container], needle: &str) -> Vec<usize> {
     if needle.is_empty() {
@@ -1182,6 +1216,11 @@ fn search_line(app: &TuiApp) -> Line<'static> {
             app.container_search.clone(),
             "Search Name, Image, ID, State...",
         )
+    } else if app.tab == Tab::Locks {
+        (
+            app.lock_search.clone(),
+            "Search Kind, Mode, PID, Process, Path...",
+        )
     } else {
         (app.search.clone(), "Search PID, Name, User...")
     };
@@ -1331,9 +1370,10 @@ fn locks_table(app: &TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
     let header =
         Row::new(["#", "Kind", "Mode", "PID", "Process", "Path"]).style(Style::new().fg(ACCENT).bold());
     let rows: Vec<Row> = app
-        .locks
+        .lock_view
         .iter()
-        .map(|l| {
+        .map(|&i| {
+            let l = &app.locks[i];
             Row::new([
                 Cell::from(l.id.clone()),
                 Cell::from(l.kind.clone()),
@@ -1892,13 +1932,20 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
                 format!("{}/{}", app.container_view.len(), app.containers.len())
             }
         }
-        Tab::Locks => app.locks.len().to_string(),
+        Tab::Locks => {
+            if app.lock_search.is_empty() {
+                app.locks.len().to_string()
+            } else {
+                format!("{}/{}", app.lock_view.len(), app.locks.len())
+            }
+        }
     };
     let mut footer = match app.tab {
         Tab::Processes | Tab::Ports => format!(
             "Total: {} | Enter: Detail | /: Search | z: Zoom | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
             total
         ),
+        Tab::Locks => format!("Total: {} | /: Search | h-l: Tab | q: Quit", total),
         _ => format!("Total: {} | q: Quit", total),
     };
     if !app.status.is_empty() {
@@ -2083,6 +2130,10 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                         app.container_search.push(c);
                         app.rebuild_container_view();
                     }
+                    Tab::Locks => {
+                        app.lock_search.push(c);
+                        app.rebuild_lock_view();
+                    }
                     _ => {
                         app.search.push(c);
                         app.rebuild_view();
@@ -2098,6 +2149,10 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                     Tab::Containers => {
                         app.container_search.pop();
                         app.rebuild_container_view();
+                    }
+                    Tab::Locks => {
+                        app.lock_search.pop();
+                        app.rebuild_lock_view();
                     }
                     _ => {
                         app.search.pop();
@@ -2130,6 +2185,9 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
             } else if app.tab == Tab::Containers && !app.container_search.is_empty() {
                 app.container_search.clear();
                 app.rebuild_container_view();
+            } else if app.tab == Tab::Locks && !app.lock_search.is_empty() {
+                app.lock_search.clear();
+                app.rebuild_lock_view();
             } else if !app.search.is_empty() {
                 app.search.clear();
                 app.rebuild_view();
@@ -2355,6 +2413,50 @@ mod tests {
         assert_eq!(app.tab, Tab::Processes);
         on_key(&mut app, KeyCode::Char('l'));
         assert_eq!(app.tab, Tab::Ports);
+    }
+
+    #[test]
+    fn locks_tab_search_filters_and_esc_clears() {
+        let mut app = TuiApp::new(crate::platform::get());
+        on_key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.tab, Tab::Locks);
+        if !app.locks_supported {
+            return; // nothing to search on platforms without lock data
+        }
+        // synthetic entries so the filter outcome is deterministic
+        app.locks = vec![
+            LockEntry {
+                id: "1".into(),
+                kind: "POSIX".into(),
+                mode: "WRITE".into(),
+                pid: Some(42),
+                owner: "node".into(),
+                path: "/tmp/data.lock".into(),
+            },
+            LockEntry {
+                id: "2".into(),
+                kind: "FLOCK".into(),
+                mode: "READ".into(),
+                pid: Some(7),
+                owner: "nginx".into(),
+                path: "/var/run/nginx.pid".into(),
+            },
+        ];
+        app.rebuild_lock_view();
+        on_key(&mut app, KeyCode::Char('/'));
+        assert!(app.search_mode);
+        for c in "nginx".chars() {
+            on_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.lock_search, "nginx");
+        assert_eq!(app.lock_view, vec![1]);
+        // the process search is untouched on this tab
+        assert!(app.search.is_empty());
+        on_key(&mut app, KeyCode::Esc); // exits search mode
+        on_key(&mut app, KeyCode::Esc); // clears the filter
+        assert!(!app.search_mode);
+        assert!(app.lock_search.is_empty());
+        assert_eq!(app.lock_view, vec![0, 1]);
     }
 
     #[test]
