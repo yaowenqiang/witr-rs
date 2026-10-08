@@ -291,6 +291,16 @@ fn render_standard(r: &TargetReport, p: &Painter) -> String {
         if let Some(env) = &m.env {
             let _ = writeln!(out, "  env {} variables (use --json for values)", env.len());
         }
+        if let Some((used, limit)) = r.fd_usage {
+            if let Some(pct) = (used * 100).checked_div(limit) {
+                let line = format!("  open files {} of {} ({}%)", used, limit, pct);
+                if pct > 80 {
+                    let _ = writeln!(out, "{}", p.yellow(&line));
+                } else {
+                    let _ = writeln!(out, "{}", line);
+                }
+            }
+        }
 
         if let Some(s) = &r.source {
             let _ = writeln!(out);

@@ -90,7 +90,9 @@ pub struct Container {
 pub struct LockEntry {
     /// /proc/locks id, or the lsof fd token (e.g. "3uW") on macOS.
     pub id: String,
-    /// POSIX / FLOCK / MAND (Linux); always "FLOCK" on macOS.
+    /// POSIX / FLOCK / MAND (Linux); always "FLOCK" on macOS. Serialized as
+    /// "type" to match the Go witr's LockedFile field name.
+    #[serde(rename = "type")]
     pub kind: String,
     /// READ / WRITE / RW.
     pub mode: String,

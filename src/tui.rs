@@ -143,6 +143,14 @@ struct TuiApp {
     lock_view: Vec<usize>,
     /// selection state for the Locks table (j/k + Enter opens the holder)
     lock_state: TableState,
+    /// Locks-tab "all open files" mode ('a'): locks merged with every open
+    /// file on the system, lock entries winning on (pid, path)
+    locks_show_all: bool,
+    /// Locks-tab sort column ('p/n/t/m/f', Go witr parity) + direction
+    lock_sort: LockSort,
+    lock_sort_desc: bool,
+    /// lock_view size before the OPEN-mode 100-row display cap
+    locks_total: usize,
     /// container enumeration runs on a background thread (a hung runtime
     /// CLI must not freeze the UI); results arrive via this channel
     containers_loading: bool,
@@ -165,6 +173,16 @@ enum Page {
     Detail,
     PortDetail,
     ContainerDetail,
+}
+
+/// Locks-tab sort columns — keys p/n/t/m/f, matching the Go witr.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LockSort {
+    Pid,
+    Process,
+    Type,
+    Mode,
+    Path,
 }
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
@@ -199,6 +217,10 @@ impl TuiApp {
             sockets: Vec::new(),
             locks: Vec::new(),
             locks_supported,
+            locks_show_all: false,
+            lock_sort: LockSort::Pid,
+            lock_sort_desc: false,
+            locks_total: 0,
             view: Vec::new(),
             sort_key: SortKey::Mem,
             sort_desc: true,
@@ -266,8 +288,7 @@ impl TuiApp {
             self.request_containers();
         }
         if tab == Tab::Locks && self.locks_supported {
-            self.locks = self.platform.list_locks(None);
-            self.rebuild_lock_view();
+            self.load_locks();
         }
         if tab == Tab::Processes {
             self.rebuild_view();
@@ -291,8 +312,7 @@ impl TuiApp {
         // read); macOS would re-run a full `lsof` scan (1-2s), so its
         // snapshot only refreshes on tab switch.
         if self.tab == Tab::Locks && self.platform.name() == "linux" {
-            self.locks = self.platform.list_locks(None);
-            self.rebuild_lock_view();
+            self.load_locks();
         }
         self.rebuild_view();
         self.last_refresh = Instant::now();
@@ -365,11 +385,51 @@ impl TuiApp {
         }
     }
 
-    /// Apply the Locks-tab filter (kind / mode / pid / process / path),
-    /// keeping the selection in range.
+    /// (Re)fetch the Locks-tab snapshot: locks plus, in "all open files"
+    /// mode ('a'), every open file merged underneath them — on the same
+    /// (pid, path) the real lock entry wins, like the Go witr's merge.
+    fn load_locks(&mut self) {
+        self.locks = self.platform.list_locks(None);
+        if self.locks_show_all {
+            let mut merged = std::mem::take(&mut self.locks);
+            let mut seen: std::collections::HashSet<(Option<Pid>, String)> =
+                merged.iter().map(|l| (l.pid, l.path.clone())).collect();
+            for e in self.platform.list_all_open_files() {
+                if seen.insert((e.pid, e.path.clone())) {
+                    merged.push(e);
+                }
+            }
+            self.locks = merged;
+        }
+        self.rebuild_lock_view();
+    }
+
+    /// Apply the Locks-tab filter + sort (p/n/t/m/f), keeping the selection
+    /// in range. In OPEN mode with an empty search the display is capped at
+    /// 100 rows; typing lifts the cap (the Go witr's openFilesDisplayCap).
     fn rebuild_lock_view(&mut self) {
         let needle = self.lock_search.to_lowercase();
-        self.lock_view = filter_locks(&self.locks, &needle);
+        let mut view = filter_locks(&self.locks, &needle);
+        let (col, desc) = (self.lock_sort, self.lock_sort_desc);
+        let locks = &self.locks;
+        view.sort_by(|&a, &b| {
+            let ord = match col {
+                LockSort::Pid => locks[a].pid.cmp(&locks[b].pid),
+                LockSort::Process => locks[a]
+                    .owner
+                    .to_lowercase()
+                    .cmp(&locks[b].owner.to_lowercase()),
+                LockSort::Type => locks[a].kind.cmp(&locks[b].kind),
+                LockSort::Mode => locks[a].mode.cmp(&locks[b].mode),
+                LockSort::Path => locks[a].path.cmp(&locks[b].path),
+            };
+            if desc { ord.reverse() } else { ord }
+        });
+        self.locks_total = view.len();
+        if self.locks_show_all && needle.is_empty() && view.len() > 100 {
+            view.truncate(100);
+        }
+        self.lock_view = view;
         if self.lock_view.is_empty() {
             self.lock_state.select(None);
         } else {
@@ -913,7 +973,7 @@ fn filter_sockets(
         .collect()
 }
 
-/// Filter locks: substring match over kind, mode, pid, process and path.
+/// Filter locks: substring match over type, mode, pid, process and path.
 fn filter_locks(locks: &[LockEntry], needle: &str) -> Vec<usize> {
     if needle.is_empty() {
         return (0..locks.len()).collect();
@@ -1242,7 +1302,7 @@ fn search_line(app: &TuiApp) -> Line<'static> {
     } else if app.tab == Tab::Locks {
         (
             app.lock_search.clone(),
-            "Search Kind, Mode, PID, Process, Path...",
+            "Search Type, Mode, PID, Process, Path...",
         )
     } else {
         (app.search.clone(), "Search PID, Name, User...")
@@ -1390,30 +1450,44 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
 }
 
 /// The Locks table (live selection — j/k moves, Enter jumps to the holder).
+/// Column layout mirrors the Go witr: PID | Process | Type | Mode | Path,
+/// with the sort key shown in each header (p:PID, n:Process, ...) and a
+/// direction arrow on the active sort column.
 fn locks_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
-    let header = Row::new(["#", "Kind", "Mode", "PID", "Process", "Path"])
-        .style(Style::new().fg(ACCENT).bold());
+    let cols = [
+        ("p", "PID", LockSort::Pid),
+        ("n", "Process", LockSort::Process),
+        ("t", "Type", LockSort::Type),
+        ("m", "Mode", LockSort::Mode),
+        ("f", "Path", LockSort::Path),
+    ];
+    let header = Row::new(cols.iter().map(|(key, name, col)| {
+        let mut title = format!("{key}:{name}");
+        if app.lock_sort == *col {
+            title.push_str(if app.lock_sort_desc { " ↓" } else { " ↑" });
+        }
+        Cell::from(title)
+    }))
+    .style(Style::new().fg(ACCENT).bold());
     let rows: Vec<Row> = app
         .lock_view
         .iter()
         .map(|&i| {
             let l = &app.locks[i];
             Row::new([
-                Cell::from(l.id.clone()),
-                Cell::from(l.kind.clone()),
-                Cell::from(l.mode.clone()),
                 Cell::from(l.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
                 Cell::from(l.owner.clone()),
+                Cell::from(l.kind.clone()),
+                Cell::from(l.mode.clone()),
                 Cell::from(l.path.clone()),
             ])
         })
         .collect();
     let widths = [
-        Constraint::Length(5),
-        Constraint::Length(7),
-        Constraint::Length(7),
         Constraint::Length(8),
-        Constraint::Length(16),
+        Constraint::Length(18),
+        Constraint::Length(8),
+        Constraint::Length(8),
         Constraint::Min(30),
     ];
     let table = Table::new(rows, widths)
@@ -1956,10 +2030,13 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
             }
         }
         Tab::Locks => {
-            if app.lock_search.is_empty() {
-                app.locks.len().to_string()
-            } else {
+            if !app.lock_search.is_empty() {
                 format!("{}/{}", app.lock_view.len(), app.locks.len())
+            } else if app.locks_total > app.lock_view.len() {
+                // OPEN mode display cap is active
+                format!("{} of {}", app.lock_view.len(), app.locks_total)
+            } else {
+                app.locks.len().to_string()
             }
         }
     };
@@ -1968,10 +2045,13 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
             "Total: {} | Enter: Detail | /: Search | z: Zoom | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
             total
         ),
-        Tab::Locks => format!(
-            "Total: {} | Enter: Detail | /: Search | j-k/g-G: Move | h-l: Tab | q: Quit",
-            total
-        ),
+        Tab::Locks => {
+            let mode = if app.locks_show_all { "OPEN" } else { "LOCKED" };
+            format!(
+                "Total: {} [{}] | a: All Files | p/n/t/m/f: Sort | Enter: Detail | /: Search | j-k/g-G: Move | h-l: Tab | q: Quit",
+                total, mode
+            )
+        }
         _ => format!("Total: {} | q: Quit", total),
     };
     if !app.status.is_empty() {
@@ -2263,6 +2343,37 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         KeyCode::Char('k') if app.focus == Focus::Table => move_selection(app, -1),
         KeyCode::Char('g') if app.focus == Focus::Table => select_edge(app, true),
         KeyCode::Char('G') if app.focus == Focus::Table => select_edge(app, false),
+        // ---- Locks tab: 'a' toggles the all-open-files view, p/n/t/m/f
+        // sort (Go witr parity; there 'f' shadows page-down — use Space) ----
+        KeyCode::Char(c)
+            if app.tab == Tab::Locks
+                && app.focus == Focus::Table
+                && matches!(c.to_ascii_lowercase(), 'a' | 'p' | 'n' | 't' | 'm' | 'f') =>
+        {
+            match c.to_ascii_lowercase() {
+                'a' => {
+                    app.locks_show_all = !app.locks_show_all;
+                    app.lock_state.select(Some(0));
+                    app.load_locks();
+                }
+                col => {
+                    let col = match col {
+                        'p' => LockSort::Pid,
+                        'n' => LockSort::Process,
+                        't' => LockSort::Type,
+                        'm' => LockSort::Mode,
+                        _ => LockSort::Path,
+                    };
+                    if app.lock_sort == col {
+                        app.lock_sort_desc = !app.lock_sort_desc;
+                    } else {
+                        app.lock_sort = col;
+                        app.lock_sort_desc = false;
+                    }
+                    app.rebuild_lock_view();
+                }
+            }
+        }
         KeyCode::PageDown if app.focus == Focus::Table => move_selection(app, 20),
         KeyCode::PageUp if app.focus == Focus::Table => move_selection(app, -20),
         KeyCode::Char('f') if app.focus == Focus::Table => move_selection(app, 20),
@@ -2496,6 +2607,9 @@ mod tests {
                 path: "/var/run/nginx.pid".into(),
             },
         ];
+        // pin the order (path sort keeps insertion order here) so the
+        // navigation assertions don't depend on the default pid sort
+        app.lock_sort = LockSort::Path;
         app.rebuild_lock_view();
         assert_eq!(app.lock_state.selected(), Some(0));
         on_key(&mut app, KeyCode::Char('j'));
@@ -2556,7 +2670,83 @@ mod tests {
         on_key(&mut app, KeyCode::Esc); // clears the filter
         assert!(!app.search_mode);
         assert!(app.lock_search.is_empty());
+        // default sort is pid ascending: 7 before 42
+        assert_eq!(app.lock_view, vec![1, 0]);
+    }
+
+    #[test]
+    fn locks_tab_sort_keys() {
+        let mut app = TuiApp::new(crate::platform::get());
+        on_key(&mut app, KeyCode::Char('4'));
+        if !app.locks_supported {
+            return;
+        }
+        app.locks = vec![
+            LockEntry {
+                id: "1".into(),
+                kind: "POSIX".into(),
+                mode: "WRITE".into(),
+                pid: Some(42),
+                owner: "node".into(),
+                path: "/tmp/data.lock".into(),
+            },
+            LockEntry {
+                id: "2".into(),
+                kind: "FLOCK".into(),
+                mode: "READ".into(),
+                pid: Some(7),
+                owner: "nginx".into(),
+                path: "/var/run/nginx.pid".into(),
+            },
+        ];
+        // default: pid ascending
+        app.rebuild_lock_view();
+        assert_eq!(app.lock_view, vec![1, 0]);
+        // same key again → descending
+        on_key(&mut app, KeyCode::Char('p'));
         assert_eq!(app.lock_view, vec![0, 1]);
+        // path sort: /tmp < /var
+        on_key(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.lock_sort, LockSort::Path);
+        assert!(!app.lock_sort_desc);
+        assert_eq!(app.lock_view, vec![0, 1]);
+        on_key(&mut app, KeyCode::Char('F'));
+        assert!(app.lock_sort_desc);
+        assert_eq!(app.lock_view, vec![1, 0]);
+        // process sort: nginx < node
+        on_key(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.lock_view, vec![1, 0]);
+    }
+
+    #[test]
+    fn locks_tab_open_files_cap_lifts_on_search() {
+        let mut app = TuiApp::new(crate::platform::get());
+        on_key(&mut app, KeyCode::Char('4'));
+        if !app.locks_supported {
+            return;
+        }
+        app.locks = (0..101)
+            .map(|i| LockEntry {
+                id: i.to_string(),
+                kind: "OPEN".into(),
+                mode: "R".into(),
+                pid: Some(i),
+                owner: format!("p{i}"),
+                path: format!("/tmp/f{i}"),
+            })
+            .collect();
+        app.locks_show_all = true;
+        app.rebuild_lock_view();
+        // OPEN mode caps the display at 100 until the user searches
+        assert_eq!(app.lock_view.len(), 100);
+        assert_eq!(app.locks_total, 101);
+        app.lock_search = "p100".into();
+        app.rebuild_lock_view();
+        assert_eq!(app.lock_view, vec![100]);
+        app.lock_search.clear();
+        app.locks_show_all = false;
+        app.rebuild_lock_view();
+        assert_eq!(app.lock_view.len(), 101);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::model::{FileOverview, Pid, Process, Socket, Source};
+use crate::model::{FileOverview, LockEntry, Pid, Process, Socket, Source};
 use crate::util::{now_unix, run_ok, strip_deleted_suffix};
 use crate::platform::{Capabilities, PlatError, PlatResult, Platform, Users};
 
@@ -253,6 +253,43 @@ fn parse_max_open_files(limits: &str) -> Option<u64> {
     line.split_whitespace().nth(3)?.parse().ok()
 }
 
+/// fd link targets worth showing in the "all open files" view: real files
+/// on disk, not kernel-internal handles (sockets, pipes, eventfds, memfds,
+/// procfs/sysfs bookkeeping, terminals).
+fn open_file_target(target: &str) -> bool {
+    !(target.starts_with("socket:[")
+        || target.starts_with("pipe:[")
+        || target.starts_with("anon_inode:")
+        || target.starts_with("/memfd:")
+        || target.starts_with("/proc/")
+        || target.starts_with("/sys/")
+        || target == "/dev/null"
+        || target.starts_with("/dev/tty")
+        || target.starts_with("/dev/pts/"))
+}
+
+/// R/W/RW from the O_ACCMODE bits in /proc/<pid>/fdinfo/<fd>; "" when the
+/// fdinfo isn't readable.
+fn fdinfo_access(pid: Pid, fd: &str) -> String {
+    let Ok(data) = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")) else {
+        return String::new();
+    };
+    for line in data.lines() {
+        if let Some(rest) = line.strip_prefix("flags:") {
+            if let Ok(flags) = i64::from_str_radix(rest.trim(), 8) {
+                return match flags & 3 {
+                    0 => "R",
+                    1 => "W",
+                    2 => "RW",
+                    _ => "",
+                }
+                .into();
+            }
+        }
+    }
+    String::new()
+}
+
 /// inode -> path map for one pid's fd table, cached per scan. /proc/locks
 /// emits device:inode but its device numbering doesn't always match what
 /// userspace stat returns, so matching is on the inode alone (collisions
@@ -290,8 +327,45 @@ impl Platform for Linux {
         }
     }
 
-    fn list_locks(&self, pid: Option<Pid>) -> Vec<crate::model::LockEntry> {
-        use crate::model::LockEntry;
+    fn list_all_open_files(&self) -> Vec<LockEntry> {
+        let mut out = Vec::new();
+        let mut comms: HashMap<Pid, String> = HashMap::new();
+        let Ok(dirs) = std::fs::read_dir("/proc") else {
+            return out;
+        };
+        for d in dirs.flatten() {
+            let Ok(pid) = d.file_name().to_string_lossy().parse::<Pid>() else {
+                continue;
+            };
+            if pid <= 0 {
+                continue;
+            }
+            let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+                continue; // permission denied or the process just exited
+            };
+            for fd in fds.flatten() {
+                let Some(target) = readlink_ok(&fd.path()) else {
+                    continue;
+                };
+                if !open_file_target(&target) {
+                    continue;
+                }
+                let fdnum = fd.file_name().to_string_lossy().to_string();
+                let owner = comms.entry(pid).or_insert_with(|| comm_of(pid)).clone();
+                out.push(LockEntry {
+                    id: fdnum.clone(),
+                    kind: "OPEN".into(),
+                    mode: fdinfo_access(pid, &fdnum),
+                    pid: Some(pid),
+                    owner,
+                    path: target,
+                });
+            }
+        }
+        out
+    }
+
+    fn list_locks(&self, pid: Option<Pid>) -> Vec<LockEntry> {
         let Some(text) = read_ok(Path::new("/proc/locks")) else {
             return Vec::new();
         };
@@ -812,6 +886,22 @@ mod tests {
         assert_eq!(parse_max_open_files(limits), Some(1024));
         assert_eq!(parse_max_open_files("Max stack size 8388608 unlimited"), None);
         assert_eq!(parse_max_open_files(""), None);
+    }
+
+    #[test]
+    fn open_file_target_classification() {
+        assert!(open_file_target("/usr/lib/libSystem.dylib"));
+        assert!(open_file_target("/var/run/nginx.pid"));
+        // kernel-internal handles and bookkeeping paths are dropped
+        assert!(!open_file_target("socket:[12345]"));
+        assert!(!open_file_target("pipe:[777]"));
+        assert!(!open_file_target("anon_inode:[eventfd]"));
+        assert!(!open_file_target("/memfd:name (deleted)"));
+        assert!(!open_file_target("/proc/123/fd"));
+        assert!(!open_file_target("/sys/fs/cgroup/x"));
+        assert!(!open_file_target("/dev/null"));
+        assert!(!open_file_target("/dev/ttys001"));
+        assert!(!open_file_target("/dev/pts/3"));
     }
 
     #[test]

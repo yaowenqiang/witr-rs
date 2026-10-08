@@ -155,6 +155,13 @@ pub trait Platform {
         Vec::new()
     }
 
+    /// Every open file on the system as lock-tab entries (kind "OPEN",
+    /// mode = fd access) — the Locks tab's "all open files" view merges
+    /// these underneath the real locks. Default: none.
+    fn list_all_open_files(&self) -> Vec<LockEntry> {
+        Vec::new()
+    }
+
     /// PIDs holding `path` open.
     fn file_to_pids(&self, path: &str) -> PlatResult<Vec<Pid>>;
 

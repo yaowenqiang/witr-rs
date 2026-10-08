@@ -303,6 +303,59 @@ fn parse_launchctl_maxfiles(out: &str) -> Option<u64> {
     out.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Parse a full `lsof -l -n -P` scan into lock-tab entries: rows with a
+/// lock flag become FLOCK entries, REG/DIR rows become OPEN entries with
+/// the fd access mode. /dev/null and /dev/tty* are dropped (kernel-internal
+/// noise), the rest of /dev stays. Deduped by (pid, path), lock rows
+/// winning — the Go witr's merge rule, satisfied in a single scan.
+fn parse_lsof_open_files(rows: &[String]) -> Vec<LockEntry> {
+    let mut map: std::collections::HashMap<(Pid, String), LockEntry> =
+        std::collections::HashMap::new();
+    for line in rows {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 9 {
+            continue;
+        }
+        let pid: Pid = match f[1].parse() {
+            Ok(p) if p > 0 => p,
+            _ => continue,
+        };
+        let fd = f[3];
+        let ty = f[4];
+        let path = f[8..].join(" ");
+        let entry = if let Some(l) = parse_lsof_lock_line(line) {
+            l
+        } else {
+            if !matches!(ty, "REG" | "VREG" | "DIR" | "VDIR") {
+                continue;
+            }
+            if path == "/dev/null" || path.starts_with("/dev/tty") {
+                continue;
+            }
+            let Some(mode) = lsof_fd_access(fd) else { continue };
+            LockEntry {
+                id: fd.to_string(),
+                kind: "OPEN".into(),
+                mode: mode.to_string(),
+                pid: Some(pid),
+                owner: f[0].to_string(),
+                path: path.clone(),
+            }
+        };
+        let is_lock = entry.kind != "OPEN";
+        map.entry((pid, path))
+            .and_modify(|e| {
+                if is_lock {
+                    *e = entry.clone();
+                }
+            })
+            .or_insert(entry);
+    }
+    let mut out: Vec<LockEntry> = map.into_values().collect();
+    out.sort_by(|a, b| (a.pid, &a.path).cmp(&(b.pid, &b.path)));
+    out
+}
+
 fn find_plist(label: &str) -> Option<String> {
     let dirs = [
         "~/Library/LaunchAgents",
@@ -558,6 +611,11 @@ impl Platform for MacOs {
         parse_lsof_files_and_locks(&self.lsof_rows(&args)).1
     }
 
+    fn list_all_open_files(&self) -> Vec<LockEntry> {
+        // one full scan yields both the lock rows and the plain open files
+        parse_lsof_open_files(&self.lsof_rows(&["-l", "-n", "-P", "-w"]))
+    }
+
     fn container_of(&self, _pid: Pid) -> Option<Source> {
         None // best-effort container attribution ships later (docker/podman CLIs)
     }
@@ -799,6 +857,32 @@ mod tests {
         // unlimited soft limit → no usable number
         assert_eq!(parse_launchctl_maxfiles("maxfiles    unlimited    unlimited"), None);
         assert_eq!(parse_launchctl_maxfiles(""), None);
+    }
+
+    #[test]
+    fn lsof_open_files_parse() {
+        let rows: Vec<String> = [
+            "COMMAND   PID    USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME",
+            "pg       1234     501  3uW   REG                1,4        0  100 /tmp/witr_lock_test.lock",
+            "nginx     350     501  5u    REG                1,4      123  101 /var/log/access.log",
+            "nginx     350     501  6u    REG                1,4      123  101 /var/log/access.log",
+            "sh        400     501  0u    CHR                1,2    0t0 9999 /dev/null",
+            "sh        400     501  1u    CHR                1,2    0t0 9998 /dev/ttys001",
+            "curl     4321     501  7u   IPv6  0x7130f663bb98979a      0t0  TCP [::1]:54321->[::1]:443 (ESTABLISHED)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = parse_lsof_open_files(&rows);
+        // dup (pid,path) collapses; /dev/null and /dev/tty* drop; IPv6 drops
+        assert_eq!(out.len(), 2, "{out:?}");
+        let log = out.iter().find(|l| l.path == "/var/log/access.log").unwrap();
+        assert_eq!(log.kind, "OPEN");
+        assert_eq!(log.mode, "RW");
+        assert_eq!(log.pid, Some(350));
+        let lock = out.iter().find(|l| l.path == "/tmp/witr_lock_test.lock").unwrap();
+        assert_eq!(lock.kind, "FLOCK");
+        assert_eq!(lock.mode, "WRITE");
     }
 
     #[test]
