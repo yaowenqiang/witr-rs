@@ -3324,6 +3324,9 @@ mod tests {
         app.tab = Tab::Ports;
         app.sockets = app.platform.list_sockets().unwrap_or_default();
         app.socket_view = (0..app.sockets.len()).collect();
+        if app.sockets.is_empty() {
+            return; // minimal environments (a bare container) have no sockets
+        }
         // pick a socket with a known owning process if any, else the first
         let sel = app
             .sockets

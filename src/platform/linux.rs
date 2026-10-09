@@ -290,6 +290,21 @@ fn fdinfo_access(pid: Pid, fd: &str) -> String {
     String::new()
 }
 
+/// Inode of `path` — std has no portable inode, so this is unix-only; the
+/// module type-checks everywhere, hence the cfg pair.
+fn inode_of(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| m.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// inode -> path map for one pid's fd table, cached per scan. /proc/locks
 /// emits device:inode but its device numbering doesn't always match what
 /// userspace stat returns, so matching is on the inode alone (collisions
@@ -303,9 +318,8 @@ fn fd_inode_paths(
         if let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", pid)) {
             for fd in fds.flatten() {
                 if let Some(target) = readlink_ok(&fd.path()) {
-                    if let Ok(meta) = std::fs::metadata(&target) {
-                        use std::os::unix::fs::MetadataExt;
-                        m.insert(meta.ino().to_string(), target);
+                    if let Some(ino) = inode_of(std::path::Path::new(&target)) {
+                        m.insert(ino.to_string(), target);
                     }
                 }
             }

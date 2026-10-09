@@ -813,9 +813,26 @@ mod tests {
 
     #[test]
     fn git_walk_and_branch() {
+        // ground truth computed without git_info: walk up from the manifest
+        // dir to the checkout root. The repo basename depends on where the
+        // checkout lives (CI: /home/runner/work/<repo>/<repo>; containers:
+        // anything), and a tag build checks out a DETACHED HEAD (no branch)
+        // — so neither fact may be hardcoded.
+        let mut root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        while !root.join(".git").exists() {
+            assert!(root.pop(), "no .git found above the manifest dir");
+        }
+        let expected_branch = std::fs::read_to_string(root.join(".git").join("HEAD"))
+            .ok()
+            .and_then(|head| {
+                head.trim()
+                    .strip_prefix("ref: refs/heads/")
+                    .map(|b| b.to_string())
+            });
+
         let (repo, branch) = git_info(Some(env!("CARGO_MANIFEST_DIR"))).unwrap();
-        assert_eq!(repo, "witr-rs");
-        assert_eq!(branch.as_deref(), Some("main"));
+        assert_eq!(repo, root.file_name().unwrap().to_string_lossy());
+        assert_eq!(branch, expected_branch);
         assert!(git_info(Some("/")).is_none());
         assert!(git_info(None).is_none());
     }
