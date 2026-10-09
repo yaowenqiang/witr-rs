@@ -7,8 +7,13 @@ use std::io::Result;
 use std::time::{Duration, Instant};
 
 use ratatui::{
-    crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind},
-    layout::{Constraint, Layout},
+    crossterm::{
+        execute,
+        event::{
+            self, Event as CEvent, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+        },
+    },
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     symbols::border,
     text::{Line, Span},
@@ -133,10 +138,30 @@ struct TuiApp {
     port_search: String,
     /// indices into `sockets` after the port filter
     socket_view: Vec<usize>,
+    /// Ports-tab 'a' toggle: false = listening tcp + bound udp (the Go
+    /// witr's default view), true = every socket incl. connections
+    ports_show_all: bool,
+    /// Ports-tab sort column ('p/t/n/s', Go witr parity) + direction
+    port_sort: PortSort,
+    port_sort_desc: bool,
     containers: Vec<Container>,
     container_search: String,
     /// indices into `containers` after the filter
     container_view: Vec<usize>,
+    /// Containers-tab sort column ('i/n/r/g/s', Go witr parity); None =
+    /// the runtime's natural order. Direction flips when the same key is
+    /// pressed again.
+    container_sort: Option<ContainerSort>,
+    container_sort_desc: bool,
+    /// 'n' in the actions bar opens this free-form nice value (−20…19)
+    renice_input: Option<String>,
+    /// last left-click (time + cell) for double-click → open detail
+    last_click: Option<(Instant, u16, u16)>,
+    /// screen rects captured during draw so mouse events can be mapped
+    /// back to rows / tabs / panes
+    tab_rect: Option<ratatui::prelude::Rect>,
+    table_rect: Option<ratatui::prelude::Rect>,
+    detail_rect: Option<ratatui::prelude::Rect>,
     /// Locks-tab filter (kind / mode / pid / process / path)
     lock_search: String,
     /// indices into `locks` after the filter
@@ -185,7 +210,90 @@ enum LockSort {
     Path,
 }
 
+/// Ports-tab sort columns — keys p/t/n/s, matching the Go witr.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PortSort {
+    Port,
+    Proto,
+    Addr,
+    State,
+}
+
+/// Containers-tab sort columns — keys i/n/r/g/s, matching the Go witr.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ContainerSort {
+    Id,
+    Name,
+    Runtime,
+    Image,
+    Status,
+}
+
 const DEBOUNCE: Duration = Duration::from_millis(500);
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// CLI targets carried into the TUI, so `witr -i --pid 42` opens where a
+/// one-shot run would have looked (Go witr parity).
+#[derive(Default)]
+pub struct Seed {
+    pub name: Option<String>,
+    pub pid: Option<Pid>,
+    pub port: Option<u16>,
+    pub container: Option<String>,
+    pub file: Option<String>,
+    /// targets past the first of each type — the TUI shows one per type
+    pub skipped: Vec<String>,
+}
+
+impl Seed {
+    /// First target of each type wins, extras are reported (mirrors the Go
+    /// witr's withTargets).
+    pub fn from_targets(
+        names: &[String],
+        pids: &[Pid],
+        ports: &[u16],
+        files: &[String],
+        containers: &[String],
+    ) -> Seed {
+        let mut s = Seed::default();
+        for n in names {
+            if s.name.is_none() {
+                s.name = Some(n.clone());
+            } else {
+                s.skipped.push(format!("name {n}"));
+            }
+        }
+        for p in pids {
+            if s.pid.is_none() {
+                s.pid = Some(*p);
+            } else {
+                s.skipped.push(format!("pid {p}"));
+            }
+        }
+        for p in ports {
+            if s.port.is_none() {
+                s.port = Some(*p);
+            } else {
+                s.skipped.push(format!("port {p}"));
+            }
+        }
+        for c in containers {
+            if s.container.is_none() {
+                s.container = Some(c.clone());
+            } else {
+                s.skipped.push(format!("container {c}"));
+            }
+        }
+        for f in files {
+            if s.file.is_none() {
+                s.file = Some(f.clone());
+            } else {
+                s.skipped.push(format!("file {f}"));
+            }
+        }
+        s
+    }
+}
 
 impl Tab {
     fn next(self) -> Self {
@@ -207,7 +315,7 @@ impl Tab {
 }
 
 impl TuiApp {
-    fn new(platform: Box<dyn Platform>) -> Self {
+    fn new(platform: Box<dyn Platform>, seed: Seed) -> Self {
         let locks_supported = matches!(platform.name(), "linux" | "macos");
         let mut app = TuiApp {
             platform,
@@ -257,9 +365,19 @@ impl TuiApp {
             detail_pending_since: None,
             port_search: String::new(),
             socket_view: Vec::new(),
+            ports_show_all: false,
+            port_sort: PortSort::Port,
+            port_sort_desc: false,
             containers: Vec::new(),
             container_search: String::new(),
             container_view: Vec::new(),
+            container_sort: None,
+            container_sort_desc: false,
+            renice_input: None,
+            last_click: None,
+            tab_rect: None,
+            table_rect: None,
+            detail_rect: None,
             lock_search: String::new(),
             lock_view: Vec::new(),
             lock_state: TableState::default(),
@@ -272,7 +390,40 @@ impl TuiApp {
             status: String::new(),
             confirm_kill: None,
         };
+        // CLI seeding: filters before the first refresh, then tab + selection
+        if let Some(n) = seed.name {
+            app.search = n;
+        }
         app.refresh();
+        if let Some(pid) = seed.pid {
+            let row = app.view.iter().position(|&i| app.procs[i].pid == pid);
+            match row {
+                Some(r) => app.table_state.select(Some(r)),
+                None => app.status = format!("pid {pid} is not in the process list"),
+            }
+        }
+        // one target type per tab; the last one wins the tab (Go witr parity)
+        if let Some(port) = seed.port {
+            app.switch_tab(Tab::Ports);
+            app.port_search = port.to_string();
+            app.rebuild_socket_view();
+        }
+        if let Some(c) = seed.container {
+            app.switch_tab(Tab::Containers);
+            app.container_search = c;
+            app.rebuild_container_view();
+        }
+        if let Some(f) = seed.file {
+            app.switch_tab(Tab::Locks);
+            app.lock_search = f;
+            app.rebuild_lock_view();
+        }
+        if !seed.skipped.is_empty() {
+            app.status = format!(
+                "interactive mode shows one target of each type; not shown: {}",
+                seed.skipped.join(", ")
+            );
+        }
         app.update_details(); // cold start: no debounce for the first fill
         app
     }
@@ -281,7 +432,7 @@ impl TuiApp {
     fn switch_tab(&mut self, tab: Tab) {
         self.tab = tab;
         if tab == Tab::Ports {
-            self.sockets = self.platform.list_sockets().unwrap_or_default();
+            self.load_sockets();
             self.rebuild_socket_view();
         }
         if tab == Tab::Containers {
@@ -296,13 +447,19 @@ impl TuiApp {
         self.status.clear();
     }
 
+    /// Sockets for the Ports tab: the full table so the 'a' toggle can
+    /// widen the view without a refetch.
+    fn load_sockets(&mut self) {
+        self.sockets = self.platform.list_all_sockets().unwrap_or_default();
+    }
+
     fn refresh(&mut self) {
         if let Ok(p) = self.platform.list_processes() {
             self.procs = p;
             self.hist.update(&self.procs);
         }
         if self.tab == Tab::Ports {
-            self.sockets = self.platform.list_sockets().unwrap_or_default();
+            self.load_sockets();
             self.rebuild_socket_view();
         }
         if self.tab == Tab::Containers {
@@ -348,11 +505,26 @@ impl TuiApp {
         }
     }
 
-    /// Apply the Containers-tab filter (name / image / id / runtime / state),
-    /// keeping the selection in range.
+    /// Apply the Containers-tab filter (name / image / id / runtime / state)
+    /// + sort ('i/n/r/g/s'), keeping the selection in range.
     fn rebuild_container_view(&mut self) {
         let needle = self.container_search.to_lowercase();
-        self.container_view = filter_containers(&self.containers, &needle);
+        let mut view = filter_containers(&self.containers, &needle);
+        if let Some(col) = self.container_sort {
+            let desc = self.container_sort_desc;
+            let cs = &self.containers;
+            view.sort_by(|&a, &b| {
+                let ord = match col {
+                    ContainerSort::Id => cs[a].id.cmp(&cs[b].id),
+                    ContainerSort::Name => cs[a].name.to_lowercase().cmp(&cs[b].name.to_lowercase()),
+                    ContainerSort::Runtime => cs[a].runtime.cmp(&cs[b].runtime),
+                    ContainerSort::Image => cs[a].image.cmp(&cs[b].image),
+                    ContainerSort::Status => cs[a].status.cmp(&cs[b].status),
+                };
+                if desc { ord.reverse() } else { ord }
+            });
+        }
+        self.container_view = view;
         if self.container_view.is_empty() {
             self.table_state.select(None);
         } else {
@@ -365,14 +537,35 @@ impl TuiApp {
         }
     }
 
-    /// Apply the Ports-tab filter (port / pid / process / address / state),
-    /// keeping the selection in range.
+    /// Apply the Ports-tab LISTEN-only gate ('a' lifts it), filter (port /
+    /// pid / process / address / state) and sort ('p/t/n/s'), keeping the
+    /// selection in range.
     fn rebuild_socket_view(&mut self) {
         let needle = self.port_search.to_lowercase();
         let names: HashMap<Pid, String> =
             self.procs.iter().map(|p| (p.pid, p.name.to_lowercase())).collect();
         let name_of = |pid: Pid| -> Option<String> { names.get(&pid).cloned() };
-        self.socket_view = filter_sockets(&self.sockets, &needle, name_of);
+        let mut view = filter_sockets(&self.sockets, &needle, name_of);
+        if !self.ports_show_all {
+            // default view: listening tcp + bound udp, like the Go witr
+            view.retain(|&i| {
+                let s = &self.sockets[i];
+                s.proto.starts_with("udp") || s.state.eq_ignore_ascii_case("LISTEN")
+            });
+        }
+        let (col, desc) = (self.port_sort, self.port_sort_desc);
+        let socks = &self.sockets;
+        view.sort_by(|&a, &b| {
+            let (x, y) = (&socks[a], &socks[b]);
+            let ord = match col {
+                PortSort::Port => x.local_port.cmp(&y.local_port),
+                PortSort::Proto => x.proto.cmp(&y.proto),
+                PortSort::Addr => x.local_addr.cmp(&y.local_addr),
+                PortSort::State => x.state.cmp(&y.state),
+            };
+            if desc { ord.reverse() } else { ord }
+        });
+        self.socket_view = view;
         if self.socket_view.is_empty() {
             self.table_state.select(None);
         } else {
@@ -1267,6 +1460,27 @@ fn mode_line(app: &TuiApp) -> Line<'static> {
             format!("  Mode: Confirm — kill pid {}? (y/n)", pid),
         ));
     }
+    if let Some(input) = &app.renice_input {
+        let pid = app.detail_pid.or_else(|| app.selected_pid()).unwrap_or(0);
+        return Line::from(vec![
+            styled(
+                Style::new().fg(Color::Yellow).bold(),
+                format!("  Mode: Renice — nice value for pid {pid} (−20…19): "),
+            ),
+            Span::raw(input.clone()),
+            styled(Style::new().fg(Color::Yellow), "▏"),
+            styled(Style::new().fg(MID), "  (Enter: apply — any other key cancels)"),
+        ]);
+    }
+    if app.actions_open {
+        return Line::from(styled(
+            Style::new().fg(Color::Yellow).bold(),
+            format!(
+                "  Mode: Actions on pid {} — [k]ill [t]erm [p]ause [r]esume [n]ice (Esc: cancel)",
+                app.detail_pid.or_else(|| app.selected_pid()).unwrap_or(0)
+            ),
+        ));
+    }
     if app.search_mode {
         return Line::from(styled(Style::new().fg(ACCENT), "  Mode: Search (Enter: apply — Esc: cancel)"));
     }
@@ -1588,6 +1802,11 @@ fn ui_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
     let cols = Layout::horizontal([Constraint::Percentage(dl), Constraint::Percentage(dr)])
         .split(v[2]);
 
+    // mouse mapping: left pane = process detail, right = environment
+    app.tab_rect = None;
+    app.table_rect = Some(cols[0]);
+    app.detail_rect = Some(cols[1]);
+
     // left: process detail
     let d_active = app.detail_pane;
     let d_title = format!(
@@ -1680,6 +1899,11 @@ fn ui_port_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
         Constraint::Length(1), // footer
     ])
     .split(inner);
+
+    // mouse mapping: connections pane above, owner pane below
+    app.tab_rect = None;
+    app.table_rect = Some(v[2]);
+    app.detail_rect = Some(v[3]);
 
     let n = app.port_detail_sockets.len();
     let established = app
@@ -1824,6 +2048,11 @@ fn ui_container_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
     let cols = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(v[2]);
 
+    // mouse mapping: info pane left, in-container processes right
+    app.tab_rect = None;
+    app.table_rect = Some(cols[0]);
+    app.detail_rect = Some(cols[1]);
+
     // left: container attributes
     let info = app.container_info_lines();
     app.detail_line_count = wrapped_count(&info, cols[0].width.saturating_sub(2));
@@ -1935,6 +2164,12 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
     f.render_widget(Paragraph::new(mode_line(app)), v[2]);
     f.render_widget(Paragraph::new(search_line(app)), v[4]);
 
+    // mouse mapping: full-width table by default; the Processes tab narrows
+    // it and adds the details pane
+    app.tab_rect = Some(v[0]);
+    app.table_rect = Some(v[6]);
+    app.detail_rect = None;
+
     match app.tab {
         Tab::Processes => {
             // tmux-style zoom (z): the focused pane temporarily takes the row
@@ -1949,6 +2184,8 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
                 Constraint::Percentage(dw),
             ])
             .split(v[6]);
+            app.table_rect = (tw > 0).then_some(cols[0]);
+            app.detail_rect = (dw > 0).then_some(cols[2]);
             if tw > 0 {
                 processes_table(app, cols[0], f);
             }
@@ -2041,8 +2278,16 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
         }
     };
     let mut footer = match app.tab {
-        Tab::Processes | Tab::Ports => format!(
-            "Total: {} | Enter: Detail | /: Search | z: Zoom | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
+        Tab::Processes => format!(
+            "Total: {} | Enter: Detail | a: Actions | /: Search | z: Zoom | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
+            total
+        ),
+        Tab::Ports => format!(
+            "Total: {} | Enter: Detail | a: All States | p/t/n/s: Sort | /: Search | h-l: Tab | r: Refresh | q: Quit",
+            total
+        ),
+        Tab::Containers => format!(
+            "Total: {} | Enter: Detail | i/n/r/g/s: Sort | /: Search | h-l: Tab | r: Refresh | q: Quit",
             total
         ),
         Tab::Locks => {
@@ -2052,8 +2297,8 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
                 total, mode
             )
         }
-        _ => format!("Total: {} | q: Quit", total),
     };
+    footer = format!("witr-rs v{} · {}", env!("CARGO_PKG_VERSION"), footer);
     if !app.status.is_empty() {
         footer.push_str(&format!("  ·  {}", app.status));
     }
@@ -2107,6 +2352,193 @@ fn select_edge(app: &mut TuiApp, first: bool) {
     app.detail_pending_since = Some(Instant::now());
 }
 
+/// Mutably borrow the scroll offset of the pane that has focus on the
+/// current full-page view (shared by the keymap and the mouse wheel).
+fn focused_scroll_mut(app: &mut TuiApp) -> Option<&mut u16> {
+    match (app.page, app.detail_pane, app.port_pane_conn, app.cd_pane_info) {
+        (Page::Detail, true, _, _) => Some(&mut app.detail_scroll),
+        (Page::Detail, false, _, _) => Some(&mut app.env_scroll),
+        (Page::PortDetail, _, true, _) => Some(&mut app.port_scroll),
+        (Page::PortDetail, _, false, _) => Some(&mut app.port_owner_scroll),
+        (Page::ContainerDetail, _, _, true) => Some(&mut app.cd_scroll),
+        (Page::ContainerDetail, _, _, false) => Some(&mut app.cdp_scroll),
+        (Page::Browse, _, _, _) => None,
+    }
+}
+
+/// Open the detail view for whatever the current tab's cursor is on — the
+/// Enter key and a table double-click share this.
+fn open_selection(app: &mut TuiApp) {
+    match app.tab {
+        Tab::Processes => app.open_detail_page(),
+        Tab::Ports => app.open_port_detail_page(),
+        Tab::Containers => app.open_container_detail_page(),
+        // "from the lock back to the process": jump straight into the
+        // holder's detail page
+        Tab::Locks => {
+            if let Some(pid) = app.selected_lock_pid() {
+                app.open_detail_page_for(pid);
+            }
+        }
+    }
+}
+
+/// Move the tab's table cursor to an absolute row (used by mouse clicks).
+fn select_row(app: &mut TuiApp, row: usize) {
+    if app.tab == Tab::Locks {
+        if row < app.lock_view.len() {
+            app.lock_state.select(Some(row));
+        }
+        return;
+    }
+    if row < app.view.len() {
+        app.table_state.select(Some(row));
+        app.detail_pid = None;
+        app.detail_scroll = 0;
+        app.detail_pending_since = Some(Instant::now());
+    }
+}
+
+/// Scroll offset of whichever table the current tab drives.
+fn table_offset(app: &TuiApp) -> usize {
+    if app.tab == Tab::Locks {
+        app.lock_state.offset()
+    } else {
+        app.table_state.offset()
+    }
+}
+
+/// Position inside a rect (rects have zero-size guard for free: a zero
+/// width/height rect contains nothing).
+fn in_rect(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+/// Which tab a click in the tab bar lands on — recomputed from the same
+/// span widths tab_bar() renders (" witr-rs " + gap, then " title " + gap).
+fn tab_at_x(x: u16) -> Option<Tab> {
+    let mut cx = 9 + 2; // " witr-rs " + "  "
+    for t in [Tab::Processes, Tab::Ports, Tab::Containers, Tab::Locks] {
+        let w = t.title().chars().count() as u16 + 2;
+        if x >= cx && x < cx + w {
+            return Some(t);
+        }
+        cx += w + 1;
+    }
+    None
+}
+
+/// Mouse handling: wheel scrolls (table cursor / focused detail pane),
+/// left click selects tabs, rows and panes; a double-click on a table row
+/// opens its detail view.
+fn on_mouse(app: &mut TuiApp, m: MouseEvent) {
+    match m.kind {
+        MouseEventKind::ScrollDown => on_wheel(app, 1, m.column, m.row),
+        MouseEventKind::ScrollUp => on_wheel(app, -1, m.column, m.row),
+        MouseEventKind::Down(MouseButton::Left) => on_click(app, m.column, m.row),
+        _ => {}
+    }
+}
+
+fn on_wheel(app: &mut TuiApp, delta: i32, x: u16, y: u16) {
+    if app.page != Page::Browse {
+        if let Some(pane) = focused_scroll_mut(app) {
+            if delta > 0 {
+                *pane = pane.saturating_add(delta as u16);
+            } else {
+                *pane = pane.saturating_sub(delta.unsigned_abs() as u16);
+            }
+        }
+        return;
+    }
+    // over the details panel: scroll its content instead of the table
+    if app.tab == Tab::Processes && app.focus == Focus::Details {
+        if let Some(r) = app.detail_rect {
+            if in_rect(r, x, y) {
+                if delta > 0 {
+                    app.detail_scroll = app.detail_scroll.saturating_add(delta as u16);
+                } else {
+                    app.detail_scroll = app.detail_scroll.saturating_sub(delta.unsigned_abs() as u16);
+                }
+                return;
+            }
+        }
+    }
+    move_selection(app, delta);
+}
+
+fn on_click(app: &mut TuiApp, x: u16, y: u16) {
+    // full-page views: click a pane to focus it
+    if app.page != Page::Browse {
+        if let Some(r) = app.detail_rect {
+            if in_rect(r, x, y) {
+                match app.page {
+                    Page::Detail => app.detail_pane = false,
+                    Page::PortDetail => app.port_pane_conn = false,
+                    Page::ContainerDetail => app.cd_pane_info = false,
+                    Page::Browse => {}
+                }
+                return;
+            }
+        }
+        if let Some(r) = app.table_rect {
+            if in_rect(r, x, y) {
+                match app.page {
+                    Page::Detail => app.detail_pane = true,
+                    Page::PortDetail => app.port_pane_conn = true,
+                    Page::ContainerDetail => app.cd_pane_info = true,
+                    Page::Browse => {}
+                }
+            }
+        }
+        return;
+    }
+
+    // tab bar
+    if let Some(r) = app.tab_rect {
+        if in_rect(r, x, y) {
+            if let Some(t) = tab_at_x(x) {
+                app.switch_tab(t);
+            }
+            return;
+        }
+    }
+    // details panel (Processes tab): click focuses it
+    if let Some(r) = app.detail_rect {
+        if in_rect(r, x, y) {
+            app.focus = Focus::Details;
+            return;
+        }
+    }
+    // table rows: the header row is y == r.y, data starts below it
+    let Some(r) = app.table_rect else { return };
+    if !in_rect(r, x, y) || y == r.y {
+        return;
+    }
+    let vis = (y - r.y - 1) as usize;
+    let abs = table_offset(app) + vis;
+    let len = if app.tab == Tab::Locks {
+        app.lock_view.len()
+    } else {
+        app.view.len()
+    };
+    if abs >= len {
+        return;
+    }
+    select_row(app, abs);
+    app.focus = Focus::Table;
+    // double-click on the same cell opens the detail view
+    let dbl = app
+        .last_click
+        .take()
+        .is_some_and(|(t, lx, ly)| t.elapsed() <= DOUBLE_CLICK && lx == x && ly == y);
+    if dbl {
+        open_selection(app);
+    } else {
+        app.last_click = Some((Instant::now(), x, y));
+    }
+}
+
 /// Returns false when the app should quit.
 fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
     if app.confirm_kill.is_some() {
@@ -2114,6 +2546,69 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
             app.kill_selected();
         } else {
             app.confirm_kill = None;
+        }
+        return true;
+    }
+
+    // Renice value input ('n' in the actions bar): free-form −20…19
+    if app.renice_input.is_some() {
+        let pid = app.detail_pid.or_else(|| app.selected_pid());
+        let mut input = app.renice_input.take().unwrap();
+        match key {
+            KeyCode::Char(c) if c.is_ascii_digit() || (c == '-' && input.is_empty()) => {
+                if input.len() < 4 {
+                    input.push(c);
+                }
+                app.renice_input = Some(input);
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                app.renice_input = Some(input);
+            }
+            KeyCode::Enter => match input.parse::<i32>() {
+                Ok(v) if (-20..=19).contains(&v) => {
+                    if let Some(pid) = pid {
+                        app.status = match renice_pid(pid, v) {
+                            Ok(msg) => format!("renice pid {pid}: {msg}"),
+                            Err(e) => e.to_string(),
+                        };
+                    }
+                }
+                _ => app.status = "nice value must be between -20 and 19".into(),
+            },
+            _ => {} // any other key cancels
+        }
+        return true;
+    }
+
+    // Actions bar: one-key signals on the selected process (Go witr parity)
+    // — openable from the detail page ('a') and straight from the browse
+    // table ('a' on Processes).
+    if app.actions_open {
+        let Some(pid) = app.detail_pid.or_else(|| app.selected_pid()) else {
+            app.actions_open = false;
+            return true;
+        };
+        app.actions_open = false;
+        match key {
+            KeyCode::Char('k') => app.status = match send_signal(pid, "KILL") {
+                Ok(()) => format!("SIGKILL sent to pid {pid}"),
+                Err(e) => e.to_string(),
+            },
+            KeyCode::Char('t') => app.status = match send_signal(pid, "TERM") {
+                Ok(()) => format!("SIGTERM sent to pid {pid}"),
+                Err(e) => e.to_string(),
+            },
+            KeyCode::Char('p') => app.status = match send_signal(pid, "STOP") {
+                Ok(()) => format!("SIGSTOP sent to pid {pid} (paused)"),
+                Err(e) => e.to_string(),
+            },
+            KeyCode::Char('r') => app.status = match send_signal(pid, "CONT") {
+                Ok(()) => format!("SIGCONT sent to pid {pid} (resumed)"),
+                Err(e) => e.to_string(),
+            },
+            KeyCode::Char('n') => app.renice_input = Some(String::new()),
+            _ => return true, // any other key just closes the bar
         }
         return true;
     }
@@ -2135,38 +2630,6 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                 }
                 KeyCode::Enter | KeyCode::Esc => app.env_search_mode = false,
                 _ => {}
-            }
-            return true;
-        }
-        // Actions bar: one-key signals on this process (Go witr parity)
-        if app.actions_open {
-            let Some(pid) = app.detail_pid else {
-                app.actions_open = false;
-                return true;
-            };
-            app.actions_open = false;
-            match key {
-                KeyCode::Char('k') => app.status = match send_signal(pid, "KILL") {
-                    Ok(()) => format!("SIGKILL sent to pid {pid}"),
-                    Err(e) => e.to_string(),
-                },
-                KeyCode::Char('t') => app.status = match send_signal(pid, "TERM") {
-                    Ok(()) => format!("SIGTERM sent to pid {pid}"),
-                    Err(e) => e.to_string(),
-                },
-                KeyCode::Char('p') => app.status = match send_signal(pid, "STOP") {
-                    Ok(()) => format!("SIGSTOP sent to pid {pid} (paused)"),
-                    Err(e) => e.to_string(),
-                },
-                KeyCode::Char('r') => app.status = match send_signal(pid, "CONT") {
-                    Ok(()) => format!("SIGCONT sent to pid {pid} (resumed)"),
-                    Err(e) => e.to_string(),
-                },
-                KeyCode::Char('n') => app.status = match renice_pid(pid, 10) {
-                    Ok(msg) => format!("renice pid {pid}: {msg}"),
-                    Err(e) => e.to_string(),
-                },
-                _ => return true, // any other key just closes the bar
             }
             return true;
         }
@@ -2225,16 +2688,7 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
             _ => 0,
         };
         if delta != 0 {
-            let pane = match (app.page, app.detail_pane, app.port_pane_conn, app.cd_pane_info) {
-                (Page::Detail, true, _, _) => Some(&mut app.detail_scroll),
-                (Page::Detail, false, _, _) => Some(&mut app.env_scroll),
-                (Page::PortDetail, _, true, _) => Some(&mut app.port_scroll),
-                (Page::PortDetail, _, false, _) => Some(&mut app.port_owner_scroll),
-                (Page::ContainerDetail, _, _, true) => Some(&mut app.cd_scroll),
-                (Page::ContainerDetail, _, _, false) => Some(&mut app.cdp_scroll),
-                (Page::Browse, _, _, _) => None,
-            };
-            if let Some(pane) = pane {
+            if let Some(pane) = focused_scroll_mut(app) {
                 if delta > 0 {
                     *pane = pane.saturating_add(delta as u16);
                 } else {
@@ -2291,6 +2745,9 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                 app.search_mode = false;
                 app.focus = Focus::Table;
             }
+            // keep the list navigable while the search box has focus
+            KeyCode::Up => move_selection(app, -1),
+            KeyCode::Down => move_selection(app, 1),
             _ => {}
         }
         return true;
@@ -2343,6 +2800,58 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         KeyCode::Char('k') if app.focus == Focus::Table => move_selection(app, -1),
         KeyCode::Char('g') if app.focus == Focus::Table => select_edge(app, true),
         KeyCode::Char('G') if app.focus == Focus::Table => select_edge(app, false),
+        // ---- Ports tab: 'a' widens to every socket state, p/t/n/s sort
+        // (Go witr parity) ----
+        KeyCode::Char('a') if app.tab == Tab::Ports && app.focus == Focus::Table => {
+            app.ports_show_all = !app.ports_show_all;
+            app.rebuild_socket_view();
+        }
+        KeyCode::Char(c)
+            if app.tab == Tab::Ports
+                && app.focus == Focus::Table
+                && matches!(c.to_ascii_lowercase(), 'p' | 't' | 'n' | 's') =>
+        {
+            let col = match c.to_ascii_lowercase() {
+                'p' => PortSort::Port,
+                't' => PortSort::Proto,
+                'n' => PortSort::Addr,
+                _ => PortSort::State,
+            };
+            if app.port_sort == col {
+                app.port_sort_desc = !app.port_sort_desc;
+            } else {
+                app.port_sort = col;
+                app.port_sort_desc = false;
+            }
+            app.rebuild_socket_view();
+        }
+        // ---- Containers tab: i/n/r/g/s sort (Go witr parity) ----
+        KeyCode::Char(c)
+            if app.tab == Tab::Containers
+                && app.focus == Focus::Table
+                && matches!(c.to_ascii_lowercase(), 'i' | 'n' | 'r' | 'g' | 's') =>
+        {
+            let col = match c.to_ascii_lowercase() {
+                'i' => ContainerSort::Id,
+                'n' => ContainerSort::Name,
+                'r' => ContainerSort::Runtime,
+                'g' => ContainerSort::Image,
+                _ => ContainerSort::Status,
+            };
+            if app.container_sort == Some(col) {
+                app.container_sort_desc = !app.container_sort_desc;
+            } else {
+                app.container_sort = Some(col);
+                app.container_sort_desc = false;
+            }
+            app.rebuild_container_view();
+        }
+        // ---- Processes tab: 'a' opens the actions bar on the selection ----
+        KeyCode::Char('a') if app.tab == Tab::Processes && app.focus == Focus::Table => {
+            if app.selected_pid().is_some() {
+                app.actions_open = true;
+            }
+        }
         // ---- Locks tab: 'a' toggles the all-open-files view, p/n/t/m/f
         // sort (Go witr parity; there 'f' shadows page-down — use Space) ----
         KeyCode::Char(c)
@@ -2428,18 +2937,7 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
             app.detail_scroll = app.detail_scroll.saturating_sub(app.detail_height)
         }
 
-        KeyCode::Enter => match app.tab {
-            Tab::Processes => app.open_detail_page(),
-            Tab::Ports => app.open_port_detail_page(),
-            Tab::Containers => app.open_container_detail_page(),
-            // "from the lock back to the process": jump straight into the
-            // holder's detail page
-            Tab::Locks => {
-                if let Some(pid) = app.selected_lock_pid() {
-                    app.open_detail_page_for(pid);
-                }
-            }
-        },
+        KeyCode::Enter => open_selection(app),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('x') => {
             if let Some(pid) = app.selected_pid() {
@@ -2476,15 +2974,19 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
     true
 }
 
-fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
-    let mut app = TuiApp::new(crate::platform::get());
+fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()> {
+    let mut app = TuiApp::new(crate::platform::get(), seed);
     loop {
         terminal.draw(|f| ui(&mut app, f))?;
         if event::poll(Duration::from_millis(200))? {
-            if let CEvent::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && !on_key(&mut app, key.code) {
-                    return Ok(());
+            match event::read()? {
+                CEvent::Key(key) => {
+                    if key.kind == KeyEventKind::Press && !on_key(&mut app, key.code) {
+                        return Ok(());
+                    }
                 }
+                CEvent::Mouse(m) => on_mouse(&mut app, m),
+                _ => {}
             }
         }
         if app.last_refresh.elapsed() >= REFRESH {
@@ -2502,14 +3004,19 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     }
 }
 
-/// Entry point: alternate screen + raw mode, restored on every exit path.
-pub fn run() -> Result<()> {
+/// Entry point: alternate screen + raw mode + mouse capture, restored on
+/// every exit path. `seed` pre-selects the CLI target (Go witr parity).
+pub fn run(seed: Seed) -> Result<()> {
     let mut terminal = ratatui::init();
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| event_loop(&mut terminal)));
+    let _ = execute!(std::io::stdout(), event::EnableMouseCapture);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        event_loop(&mut terminal, seed)
+    }));
     let out = match res {
         Ok(r) => r,
         Err(_) => Err(std::io::Error::other("tui panicked")),
     };
+    let _ = execute!(std::io::stdout(), event::DisableMouseCapture);
     ratatui::restore();
     out
 }
@@ -2545,7 +3052,7 @@ mod tests {
 
     #[test]
     fn vim_navigation() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         if app.view.len() < 3 {
             panic!("need a few processes for the test");
         }
@@ -2570,7 +3077,7 @@ mod tests {
 
     #[test]
     fn h_l_switch_tabs() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         on_key(&mut app, KeyCode::Char('h'));
         assert_eq!(app.tab, Tab::Locks);
         on_key(&mut app, KeyCode::Char('l'));
@@ -2581,7 +3088,7 @@ mod tests {
 
     #[test]
     fn locks_tab_selection_and_enter_opens_detail() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         on_key(&mut app, KeyCode::Char('4'));
         assert_eq!(app.tab, Tab::Locks);
         if !app.locks_supported {
@@ -2631,7 +3138,7 @@ mod tests {
 
     #[test]
     fn locks_tab_search_filters_and_esc_clears() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         on_key(&mut app, KeyCode::Char('4'));
         assert_eq!(app.tab, Tab::Locks);
         if !app.locks_supported {
@@ -2676,7 +3183,7 @@ mod tests {
 
     #[test]
     fn locks_tab_sort_keys() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         on_key(&mut app, KeyCode::Char('4'));
         if !app.locks_supported {
             return;
@@ -2720,7 +3227,7 @@ mod tests {
 
     #[test]
     fn locks_tab_open_files_cap_lifts_on_search() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         on_key(&mut app, KeyCode::Char('4'));
         if !app.locks_supported {
             return;
@@ -2751,7 +3258,7 @@ mod tests {
 
     #[test]
     fn selection_debounce_refreshes_details() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         let first_pid = app.detail_pid;
         on_key(&mut app, KeyCode::Char('j'));
         // pending refresh is armed and the "computed for" marker is cleared
@@ -2803,7 +3310,7 @@ mod tests {
 
     #[test]
     fn kill_moves_to_x_and_confirm_cancels() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         let pid = app.selected_pid().unwrap();
         on_key(&mut app, KeyCode::Char('x'));
         assert_eq!(app.confirm_kill, Some(pid));
@@ -2813,7 +3320,7 @@ mod tests {
 
     #[test]
     fn port_detail_page_opens_and_closes() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         app.tab = Tab::Ports;
         app.sockets = app.platform.list_sockets().unwrap_or_default();
         app.socket_view = (0..app.sockets.len()).collect();
@@ -2876,7 +3383,7 @@ mod tests {
 
     #[test]
     fn container_search_filters_view() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         app.tab = Tab::Containers;
         app.containers = vec![
             Container {
@@ -2884,6 +3391,7 @@ mod tests {
                 id: "98974e0e63d6".into(),
                 name: "powershell".into(),
                 image: "dotnet/sdk:9.0".into(),
+                command: String::new(),
                 state: "running".into(),
                 status: "Up 2 weeks".into(),
                 ports: "".into(),
@@ -2893,6 +3401,7 @@ mod tests {
                 id: "1daeb5281349".into(),
                 name: "stack-akhq-1".into(),
                 image: "tchiotludo/akhq".into(),
+                command: String::new(),
                 state: "running".into(),
                 status: "Up 2 weeks".into(),
                 ports: "".into(),
@@ -2911,7 +3420,7 @@ mod tests {
 
     #[test]
     fn detail_page_opens_and_closes() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         let pid = app.selected_pid().unwrap();
         on_key(&mut app, KeyCode::Enter);
         assert_eq!(app.page, Page::Detail);
@@ -2939,7 +3448,7 @@ mod tests {
 
     #[test]
     fn detail_actions_bar_keymap() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         on_key(&mut app, KeyCode::Enter);
         assert_eq!(app.page, Page::Detail);
         assert!(!app.actions_open);
@@ -3054,7 +3563,7 @@ mod tests {
 
     #[test]
     fn browse_zoom_toggles_and_esc_unzooms() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         assert_eq!(app.page, Page::Browse);
         assert!(!app.browse_zoom);
 
@@ -3091,7 +3600,7 @@ mod tests {
 
     #[test]
     fn detail_zoom_toggles_and_resets() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         on_key(&mut app, KeyCode::Enter);
         assert_eq!(app.page, Page::Detail);
         assert!(!app.detail_zoom);
@@ -3125,7 +3634,7 @@ mod tests {
 
     #[test]
     fn detail_env_search_filters_and_esc_clears() {
-        let mut app = TuiApp::new(crate::platform::get());
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         let pid = app.selected_pid().unwrap();
         on_key(&mut app, KeyCode::Enter);
         assert_eq!(app.page, Page::Detail);
@@ -3167,6 +3676,77 @@ mod tests {
         on_key(&mut app, KeyCode::Esc);
         assert_eq!(app.page, Page::Browse);
         assert_eq!(app.detail_report.as_ref().unwrap().matches[0].pid, pid);
+    }
+
+    #[test]
+    fn seed_applies_filters_tabs_and_skip_note() {
+        let app = TuiApp::new(
+            crate::platform::get(),
+            Seed {
+                name: Some("definitely-not-a-process-name-zz".into()),
+                pid: None,
+                port: Some(8080),
+                container: None,
+                file: None,
+                skipped: vec!["pid 99".into()],
+            },
+        );
+        // port seed wins the tab, filter prefilled, extras reported
+        assert_eq!(app.tab, Tab::Ports);
+        assert_eq!(app.port_search, "8080");
+        assert!(app.status.contains("not shown: pid 99"));
+        // the name seed went to the process search untouched by the port tab
+        assert_eq!(app.search, "definitely-not-a-process-name-zz");
+    }
+
+    #[test]
+    fn seed_from_targets_first_of_each_type_wins() {
+        let s = Seed::from_targets(
+            &["nginx".into(), "redis".into()],
+            &[1, 2],
+            &[80],
+            &[],
+            &["web".into()],
+        );
+        assert_eq!(s.name.as_deref(), Some("nginx"));
+        assert_eq!(s.pid, Some(1));
+        assert_eq!(s.port, Some(80));
+        assert_eq!(s.container.as_deref(), Some("web"));
+        assert_eq!(s.skipped, vec!["name redis".to_string(), "pid 2".to_string()]);
+    }
+
+    #[test]
+    fn mouse_click_tab_row_and_double_click() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        app.tab_rect = Some(Rect { x: 0, y: 0, width: 80, height: 1 });
+        app.table_rect = Some(Rect { x: 0, y: 2, width: 80, height: 12 });
+        app.detail_rect = None;
+
+        // click in the tab bar: x=12 is inside " 1. Processes "
+        on_click(&mut app, 12, 0);
+        assert_eq!(app.tab, Tab::Processes);
+
+        // click the first data row (header occupies y == r.y)
+        on_click(&mut app, 3, 3);
+        assert_eq!(app.focus, Focus::Table);
+        assert_eq!(app.table_state.selected(), Some(0));
+
+        // same cell again within the double-click window → detail page
+        on_click(&mut app, 3, 3);
+        assert_eq!(app.page, Page::Detail);
+
+        // wheel scrolls the focused pane, click on pane B focuses it
+        on_wheel(&mut app, 1, 40, 5);
+        assert_eq!(app.detail_scroll, 1);
+        app.detail_rect = Some(Rect { x: 60, y: 2, width: 20, height: 20 });
+        app.table_rect = Some(Rect { x: 0, y: 2, width: 58, height: 20 });
+        on_click(&mut app, 65, 5);
+        assert!(!app.detail_pane);
+        on_click(&mut app, 10, 5);
+        assert!(app.detail_pane);
+
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Browse);
     }
 
     #[test]

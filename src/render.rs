@@ -3,6 +3,24 @@ use std::fmt::Write as _;
 use crate::model::{Process, TargetReport};
 use crate::util::{fmt_age, fmt_time};
 
+/// One-line explanation for a socket state, shown for `--port` targets
+/// where the state itself is the interesting part.
+pub fn socket_explanation(state: &str) -> Option<&'static str> {
+    match state {
+        "LISTEN" => Some("listening for connections"),
+        "ESTABLISHED" => Some("active connection"),
+        "TIME_WAIT" => Some("connection closed, waiting for delayed packets"),
+        "CLOSE_WAIT" => Some("remote side closed; the app has not close()d yet"),
+        "FIN_WAIT_1" | "FIN_WAIT_2" | "FIN_WAIT" => {
+            Some("local close in progress, waiting for the remote end")
+        }
+        "SYN_SENT" => Some("connecting (no response yet)"),
+        "SYN_RECV" => Some("connection attempt received"),
+        "LAST_ACK" => Some("closing, waiting for the final acknowledgment"),
+        _ => None,
+    }
+}
+
 /// Render the "no target" default view: every process in a table.
 pub fn render_process_table(procs: &[Process], p: &Painter) -> String {
     let mut sorted: Vec<&Process> = procs.iter().collect();
@@ -148,6 +166,8 @@ pub enum Format {
     Standard,
     Tree,
     Short,
+    Warnings,
+    EnvOnly,
     Json,
 }
 
@@ -179,41 +199,108 @@ impl Painter {
     pub fn green(&self, s: &str) -> String {
         self.wrap("32", s)
     }
+    pub fn cyan(&self, s: &str) -> String {
+        self.wrap("36", s)
+    }
+    pub fn red(&self, s: &str) -> String {
+        self.wrap("31", s)
+    }
 }
 
 pub fn render(reports: &[TargetReport], format: Format, color: bool) -> String {
     let p = Painter::new(color);
-    match format {
-        Format::Json => serde_json::to_string_pretty(reports).unwrap_or_else(|_| "[]".into()),
-        Format::Short => reports
-            .iter()
-            .map(|r| render_short(r, &p))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Format::Tree => reports
-            .iter()
-            .map(|r| render_tree(r, &p))
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        Format::Standard => reports
-            .iter()
-            .map(|r| render_standard(r, &p))
-            .collect::<Vec<_>>()
-            .join("\n\n"),
+    if format == Format::Json {
+        return serde_json::to_string_pretty(reports).unwrap_or_else(|_| "[]".into());
+    }
+    let body = |r: &TargetReport| match format {
+        Format::Short => render_short(r, &p),
+        Format::Tree => render_tree(r, &p),
+        Format::Warnings => render_warnings(r, &p),
+        Format::EnvOnly => render_env_only(r, &p),
+        _ => render_standard(r, &p),
+    };
+    if reports.len() > 1 {
+        // Go witr's multi-target mode: a cyan divider labels each section.
+        let mut out = String::new();
+        for r in reports {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            let _ = writeln!(
+                out,
+                "{}",
+                p.cyan(&format!("----- [{}] -----", r.target.divider_label()))
+            );
+            out.push_str(&body(r));
+        }
+        out
+    } else {
+        reports.iter().map(body).collect::<Vec<_>>().join("\n\n")
     }
 }
 
-fn header(r: &TargetReport, p: &Painter) -> String {
-    p.bold(&format!("== {} ==", r.target.describe()))
+fn error_line(r: &TargetReport, p: &Painter) -> String {
+    if !r.found && r.container.is_some() {
+        return render_container_fallback(r, p);
+    }
+    p.yellow(r.error.as_deref().unwrap_or("no process matched"))
+}
+
+/// A container whose main process witr-rs can't see on this host
+/// (VM-backed runtime like Docker Desktop / podman machine): show the
+/// runtime-side view instead of a bare error.
+fn render_container_fallback(r: &TargetReport, p: &Painter) -> String {
+    let mut out = String::new();
+    let Some(c) = &r.container else {
+        return out;
+    };
+    let _ = writeln!(
+        out,
+        "{} {}",
+        p.bold("Target:"),
+        r.target.divider_label()
+    );
+    let mut line = format!("{} {}", p.bold("Container:"), p.green(&c.name));
+    let short: String = c.id.chars().take(12).collect();
+    if !short.is_empty() {
+        line.push_str(&format!(" {}", p.dim(&format!("(id {short})"))));
+    }
+    let tag = c.state_tag();
+    if !tag.is_empty() {
+        let colored = if tag == "healthy" {
+            p.green(&format!("[{tag}]"))
+        } else {
+            p.red(&format!("[{tag}]"))
+        };
+        line.push_str(&format!(" {colored}"));
+    }
+    let _ = writeln!(out, "{}", line);
+    if !c.image.is_empty() {
+        let _ = writeln!(out, "{} {}", p.bold("Image:"), c.image);
+    }
+    if !c.command.is_empty() {
+        let _ = writeln!(out, "{} {}", p.bold("Command:"), c.command);
+    }
+    if !c.status.is_empty() {
+        let _ = writeln!(out, "{} {}", p.bold("Status:"), c.status);
+    }
+    if !c.ports.is_empty() {
+        let _ = writeln!(out, "{} {}", p.bold("Ports:"), c.ports);
+    }
+    if let Some(e) = &r.error {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", p.yellow(e));
+    }
+    out.trim_end().to_string() + "\n"
 }
 
 fn render_short(r: &TargetReport, p: &Painter) -> String {
     if !r.found {
-        return format!(
-            "{} {}",
-            header(r, p),
-            p.yellow(r.error.as_deref().unwrap_or("no match"))
-        );
+        if let Some(c) = &r.container {
+            // compact fallback: just the identity line
+            return format!("{} {}", p.bold("container:"), c.format_line());
+        }
+        return p.yellow(r.error.as_deref().unwrap_or("no match"));
     }
     let mut lines = Vec::new();
     for m in &r.matches {
@@ -244,18 +331,17 @@ fn render_short(r: &TargetReport, p: &Painter) -> String {
     } else {
         format!(" {}", p.yellow(&format!("⚠ {} warning(s)", r.warnings.len())))
     };
-    lines.iter().map(|l| format!("{}{}{}{}", header(r, p), " ", l, warn)).collect::<Vec<_>>().join("\n")
+    lines
+        .iter()
+        .map(|l| format!("{}{}", l, warn))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_standard(r: &TargetReport, p: &Painter) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "{}", header(r, p));
     if !r.found {
-        let _ = writeln!(
-            out,
-            "  {}",
-            p.yellow(r.error.as_deref().unwrap_or("no process matched"))
-        );
+        let _ = writeln!(out, "{}", error_line(r, p));
         return out;
     }
 
@@ -267,6 +353,9 @@ fn render_standard(r: &TargetReport, p: &Painter) -> String {
         if let Some(u) = &m.user {
             title.push_str(&format!(" (user {})", u));
         }
+        if m.forked {
+            title.push_str(&format!(" {}", p.yellow("{forked}")));
+        }
         let _ = writeln!(out, "{}", p.bold(&title));
         if let Some(t) = m.started {
             let _ = writeln!(
@@ -277,6 +366,21 @@ fn render_standard(r: &TargetReport, p: &Painter) -> String {
         }
         if let Some(cwd) = &m.cwd {
             let _ = writeln!(out, "  cwd {}", cwd);
+        }
+        if m.git_repo.is_some() || m.git_branch.is_some() {
+            let mut line = String::from("  git ");
+            if let Some(repo) = &m.git_repo {
+                line.push_str(repo);
+                if let Some(branch) = &m.git_branch {
+                    if !branch.is_empty() {
+                        line.push_str(&format!(" ({branch})"));
+                    }
+                }
+            }
+            let _ = writeln!(out, "{}", p.dim(&line));
+        }
+        if let Some(container) = &m.container {
+            let _ = writeln!(out, "  {} {}", p.bold("container:"), container);
         }
         if let Some(exe) = &m.exe {
             let mut exe_line = format!("  exe {}", exe);
@@ -310,6 +414,11 @@ fn render_standard(r: &TargetReport, p: &Painter) -> String {
                 line.push_str(&format!(" — {}", d));
             }
             let _ = writeln!(out, "{}", line.trim_end());
+            if let Some(n) = s.restarts {
+                if n > 0 {
+                    let _ = writeln!(out, "    {} restart(s) recorded by the service manager", p.yellow(&n.to_string()));
+                }
+            }
         }
 
         if r.ancestry.len() > 1 || r.matches.len() != r.ancestry.len() {
@@ -342,6 +451,7 @@ fn render_standard(r: &TargetReport, p: &Painter) -> String {
         if !r.sockets.is_empty() {
             let _ = writeln!(out);
             let _ = writeln!(out, "  {}", p.dim("sockets:"));
+            let mut explained: Vec<&str> = Vec::new();
             for s in &r.sockets {
                 let mut line = format!("    {:<5} {}:{}", s.proto, s.local_addr, s.local_port);
                 if let (Some(pa), Some(pp)) = (&s.peer_addr, s.peer_port) {
@@ -349,6 +459,16 @@ fn render_standard(r: &TargetReport, p: &Painter) -> String {
                 }
                 line.push_str(&format!(" {}", s.state));
                 let _ = writeln!(out, "{}", line);
+                // For --port targets the state is the interesting part:
+                // explain each distinct state once, under the list.
+                if matches!(r.target, crate::model::TargetSpec::Port { .. })
+                    && !explained.contains(&s.state.as_str())
+                {
+                    if let Some(note) = socket_explanation(&s.state) {
+                        explained.push(&s.state);
+                        let _ = writeln!(out, "      {} {}", p.dim(&s.state), p.dim(&format!("— {note}")));
+                    }
+                }
             }
         }
 
@@ -532,11 +652,10 @@ fn fmt_started_line(t: i64) -> String {
 
 fn render_tree(r: &TargetReport, p: &Painter) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "{}", header(r, p));
     if !r.found {
         let _ = writeln!(
             out,
-            "  {}",
+            "{}",
             p.yellow(r.error.as_deref().unwrap_or("no process matched"))
         );
         return out;
@@ -575,6 +694,75 @@ fn render_tree(r: &TargetReport, p: &Painter) -> String {
         let _ = writeln!(out);
         for w in &r.warnings {
             let _ = writeln!(out, "  {} {}", p.yellow("⚠"), w);
+        }
+    }
+    out
+}
+
+/// Go witr's RenderWarnings: process identity, then only the warnings.
+fn render_warnings(r: &TargetReport, p: &Painter) -> String {
+    let mut out = String::new();
+    let Some(m) = r.matches.first() else {
+        let _ = writeln!(out, "{}", p.yellow(r.error.as_deref().unwrap_or("no process matched")));
+        return out;
+    };
+    let _ = writeln!(out, "{} {}", p.bold(&format!("{} (pid {})", m.name, m.pid)), m.command_line());
+    if r.warnings.is_empty() {
+        let _ = writeln!(out, "{} {}", p.bold("Warnings:"), p.green("No warnings."));
+        return out;
+    }
+    let _ = writeln!(out, "{}", p.red("Warnings:"));
+    for w in &r.warnings {
+        let _ = writeln!(out, "  {} {}", p.yellow("•"), w);
+    }
+    out
+}
+
+/// Go witr's RenderEnvOnly: the command and environment block, nothing else.
+/// Multiple matches are an error so the values can't be misattributed.
+fn render_env_only(r: &TargetReport, p: &Painter) -> String {
+    let mut out = String::new();
+    if !r.found {
+        if let Some(c) = &r.container {
+            let _ = writeln!(out, "{}", p.yellow(&format!("error: {} ({})", r.error.as_deref().unwrap_or("not visible"), c.format_line())));
+        } else {
+            let _ = writeln!(out, "{}", p.yellow(r.error.as_deref().unwrap_or("no process matched")));
+        }
+        return out;
+    }
+    if r.matches.len() > 1 {
+        let _ = writeln!(
+            out,
+            "{}",
+            p.yellow(&format!(
+                "error: multiple processes matched ({} results) — narrow the target",
+                r.matches.len()
+            ))
+        );
+        return out;
+    }
+    let m = &r.matches[0];
+    let _ = writeln!(
+        out,
+        "{} {} {}",
+        p.bold("Process"),
+        p.dim(&format!("(pid {}):", m.pid)),
+        p.green(&m.command_line())
+    );
+    match &m.env {
+        Some(env) if !env.is_empty() => {
+            let _ = writeln!(out, "{}", p.bold("Environment:"));
+            for (k, v) in env {
+                let _ = writeln!(out, "  {k}={v}");
+            }
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "{} {}",
+                p.bold("Environment:"),
+                p.red("No environment variables found.")
+            );
         }
     }
     out

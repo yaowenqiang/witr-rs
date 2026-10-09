@@ -32,8 +32,8 @@ impl MacOs {
     }
 }
 
-/// `ps -axo pid=,ppid=,uid=,etime=,time=,pcpu=,rss=,vsz=,comm=` — comm is the
-/// last column and may contain spaces, so the first eight whitespace
+/// `ps -axo pid=,ppid=,uid=,state=,etime=,time=,pcpu=,rss=,vsz=,comm=` — comm
+/// is the last column and may contain spaces, so the first nine whitespace
 /// tokens are fixed and the rest is the executable path.
 fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
     let line = line.trim();
@@ -42,8 +42,8 @@ fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
     }
     let bytes = line.as_bytes();
     let mut idx = 0usize;
-    // skip leading whitespace, then consume eight fixed fields
-    let mut fixed: [Option<&str>; 8] = [None; 8];
+    // skip leading whitespace, then consume nine fixed fields
+    let mut fixed: [Option<&str>; 9] = [None; 9];
     for slot in fixed.iter_mut() {
         while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
             idx += 1;
@@ -62,11 +62,12 @@ fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
     let pid: Pid = fixed[0]?.parse().ok()?;
     let ppid: Pid = fixed[1]?.parse().ok()?;
     let uid: u32 = fixed[2]?.parse().ok()?;
-    let started = parse_etime_to_secs(fixed[3]?).map(|age| now_unix() - age);
-    let cpu_time_ms = parse_cpu_time_to_ms(fixed[4]?);
-    let cpu = fixed[5]?.parse::<f64>().ok().filter(|c| *c > 0.05);
-    let mem_kb = fixed[6]?.parse::<u64>().ok().filter(|m| *m > 0);
-    let vm_kb = fixed[7]?.parse::<u64>().ok().filter(|m| *m > 0);
+    let state = fixed[3].and_then(|s| s.chars().next()).map(|c| c.to_string());
+    let started = parse_etime_to_secs(fixed[4]?).map(|age| now_unix() - age);
+    let cpu_time_ms = parse_cpu_time_to_ms(fixed[5]?);
+    let cpu = fixed[6]?.parse::<f64>().ok().filter(|c| *c > 0.05);
+    let mem_kb = fixed[7]?.parse::<u64>().ok().filter(|m| *m > 0);
+    let vm_kb = fixed[8]?.parse::<u64>().ok().filter(|m| *m > 0);
     Some(Process {
         pid,
         ppid: Some(ppid),
@@ -75,6 +76,7 @@ fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
         user: users.name_for(uid),
         uid: Some(uid),
         started,
+        state,
         cpu,
         mem_kb,
         vm_kb,
@@ -382,6 +384,42 @@ fn find_plist(label: &str) -> Option<String> {
     None
 }
 
+/// One lsof sweep for the Ports tab. `listen_only` (the default view) asks
+/// lsof for LISTEN tcp; the TUI's 'a' toggle pulls every tcp state too.
+fn socket_snapshot(listen_only: bool) -> PlatResult<Vec<Socket>> {
+    let mut out = Vec::new();
+    let mut tcp_args = vec!["-nP", "-w", "-iTCP"];
+    if listen_only {
+        tcp_args.push("-sTCP:LISTEN");
+    }
+    for args in [tcp_args, vec!["-nP", "-w", "-iUDP"]] {
+        match std::process::Command::new("lsof").args(&args).output() {
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                for line in text.lines().skip(1) {
+                    if let Some(s) = parse_lsof_net_line(line) {
+                        // same socket can appear once per owning fd
+                        if !out.iter().any(|x: &Socket| {
+                            x.pid == s.pid
+                                && x.proto == s.proto
+                                && x.local_port == s.local_port
+                                && x.local_addr == s.local_addr
+                        }) {
+                            out.push(s);
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PlatError::Unsupported("lsof not found on PATH".into()))
+            }
+            Err(e) => return Err(PlatError::Failed(format!("lsof: {}", e))),
+        }
+    }
+    out.sort_by(|a, b| (a.proto.clone(), a.local_port).cmp(&(b.proto.clone(), b.local_port)));
+    Ok(out)
+}
+
 impl Platform for MacOs {
     fn name(&self) -> &'static str {
         "macos"
@@ -400,7 +438,7 @@ impl Platform for MacOs {
             "ps",
             &[
                 "-axo",
-                "pid=,ppid=,uid=,etime=,time=,pcpu=,rss=,vsz=,comm=",
+                "pid=,ppid=,uid=,state=,etime=,time=,pcpu=,rss=,vsz=,comm=",
             ],
             CMD_TIMEOUT,
         )
@@ -413,36 +451,11 @@ impl Platform for MacOs {
     }
 
     fn list_sockets(&self) -> PlatResult<Vec<Socket>> {
-        let mut out = Vec::new();
-        for args in [
-            vec!["-nP", "-w", "-iTCP", "-sTCP:LISTEN"],
-            vec!["-nP", "-w", "-iUDP"],
-        ] {
-            match std::process::Command::new("lsof").args(&args).output() {
-                Ok(o) => {
-                    let text = String::from_utf8_lossy(&o.stdout);
-                    for line in text.lines().skip(1) {
-                        if let Some(s) = parse_lsof_net_line(line) {
-                            // same socket can appear once per owning fd
-                            if !out.iter().any(|x: &Socket| {
-                                x.pid == s.pid
-                                    && x.proto == s.proto
-                                    && x.local_port == s.local_port
-                                    && x.local_addr == s.local_addr
-                            }) {
-                                out.push(s);
-                            }
-                        }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(PlatError::Unsupported("lsof not found on PATH".into()))
-                }
-                Err(e) => return Err(PlatError::Failed(format!("lsof: {}", e))),
-            }
-        }
-        out.sort_by(|a, b| (a.proto.clone(), a.local_port).cmp(&(b.proto.clone(), b.local_port)));
-        Ok(out)
+        socket_snapshot(true)
+    }
+
+    fn list_all_sockets(&self) -> PlatResult<Vec<Socket>> {
+        socket_snapshot(false)
     }
 
     fn detail(&self, brief: &Process, want_env: bool) -> Process {
@@ -616,8 +629,25 @@ impl Platform for MacOs {
         parse_lsof_open_files(&self.lsof_rows(&["-l", "-n", "-P", "-w"]))
     }
 
-    fn container_of(&self, _pid: Pid) -> Option<Source> {
-        None // best-effort container attribution ships later (docker/podman CLIs)
+    fn container_of(&self, pid: Pid) -> Option<Source> {
+        // No cgroups on macOS: attribute from the target's own command line
+        // (colima, Docker Desktop helpers...), like Go witr.
+        let cmdline = self
+            .detail(
+                &Process {
+                    pid,
+                    ..Default::default()
+                },
+                false,
+            )
+            .command_line();
+        let label = crate::platform::windows::container_from_cmdline(&cmdline)?;
+        Some(Source {
+            kind: "container".into(),
+            label: Some(label),
+            detail: Some("detected from the process command line".into()),
+            ..Default::default()
+        })
     }
 
     fn service_source(&self, chain: &[Process]) -> Option<Source> {
@@ -630,14 +660,18 @@ impl Platform for MacOs {
             for line in out.lines() {
                 if let Some((pid, label)) = parse_launchctl_pid_label(line) {
                     if pid == target.pid {
-                        let detail = match find_plist(&label) {
-                            Some(p) => format!("launchd job \"{}\" (plist: {})", label, p),
-                            None => format!("launchd job \"{}\"", label),
-                        };
+                        let mut detail = format!("launchd job \"{}\"", label);
+                        if let Some(plist) = find_plist(&label) {
+                            detail.push_str(&format!(" (plist: {})", plist));
+                            if let Some(extra) = plist_details(&plist) {
+                                detail.push_str(&format!(" — {}", extra.join(" — ")));
+                            }
+                        }
                         return Some(Source {
                             kind: "launchd".into(),
                             label: Some(label),
                             detail: Some(detail),
+                            ..Default::default()
                         });
                     }
                 }
@@ -656,10 +690,323 @@ impl Platform for MacOs {
                     "spawned directly by launchd (pid {}), but no LaunchAgent/Daemon claims it (XPC?)",
                     target.pid
                 )),
+                ..Default::default()
             })
         } else {
             None
         }
+    }
+
+    fn service_pid(&self, name: &str) -> Option<Pid> {
+        if let Some(out) = run_ok("launchctl", &["list"], CMD_TIMEOUT) {
+            for line in out.lines() {
+                if let Some((pid, label)) = parse_launchctl_pid_label(line) {
+                    if label == name {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+/// schedule, keepalive. `plutil` normalizes binary plists to XML, then a
+/// small scanner pulls the root-dict keys out (nested dicts are skipped).
+fn plist_details(plist_path: &str) -> Option<Vec<String>> {
+    let xml = run_ok(
+        "plutil",
+        &["-convert", "xml1", "-o", "-", plist_path],
+        CMD_TIMEOUT,
+    )?;
+    let parsed = parse_plist_root_keys(&xml);
+    let mut out = Vec::new();
+    let domain = if plist_path.contains("/LaunchDaemons/") {
+        "Launch Daemon"
+    } else if plist_path.contains("/LaunchAgents/") {
+        "Launch Agent"
+    } else {
+        "launchd service"
+    };
+    out.push(domain.to_string());
+    if parsed.bool("RunAtLoad").unwrap_or(false) {
+        out.push("RunAtLoad (starts at login/boot)".into());
+    }
+    if let Some(secs) = parsed.int("StartInterval") {
+        out.push(format!("StartInterval (every {})", fmt_duration_short(secs)));
+    }
+    if let Some(cal) = parsed.text("StartCalendarInterval") {
+        out.push(format!("StartCalendarInterval ({})", cal));
+    }
+    if let Some(paths) = parsed.array("WatchPaths") {
+        for p in paths {
+            out.push(format!("WatchPaths: {}", p));
+        }
+    }
+    if let Some(dirs) = parsed.array("QueueDirectories") {
+        for d in dirs {
+            out.push(format!("QueueDirectories: {}", d));
+        }
+    }
+    if parsed.bool("KeepAlive").unwrap_or(false) {
+        out.push("KeepAlive: Yes (restarts if killed)".into());
+    }
+    Some(out)
+}
+
+/// Minimal XML-plist root-dict reader: collects key → value for the scalar
+/// types (<string>/<integer>/<true>/<false>) and flattens
+/// <array>/<dict> values to their string form. Good enough for launchd
+/// trigger metadata; not a general plist parser.
+struct PlistRoot {
+    keys: Vec<(String, PlistVal)>,
+}
+
+enum PlistVal {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+    List(Vec<String>),
+}
+
+impl PlistRoot {
+    fn get(&self, key: &str) -> Option<&PlistVal> {
+        self.keys.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+    fn bool(&self, key: &str) -> Option<bool> {
+        match self.get(key) {
+            Some(PlistVal::Bool(b)) => Some(*b),
+            _ => None,
+        }
+    }
+    fn int(&self, key: &str) -> Option<i64> {
+        match self.get(key) {
+            Some(PlistVal::Int(i)) => Some(*i),
+            _ => None,
+        }
+    }
+    fn text(&self, key: &str) -> Option<String> {
+        match self.get(key) {
+            Some(PlistVal::Str(s)) => Some(s.clone()),
+            Some(PlistVal::List(l)) if !l.is_empty() => Some(l.join("; ")),
+            _ => None,
+        }
+    }
+    fn array(&self, key: &str) -> Option<Vec<String>> {
+        match self.get(key) {
+            Some(PlistVal::List(l)) => Some(l.clone()),
+            Some(PlistVal::Str(s)) => Some(vec![s.clone()]),
+            _ => None,
+        }
+    }
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Extract one XML element's text (no nesting): returns (inner text, index
+/// after the closing tag).
+fn xml_element_text(s: &str, open: &str, close: &str, from: usize) -> Option<(String, usize)> {
+    let start = s[from..].find(&format!("<{}>", open))? + from + open.len() + 2;
+    let end = s[start..].find(close)? + start;
+    Some((xml_unescape(s[start..end].trim()), end + close.len() + 2))
+}
+
+fn parse_plist_root_keys(xml: &str) -> PlistRoot {
+    let mut keys = Vec::new();
+    // The root dict spans the first <dict> to the last </dict>; nested dicts
+    // live inside it.
+    let Some(body_start) = xml.find("<dict>").map(|p| p + "<dict>".len()) else {
+        return PlistRoot { keys };
+    };
+    let Some(body_end) = xml.rfind("</dict>") else {
+        return PlistRoot { keys };
+    };
+    let body = &xml[body_start..body_end];
+    let mut i = 0usize;
+    while let Some((key, after_key)) = xml_element_text(body, "key", "</key>", i) {
+        i = scan_plist_value(body, after_key, key, &mut keys);
+    }
+    PlistRoot { keys }
+}
+
+/// Read the value element that follows a root-dict key, record it, and
+/// return the offset just past the value block.
+fn scan_plist_value(body: &str, from: usize, key: String, keys: &mut Vec<(String, PlistVal)>) -> usize {
+    let rest = &body[from..];
+    let (value, consumed): (Option<PlistVal>, usize) = if let Some(rest2) = rest.strip_prefix("<string>") {
+        match rest2.find("</string>") {
+            Some(e) => (
+                Some(PlistVal::Str(xml_unescape(rest2[..e].trim()))),
+                "<string>".len() + e + "</string>".len(),
+            ),
+            None => (None, 0),
+        }
+    } else if let Some(rest2) = rest.strip_prefix("<integer>") {
+        match rest2.find("</integer>") {
+            Some(e) => (
+                rest2[..e].trim().parse::<i64>().ok().map(PlistVal::Int),
+                "<integer>".len() + e + "</integer>".len(),
+            ),
+            None => (None, 0),
+        }
+    } else if rest.starts_with("<true/>") {
+        (Some(PlistVal::Bool(true)), "<true/>".len())
+    } else if rest.starts_with("<false/>") {
+        (Some(PlistVal::Bool(false)), "<false/>".len())
+    } else if let Some(rest2) = rest.strip_prefix("<array>") {
+        match rest2.find("</array>") {
+            Some(end) => {
+                let inner = &rest2[..end];
+                let mut items: Vec<String> = Vec::new();
+                let mut j = 0usize;
+                while let Some((text, next)) = xml_element_text(inner, "string", "</string>", j) {
+                    items.push(text);
+                    j = next;
+                }
+                if items.is_empty() {
+                    // array of dicts: format each one's key/integer pairs
+                    let mut k = 0usize;
+                    while let Some((dict, next)) = dict_block(inner, k) {
+                        if let Some(s) = format_calendar(&dict) {
+                            items.push(s);
+                        }
+                        k = next;
+                    }
+                }
+                let v = (!items.is_empty()).then_some(PlistVal::List(items));
+                (v, "<array>".len() + end + "</array>".len())
+            }
+            None => (None, 0),
+        }
+    } else if let Some(rest2) = rest.strip_prefix("<dict>") {
+        // value dict: StartCalendarInterval most notably
+        match matching_dict_close(rest2) {
+            Some(end) => {
+                let cal = format_calendar(&rest2[..end]).map(PlistVal::Str);
+                (cal, "<dict>".len() + end + "</dict>".len())
+            }
+            None => (None, 0),
+        }
+    } else {
+        (None, 0)
+    };
+    if let Some(v) = value {
+        keys.push((key, v));
+    }
+    from + consumed.max(1)
+}
+
+/// The first `<dict>…</dict>` block starting at `from`, respecting nesting.
+fn dict_block(s: &str, from: usize) -> Option<(String, usize)> {
+    let start = s[from..].find("<dict>")? + from;
+    let inner_from = start + "<dict>".len();
+    let mut depth = 1usize;
+    let mut j = inner_from;
+    while depth > 0 {
+        let next_open = s[j..].find("<dict>");
+        let next_close = s[j..].find("</dict>")? + j;
+        match next_open {
+            Some(o) if o + j < next_close => {
+                depth += 1;
+                j = o + j + "<dict>".len();
+            }
+            _ => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((s[inner_from..next_close].to_string(), next_close + "</dict>".len()));
+                }
+                j = next_close + "</dict>".len();
+            }
+        }
+    }
+    None
+}
+
+/// matching_dict_close finds where the dict starting at s[0] (which is just
+/// past its opening <dict>) closes, respecting nesting; returns the offset of
+/// its </dict>.
+fn matching_dict_close(s: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut j = 0usize;
+    while depth > 0 {
+        let next_open = s[j..].find("<dict>").map(|p| p + j);
+        let next_close = s[j..].find("</dict>").map(|p| p + j)?;
+        match next_open {
+            Some(o) if o < next_close => {
+                depth += 1;
+                j = o + "<dict>".len();
+            }
+            _ => {
+                depth -= 1;
+                j = next_close + "</dict>".len();
+                if depth == 0 {
+                    return Some(next_close);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// "Sun at 06:00", "month 3 day 15 at 02:30" — Go's formatCalendarInterval.
+fn format_calendar(dict_inner: &str) -> Option<String> {
+    let mut cal: Vec<(String, i64)> = Vec::new();
+    let mut j = 0usize;
+    while let Some((key, after)) = xml_element_text(dict_inner, "key", "</key>", j) {
+        if let Some((val, next)) = xml_element_text(dict_inner, "integer", "</integer>", after) {
+            if let Ok(v) = val.parse::<i64>() {
+                cal.push((key, v));
+            }
+            j = next;
+        } else {
+            break;
+        }
+    }
+    if cal.is_empty() {
+        return None;
+    }
+    let get = |name: &str| cal.iter().find(|(k, _)| k == name).map(|(_, v)| *v);
+    let weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(w) = get("Weekday") {
+        if let Some(name) = weekdays.get(w as usize) {
+            parts.push(name.to_string());
+        }
+    }
+    if let Some(m) = get("Month") {
+        parts.push(format!("month {}", m));
+    }
+    if let Some(d) = get("Day") {
+        parts.push(format!("day {}", d));
+    }
+    match (get("Hour"), get("Minute")) {
+        (Some(h), Some(m)) => parts.push(format!("at {:02}:{:02}", h, m)),
+        (Some(h), None) => parts.push(format!("at {:02}:00", h)),
+        (None, Some(m)) => parts.push(format!("at *:{:02}", m)),
+        (None, None) => {}
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+/// "5m"-style short duration for StartInterval.
+fn fmt_duration_short(secs: i64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
     }
 }
 
@@ -715,13 +1062,14 @@ mod tests {
     #[test]
     fn ps_list_line() {
         let p = parse_ps_list_line(
-            "  350   1   501 2-03:10:31 0:05.00  1.2  45600 456780 /opt/homebrew/bin/nginx",
+            "  350   1   501 S 2-03:10:31 0:05.00  1.2  45600 456780 /opt/homebrew/bin/nginx",
             &Users::load(),
         )
         .unwrap();
         assert_eq!(p.pid, 350);
         assert_eq!(p.ppid, Some(1));
         assert_eq!(p.uid, Some(501));
+        assert_eq!(p.state.as_deref(), Some("S"));
         assert_eq!(p.started, Some(now_unix() - 184_231));
         assert_eq!(p.cpu_time_ms, Some(5_000));
         assert_eq!(p.cpu, Some(1.2));
@@ -734,12 +1082,13 @@ mod tests {
     #[test]
     fn ps_list_line_with_spaces_in_path() {
         let p = parse_ps_list_line(
-            "  999   1   0  42 1:02:03.4  0.0   1024   2048 /Applications/My App/Helper --flag",
+            "  999   1   0  S 42 1:02:03.4  0.0   1024   2048 /Applications/My App/Helper --flag",
             &Users::load(),
         )
         .unwrap();
         assert_eq!(p.exe.as_deref(), Some("/Applications/My App/Helper --flag"));
         assert_eq!(p.name, "Helper --flag");
+        assert_eq!(p.state.as_deref(), Some("S"));
         assert_eq!(p.cpu_time_ms, Some(3_723_400));
     }
 

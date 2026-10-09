@@ -53,9 +53,27 @@ pub fn assess(p: &Process, sockets: &[Socket], fd_usage: Option<(u64, u64)>) -> 
     if let Some(env) = &p.env {
         for (k, v) in env {
             let ku = k.to_ascii_uppercase();
-            if (ku == "LD_PRELOAD" || ku == "DYLD_INSERT_LIBRARIES") && !v.is_empty() {
+            if ku == "LD_PRELOAD" && !v.is_empty() {
                 add(3, format!("{} injection (={})", k, v), &mut score, &mut signals);
             }
+        }
+        // Any DYLD_* variable is potential library injection on macOS; list
+        // the keys so the report says exactly which.
+        let mut dyld: Vec<String> = env
+            .iter()
+            .filter(|(k, v)| {
+                k.to_ascii_uppercase().starts_with("DYLD_") && !v.is_empty()
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        dyld.sort();
+        if !dyld.is_empty() {
+            add(
+                3,
+                format!("DYLD_* variables set (potential library injection): {}", dyld.join(", ")),
+                &mut score,
+                &mut signals,
+            );
         }
     }
     let external = sockets.iter().any(|s| {
@@ -91,10 +109,89 @@ pub fn assess(p: &Process, sockets: &[Socket], fd_usage: Option<(u64, u64)>) -> 
         }
     }
 
+    // Health state (Linux stat / macOS ps): zombie and stopped are findings.
+    match p.state.as_deref() {
+        Some("Z") => add(2, "process is a zombie (defunct)".into(), &mut score, &mut signals),
+        Some("T") => add(1, "process is stopped (T state)".into(), &mut score, &mut signals),
+        _ => {}
+    }
+    // High CPU: over 2h of cumulative CPU time (Go witr's Linux threshold).
+    if let Some(ms) = p.cpu_time_ms {
+        if ms > 2 * 60 * 60 * 1000 {
+            add(1, "process has consumed over 2h of CPU time".into(), &mut score, &mut signals);
+        }
+    }
+    // High memory: RSS over 1 GiB.
+    if let Some(kb) = p.mem_kb {
+        if kb > 1024 * 1024 {
+            add(1, "process is using over 1 GB of memory (RSS)".into(), &mut score, &mut signals);
+        }
+    }
+    // Very old process. A missing start time means "couldn't read it", not
+    // "ancient" — only warn on a real timestamp.
+    if let Some(started) = p.started {
+        let now = crate::util::now_unix();
+        if now.saturating_sub(started) > 90 * 24 * 3600 {
+            add(1, "process has been running for over 90 days".into(), &mut score, &mut signals);
+        }
+    }
+    // Suspicious working directory (container cwds live in the container's
+    // own filesystem, usually "/", so they don't count).
+    if p.container.is_none() {
+        if let Some(cwd) = &p.cwd {
+            if is_suspicious_cwd(cwd) {
+                add(
+                    2,
+                    format!("process is running from a suspicious working directory: {cwd}"),
+                    &mut score,
+                    &mut signals,
+                );
+            }
+        }
+    }
+    // Dangerous Linux capabilities (non-root holders only; root already has
+    // them by definition and the pipeline warns about root separately).
+    if p.user.as_deref() != Some("root") && !p.capabilities.is_empty() {
+        let dangerous: Vec<&str> = p
+            .capabilities
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|c| is_dangerous_capability(c))
+            .collect();
+        if !dangerous.is_empty() {
+            add(
+                2,
+                format!("process has dangerous capabilities: {}", dangerous.join(", ")),
+                &mut score,
+                &mut signals,
+            );
+        }
+    }
+
     Risk {
         score: score.min(MAX_SCORE as u32) as u8,
         signals,
     }
+}
+
+/// Go witr's suspiciousDirs: the fs root and the world-writable temp dirs.
+fn is_suspicious_cwd(cwd: &str) -> bool {
+    matches!(cwd, "/" | "/tmp" | "/var/tmp" | "/private/tmp" | "/private/var/tmp")
+}
+
+/// The capability set Go witr flags: powerful enough to matter on their own.
+fn is_dangerous_capability(cap: &str) -> bool {
+    matches!(
+        cap,
+        "CAP_SYS_ADMIN"
+            | "CAP_SYS_PTRACE"
+            | "CAP_NET_RAW"
+            | "CAP_DAC_OVERRIDE"
+            | "CAP_DAC_READ_SEARCH"
+            | "CAP_FOWNER"
+            | "CAP_SYS_MODULE"
+            | "CAP_SYS_RAWIO"
+    )
 }
 
 fn is_temp_path(path: &str) -> bool {
@@ -215,5 +312,82 @@ mod tests {
         assert!(!is_public_addr("fd00::1"));
         assert!(is_public_addr("2606:4700::1"));
         assert!(!is_public_addr("*"));
+    }
+
+    #[test]
+    fn health_state_signals() {
+        let mut zombie = proc_with(None, "x", false);
+        zombie.state = Some("Z".into());
+        let r = assess(&zombie, &[], None);
+        assert!(r.signals.iter().any(|s| s.contains("zombie")));
+        assert_eq!(r.score, 2);
+
+        let mut stopped = proc_with(None, "x", false);
+        stopped.state = Some("T".into());
+        let r = assess(&stopped, &[], None);
+        assert!(r.signals.iter().any(|s| s.contains("stopped")));
+        assert_eq!(r.score, 1);
+    }
+
+    #[test]
+    fn resource_and_age_signals() {
+        let mut hot = proc_with(None, "x", false);
+        hot.cpu_time_ms = Some(3 * 3600 * 1000); // 3h cpu
+        hot.mem_kb = Some(2 * 1024 * 1024); // 2 GiB
+        hot.started = Some(crate::util::now_unix() - 100 * 24 * 3600); // 100 days
+        let r = assess(&hot, &[], None);
+        assert!(r.signals.iter().any(|s| s.contains("2h of CPU")));
+        assert!(r.signals.iter().any(|s| s.contains("1 GB of memory")));
+        assert!(r.signals.iter().any(|s| s.contains("90 days")));
+        assert_eq!(r.score, 3);
+
+        // Missing fields stay silent.
+        let clean = assess(&proc_with(None, "x", false), &[], None);
+        assert_eq!(clean.score, 0);
+    }
+
+    #[test]
+    fn suspicious_cwd_and_caps() {
+        let mut sussy = proc_with(None, "x", false);
+        sussy.cwd = Some("/tmp".into());
+        let r = assess(&sussy, &[], None);
+        assert!(r.signals.iter().any(|s| s.contains("suspicious working directory")));
+
+        // Container cwds are inside the container's own fs — skip.
+        let mut boxed = proc_with(None, "x", false);
+        boxed.cwd = Some("/".into());
+        boxed.container = Some("docker: web (id ab)".into());
+        let r = assess(&boxed, &[], None);
+        assert!(r.signals.is_empty());
+
+        let mut capped = proc_with(None, "x", false);
+        capped.user = Some("alice".into());
+        capped.capabilities = vec!["CAP_CHOWN".into(), "CAP_SYS_ADMIN".into()];
+        let r = assess(&capped, &[], None);
+        assert!(r
+            .signals
+            .iter()
+            .any(|s| s.contains("dangerous capabilities: CAP_SYS_ADMIN")));
+        // root holding the same caps is reported by the root warning instead.
+        let mut root = proc_with(None, "x", false);
+        root.user = Some("root".into());
+        root.capabilities = vec!["CAP_SYS_ADMIN".into()];
+        let r = assess(&root, &[], None);
+        assert!(r.signals.is_empty());
+    }
+
+    #[test]
+    fn dyld_any_var_flagged() {
+        let mut p = proc_with(None, "x", false);
+        p.env = Some(vec![
+            ("HOME".into(), "/Users/x".into()),
+            ("DYLD_LIBRARY_PATH".into(), "/tmp".into()),
+            ("DYLD_INSERT_LIBRARIES".into(), "/tmp/evil.dylib".into()),
+        ]);
+        let r = assess(&p, &[], None);
+        assert!(r
+            .signals
+            .iter()
+            .any(|s| s.contains("DYLD_* variables set") && s.contains("DYLD_INSERT_LIBRARIES")));
     }
 }

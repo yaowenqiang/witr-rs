@@ -85,9 +85,41 @@ pub fn parse_container_line(line: &str, runtime: &str) -> Option<Container> {
         id,
         name,
         image: get("Image").to_string(),
+        command: get("Command").to_string(),
         state: get("State").to_string(),
         status: get("Status").to_string(),
         ports: get("Ports").to_string(),
+    })
+}
+
+/// The host pid of a container's main process, via the runtime's `inspect`.
+/// Inside a VM-backed setup (Docker Desktop, podman machine) this is the pid
+/// inside the VM, so callers must verify it against the host snapshot.
+pub fn container_host_pid(runtime: &str, id: &str) -> Option<Pid> {
+    let out = crate::util::run(
+        runtime,
+        &["inspect", "--format", "{{.State.Pid}}", id],
+        std::time::Duration::from_secs(6),
+    )
+    .ok()?;
+    let pid: i32 = out.trim().parse().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+/// The container that publishes `port` on the host, found by matching the
+/// runtime's port mapping strings ("0.0.0.0:8088->8088/tcp"). This is how a
+/// Docker Desktop / podman-machine port is explained when no host process
+/// owns the socket.
+pub fn container_by_port(port: u16) -> Option<Container> {
+    enumerate_containers().into_iter().find(|c| {
+        c.ports.split(',').any(|entry| {
+            let entry = entry.trim();
+            entry
+                .split("->")
+                .next()
+                .and_then(|host| host.rsplit(':').next())
+                .is_some_and(|hp| hp == port.to_string())
+        })
     })
 }
 
@@ -119,6 +151,12 @@ pub trait Platform {
 
     /// Snapshot for the TUI Ports tab: tcp LISTEN + bound udp sockets.
     fn list_sockets(&self) -> PlatResult<Vec<Socket>>;
+
+    /// Every socket (tcp in any state + udp). The Ports tab's 'a' toggle
+    /// switches between this and the LISTEN-only [`Platform::list_sockets`].
+    fn list_all_sockets(&self) -> PlatResult<Vec<Socket>> {
+        self.list_sockets()
+    }
 
     /// Processes running inside container `id` (Linux via cgroup matching;
     /// on macOS the VM's processes aren't visible — default: none).
@@ -168,9 +206,25 @@ pub trait Platform {
     /// If this pid runs inside a container, attribute it.
     fn container_of(&self, pid: Pid) -> Option<Source>;
 
+    /// Effective Linux capability names for the pid (CapEff); empty
+    /// elsewhere or when unreadable.
+    fn process_capabilities(&self, pid: Pid) -> Vec<String> {
+        let _ = pid;
+        Vec::new()
+    }
+
     /// Service-manager attribution (systemd / launchd / SCM) for a process
     /// whose ancestry is `chain` (root first, the process itself last).
     fn service_source(&self, chain: &[Process]) -> Option<Source>;
+
+    /// Reverse lookup: the main pid of the service manager unit whose name
+    /// matches `name` (systemd unit / launchd label). None when no unit or
+    /// the platform has no service manager. Lets a name target that matches
+    /// no process still resolve through its unit.
+    fn service_pid(&self, name: &str) -> Option<Pid> {
+        let _ = name;
+        None
+    }
 }
 
 pub fn get() -> Box<dyn Platform> {

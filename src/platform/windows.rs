@@ -255,6 +255,31 @@ fn netstat_sockets(port: u16) -> PlatResult<Vec<Socket>> {
     Ok(out)
 }
 
+/// Full netstat sweep for the TUI Ports tab. `listen_only` keeps tcp
+/// LISTENING rows (the default view); the 'a' toggle keeps every state.
+fn netstat_snapshot(listen_only: bool) -> PlatResult<Vec<Socket>> {
+    let mut out = Vec::new();
+    for proto in ["tcp", "udp"] {
+        let out_text = std::process::Command::new("netstat")
+            .args(["-ano", "-p", proto])
+            .output()
+            .map_err(|e| PlatError::Failed(format!("netstat: {}", e)))?;
+        let text = String::from_utf8_lossy(&out_text.stdout);
+        for s in parse_netstat(&text, proto) {
+            let keep = if proto == "tcp" {
+                !listen_only || s.state.eq_ignore_ascii_case("LISTENING")
+            } else {
+                true
+            };
+            if keep {
+                out.push(s);
+            }
+        }
+    }
+    out.sort_by(|a, b| (a.proto.clone(), a.local_port).cmp(&(b.proto.clone(), b.local_port)));
+    Ok(out)
+}
+
 // ---------- tasklist /svc ----------
 
 /// CSV row `"name","pid","SvcA, Svc B"` → fields via quote-splitting.
@@ -370,26 +395,11 @@ impl Platform for Windows {
     }
 
     fn list_sockets(&self) -> PlatResult<Vec<Socket>> {
-        let mut out = Vec::new();
-        for proto in ["tcp", "udp"] {
-            let out_text = std::process::Command::new("netstat")
-                .args(["-ano", "-p", proto])
-                .output()
-                .map_err(|e| PlatError::Failed(format!("netstat: {}", e)))?;
-            let text = String::from_utf8_lossy(&out_text.stdout);
-            for s in parse_netstat(&text, proto) {
-                let keep = if proto == "tcp" {
-                    s.state.eq_ignore_ascii_case("LISTENING")
-                } else {
-                    true
-                };
-                if keep {
-                    out.push(s);
-                }
-            }
-        }
-        out.sort_by(|a, b| (a.proto.clone(), a.local_port).cmp(&(b.proto.clone(), b.local_port)));
-        Ok(out)
+        Ok(netstat_snapshot(true)?)
+    }
+
+    fn list_all_sockets(&self) -> PlatResult<Vec<Socket>> {
+        netstat_snapshot(false)
     }
 
     fn file_to_pids(&self, _path: &str) -> PlatResult<Vec<Pid>> {
@@ -398,8 +408,24 @@ impl Platform for Windows {
         ))
     }
 
-    fn container_of(&self, _pid: Pid) -> Option<Source> {
-        None
+    fn container_of(&self, pid: Pid) -> Option<Source> {
+        // No cgroups on Windows: fall back to the target's own command line
+        // (Go witr's detectContainerFromCmdline).
+        let cmdline = self.detail(
+            &Process {
+                pid,
+                ..Default::default()
+            },
+            false,
+        )
+        .command_line();
+        let label = container_from_cmdline(&cmdline)?;
+        Some(Source {
+            kind: "container".into(),
+            label: Some(label),
+            detail: Some("detected from the process command line".into()),
+            ..Default::default()
+        })
     }
 
     fn service_source(&self, chain: &[Process]) -> Option<Source> {
@@ -414,6 +440,7 @@ impl Platform for Windows {
                 kind: "windows-service".into(),
                 label: Some(svcs.join(", ")),
                 detail: Some("registered Windows service(s) (Service Control Manager)".into()),
+                ..Default::default()
             });
         }
         Some(Source {
@@ -423,8 +450,49 @@ impl Platform for Windows {
                 "descendant of the Service Control Manager (services.exe), but pid {} is itself not a registered service",
                 target.pid
             )),
+            ..Default::default()
         })
     }
+}
+
+/// Command-line container attribution for platforms without cgroups: the
+/// runtime's name in the target's own command line, plus its `--name` when
+/// present. Mirrors Go witr's detectContainerFromCmdline.
+pub fn container_from_cmdline(cmdline: &str) -> Option<String> {
+    if cmdline.is_empty() {
+        return None;
+    }
+    let lower = cmdline.to_lowercase();
+    let named = |flag: &str| -> Option<String> {
+        let mut it = lower.split_whitespace();
+        while let Some(tok) = it.next() {
+            if tok == flag {
+                if let Some(v) = it.next() {
+                    if !v.starts_with('-') {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+            if let Some(v) = tok.strip_prefix(&format!("{}=", flag)) {
+                return Some(v.to_string());
+            }
+        }
+        None
+    };
+    let (kind, label) = if lower.contains("docker") {
+        ("docker", named("--name").map(|n| format!("docker: {n}")))
+    } else if lower.contains("podman") || lower.contains("libpod") {
+        ("podman", named("--name").map(|n| format!("podman: {n}")))
+    } else if lower.contains("colima") {
+        ("colima", Some("colima: default".into()))
+    } else if lower.contains("minikube") || lower.contains("kind") || lower.contains("kubepods") {
+        ("kubernetes", None)
+    } else if lower.contains("nerdctl") || lower.contains("containerd") {
+        ("containerd", named("--name").map(|n| format!("containerd: {n}")))
+    } else {
+        return None;
+    };
+    Some(label.unwrap_or_else(|| kind.to_string()))
 }
 
 #[cfg(test)]

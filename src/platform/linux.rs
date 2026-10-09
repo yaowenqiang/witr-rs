@@ -447,8 +447,7 @@ impl Platform for Linux {
             });
             let cpu_time_ms = (!kernel_thread && cpu_ticks > 0)
                 .then_some((cpu_ticks as f64 * 1000.0 / CLK_TCK) as u64);
-            let mem_kb = (rss_pages > 0).then(|| rss_pages as u64 * 4); // 4 KiB pages
-            let _ = state;
+            let mem_kb = (rss_pages > 0).then_some(rss_pages * 4); // 4 KiB pages
             procs.push(Process {
                 pid,
                 ppid: Some(ppid),
@@ -460,6 +459,7 @@ impl Platform for Linux {
                 cpu: cpu.filter(|c| *c > 0.05),
                 mem_kb: mem_kb.filter(|m| *m > 0),
                 cpu_time_ms,
+                state: Some(state.to_string()),
                 ..Default::default()
             });
         }
@@ -557,7 +557,28 @@ impl Platform for Linux {
                 }
             }
         }
+        p.capabilities = self.process_capabilities(brief.pid);
         p
+    }
+
+    /// Effective capabilities from /proc/<pid>/status CapEff, decoded to the
+    /// kernel's names. A process in another user namespace (rootless
+    /// container) holds them only over that namespace — report none, like
+    /// Go witr.
+    fn process_capabilities(&self, pid: Pid) -> Vec<String> {
+        if in_other_user_namespace(pid) {
+            return Vec::new();
+        }
+        let Some(status) = read_ok(&Path::new("/proc").join(pid.to_string()).join("status"))
+        else {
+            return Vec::new();
+        };
+        for line in status.lines() {
+            if let Some(hex) = line.strip_prefix("CapEff:") {
+                return decode_capabilities(hex.trim());
+            }
+        }
+        Vec::new()
     }
 
     fn port_to_sockets(&self, port: u16) -> PlatResult<Vec<Socket>> {
@@ -576,25 +597,11 @@ impl Platform for Linux {
     }
 
     fn list_sockets(&self) -> PlatResult<Vec<Socket>> {
-        let owners = inode_owner_map();
-        let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for proto in ["tcp", "tcp6", "udp", "udp6"] {
-            for (addr, p, rem, state, inode) in read_socket_table(proto) {
-                // Ports tab mirrors the Go witr: listening tcp + bound udp.
-                let keep = if proto.starts_with("tcp") {
-                    state == "LISTEN"
-                } else {
-                    true
-                };
-                if !keep || !seen.insert(inode) {
-                    continue;
-                }
-                out.push(build_socket(proto, addr, p, rem, state, inode, &owners));
-            }
-        }
-        out.sort_by(|a, b| (a.proto.clone(), a.local_port).cmp(&(b.proto.clone(), b.local_port)));
-        Ok(out)
+        socket_snapshot_impl(false)
+    }
+
+    fn list_all_sockets(&self) -> PlatResult<Vec<Socket>> {
+        socket_snapshot_impl(true)
     }
 
     fn container_processes(&self, id: &str) -> Vec<Process> {
@@ -728,6 +735,14 @@ impl Platform for Linux {
                 .and_then(|s| s.split(".scope").next())
             {
                 ("podman", rest)
+            } else if path.contains("kubepods") {
+                // .../kubepods/<qos>/pod<uid>/<container-id>
+                let id = path.rsplit('/').next().unwrap_or(path);
+                ("kubernetes", id)
+            } else if path.contains("colima") {
+                // colima's docker cgroups live under its own slice
+                let id = path.rsplit('/').next().unwrap_or(path);
+                ("colima", id)
             } else if let Some(rest) = path.strip_prefix("/lxc/") {
                 ("lxc", rest)
             } else {
@@ -736,7 +751,7 @@ impl Platform for Linux {
             let id = id.split('/').next().unwrap_or(id);
             let mut label = id.chars().take(12).collect::<String>();
             let mut detail = format!("runtime: {}", runtime);
-            if runtime == "docker" {
+            if runtime == "docker" || runtime == "colima" {
                 if let Some(name) = run_ok(
                     "docker",
                     &["ps", "--filter", &format!("id={}", label), "--format", "{{.Names}}"],
@@ -753,6 +768,7 @@ impl Platform for Linux {
                 kind: "container".into(),
                 label: Some(label),
                 detail: Some(detail),
+                ..Default::default()
             });
         }
         None
@@ -775,6 +791,7 @@ impl Platform for Linux {
                     kind: "init".into(),
                     label: Some(init.name.clone()),
                     detail: Some("systemctl unavailable; started under init".into()),
+                    ..Default::default()
                 })
             }
         };
@@ -816,17 +833,179 @@ impl Platform for Linux {
                 };
                 Some(Source {
                     kind: "systemd".into(),
-                    label: Some(unit),
+                    label: Some(unit.clone()),
                     detail,
+                    ..enrich_systemd_unit(&unit)
                 })
             }
             None => Some(Source {
                 kind: "init".into(),
                 label: Some(init.name.clone()),
                 detail: Some(format!("pid {} is not part of a systemd unit", target.pid)),
+                ..Default::default()
             }),
         }
     }
+
+    fn service_pid(&self, name: &str) -> Option<Pid> {
+        // Accept both "nginx" and "nginx.service".
+        let unit = if name.ends_with(".service") {
+            name.to_string()
+        } else {
+            format!("{}.service", name)
+        };
+        let out = run_ok(
+            "systemctl",
+            &["show", &unit, "--no-pager", "--property=MainPID"],
+            CMD_TIMEOUT,
+        )?;
+        let pid: Pid = out
+            .lines()
+            .find_map(|l| l.strip_prefix("MainPID="))
+            .and_then(|v| v.trim().parse().ok())?;
+        (pid > 0).then_some(pid)
+    }
+}
+
+/// One sweep over /proc/net/{tcp,tcp6,udp,udp6}. `all_states` keeps tcp
+/// connections in any state (Ports-tab 'a' toggle); otherwise only
+/// listening tcp + bound udp, mirroring the Go witr's default view.
+fn socket_snapshot_impl(all_states: bool) -> PlatResult<Vec<Socket>> {
+    let owners = inode_owner_map();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for proto in ["tcp", "tcp6", "udp", "udp6"] {
+        for (addr, p, rem, state, inode) in read_socket_table(proto) {
+            let keep = if proto.starts_with("tcp") {
+                all_states || state == "LISTEN"
+            } else {
+                true
+            };
+            if !keep || !seen.insert(inode) {
+                continue;
+            }
+            out.push(build_socket(proto, addr, p, rem, state, inode, &owners));
+        }
+    }
+    out.sort_by(|a, b| (a.proto.clone(), a.local_port).cmp(&(b.proto.clone(), b.local_port)));
+    Ok(out)
+}
+
+/// Best-effort `systemctl show` enrichment for a unit: description file,
+/// restart count and the timer that triggers it (when one exists).
+fn enrich_systemd_unit(unit: &str) -> Source {
+    let mut src = Source::default();
+    let Ok(out) = crate::util::run(
+        "systemctl",
+        &[
+            "show",
+            unit,
+            "--no-pager",
+            "--property=Description,FragmentPath,SourcePath,NRestarts,Triggers",
+        ],
+        std::time::Duration::from_secs(3),
+    ) else {
+        return src;
+    };
+    let mut triggers: Vec<String> = Vec::new();
+    for line in out.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        match k {
+            "Description" if !v.is_empty() && v != unit => {
+                src.detail = Some(v.to_string());
+            }
+            "FragmentPath" if !v.is_empty() => src.detail = src.detail.map(|d| format!("{d} — loaded from {v}")),
+            "SourcePath" if !v.is_empty() && !out.contains("FragmentPath=") => {
+                src.detail = src.detail.map(|d| format!("{d} — loaded from {v}"))
+            }
+            "NRestarts" => src.restarts = v.parse::<u32>().ok(),
+            "Triggers" if !v.is_empty() => {
+                triggers = v.split_whitespace().map(|t| t.to_string()).collect()
+            }
+            _ => {}
+        }
+    }
+    if let Some(timer) = triggers.iter().find(|t| t.ends_with(".timer")) {
+        if let Some(extra) = src.detail.as_mut() {
+            extra.push_str(&format!(" — triggered by {timer}"));
+        } else {
+            src.detail = Some(format!("triggered by {timer}"));
+        }
+    }
+    src
+}
+
+fn in_other_user_namespace(pid: Pid) -> bool {
+    let (Ok(own), Ok(theirs)) = (
+        std::fs::read_link("/proc/self/ns/user"),
+        std::fs::read_link(format!("/proc/{}/ns/user", pid)),
+    ) else {
+        return false;
+    };
+    own != theirs
+}
+
+/// Capability bit names from include/uapi/linux/capability.h.
+fn cap_name(bit: u32) -> Option<&'static str> {
+    Some(match bit {
+        0 => "CAP_CHOWN",
+        1 => "CAP_DAC_OVERRIDE",
+        2 => "CAP_DAC_READ_SEARCH",
+        3 => "CAP_FOWNER",
+        4 => "CAP_FSETID",
+        5 => "CAP_KILL",
+        6 => "CAP_SETGID",
+        7 => "CAP_SETUID",
+        8 => "CAP_SETPCAP",
+        9 => "CAP_LINUX_IMMUTABLE",
+        10 => "CAP_NET_BIND_SERVICE",
+        11 => "CAP_NET_BROADCAST",
+        12 => "CAP_NET_ADMIN",
+        13 => "CAP_NET_RAW",
+        14 => "CAP_IPC_LOCK",
+        15 => "CAP_IPC_OWNER",
+        16 => "CAP_SYS_MODULE",
+        17 => "CAP_SYS_RAWIO",
+        18 => "CAP_SYS_CHROOT",
+        19 => "CAP_SYS_PTRACE",
+        20 => "CAP_SYS_PACCT",
+        21 => "CAP_SYS_ADMIN",
+        22 => "CAP_SYS_BOOT",
+        23 => "CAP_SYS_NICE",
+        24 => "CAP_SYS_RESOURCE",
+        25 => "CAP_SYS_TIME",
+        26 => "CAP_SYS_TTY_CONFIG",
+        27 => "CAP_MKNOD",
+        28 => "CAP_LEASE",
+        29 => "CAP_AUDIT_WRITE",
+        30 => "CAP_AUDIT_CONTROL",
+        31 => "CAP_SETFCAP",
+        32 => "CAP_MAC_OVERRIDE",
+        33 => "CAP_MAC_ADMIN",
+        34 => "CAP_SYSLOG",
+        35 => "CAP_WAKE_ALARM",
+        36 => "CAP_BLOCK_SUSPEND",
+        37 => "CAP_AUDIT_READ",
+        38 => "CAP_PERFMON",
+        39 => "CAP_BPF",
+        40 => "CAP_CHECKPOINT_RESTORE",
+        _ => return None,
+    })
+}
+
+fn decode_capabilities(hex: &str) -> Vec<String> {
+    let Ok(val) = u64::from_str_radix(hex, 16) else {
+        return Vec::new();
+    };
+    if val == 0 {
+        return Vec::new();
+    }
+    (0..64)
+        .filter(|bit| val & (1u64 << bit) != 0)
+        .filter_map(|bit| cap_name(bit).map(|n| n.to_string()))
+        .collect()
 }
 
 #[cfg(test)]
