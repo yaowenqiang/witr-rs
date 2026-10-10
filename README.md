@@ -6,7 +6,7 @@
 
 Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go，Apache-2.0）同类工具，平台采集策略与其对齐。
 
-**直接运行 `witr-rs`（无参数）进入交互式 TUI**，布局与原版一致：顶部四个标签页（1. Processes / 2. Ports / 3. Containers / 4. Locks），左侧进程表（PID / User / Name / CPU% / Mem / Started），右侧实时显示选中进程的溯源摘要，按 `Enter` 进入全屏**进程详情页**（左 70% 详情 + 右 30% 环境变量，双面板独立滚动），底部快捷键提示，每 3 秒自动刷新。管道输出时自动退化为静态进程表（`--list` 可强制）。
+**直接运行 `witr-rs`（无参数）进入交互式 TUI**，布局与原版一致：顶部四个标签页（1. Processes / 2. Ports / 3. Containers / 4. Locks），左侧进程表（PID / User / Name / CPU% / Mem / Started），右侧实时显示选中进程的溯源摘要，按 `Enter` 进入全屏**进程详情页**（左 70% 详情 + 右 30% 环境变量，双面板独立滚动），底部快捷键提示，每 3 秒自动刷新。支持鼠标（滚轮滚动、点击标签/行/面板、双击打开详情）。带目标时用 `-i` 也能进 TUI 并直接定位到目标（`witr-rs -i --port 8080` 打开即落在 Ports 页的该端口上）。管道输出时自动退化为静态进程表（`--list` 可强制）。
 
 ## TUI 按键
 
@@ -19,12 +19,18 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | `f` `b` `空格` / PgUp PgDn | 翻页 |
 | `h` `l` / `←` `→` | 切换标签页 |
 | `1`–`4` / Tab | 直接跳页 / 切换焦点（表格 ↔ 详情） |
-| `/` | 搜索：Processes 页按 PID/用户名/进程名；Ports 页按端口号/PID/进程名/地址/协议/状态（两页过滤器独立，Enter 应用，Esc 清除） |
-| `Enter` | Processes 页：打开全屏进程详情页（左侧详情 + 右侧环境变量）；Ports 页：打开端口详情页（该端口全部连接 + 归属进程） |
-| `p` `n` `u` `c` `m` `t` | 按 PID / 名称 / 用户 / CPU / 内存 / 启动时间排序，重复按切换升降序 |
+| `/` | 搜索：Processes 页按 PID/用户名/进程名；Ports 页按端口号/PID/进程名/地址/协议/状态（各页过滤器独立，Enter 应用，Esc 清除） |
+| `Enter` | Processes 页：打开全屏进程详情页；Ports 页：端口详情页（该端口全部连接 + 归属进程）；Containers 页：容器详情页；Locks 页：跳到持锁进程的详情页 |
+| `p` `n` `u` `c` `m` `t` | Processes 页按 PID / 名称 / 用户 / CPU / 内存 / 启动时间排序，重复按切换升降序 |
+| `p` `t` `n` `s` | Ports 页按 端口 / 协议 / 地址 / 状态 排序 |
+| `i` `n` `r` `g` `s` | Containers 页按 ID / 名称 / 运行时 / 镜像 / 状态 排序 |
+| `p` `n` `t` `m` `f` | Locks 页按 PID / 进程 / 类型 / 模式 / 路径 排序 |
+| `a` | Ports 页：切换 仅监听 ↔ 全部状态；Locks 页：切换 锁 ↔ 全部打开文件；Processes 页：打开操作栏（`k` kill / `t` term / `p` 暂停 / `r` 恢复 / `n` renice） |
+| `z` | 缩放：聚焦面板临时占满整行（tmux 风格） |
 | `x` | 杀掉选中进程（y/n 确认） |
 | `r` | 立即刷新 |
-| 详情页内 | `j/k` 滚动、`d/u` 半页、`g/G` 顶部/底部、`b/f` 翻页、`Tab` 切换面板、`c` 复制当前面板、`Esc/q` 返回 |
+| 详情页内 | `j/k` 滚动、`d/u` 半页、`g/G` 顶部/底部、`b/f` 翻页、`Tab` 切换面板、`a` 操作栏、`/` 搜索环境变量、`z` 缩放、`c` 复制当前面板、`Esc/q` 返回 |
+| 鼠标 | 滚轮滚动列表 / 详情面板；点击标签页切换、点击行选中、点击面板聚焦；双击行打开详情 |
 | `q` / `Esc` | 退出 |
 
 选中进程的详情在光标停止移动 500ms 后自动刷新（防抖，按住 j 快速滚动不会连发查询），与原版 `selectionDebounce` 一致。
@@ -41,7 +47,11 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **`--export`**：`witr-rs --pid <N> --export` 输出可直接贴进 issue 的纯文本排查报告（含环境变量值与打开文件列表）。
 
-**Containers 页**：通过 PATH 上的运行时 CLI（docker / podman / nerdctl）枚举容器，显示 Runtime / ID / State / Status / Image / Name；`/` 按 名称/镜像/ID/运行时/状态 过滤。枚举在后台线程执行（运行时 CLI 挂起不会卡住界面），每 3 秒自动刷新；刷新期间保留旧表格不闪烁，首次加载才显示 loading。**`Enter` 打开容器详情页**：左侧容器属性（Name/Runtime/ID/Image/State/Status/Ports），右侧容器内进程列表（Linux 通过 cgroup 匹配；macOS/Windows 容器进程在 VM 内不可见，显示说明）。
+**Containers 页**：通过 PATH 上的运行时 CLI（docker / podman / nerdctl）枚举容器，显示 Runtime / ID / State / Status / Image / Name；`/` 按 名称/镜像/ID/运行时/状态 过滤，`i/n/r/g/s` 排序。枚举在后台线程执行（运行时 CLI 挂起不会卡住界面），每 3 秒自动刷新；刷新期间保留旧表格不闪烁，首次加载才显示 loading。**`Enter` 打开容器详情页**：左侧容器属性（Name/Runtime/ID/Image/State/Status/Ports），右侧容器内进程列表（Linux 通过 cgroup 匹配；macOS/Windows 容器进程在 VM 内不可见，显示说明）。
+
+**Locks 页**：文件锁 + 打开文件视图（Linux 读 `/proc/locks`，macOS 从 `lsof` 提取锁标志并辅以锁文件名启发式）；`a` 在 锁视图 ↔ 全部打开文件 之间切换（打开文件视图空搜索时截断显示前 100 行，搜索即放开），选中行按 `Enter` 直接跳到持锁进程的详情页。
+
+**CLI 预置进 TUI（`-i`）**：`witr-rs -i --pid 1234` / `witr-rs -i nginx` / `witr-rs -i --port 8080` / `witr-rs -c web -i` / `witr-rs -i --file /var/log/x.log` — 打开 TUI 并直接落到对应标签页与过滤条件上（name 预填搜索词、pid 选中行、port/file/container 跳到对应页并预填过滤器）。每种类型取第一个目标，多余的会在状态栏提示；无终端时退出码 4。
 
 ## 平台支持
 
@@ -51,6 +61,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | cmdline / cwd / exe | `/proc/<pid>/*` | `ps` + `lsof` | PowerShell (Get-CimInstance) |
 | 端口 → 进程 | `/proc/net/*` + fd inode 匹配 | `lsof -i` | `netstat -ano` |
 | 文件 → 进程 | `/proc/*/fd` | `lsof` | ✗（需 Sysinternals handle.exe） |
+| 文件锁（Locks 页） | `/proc/locks` + fdinfo | `lsof` 锁标志 + 锁文件名启发式 | ✗ |
 | 服务归因 | systemd（`systemctl status`） | launchd（`launchctl list` + plist 探测） | SCM（`tasklist /svc`，识别 services.exe 后代） |
 | 容器归因 | cgroup（docker/containerd/podman/lxc） | ✗ | ✗ |
 | 环境变量（`--env` / TUI 详情页） | ✓ `/proc/<pid>/environ`（同用户） | ✓ 同用户进程走 `ps -E`（其余受 SIP 限制，面板会提示） | ✗ |
@@ -90,11 +101,16 @@ witr-rs python --exact        # 精确匹配（不区分大小写）
 witr-rs --pid 1234            # 按 PID
 witr-rs --port 8080           # 谁占了这个端口
 witr-rs --file /var/log/x.log # 谁打开着这个文件
+witr-rs -c web                # 谁在跑这个容器（名称/镜像/ID 前缀匹配）
 witr-rs nginx --tree          # 祖先树 + 子进程
 witr-rs nginx --short         # 单行输出（脚本友好）
 witr-rs --port 8080 --json    # 机器可读 JSON
-witr-rs nginx --env           # 顺带收集环境变量（Linux 全量；macOS 同用户进程）
-witr-rs nginx --pid 1         # 多目标混用
+witr-rs nginx --env           # 只输出命令 + 环境变量（Linux 全量；macOS 同用户进程）
+witr-rs nginx --warnings      # 只输出告警列表
+witr-rs --pid 1234 --export   # 可直接贴 issue 的纯文本排查报告
+witr-rs -i --port 8080        # 进 TUI 并直接落到该端口（-i 预置，见上）
+witr-rs nginx --pid 1         # 多目标混用（各目标间以分隔线输出）
+NO_COLOR=1 witr-rs nginx      # 禁用着色（--no-color 同理）
 ```
 
 ### 退出码
@@ -104,8 +120,12 @@ witr-rs nginx --pid 1         # 多目标混用
 | 0 | 正常且无告警 |
 | 1 | 找到了，但有告警（root 运行、监听所有网卡、二进制已删除、LD_PRELOAD 等） |
 | 2 | 目标未找到 |
+| 3 | 权限不足（如需要 root 的查询） |
 | 4 | 参数无效 |
 | 5 | 内部错误（如进程表不可读） |
+| 6 | 找到了，但无法归因来源（Windows 上不出现——其祖先链常止于已退出进程） |
+
+多目标时取最严重的退出码；严重度排序与原版一致（6 排在 1 之后）。
 
 ## 输出示例（macOS）
 
@@ -139,9 +159,11 @@ src/
 ├── cli.rs          clap 参数定义
 ├── model.rs        Process / Socket / Source / TargetReport 数据模型
 ├── ancestry.rs     ppid 链回溯（防环、深度限制、父进程已退出的告警）
-├── pipeline.rs     目标解析（name/pid/port/file → pid）、归因优先级、风险告警
-├── tui.rs          交互界面（ratatui/crossterm）：四标签页 + 详情面板 + 3s 自动刷新
-├── render.rs       standard / tree / short / json 四种渲染
+├── pipeline.rs     目标解析（name/pid/port/file/container → pid）、归因优先级、风险告警
+├── tui.rs          交互界面（ratatui/crossterm）：四标签页 + 详情面板 + 鼠标 + 3s 自动刷新
+├── render.rs       standard / tree / short / json / env / warnings / export 渲染
+├── history.rs      采样历史：瞬时 CPU、sparkline、重启检测
+├── risk.rs         0–10 风险评分（临时目录二进制、curl|sh、注入、公网对端等）
 ├── util.rs         带超时的命令执行、时间格式化、用户名解析（带负缓存）、host:port 解析
 └── platform/
     ├── mod.rs      Platform trait（唯一的平台接缝）
@@ -150,16 +172,16 @@ src/
     └── windows.rs  ToolHelp32 / PowerShell / netstat / tasklist
 ```
 
-归因优先级：容器 > 服务管理器（systemd/launchd/SCM）> cron/tmux/screen/ssh > 交互 shell。Linux 的 service_source 返回 "init" 兜底时会被 pipeline 放弃，转而走通用归因。
+归因优先级：容器 > ssh 会话 > 交互 shell > 服务管理器（systemd/launchd/SCM）> 保活 supervisor（supervisord/runc 等，含 cmdline 令牌匹配）> cron > init 兜底（pid 1 直启且链上无 shell，如系统 daemon）。Linux 的 service_source 返回 "init" 兜底时会被 pipeline 放弃，转而走通用归因。
 
-## v0.2 已知限制
+## v0.3 已知限制
 
-- Locks 页仅 Linux；TUI 的 Ports/Containers/详情页均为打开瞬间快照，`r` 手动刷新
+- TUI 的 Ports/Containers/详情页均为打开瞬间快照，`r` 手动刷新
 - Windows 进程详情依赖 PowerShell 批量查询（每个目标一次调用，20s 超时保护）
 - TUI 中 Windows 的 CPU% 列为空（tasklist 不提供）
-- 容器归因目前仅 Linux（macOS 上 colima/Docker Desktop 的容器进程未归因）
-- Windows 上 `--file` 返回 "不支持" 并计入告警
-- macOS `launchctl list` 只覆盖当前用户域，系统域 daemon 需要 sudo 才能标注
+- 容器归因目前仅 Linux（macOS 上 colima/Docker Desktop 的容器进程未归因，但 `-c` 目标有运行时侧兜底视图）
+- Windows 上 `--file` 返回 "不支持" 并计入告警；Windows 无 Locks 页数据
+- macOS `launchctl list` 只覆盖当前用户域，系统域 daemon 需要 sudo 才能标注；文件锁来自 `lsof` 标志近似，内核未导出锁表
 
 ## 许可
 
