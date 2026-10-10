@@ -32,7 +32,8 @@ pub struct Cli {
     #[arg(long = "port", value_name = "PORT")]
     pub ports: Vec<u16>,
 
-    /// Trace by open file path (repeatable)
+    /// Trace by open file path (repeatable; globs like /var/log/*.log
+    /// match every existing file)
     #[arg(short = 'f', long = "file", value_name = "PATH")]
     pub files: Vec<String>,
 
@@ -81,4 +82,19 @@ pub struct Cli {
     /// open files) — combine with any target
     #[arg(long = "export")]
     pub export: bool,
+
+    /// Only list processes started within this window (30, 30s, 5m, 2h,
+    /// 1d, 1h30m). Filters the listing; cannot be combined with targets.
+    #[arg(long = "recent", value_name = "DURATION")]
+    pub recent: Option<String>,
+
+    /// Re-run the current query every N seconds (default 2) until Ctrl-C.
+    /// Works with targets, the plain listing and --recent.
+    #[arg(
+        long = "watch",
+        value_name = "SECONDS",
+        num_args = 0..=1,
+        default_missing_value = "2"
+    )]
+    pub watch: Option<u64>,
 }

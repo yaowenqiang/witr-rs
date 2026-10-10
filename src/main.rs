@@ -1,6 +1,9 @@
 mod ancestry;
+mod binary_id;
 mod cli;
+mod gpu;
 mod history;
+mod k8s;
 mod model;
 mod pipeline;
 mod platform;
@@ -11,8 +14,9 @@ mod util;
 
 use clap::Parser as _;
 use std::io::{IsTerminal, Write};
+use std::time::Duration;
 
-use model::{TargetReport, TargetSpec};
+use model::{Process, TargetReport, TargetSpec};
 
 /// Print and ignore write errors — a closed pipe (`| head`) must not panic.
 fn write_out(s: &str) {
@@ -67,6 +71,23 @@ fn overall_exit(reports: &[TargetReport], plat: &str) -> i32 {
         .unwrap_or(0)
 }
 
+/// Output format for the target path, from the mode flags.
+fn format_for(cli: &cli::Cli) -> render::Format {
+    if cli.json {
+        render::Format::Json
+    } else if cli.env {
+        render::Format::EnvOnly
+    } else if cli.warnings {
+        render::Format::Warnings
+    } else if cli.short {
+        render::Format::Short
+    } else if cli.tree {
+        render::Format::Tree
+    } else {
+        render::Format::Standard
+    }
+}
+
 fn main() {
     let cli = match cli::Cli::try_parse() {
         Ok(c) => c,
@@ -77,6 +98,22 @@ fn main() {
         }
     };
     let no_color = cli.no_color || std::env::var_os("NO_COLOR").is_some();
+
+    // --recent: parse the window up front and keep it a listing-only filter
+    let recent_secs = match &cli.recent {
+        Some(raw) => match util::parse_duration(raw) {
+            Some(secs) => Some(secs),
+            None => {
+                eprintln!("invalid --recent duration {:?} (try 30s, 5m, 2h, 1d)", raw);
+                std::process::exit(4);
+            }
+        },
+        None => None,
+    };
+    if recent_secs.is_some() && cli.interactive {
+        eprintln!("--recent filters the static listing; drop --recent or drop -i");
+        std::process::exit(4);
+    }
 
     let mut specs: Vec<TargetSpec> = Vec::new();
     for n in &cli.names {
@@ -94,6 +131,21 @@ fn main() {
     for c in &cli.containers {
         specs.push(TargetSpec::Container { query: c.clone(), exact: cli.exact });
     }
+    if recent_secs.is_some() && !specs.is_empty() {
+        eprintln!("--recent filters the process listing and cannot be combined with targets");
+        std::process::exit(4);
+    }
+
+    // Keep the recent processes only (listing mode + --watch).
+    let recent_only = |procs: Vec<Process>| -> Vec<Process> {
+        match recent_secs {
+            Some(secs) => {
+                let cutoff = util::now_unix() - secs;
+                procs.into_iter().filter(|p| p.started.is_some_and(|s| s >= cutoff)).collect()
+            }
+            None => procs,
+        }
+    };
 
     // --interactive: TUI seeded from the targets, terminal required
     // (mirrors the Go witr's -i, exit 4 without a tty)
@@ -115,11 +167,14 @@ fn main() {
     }
 
     // No target: default browse mode — interactive TUI on a terminal
-    // (like the Go witr), static listing when piped or with --list.
+    // (like the Go witr), static listing when piped, with --list/--recent
+    // or under --watch.
     if specs.is_empty() {
         let interactive = std::io::stdout().is_terminal()
             && std::io::stdin().is_terminal()
-            && !cli.list;
+            && !cli.list
+            && cli.watch.is_none()
+            && recent_secs.is_none();
         if interactive {
             if let Err(e) = tui::run(tui::Seed::default()) {
                 eprintln!("tui error: {}", e);
@@ -128,8 +183,52 @@ fn main() {
             std::process::exit(0);
         }
         let platform = platform::get();
+        let format = if cli.json {
+            render::Format::Json
+        } else if cli.tree && recent_secs.is_none() {
+            render::Format::Tree
+        } else {
+            render::Format::Standard
+        };
+        let color = !no_color && std::io::stdout().is_terminal() && format != render::Format::Json;
+        let painter = render::Painter::new(color);
+
+        // --watch on the listing: re-sample every N seconds until Ctrl-C.
+        if let Some(secs) = cli.watch {
+            let interval = secs.max(1);
+            let label = cli.recent.clone().unwrap_or_else(|| "all processes".into());
+            loop {
+                let mut listed = match platform.list_processes() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("cannot list processes: {}", e);
+                        std::process::exit(5);
+                    }
+                };
+                gpu::enrich(&mut listed);
+                let procs = recent_only(listed);
+                write_out("\x1b[2J\x1b[1;1H");
+                let now = util::fmt_time(util::now_unix());
+                write_out(&format!(
+                    "witr-rs watch · {} · every {}s · {} · Ctrl-C to stop",
+                    label, interval, now
+                ));
+                let body = match format {
+                    render::Format::Json => {
+                        serde_json::to_string_pretty(&procs).unwrap_or_else(|_| "[]".into())
+                    }
+                    _ => render::render_process_table(&procs, &painter),
+                };
+                write_out(&body);
+                std::thread::sleep(Duration::from_secs(interval));
+            }
+        }
+
         let procs = match platform.list_processes() {
-            Ok(p) if !p.is_empty() => p,
+            Ok(mut p) if !p.is_empty() => {
+                gpu::enrich(&mut p);
+                recent_only(p)
+            }
             Ok(_) => {
                 eprintln!("no processes visible to this user");
                 std::process::exit(5);
@@ -139,15 +238,13 @@ fn main() {
                 std::process::exit(5);
             }
         };
-        let format = if cli.json {
-            render::Format::Json
-        } else if cli.tree {
-            render::Format::Tree
-        } else {
-            render::Format::Standard
-        };
-        let color = !no_color && std::io::stdout().is_terminal() && format != render::Format::Json;
-        let painter = render::Painter::new(color);
+        if procs.is_empty() && recent_secs.is_some() && !cli.json {
+            eprintln!(
+                "no processes started within the last {}",
+                cli.recent.clone().unwrap_or_default()
+            );
+            std::process::exit(2);
+        }
         let body = match format {
             render::Format::Json => serde_json::to_string_pretty(&procs).unwrap_or_else(|_| "[]".into()),
             render::Format::Tree => render::render_process_forest(&procs, &painter),
@@ -159,7 +256,31 @@ fn main() {
 
     let platform = platform::get();
     let want_env = cli.export || cli.env;
-    let opts = pipeline::Options { want_env, deep_files: true, ..Default::default() };
+    let opts = pipeline::Options {
+        want_env,
+        deep_files: true,
+        deep_binaries: cli.export,
+        ..Default::default()
+    };
+
+    // --watch with targets: re-run the pipeline and re-render every N
+    // seconds until Ctrl-C.
+    if let Some(secs) = cli.watch {
+        let interval = secs.max(1);
+        let color = !no_color && std::io::stdout().is_terminal() && !cli.json;
+        loop {
+            let reports = pipeline::run(platform.as_ref(), specs.clone(), &opts);
+            write_out("\x1b[2J\x1b[1;1H");
+            let now = util::fmt_time(util::now_unix());
+            write_out(&format!(
+                "witr-rs watch · every {}s · {} · Ctrl-C to stop",
+                interval, now
+            ));
+            write_out(&render::render(&reports, format_for(&cli), color));
+            std::thread::sleep(Duration::from_secs(interval));
+        }
+    }
+
     let reports = pipeline::run(platform.as_ref(), specs, &opts);
 
     // --export: paste-ready diagnostic reports

@@ -38,6 +38,7 @@ enum Tab {
     Ports,
     Containers,
     Locks,
+    Events,
 }
 
 impl Tab {
@@ -47,6 +48,7 @@ impl Tab {
             Tab::Ports => "2. Ports",
             Tab::Containers => "3. Containers",
             Tab::Locks => "4. Locks",
+            Tab::Events => "5. Events",
         }
     }
     fn from_digit(c: char) -> Option<Self> {
@@ -55,6 +57,7 @@ impl Tab {
             '2' => Some(Tab::Ports),
             '3' => Some(Tab::Containers),
             '4' => Some(Tab::Locks),
+            '5' => Some(Tab::Events),
             _ => None,
         }
     }
@@ -176,6 +179,15 @@ struct TuiApp {
     lock_sort_desc: bool,
     /// lock_view size before the OPEN-mode 100-row display cap
     locks_total: usize,
+    /// Events-tab filter (kind / pid / name / detail) + selection over the
+    /// history event ring (newest first)
+    event_search: String,
+    event_view: Vec<usize>,
+    event_state: TableState,
+    /// Events-tab sort column ('t/e/p/n') + direction (Time defaults
+    /// newest-first to match the ring's natural order)
+    event_sort: EventSort,
+    event_sort_desc: bool,
     /// container enumeration runs on a background thread (a hung runtime
     /// CLI must not freeze the UI); results arrive via this channel
     containers_loading: bool,
@@ -227,6 +239,15 @@ enum ContainerSort {
     Runtime,
     Image,
     Status,
+}
+
+/// Events-tab sort columns — keys t/e/p/n (Time defaults newest-first).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EventSort {
+    Time,
+    Kind,
+    Pid,
+    Process,
 }
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
@@ -301,15 +322,17 @@ impl Tab {
             Tab::Processes => Tab::Ports,
             Tab::Ports => Tab::Containers,
             Tab::Containers => Tab::Locks,
-            Tab::Locks => Tab::Processes,
+            Tab::Locks => Tab::Events,
+            Tab::Events => Tab::Processes,
         }
     }
     fn prev(self) -> Self {
         match self {
-            Tab::Processes => Tab::Locks,
+            Tab::Processes => Tab::Events,
             Tab::Ports => Tab::Processes,
             Tab::Containers => Tab::Ports,
             Tab::Locks => Tab::Containers,
+            Tab::Events => Tab::Locks,
         }
     }
 }
@@ -381,6 +404,11 @@ impl TuiApp {
             lock_search: String::new(),
             lock_view: Vec::new(),
             lock_state: TableState::default(),
+            event_search: String::new(),
+            event_view: Vec::new(),
+            event_state: TableState::default(),
+            event_sort: EventSort::Time,
+            event_sort_desc: true,
             containers_loading: false,
             containers_loaded: false,
             containers_rx: None,
@@ -441,6 +469,11 @@ impl TuiApp {
         if tab == Tab::Locks && self.locks_supported {
             self.load_locks();
         }
+        if tab == Tab::Events {
+            // events accumulated while other tabs were open — apply the
+            // filter so the table isn't stale until the next refresh
+            self.rebuild_event_view();
+        }
         if tab == Tab::Processes {
             self.rebuild_view();
         }
@@ -454,7 +487,8 @@ impl TuiApp {
     }
 
     fn refresh(&mut self) {
-        if let Ok(p) = self.platform.list_processes() {
+        if let Ok(mut p) = self.platform.list_processes() {
+            crate::gpu::enrich(&mut p);
             self.procs = p;
             self.hist.update(&self.procs);
         }
@@ -472,6 +506,10 @@ impl TuiApp {
             self.load_locks();
         }
         self.rebuild_view();
+        if self.tab == Tab::Events {
+            // hist.update() above appended new events; reapply the filter
+            self.rebuild_event_view();
+        }
         self.last_refresh = Instant::now();
     }
 
@@ -484,7 +522,10 @@ impl TuiApp {
         self.containers_loading = true;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let cs = crate::platform::enumerate_containers();
+            let mut cs = crate::platform::enumerate_containers();
+            // pod attribution rides the same background thread (kubectl
+            // adds ~1s when a cluster is reachable)
+            crate::k8s::annotate(&mut cs);
             let _ = tx.send(cs);
         });
         self.containers_rx = Some(rx);
@@ -641,6 +682,54 @@ impl TuiApp {
         self.lock_view.get(i).and_then(|&li| self.locks[li].pid)
     }
 
+    /// Apply the Events-tab filter over the history ring (kind / pid /
+    /// name / detail substrings), then order by the active sort column.
+    fn rebuild_event_view(&mut self) {
+        let needle = self.event_search.to_lowercase();
+        let events = &self.hist.events;
+        self.event_view = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                needle.is_empty()
+                    || e.kind.contains(&needle)
+                    || e.name.to_lowercase().contains(&needle)
+                    || e.detail.to_lowercase().contains(&needle)
+                    || e.pid.to_string().contains(&needle)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let (col, desc) = (self.event_sort, self.event_sort_desc);
+        self.event_view.sort_by(|&a, &b| {
+            let ord = match col {
+                EventSort::Time => events[a].at_unix.cmp(&events[b].at_unix),
+                EventSort::Kind => events[a].kind.cmp(&events[b].kind),
+                EventSort::Pid => events[a].pid.cmp(&events[b].pid),
+                EventSort::Process => events[a]
+                    .name
+                    .to_lowercase()
+                    .cmp(&events[b].name.to_lowercase()),
+            };
+            if desc { ord.reverse() } else { ord }
+        });
+        if self.event_view.is_empty() {
+            self.event_state.select(None);
+        } else {
+            let cur = self
+                .event_state
+                .selected()
+                .unwrap_or(0)
+                .min(self.event_view.len() - 1);
+            self.event_state.select(Some(cur));
+        }
+    }
+
+    /// Pid of the event row the Events-tab cursor is on.
+    fn selected_event_pid(&self) -> Option<Pid> {
+        let i = self.event_state.selected()?;
+        self.event_view.get(i).and_then(|&ei| self.hist.events.get(ei)).map(|e| e.pid)
+    }
+
     /// Apply search filter + sort, keeping the selection in range.
     fn rebuild_view(&mut self) {
         let needle = self.search.to_lowercase();
@@ -722,13 +811,20 @@ impl TuiApp {
         }
         self.detail_pid = Some(pid);
         self.detail_scroll = 0;
-        let report = pipeline::run(
+        let mut report = pipeline::run(
             self.platform.as_ref(),
             vec![TargetSpec::Pid { pid }],
             &pipeline::Options::default(),
         )
         .into_iter()
         .next();
+        if let Some(r) = report.as_mut() {
+            if let Some(mp) = r.matches.first_mut() {
+                if let Some(p) = self.procs.iter().find(|p| p.pid == mp.pid) {
+                    crate::gpu::copy_fields(p, mp);
+                }
+            }
+        }
         self.detail_lines = match report {
             Some(r) if r.found => {
                 let mut lines = detail_lines(&r, &[], &[]);
@@ -765,27 +861,67 @@ impl TuiApp {
             self.platform.as_ref(),
             vec![TargetSpec::Pid { pid }],
             // deep_files: the report then carries open files + locks + fd
-            // usage from one platform probe (one lsof scan on macOS)
-            &pipeline::Options { want_env: true, deep_files: true, ..Default::default() },
+            // usage from one platform probe (one lsof scan on macOS);
+            // deep_binaries: sha256 + code-signature verdict for the page
+            &pipeline::Options {
+                want_env: true,
+                deep_files: true,
+                deep_binaries: true,
+                ..Default::default()
+            },
         )
         .into_iter()
         .next();
         match report {
-            Some(r) if r.found => {
+            Some(mut r) if r.found => {
                 // rebuild the pane content for THIS process (detail_lines is
                 // shared with the browse side panel, which may still hold the
                 // previously selected process); the live socket list is not
-                // part of a Pid report, so filter a fresh snapshot
-                let socks: Vec<Socket> = self
-                    .platform
-                    .list_sockets()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|s| s.pid == Some(pid))
-                    .collect();
+                // part of a Pid report, so fetch a full fresh snapshot —
+                // every state, so peer attribution can reverse-match
+                if let Some(mp) = r.matches.first_mut() {
+                    if let Some(p) = self.procs.iter().find(|p| p.pid == mp.pid) {
+                        crate::gpu::copy_fields(p, mp);
+                    }
+                }
+                let full_socks = self.platform.list_all_sockets().unwrap_or_default();
+                let socks: Vec<Socket> =
+                    full_socks.iter().filter(|s| s.pid == Some(pid)).cloned().collect();
                 let locks = r.locks.clone();
                 let mut lines = detail_lines(&r, &socks, &locks);
                 push_history_lines(&mut lines, &self.hist, pid);
+                let names: HashMap<Pid, String> =
+                    self.procs.iter().map(|p| (p.pid, p.name.clone())).collect();
+                push_peer_lines(&mut lines, &full_socks, &names, pid);
+                if let Some(b) = &r.binary {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled("Binary:", Style::new().bold())));
+                    match &b.sha256 {
+                        Some(h) => lines.push(Line::from(format!(
+                            "  sha256: {}…{}",
+                            &h[..16.min(h.len())],
+                            &h[h.len().saturating_sub(8)..]
+                        ))),
+                        None => lines.push(Line::from(Span::styled(
+                            "  sha256: unreadable (permissions?)",
+                            Style::new().fg(MID),
+                        ))),
+                    }
+                    let sig_line = b.signature.clone().unwrap_or_else(|| {
+                        "no signature infrastructure on this platform".into()
+                    });
+                    let sig_style = if sig_line.starts_with("NOT VALID") {
+                        Style::new().fg(Color::Red)
+                    } else if sig_line == "unsigned" {
+                        Style::new().fg(Color::Yellow)
+                    } else {
+                        Style::new().fg(GREEN)
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("  signature: {sig_line}"),
+                        sig_style,
+                    )));
+                }
                 self.open_files = r.open_files.clone();
                 if let Some(files) = &self.open_files {
                     lines.push(Line::from(""));
@@ -928,9 +1064,14 @@ impl TuiApp {
         let Some(c) = self.containers.get(idx) else {
             return;
         };
-        let c = c.clone();
+        let mut c = c.clone();
         // process mapping works on Linux (cgroup match); elsewhere empty
         self.container_procs = self.platform.container_processes(&c.id);
+        // restart count is a lazily-fetched inspect (one extra CLI call,
+        // fine for a user-opened detail page)
+        if c.restarts.is_none() {
+            c.restarts = crate::platform::container_restarts(&c.runtime, &c.id);
+        }
         self.container_detail = Some(c);
         self.cd_scroll = 0;
         self.cdp_scroll = 0;
@@ -957,6 +1098,20 @@ impl TuiApp {
             kv("State", c.state.clone()),
             kv("Status", c.status.clone()),
             kv("Ports", if c.ports.is_empty() { "-".into() } else { c.ports.clone() }),
+            if let Some(n) = c.restarts {
+                let line = Line::from(vec![
+                    styled(Style::new().fg(MID), format!("{:<9}", "Restarts")),
+                    Span::raw(n.to_string()),
+                    if n > 0 {
+                        styled(Style::new().fg(Color::Yellow).bold(), "  (restart policy fired)")
+                    } else {
+                        Span::raw("")
+                    },
+                ]);
+                line
+            } else {
+                kv("Restarts", "unavailable".into())
+            },
         ]
     }
 
@@ -1230,6 +1385,72 @@ fn line_to_string(l: &Line<'_>) -> String {
 }
 
 /// Crash-loop signal appended to detail panes from the sampling history.
+/// Who is `pid` talking to right now? Reverse-match its ESTABLISHED
+/// sockets' (peer addr, peer port) against every other socket's local end
+/// in the same snapshot — listeners on wildcard addresses match too, and
+/// on loopback the server-side accepted socket pairs up exactly. Remote
+/// peers (no local socket) are reported as such. Returns one label per
+/// distinct destination with its connection count.
+fn describe_peers(full: &[Socket], names: &HashMap<Pid, String>, pid: Pid) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for s in full
+        .iter()
+        .filter(|s| s.pid == Some(pid) && s.state == "ESTABLISHED")
+    {
+        let (Some(pa), Some(pp)) = (&s.peer_addr, s.peer_port) else {
+            continue;
+        };
+        let peer_pid = full
+            .iter()
+            .filter(|o| o.pid.is_some() && o.pid != s.pid)
+            .find(|o| {
+                o.local_port == pp
+                    && (o.local_addr == *pa
+                        || pa == "127.0.0.1"
+                        || pa == "::1"
+                        || o.local_addr == "*"
+                        || o.local_addr == "0.0.0.0"
+                        || o.local_addr == "::")
+            })
+            .and_then(|o| o.pid);
+        let label = match peer_pid.and_then(|p| names.get(&p)) {
+            Some(name) => format!("{} (pid {})", name, peer_pid.unwrap_or(0)),
+            None => format!("remote {}:{}", pa, pp),
+        };
+        match out.iter_mut().find(|(l, _)| *l == label) {
+            Some((_, n)) => *n += 1,
+            None => out.push((label, 1)),
+        }
+    }
+    out
+}
+
+/// Append the "talking to" section (detail pages): peer-process attribution
+/// for the process's live connections.
+fn push_peer_lines(
+    lines: &mut Vec<Line<'static>>,
+    full: &[Socket],
+    names: &HashMap<Pid, String>,
+    pid: Pid,
+) {
+    let peers = describe_peers(full, names, pid);
+    if peers.is_empty() {
+        return;
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("talking to:", Style::new().bold())));
+    for (label, n) in peers.iter().take(6) {
+        let conn = if *n == 1 { "connection" } else { "connections" };
+        lines.push(Line::from(Span::styled(
+            format!("  {label} — {n} {conn}"),
+            Style::new().fg(MID),
+        )));
+    }
+    if peers.len() > 6 {
+        lines.push(Line::from(format!("  … {} more", peers.len() - 6)));
+    }
+}
+
 fn push_history_lines(lines: &mut Vec<Line<'static>>, hist: &crate::history::History, pid: Pid) {
     if let Some(n) = hist.recent_restarts(pid) {
         if n >= 2 {
@@ -1262,6 +1483,18 @@ fn push_sub(v: &mut Vec<Line<'static>>, k: &str, val: String) {
         styled(Style::new().fg(MID), format!("  {:<9}", format!("{}:", k))),
         Span::raw(val),
     ]));
+}
+
+/// "45% SM · 1200 MiB" when the process carries NVIDIA usage; None otherwise.
+fn gpu_line(p: &crate::model::Process) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(sm) = p.gpu_sm_pct {
+        parts.push(format!("{sm}% SM"));
+    }
+    if let Some(mb) = p.gpu_mem_mb {
+        parts.push(format!("{mb} MiB"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// Right-hand details panel: identity + resources + ancestry tree + warnings.
@@ -1354,6 +1587,9 @@ fn detail_lines(
     if let Some(t) = m.threads {
         push_kv(&mut v, "Threads", t.to_string());
     }
+    if let Some(g) = gpu_line(m) {
+        push_kv(&mut v, "GPU", g);
+    }
     if !sockets.is_empty() {
         v.push(Line::from(""));
         v.push(Line::from(Span::styled("Sockets:", Style::new().bold())));
@@ -1436,7 +1672,7 @@ fn tab_bar(app: &TuiApp) -> Line<'static> {
         styled(Style::new().bg(PURPLE).fg(Color::White).bold(), " witr-rs "),
         Span::raw("  "),
     ];
-    for t in [Tab::Processes, Tab::Ports, Tab::Containers, Tab::Locks] {
+    for t in [Tab::Processes, Tab::Ports, Tab::Containers, Tab::Locks, Tab::Events] {
         if app.tab == t {
             spans.push(styled(
                 Style::new().bg(GREEN).fg(Color::White).bold(),
@@ -1518,6 +1754,11 @@ fn search_line(app: &TuiApp) -> Line<'static> {
             app.lock_search.clone(),
             "Search Type, Mode, PID, Process, Path...",
         )
+    } else if app.tab == Tab::Events {
+        (
+            app.event_search.clone(),
+            "Search Event, PID, Process, Detail...",
+        )
     } else {
         (app.search.clone(), "Search PID, Name, User...")
     };
@@ -1544,17 +1785,34 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
         }
     };
     let (k, d) = (app.sort_key, app.sort_desc);
-    let header = Row::new([
+    // GPU column only when the host actually reports NVIDIA usage — it
+    // would be dead width everywhere else.
+    let has_gpu = app.procs.iter().any(crate::gpu::has_gpu_data);
+    let mut header: Vec<Cell> = vec![
         Cell::from(format!("PID{}", arrow(k, SortKey::Pid, d))),
         Cell::from(format!("User{}", arrow(k, SortKey::User, d))),
         Cell::from(format!("Name{}", arrow(k, SortKey::Name, d))),
         Cell::from(format!("CPU%{}", arrow(k, SortKey::Cpu, d))),
         Cell::from("Trend"),
         Cell::from(format!("Mem{}", arrow(k, SortKey::Mem, d))),
-        Cell::from("Rst"),
-        Cell::from(format!("Age{}", arrow(k, SortKey::Started, d))),
-    ])
-    .style(Style::new().fg(ACCENT).bold());
+    ];
+    let mut widths: Vec<Constraint> = vec![
+        Constraint::Length(7),
+        Constraint::Length(12),
+        Constraint::Min(18),
+        Constraint::Length(6),
+        Constraint::Length(8),
+        Constraint::Length(8),
+    ];
+    if has_gpu {
+        header.push(Cell::from("GPU"));
+        widths.push(Constraint::Length(9));
+    }
+    header.push(Cell::from("Rst"));
+    header.push(Cell::from(format!("Age{}", arrow(k, SortKey::Started, d))));
+    widths.push(Constraint::Length(4));
+    widths.push(Constraint::Length(9));
+    let header = Row::new(header).style(Style::new().fg(ACCENT).bold());
 
     let rows: Vec<Row> = app
         .view
@@ -1563,29 +1821,23 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
         .map(|p| {
             let cpu = app.hist.display_cpu(p);
             let rst = app.hist.total_restarts(p.pid);
-            Row::new([
+            let mut cells = vec![
                 Cell::from(p.pid.to_string()),
                 Cell::from(p.user.clone().unwrap_or_else(|| "-".into())),
                 Cell::from(p.name.clone()),
                 Cell::from(cpu.map(|c| format!("{:.1}", c)).unwrap_or_else(|| "-".into())),
                 Cell::from(app.hist.spark(p.pid).unwrap_or("").to_string()),
                 Cell::from(fmt_mem(p.mem_kb)),
-                Cell::from(if rst > 0 { rst.to_string() } else { String::new() }),
-                Cell::from(fmt_age_short(p.started)),
-            ])
+            ];
+            if has_gpu {
+                cells.push(Cell::from(crate::gpu::cell(p)));
+            }
+            cells.push(Cell::from(if rst > 0 { rst.to_string() } else { String::new() }));
+            cells.push(Cell::from(fmt_age_short(p.started)));
+            Row::new(cells)
         })
         .collect();
 
-    let widths = [
-        Constraint::Length(7),
-        Constraint::Length(12),
-        Constraint::Min(18),
-        Constraint::Length(6),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(4),
-        Constraint::Length(9),
-    ];
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
@@ -1630,32 +1882,65 @@ fn ports_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
+/// State-cell color: green for healthy/running, red for unhealthy or dead,
+/// yellow for the transient states, muted for everything else.
+fn container_state_style(c: &crate::model::Container) -> Style {
+    let tag = c.state_tag();
+    if tag.contains("unhealthy") {
+        Style::new().fg(Color::Red).bold()
+    } else if tag == "starting" || tag == "restarting" || tag == "paused" {
+        Style::new().fg(Color::Yellow)
+    } else if tag == "healthy" || c.state == "running" {
+        Style::new().fg(GREEN)
+    } else {
+        Style::new().fg(MID)
+    }
+}
+
 fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
-    let header = Row::new(["Runtime", "ID", "State", "Status", "Image", "Name"])
-        .style(Style::new().fg(ACCENT).bold());
+    // Pod column only when k8s attribution actually produced something —
+    // it's dead width on plain-docker hosts.
+    let has_pod = app.containers.iter().any(|c| c.pod.is_some());
+    let mut header: Vec<Cell> = vec![
+        Cell::from("Runtime"),
+        Cell::from("ID"),
+        Cell::from("State"),
+        Cell::from("Status"),
+    ];
+    let mut widths: Vec<Constraint> = vec![
+        Constraint::Length(8),
+        Constraint::Length(13),
+        Constraint::Length(10),
+        Constraint::Length(24),
+    ];
+    if has_pod {
+        header.push(Cell::from("Pod"));
+        widths.push(Constraint::Length(24));
+    }
+    header.push(Cell::from("Image"));
+    header.push(Cell::from("Name"));
+    widths.push(Constraint::Min(20));
+    widths.push(Constraint::Min(18));
+    let header = Row::new(header).style(Style::new().fg(ACCENT).bold());
     let rows: Vec<Row> = app
         .container_view
         .iter()
         .filter_map(|&i| app.containers.get(i))
         .map(|c| {
-            Row::new([
+            let mut cells = vec![
                 Cell::from(c.runtime.clone()),
                 Cell::from(c.id.chars().take(12).collect::<String>()),
-                Cell::from(c.state.clone()),
+                Cell::from(c.state.clone()).style(container_state_style(c)),
                 Cell::from(c.status.clone()),
-                Cell::from(c.image.clone()),
-                Cell::from(c.name.clone()),
-            ])
+            ];
+            if has_pod {
+                cells.push(Cell::from(c.pod.clone().unwrap_or_else(|| "-".into())));
+            }
+            cells.push(Cell::from(c.image.clone()));
+            cells.push(Cell::from(c.name.clone()));
+            Row::new(cells)
         })
         .collect();
-    let widths = [
-        Constraint::Length(8),
-        Constraint::Length(13),
-        Constraint::Length(10),
-        Constraint::Length(24),
-        Constraint::Min(20),
-        Constraint::Min(18),
-    ];
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(3)
@@ -1709,6 +1994,57 @@ fn locks_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>
         .column_spacing(2)
         .row_highlight_style(Style::new().bg(PURPLE).fg(Color::White).bold());
     f.render_stateful_widget(table, area, &mut app.lock_state);
+}
+
+/// The Events table: the sampling history's appear/exit/restart ring,
+/// newest first. Time | Event | PID | Process | Detail.
+fn events_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
+    let arrow = |name: &str, col: EventSort| {
+        if app.event_sort == col {
+            format!("{name} {}", if app.event_sort_desc { "↓" } else { "↑" })
+        } else {
+            name.to_string()
+        }
+    };
+    let header = Row::new([
+        arrow("Time", EventSort::Time),
+        arrow("Event", EventSort::Kind),
+        arrow("PID", EventSort::Pid),
+        arrow("Process", EventSort::Process),
+        "Detail".to_string(),
+    ])
+    .style(Style::new().fg(ACCENT).bold());
+    let rows: Vec<Row> = app
+        .event_view
+        .iter()
+        .filter_map(|&i| app.hist.events.get(i))
+        .map(|e| {
+            let kind = match e.kind.as_str() {
+                "started" => "started",
+                "exited" => "exited",
+                _ => "restarted",
+            };
+            Row::new([
+                Cell::from(fmt_age_short(Some(e.at_unix))),
+                Cell::from(kind.to_string()),
+                Cell::from(e.pid.to_string()),
+                Cell::from(e.name.clone()),
+                Cell::from(e.detail.clone()),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Min(16),
+        Constraint::Min(30),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(3)
+        .row_highlight_style(Style::new().bg(PURPLE).fg(Color::White).bold());
+    f.render_stateful_widget(table, area, &mut app.event_state);
 }
 
 /// Full-page process detail (the Go witr's stateDetail): header with the
@@ -2027,11 +2363,13 @@ fn ui_container_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
     ])
     .split(inner);
 
-    let (name, state) = match &app.container_detail {
-        Some(c) => (c.name.clone(), c.state.clone()),
-        None => ("-".into(), "-".into()),
+    let (name, state, status) = match &app.container_detail {
+        Some(c) => (c.name.clone(), c.state.clone(), c.status.clone()),
+        None => ("-".into(), "-".into(), String::new()),
     };
-    let state_style = if state == "running" {
+    let state_style = if status.contains("unhealthy") {
+        Style::new().fg(Color::Red).bold()
+    } else if state == "running" {
         Style::new().fg(GREEN).bold()
     } else {
         Style::new().fg(MID)
@@ -2242,6 +2580,17 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
                 placeholder(v[6], f, "  file locks are not collected on this platform");
             }
         }
+        Tab::Events => {
+            if app.hist.events.is_empty() {
+                placeholder(
+                    v[6],
+                    f,
+                    "  no events yet — appear / exit / restart deltas land here as the TUI samples (every 3s)",
+                );
+            } else {
+                events_table(app, v[6], f);
+            }
+        }
     }
 
     let sep = Line::from(styled(
@@ -2276,6 +2625,13 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
                 app.locks.len().to_string()
             }
         }
+        Tab::Events => {
+            if app.event_search.is_empty() {
+                app.hist.events.len().to_string()
+            } else {
+                format!("{}/{}", app.event_view.len(), app.hist.events.len())
+            }
+        }
     };
     let mut footer = match app.tab {
         Tab::Processes => format!(
@@ -2297,6 +2653,10 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
                 total, mode
             )
         }
+        Tab::Events => format!(
+            "Total: {} | Enter: Open Process | t/e/p/n: Sort | /: Search | j-k/g-G: Move | h-l: Tab | r: Refresh | q: Quit",
+            total
+        ),
     };
     footer = format!("witr-rs v{} · {}", env!("CARGO_PKG_VERSION"), footer);
     if !app.status.is_empty() {
@@ -2316,6 +2676,19 @@ fn move_selection(app: &mut TuiApp, delta: i32) {
         let next = (cur + delta).clamp(0, len - 1);
         if next != cur {
             app.lock_state.select(Some(next as usize));
+        }
+        return;
+    }
+    if app.tab == Tab::Events {
+        // same pattern for the Events feed
+        if app.event_view.is_empty() {
+            return;
+        }
+        let len = app.event_view.len() as i32;
+        let cur = app.event_state.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, len - 1);
+        if next != cur {
+            app.event_state.select(Some(next as usize));
         }
         return;
     }
@@ -2340,6 +2713,14 @@ fn select_edge(app: &mut TuiApp, first: bool) {
         }
         let next = if first { 0 } else { app.lock_view.len() - 1 };
         app.lock_state.select(Some(next));
+        return;
+    }
+    if app.tab == Tab::Events {
+        if app.event_view.is_empty() {
+            return;
+        }
+        let next = if first { 0 } else { app.event_view.len() - 1 };
+        app.event_state.select(Some(next));
         return;
     }
     if app.view.is_empty() {
@@ -2380,6 +2761,17 @@ fn open_selection(app: &mut TuiApp) {
                 app.open_detail_page_for(pid);
             }
         }
+        // same idea from the Events feed — but the pid may already be gone;
+        // only jump when it's still alive, otherwise say so
+        Tab::Events => {
+            if let Some(pid) = app.selected_event_pid() {
+                if app.procs.iter().any(|p| p.pid == pid) {
+                    app.open_detail_page_for(pid);
+                } else {
+                    app.status = format!("pid {pid} has exited — details unavailable");
+                }
+            }
+        }
     }
 }
 
@@ -2388,6 +2780,12 @@ fn select_row(app: &mut TuiApp, row: usize) {
     if app.tab == Tab::Locks {
         if row < app.lock_view.len() {
             app.lock_state.select(Some(row));
+        }
+        return;
+    }
+    if app.tab == Tab::Events {
+        if row < app.event_view.len() {
+            app.event_state.select(Some(row));
         }
         return;
     }
@@ -2401,10 +2799,10 @@ fn select_row(app: &mut TuiApp, row: usize) {
 
 /// Scroll offset of whichever table the current tab drives.
 fn table_offset(app: &TuiApp) -> usize {
-    if app.tab == Tab::Locks {
-        app.lock_state.offset()
-    } else {
-        app.table_state.offset()
+    match app.tab {
+        Tab::Locks => app.lock_state.offset(),
+        Tab::Events => app.event_state.offset(),
+        _ => app.table_state.offset(),
     }
 }
 
@@ -2418,7 +2816,7 @@ fn in_rect(r: Rect, x: u16, y: u16) -> bool {
 /// span widths tab_bar() renders (" witr-rs " + gap, then " title " + gap).
 fn tab_at_x(x: u16) -> Option<Tab> {
     let mut cx = 9 + 2; // " witr-rs " + "  "
-    for t in [Tab::Processes, Tab::Ports, Tab::Containers, Tab::Locks] {
+    for t in [Tab::Processes, Tab::Ports, Tab::Containers, Tab::Locks, Tab::Events] {
         let w = t.title().chars().count() as u16 + 2;
         if x >= cx && x < cx + w {
             return Some(t);
@@ -2517,10 +2915,10 @@ fn on_click(app: &mut TuiApp, x: u16, y: u16) {
     }
     let vis = (y - r.y - 1) as usize;
     let abs = table_offset(app) + vis;
-    let len = if app.tab == Tab::Locks {
-        app.lock_view.len()
-    } else {
-        app.view.len()
+    let len = match app.tab {
+        Tab::Locks => app.lock_view.len(),
+        Tab::Events => app.event_view.len(),
+        _ => app.view.len(),
     };
     if abs >= len {
         return;
@@ -2715,6 +3113,10 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                         app.lock_search.push(c);
                         app.rebuild_lock_view();
                     }
+                    Tab::Events => {
+                        app.event_search.push(c);
+                        app.rebuild_event_view();
+                    }
                     _ => {
                         app.search.push(c);
                         app.rebuild_view();
@@ -2734,6 +3136,10 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                     Tab::Locks => {
                         app.lock_search.pop();
                         app.rebuild_lock_view();
+                    }
+                    Tab::Events => {
+                        app.event_search.pop();
+                        app.rebuild_event_view();
                     }
                     _ => {
                         app.search.pop();
@@ -2772,6 +3178,9 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
             } else if app.tab == Tab::Locks && !app.lock_search.is_empty() {
                 app.lock_search.clear();
                 app.rebuild_lock_view();
+            } else if app.tab == Tab::Events && !app.event_search.is_empty() {
+                app.event_search.clear();
+                app.rebuild_event_view();
             } else if !app.search.is_empty() {
                 app.search.clear();
                 app.rebuild_view();
@@ -2883,6 +3292,27 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                 }
             }
         }
+        // ---- Events tab: t/e/p/n sort columns ----
+        KeyCode::Char(c)
+            if app.tab == Tab::Events
+                && app.focus == Focus::Table
+                && matches!(c.to_ascii_lowercase(), 't' | 'e' | 'p' | 'n') =>
+        {
+            let col = match c.to_ascii_lowercase() {
+                'e' => EventSort::Kind,
+                'p' => EventSort::Pid,
+                'n' => EventSort::Process,
+                _ => EventSort::Time,
+            };
+            if app.event_sort == col {
+                app.event_sort_desc = !app.event_sort_desc;
+            } else {
+                app.event_sort = col;
+                // Time reads best newest-first; the rest ascending.
+                app.event_sort_desc = col == EventSort::Time;
+            }
+            app.rebuild_event_view();
+        }
         KeyCode::PageDown if app.focus == Focus::Table => move_selection(app, 20),
         KeyCode::PageUp if app.focus == Focus::Table => move_selection(app, -20),
         KeyCode::Char('f') if app.focus == Focus::Table => move_selection(app, 20),
@@ -2948,7 +3378,7 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
             if let Some(t) = Tab::from_digit(c) {
                 let tab = t;
                 app.switch_tab(tab);
-            } else {
+            } else if app.tab == Tab::Processes {
                 let k = match c {
                     'p' => Some(SortKey::Pid),
                     'n' => Some(SortKey::Name),
@@ -3079,11 +3509,131 @@ mod tests {
     fn h_l_switch_tabs() {
         let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         on_key(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.tab, Tab::Events);
+        on_key(&mut app, KeyCode::Char('h'));
         assert_eq!(app.tab, Tab::Locks);
+        on_key(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.tab, Tab::Events);
         on_key(&mut app, KeyCode::Char('l'));
         assert_eq!(app.tab, Tab::Processes);
         on_key(&mut app, KeyCode::Char('l'));
         assert_eq!(app.tab, Tab::Ports);
+        // digit jump
+        on_key(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.tab, Tab::Events);
+    }
+
+    #[test]
+    fn describe_peers_matches_local_and_remote() {
+        let mk = |proto: &str, la: &str, lp: u16, pa: Option<&str>, pp: Option<u16>, st: &str, pid: Option<Pid>| Socket {
+            proto: proto.into(),
+            local_addr: la.into(),
+            local_port: lp,
+            peer_addr: pa.map(|s| s.into()),
+            peer_port: pp,
+            state: st.into(),
+            pid,
+        };
+        let socks = vec![
+            mk("tcp6", "*", 8921, None, None, "LISTEN", Some(1)),
+            // server-side accepted socket: proves the exact loopback pairing
+            mk("tcp", "127.0.0.1", 8921, Some("127.0.0.1"), Some(5001), "ESTABLISHED", Some(1)),
+            // client side owned by pid 2
+            mk("tcp", "127.0.0.1", 5001, Some("127.0.0.1"), Some(8921), "ESTABLISHED", Some(2)),
+            // pid 3 talks to the internet — no local owner for the peer
+            mk("tcp", "10.0.0.2", 51000, Some("93.184.216.34"), Some(443), "ESTABLISHED", Some(3)),
+            // listeners don't count as "talking"
+            mk("tcp", "*", 22, None, None, "LISTEN", Some(4)),
+        ];
+        let names: HashMap<Pid, String> =
+            [(1, "server".to_string()), (2, "client".to_string()), (3, "curl".to_string())]
+                .into_iter()
+                .collect();
+        // server (pid 1): peer is the client via the accepted socket
+        let peers = describe_peers(&socks, &names, 1);
+        assert_eq!(peers, vec![("client (pid 2)".to_string(), 1)]);
+        // client (pid 2): peer is the listener's owner via wildcard match
+        let peers = describe_peers(&socks, &names, 2);
+        assert_eq!(peers, vec![("server (pid 1)".to_string(), 1)]);
+        // outbound-only process: peer unresolved → remote label
+        let peers = describe_peers(&socks, &names, 3);
+        assert_eq!(peers, vec![("remote 93.184.216.34:443".to_string(), 1)]);
+        // a pure listener has no established connections at all
+        let peers = describe_peers(&socks, &names, 4);
+        assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn events_tab_filter_and_selection() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        on_key(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.tab, Tab::Events);
+        // macOS/CI boxes always churn some short-lived helpers; if the TUI
+        // saw no events at all there is nothing to assert
+        if app.hist.events.is_empty() {
+            return;
+        }
+        assert!(!app.event_view.is_empty());
+        // filter narrows to matches only
+        app.event_search = "exited".into();
+        app.rebuild_event_view();
+        assert!(app
+            .event_view
+            .iter()
+            .all(|&i| app.hist.events[i].kind == "exited"));
+        app.event_search.clear();
+        app.rebuild_event_view();
+        // selection moves inside the event view without touching the
+        // process table cursor
+        let before = app.table_state.selected();
+        on_key(&mut app, KeyCode::Char('j'));
+        on_key(&mut app, KeyCode::Char('G'));
+        assert_eq!(
+            app.event_state.selected(),
+            Some(app.event_view.len() - 1)
+        );
+        assert_eq!(app.table_state.selected(), before);
+    }
+
+    #[test]
+    fn events_tab_sort_keys() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        on_key(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.tab, Tab::Events);
+        let ev = |at: i64, kind: &str, pid: i32, name: &str| crate::history::TuiEvent {
+            at_unix: at,
+            kind: kind.into(),
+            pid,
+            name: name.into(),
+            detail: String::new(),
+        };
+        app.hist.events = vec![
+            ev(100, "started", 3, "zsh"),
+            ev(200, "exited", 1, "nginx"),
+            ev(150, "started", 2, "node"),
+        ];
+        // default: Time newest-first
+        app.rebuild_event_view();
+        assert_eq!(app.event_view, vec![1, 2, 0]);
+        // same key again → oldest first
+        on_key(&mut app, KeyCode::Char('t'));
+        assert!(!app.event_sort_desc);
+        assert_eq!(app.event_view, vec![0, 2, 1]);
+        // pid ascending / descending
+        on_key(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.event_sort, EventSort::Pid);
+        assert!(!app.event_sort_desc);
+        assert_eq!(app.event_view, vec![1, 2, 0]);
+        on_key(&mut app, KeyCode::Char('P'));
+        assert!(app.event_sort_desc);
+        assert_eq!(app.event_view, vec![0, 2, 1]);
+        // process name ascending: nginx < node < zsh
+        on_key(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.event_view, vec![1, 2, 0]);
+        // event kind ascending: exited < started (stable among equals)
+        on_key(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.event_sort, EventSort::Kind);
+        assert_eq!(app.event_view, vec![1, 0, 2]);
     }
 
     #[test]
@@ -3385,6 +3935,41 @@ mod tests {
     }
 
     #[test]
+    fn container_state_colors() {
+        let mk = |state: &str, status: &str| Container {
+            runtime: "docker".into(),
+            id: "x".into(),
+            name: "n".into(),
+            image: String::new(),
+            command: String::new(),
+            state: state.into(),
+            status: status.into(),
+            ports: String::new(),
+            pod: None,
+            restarts: None,
+        };
+        assert_eq!(
+            container_state_style(&mk("running", "Up 2 weeks (healthy)")).fg,
+            Some(GREEN)
+        );
+        // plain "Up N" running with no health check: green
+        assert_eq!(container_state_style(&mk("running", "Up 3 days")).fg, Some(GREEN));
+        // unhealthy wins over running's green
+        assert_eq!(
+            container_state_style(&mk("running", "Up 2 weeks (unhealthy)")).fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            container_state_style(&mk("restarting", "Restarting")).fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            container_state_style(&mk("exited", "Exited (0) 2 hours ago")).fg,
+            Some(MID)
+        );
+    }
+
+    #[test]
     fn container_search_filters_view() {
         let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         app.tab = Tab::Containers;
@@ -3398,6 +3983,8 @@ mod tests {
                 state: "running".into(),
                 status: "Up 2 weeks".into(),
                 ports: "".into(),
+                pod: None,
+                restarts: None,
             },
             Container {
                 runtime: "docker".into(),
@@ -3408,6 +3995,8 @@ mod tests {
                 state: "running".into(),
                 status: "Up 2 weeks".into(),
                 ports: "".into(),
+                pod: None,
+                restarts: None,
             },
         ];
         app.rebuild_container_view();
@@ -3504,6 +4093,8 @@ mod tests {
             io_read_ops: Some(0),
             io_write_bytes: Some(53_164_675_379),
             io_write_ops: Some(1_234),
+            gpu_sm_pct: Some(45),
+            gpu_mem_mb: Some(1200),
             ..Default::default()
         }];
         let sockets = vec![Socket {
@@ -3538,6 +4129,9 @@ mod tests {
         assert!(text.iter().any(|l| l.contains("Read") && l.contains("52.4 GB")));
         assert!(text.iter().any(|l| l.contains("Write") && l.contains("(1234 ops)")));
         assert!(text.iter().any(|l| l.starts_with("Threads") && l.ends_with("13")));
+        assert!(text
+            .iter()
+            .any(|l| l.starts_with("GPU") && l.ends_with("45% SM · 1200 MiB")));
         assert!(text.iter().any(|l| l.contains("127.0.0.1:18789 (TCP | LISTEN)")));
         assert!(text
             .iter()

@@ -60,6 +60,17 @@ pub struct Process {
     /// Empty on other platforms or when unreadable.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// NVIDIA GPU usage from `nvidia-smi pmon`: SM utilization percent and
+    /// dedicated memory in MiB. Only filled when the host exposes an NVIDIA
+    /// GPU and the caller enriches the listing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_sm_pct: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_mem_mb: Option<u64>,
+    /// True when the process ignores SIGHUP (nohup / disown): it survives
+    /// terminal close. Linux only (/proc/<pid>/status SigIgn).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hup_ignored: bool,
 }
 
 impl Process {
@@ -101,6 +112,15 @@ pub struct Container {
     pub state: String,
     pub status: String, // human readable, e.g. "Up 2 weeks (healthy)"
     pub ports: String,  // published ports, e.g. "0.0.0.0:8088->8088/tcp"
+    /// Owning Kubernetes pod ("namespace/name") when the container runs in
+    /// k8s and kubectl could see it. None elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod: Option<String>,
+    /// Restart count from the runtime's inspect (docker/podman/nerdctl).
+    /// None when not fetched or unsupported — 0 alone is meaningful (the
+    /// restart policy never fired).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restarts: Option<u32>,
 }
 
 impl Container {
@@ -137,6 +157,12 @@ impl Container {
         let tag = self.state_tag();
         if !tag.is_empty() {
             parts.push_str(&format!(" [{tag}]"));
+        }
+        if let Some(pod) = &self.pod {
+            parts.push_str(&format!(" · pod {pod}"));
+        }
+        if self.restarts.is_some_and(|n| n > 0) {
+            parts.push_str(&format!(" ({} restarts)", self.restarts.unwrap()));
         }
         parts
     }
@@ -306,6 +332,11 @@ pub struct TargetReport {
     /// container, rendered as a fallback report. `found` is false then.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<Container>,
+    /// sha256 + code-signature verdict of the first match's binary. Only
+    /// collected when the caller asks for deep binary info (export /
+    /// detail page) — hashing is too expensive for listings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary: Option<crate::binary_id::BinaryIdentity>,
 }
 
 impl TargetReport {
@@ -327,6 +358,45 @@ impl TargetReport {
             risk: None,
             permission_denied: false,
             container: None,
+            binary: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn container() -> Container {
+        Container {
+            runtime: "docker".into(),
+            id: "abc123def456".into(),
+            name: "web".into(),
+            image: "nginx".into(),
+            command: String::new(),
+            state: "running".into(),
+            status: "Up 2 weeks".into(),
+            ports: String::new(),
+            pod: None,
+            restarts: None,
+        }
+    }
+
+    #[test]
+    fn format_line_pod_and_restarts() {
+        // plain running state gets no bracket tag (only non-running states)
+        let mut c = container();
+        assert_eq!(c.format_line(), "docker: web (id abc123def456)");
+        c.pod = Some("prod/web".into());
+        assert_eq!(c.format_line(), "docker: web (id abc123def456) · pod prod/web");
+        c.restarts = Some(2);
+        assert_eq!(
+            c.format_line(),
+            "docker: web (id abc123def456) · pod prod/web (2 restarts)"
+        );
+        // zero restarts is noise — omitted
+        c.restarts = Some(0);
+        assert!(c.format_line().contains("pod prod/web"));
+        assert!(!c.format_line().contains("restart"));
     }
 }

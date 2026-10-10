@@ -253,6 +253,38 @@ pub fn parse_etime_to_secs(s: &str) -> Option<i64> {
     Some(total)
 }
 
+/// Parse a human duration into seconds: "30" (bare seconds), "30s", "5m",
+/// "2h", "1d", and compound forms like "1h30m". Returns None on garbage,
+/// empty input or non-positive results.
+pub fn parse_duration(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut total: i64 = 0;
+    let mut num = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            num.push(ch);
+            continue;
+        }
+        let val: f64 = num.parse().ok()?;
+        num.clear();
+        let mult: i64 = match ch {
+            's' | 'S' => 1,
+            'm' | 'M' => 60,
+            'h' | 'H' => 3600,
+            'd' | 'D' => 86_400,
+            _ => return None,
+        };
+        total += (val * mult as f64) as i64;
+    }
+    if !num.is_empty() {
+        total += num.parse::<i64>().ok()?;
+    }
+    (total > 0).then_some(total)
+}
+
 /// Strip a trailing " (deleted)" that kernels append to exe paths.
 pub fn strip_deleted_suffix(p: &str) -> (&str, bool) {
     match p.strip_suffix(" (deleted)") {
@@ -290,6 +322,20 @@ mod tests {
         assert_eq!(parse_etime_to_secs("03:10:31"), Some(11431));
         assert_eq!(parse_etime_to_secs("1-03:10:31"), Some(97831));
         assert_eq!(parse_etime_to_secs("bad"), None);
+    }
+
+    #[test]
+    fn duration_parse() {
+        assert_eq!(parse_duration("30"), Some(30));
+        assert_eq!(parse_duration("30s"), Some(30));
+        assert_eq!(parse_duration(" 5m "), Some(300));
+        assert_eq!(parse_duration("2h"), Some(7200));
+        assert_eq!(parse_duration("1d"), Some(86_400));
+        assert_eq!(parse_duration("1h30m"), Some(5400));
+        assert_eq!(parse_duration("0"), None);
+        assert_eq!(parse_duration("-5m"), None);
+        assert_eq!(parse_duration("nope"), None);
+        assert_eq!(parse_duration(""), None);
     }
 
     #[test]

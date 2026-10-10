@@ -89,6 +89,8 @@ pub fn parse_container_line(line: &str, runtime: &str) -> Option<Container> {
         state: get("State").to_string(),
         status: get("Status").to_string(),
         ports: get("Ports").to_string(),
+        pod: None,
+        restarts: None,
     })
 }
 
@@ -104,6 +106,18 @@ pub fn container_host_pid(runtime: &str, id: &str) -> Option<Pid> {
     .ok()?;
     let pid: i32 = out.trim().parse().ok()?;
     (pid > 0).then_some(pid)
+}
+
+/// How often the runtime's restart policy has restarted this container
+/// (`inspect .RestartCount`). None when the runtime/daemon is unavailable.
+pub fn container_restarts(runtime: &str, id: &str) -> Option<u32> {
+    let out = crate::util::run(
+        runtime,
+        &["inspect", "--format", "{{.RestartCount}}", id],
+        std::time::Duration::from_secs(6),
+    )
+    .ok()?;
+    out.trim().parse().ok()
 }
 
 /// The container that publishes `port` on the host, found by matching the

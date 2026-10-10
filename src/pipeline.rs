@@ -10,13 +10,17 @@ pub struct Options {
     /// Expensive on macOS (one lsof scan per pid), so the TUI only sets it
     /// for the full detail page, never the browse panel.
     pub deep_files: bool,
+    /// Also hash the first match's binary and check its code signature
+    /// (one file read + one codesign/PowerShell call). Export and the TUI
+    /// detail page only.
+    pub deep_binaries: bool,
     /// cap for fuzzy name matches before we warn about truncation
     pub max_name_matches: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { want_env: false, deep_files: false, max_name_matches: 20 }
+        Options { want_env: false, deep_files: false, deep_binaries: false, max_name_matches: 20 }
     }
 }
 
@@ -112,10 +116,22 @@ fn analyze(
         } else {
             None
         };
+        // binary identity (sha256 + signature): only when asked, only for a
+        // binary that still exists on disk
+        let binary = if opts.deep_binaries {
+            detailed
+                .exe
+                .as_deref()
+                .filter(|_| !detailed.exe_deleted)
+                .map(crate::binary_id::inspect)
+        } else {
+            None
+        };
         let risk = crate::risk::assess(
             &detailed,
             &sockets,
             overview.as_ref().and_then(|o| o.fd_usage),
+            binary.as_ref(),
         );
 
         let source = detect_source(platform, &chain);
@@ -150,6 +166,7 @@ fn analyze(
             locks: overview.as_ref().map(|o| o.locks.clone()).unwrap_or_default(),
             fd_usage: overview.as_ref().and_then(|o| o.fd_usage),
             open_files: overview.map(|o| o.files),
+            binary,
             risk: Some(risk),
             permission_denied: false,
             container: match &source {
@@ -295,30 +312,74 @@ fn resolve(
             ),
             Err(e) => (Vec::new(), None, None, Vec::new(), Some(format!("port lookup failed: {}", e)), false),
         },
-        TargetSpec::File { path } => match platform.file_to_pids(path) {
-            Ok(pids) => {
-                let error = if pids.is_empty() {
-                    Some(format!("no process holds {} open", path))
+        TargetSpec::File { path } => {
+            // glob patterns ("*?[") expand against the filesystem; every
+            // existing match contributes its holders
+            let paths = if is_glob(path) {
+                match expand_file_glob(path) {
+                    Ok(ps) if ps.is_empty() => {
+                        return (
+                            Vec::new(),
+                            None,
+                            None,
+                            Vec::new(),
+                            Some(format!("no file matches pattern \"{}\"", path)),
+                            false,
+                        );
+                    }
+                    Ok(ps) => ps,
+                    Err(e) => {
+                        return (
+                            Vec::new(),
+                            None,
+                            None,
+                            Vec::new(),
+                            Some(format!("glob \"{}\" failed: {}", path, e)),
+                            false,
+                        );
+                    }
+                }
+            } else {
+                vec![path.clone()]
+            };
+            if !caps.file_lookup {
+                return (
+                    Vec::new(),
+                    None,
+                    None,
+                    vec!["file lookup is not supported on this platform".into()],
+                    Some(format!("file lookup failed for \"{}\"", path)),
+                    false,
+                );
+            }
+            let mut pids: Vec<Pid> = Vec::new();
+            let mut permission = false;
+            for p in &paths {
+                match platform.file_to_pids(p) {
+                    Ok(found) => pids.extend(found),
+                    Err(crate::platform::PlatError::Permission(m)) => {
+                        permission = true;
+                        let _ = m;
+                    }
+                    Err(_) => {}
+                }
+            }
+            pids.sort_unstable();
+            pids.dedup();
+            let permission_denied = permission && pids.is_empty();
+            let error = if pids.is_empty() {
+                if permission {
+                    Some(format!("file lookup failed: permission denied matching \"{}\"", path))
+                } else if paths.len() == 1 {
+                    Some(format!("no process holds {} open", paths[0]))
                 } else {
-                    None
-                };
-                (pids, None, None, Vec::new(), error, false)
-            }
-            Err(crate::platform::PlatError::Permission(m)) => {
-                let mut warnings = Vec::new();
-                if !caps.file_lookup {
-                    warnings.push("file lookup is not supported on this platform".into());
+                    Some(format!("no process holds files matching \"{}\" open", path))
                 }
-                (Vec::new(), None, None, warnings, Some(format!("file lookup failed: {}", m)), true)
-            }
-            Err(e) => {
-                let mut warnings = Vec::new();
-                if !caps.file_lookup {
-                    warnings.push("file lookup is not supported on this platform".into());
-                }
-                (Vec::new(), None, None, warnings, Some(format!("file lookup failed: {}", e)), false)
-            }
-        },
+            } else {
+                None
+            };
+            (pids, None, None, Vec::new(), error, permission_denied)
+        }
         TargetSpec::Container { query, exact } => {
             let all = crate::platform::enumerate_containers();
             let matches: Vec<Container> = all
@@ -353,7 +414,19 @@ fn resolve(
                     false,
                 );
             }
-            let c = matches.into_iter().next().unwrap();
+            let mut c = matches.into_iter().next().unwrap();
+            // k8s pod attribution for the identity line (no-op without
+            // kubectl / cluster)
+            if c.pod.is_none() {
+                if let Some(pods) = crate::k8s::pods() {
+                    c.pod = crate::k8s::find_pod(&pods, &c.id);
+                }
+            }
+            // restart count from the runtime inspect (surfaced in the
+            // identity line + export)
+            if c.restarts.is_none() {
+                c.restarts = crate::platform::container_restarts(&c.runtime, &c.id);
+            }
             // The container's main process may be visible on this host
             // (Linux, or rootless runtimes) — analyze it like any pid.
             if let Some(host_pid) = crate::platform::container_host_pid(&c.runtime, &c.id) {
@@ -383,6 +456,13 @@ fn inspect_risks(p: &Process, sockets: &[crate::model::Socket], warnings: &mut V
     if p.exe_deleted {
         warnings.push(format!(
             "the binary of pid {} has been deleted from disk (updated in place?)",
+            p.pid
+        ));
+    }
+    // nohup / disown marker: the process survives terminal close (Linux)
+    if p.hup_ignored && !p.kernel_thread {
+        warnings.push(format!(
+            "pid {} ignores SIGHUP (nohup/disown?) — it survives terminal close",
             p.pid
         ));
     }
@@ -734,6 +814,24 @@ fn git_info(cwd: Option<&str>) -> Option<(String, Option<String>)> {
     None
 }
 
+/// A file spec is a glob when it carries any metachar. Bracket classes
+/// count — `[abc].log` is a valid, common pattern.
+fn is_glob(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
+}
+
+/// Expand a filesystem glob to its existing matches, sorted for stable
+/// reports. Pattern-syntax errors surface as Err; no match is Ok(vec![]).
+fn expand_file_glob(pattern: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = glob::glob(pattern)
+        .map_err(|e| e.to_string())?
+        .filter_map(|entry| entry.ok())
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,6 +907,35 @@ mod tests {
             detect_supervisor(&wrapped).unwrap().label.as_deref(),
             Some("supervisord")
         );
+    }
+
+    #[test]
+    fn file_glob_expansion() {
+        let dir = std::env::temp_dir().join("witr-rs-glob-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a1.log"), b"x").unwrap();
+        std::fs::write(dir.join("a2.log"), b"x").unwrap();
+        std::fs::write(dir.join("b.txt"), b"x").unwrap();
+        let d = dir.to_str().unwrap();
+
+        assert!(!is_glob(&format!("{d}/a1.log")));
+        assert!(is_glob(&format!("{d}/*.log")));
+        assert!(is_glob(&format!("{d}/a?.log")));
+        assert!(is_glob(&format!("{d}/[ab].txt")));
+
+        let hits = expand_file_glob(&format!("{d}/*.log")).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].ends_with("a1.log") && hits[1].ends_with("a2.log"));
+
+        let one = expand_file_glob(&format!("{d}/?.txt")).unwrap();
+        assert_eq!(one.len(), 1);
+
+        // pattern with no filesystem match: Ok(empty)
+        assert!(expand_file_glob(&format!("{d}/*.zzz")).unwrap().is_empty());
+        // syntactically broken pattern: Err
+        assert!(expand_file_glob(&format!("{d}/[")).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

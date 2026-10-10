@@ -7,3 +7,6 @@
 
 # Local test captures
 *.log
+
+# Claude Code local settings
+.claude/

@@ -572,6 +572,7 @@ impl Platform for Linux {
             }
         }
         p.capabilities = self.process_capabilities(brief.pid);
+        p.hup_ignored = sigign_hup(brief.pid);
         p
     }
 
@@ -1022,6 +1023,26 @@ fn decode_capabilities(hex: &str) -> Vec<String> {
         .collect()
 }
 
+/// True when the process ignores SIGHUP (nohup / disown): signal 1 = bit 0
+/// of /proc/<pid>/status SigIgn. Unreadable status degrades to false —
+/// no evidence, no note.
+fn sigign_hup(pid: Pid) -> bool {
+    let Some(status) = read_ok(&Path::new("/proc").join(pid.to_string()).join("status")) else {
+        return false;
+    };
+    for line in status.lines() {
+        if let Some(hex) = line.strip_prefix("SigIgn:") {
+            return hup_bit(hex.trim());
+        }
+    }
+    false
+}
+
+/// The SIGHUP bit of a hex signal mask (SigIgn layout: bit n = signal n+1).
+fn hup_bit(hex: &str) -> bool {
+    u64::from_str_radix(hex, 16).is_ok_and(|m| m & 0x1 != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,5 +1123,15 @@ mod tests {
         let line = "11:pids:/docker/9f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a";
         let p = line.splitn(3, ':').nth(2).unwrap();
         assert!(p.strip_prefix("/docker/").is_some());
+    }
+
+    #[test]
+    fn hup_bit_detects_sighup_ignores() {
+        // SigIgn hex masks: bit 0 = SIGHUP (signal 1)
+        assert!(hup_bit("0000000000000001")); // only SIGHUP ignored (nohup)
+        assert!(hup_bit("0000000000000007")); // SIGHUP + INT + QUIT
+        assert!(!hup_bit("0000000000000004")); // SIGINT ignored, HUP not
+        assert!(!hup_bit("0000000000000000"));
+        assert!(!hup_bit("not-hex"));
     }
 }

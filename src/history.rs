@@ -22,6 +22,25 @@ struct RestartState {
     last_seen: Option<Instant>,
 }
 
+/// One thing that happened while the TUI watched the system: a process
+/// appeared, exited, or came back under a new pid (restart). Fed from
+/// [`History::update`] refresh deltas; the newest events come first.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TuiEvent {
+    /// Wall-clock seconds when the delta was observed.
+    pub at_unix: i64,
+    /// "started" | "exited" | "restarted"
+    pub kind: String,
+    pub pid: Pid,
+    pub name: String,
+    /// Extra context: what replaced an exited pid, or the pid it restarted
+    /// from, as a human string.
+    pub detail: String,
+}
+
+/// Cap on the in-memory event ring (newest first).
+const EVENT_CAP: usize = 500;
+
 #[derive(Default)]
 pub struct History {
     /// pid → (cpu ms at last sample, sampled at)
@@ -34,6 +53,10 @@ pub struct History {
     /// pid → identity hash
     identity_of: HashMap<Pid, u64>,
     restarts: HashMap<u64, RestartState>,
+    /// Newest-first ring of appear/exit/restart events.
+    pub events: Vec<TuiEvent>,
+    /// pid → name at the previous refresh (for appear/exit deltas).
+    prev_seen: HashMap<Pid, String>,
 }
 
 fn identity(p: &Process) -> u64 {
@@ -53,8 +76,16 @@ impl History {
     /// can read `cpu_now` / `sparks`.
     pub fn update(&mut self, procs: &[Process]) {
         let now = Instant::now();
+        let now_unix = crate::util::now_unix();
         let seen: std::collections::HashSet<Pid> =
             procs.iter().map(|p| p.pid).collect();
+        let event = |h: &mut History, kind: &str, pid: Pid, name: &str, detail: String| {
+            h.events.insert(
+                0,
+                TuiEvent { at_unix: now_unix, kind: kind.to_string(), pid, name: name.to_string(), detail },
+            );
+            h.events.truncate(EVENT_CAP);
+        };
 
         for p in procs {
             if p.kernel_thread {
@@ -84,13 +115,39 @@ impl History {
 
             // restart bookkeeping: same identity, different pid
             let rs = self.restarts.entry(h).or_default();
-            if rs.last_pid != 0 && rs.last_pid != p.pid {
+            let is_restart = rs.last_pid != 0 && rs.last_pid != p.pid;
+            if is_restart {
                 rs.total += 1;
                 rs.events.push(now);
             }
+            let total = rs.total;
             rs.last_pid = p.pid;
             rs.last_seen = Some(now);
+
+            // appear / restart events for the Events tab
+            match self.prev_seen.remove(&p.pid) {
+                Some(_) => {}
+                None if is_restart => event(
+                    self,
+                    "restarted",
+                    p.pid,
+                    &p.name,
+                    format!("came back after exiting ({total} restarts total)"),
+                ),
+                None => event(self, "started", p.pid, &p.name, String::new()),
+            }
         }
+
+        // everything still in prev_seen vanished since the last refresh
+        let vanished: Vec<(Pid, String)> = self.prev_seen.drain().collect();
+        for (pid, name) in vanished {
+            event(self, "exited", pid, &name, String::new());
+        }
+        self.prev_seen = procs
+            .iter()
+            .filter(|p| !p.kernel_thread)
+            .map(|p| (p.pid, p.name.clone()))
+            .collect();
 
         // drop history for processes that vanished
         self.cpu_now.retain(|pid, _| seen.contains(pid));
@@ -203,5 +260,25 @@ mod tests {
         h.update(&[]);
         assert!(h.cpu_now.is_empty());
         assert!(h.identity_of.is_empty());
+    }
+
+    #[test]
+    fn events_feed_start_exit_restart() {
+        let mut h = History::new();
+        h.update(&[proc(1, "/bin/worker", None)]);
+        h.update(&[]);
+        h.update(&[proc(2, "/bin/worker", None)]);
+        let kinds: Vec<&str> = h.events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["restarted", "exited", "started"], "newest first");
+        assert_eq!(h.events[0].pid, 2);
+        assert!(h.events[0].detail.contains("1 restarts"));
+        assert_eq!(h.events[1].pid, 1);
+        // events stay capped (within one refresh the exit delta is
+        // inserted after the appear delta, so it sits on top)
+        for i in 0..600u32 {
+            h.update(&[proc(i as i32 + 10, "/bin/x", None)]);
+        }
+        assert_eq!(h.events.len(), 500);
+        assert_eq!(h.events[0].kind, "exited");
     }
 }

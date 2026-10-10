@@ -72,6 +72,64 @@ fn toolhelp_snapshot() -> PlatResult<Vec<SnapProc>> {
     }
 }
 
+// ---------- Restart Manager file holders ----------
+
+/// Which pids hold `path` open / locked, via the Restart Manager API
+/// (rstrtmgr.dll) — the same mechanism MSI installers use to find apps to
+/// shut down. Works without admin for most files and needs no Sysinternals.
+#[cfg(windows)]
+fn rm_file_pids(path: &str) -> PlatResult<Vec<Pid>> {
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::ERROR_MORE_DATA;
+    use windows::Win32::System::RestartManager::{
+        RmEndSession, RmGetList, RmRegisterResources, RmStartSession, RM_PROCESS_INFO,
+        CCH_RM_SESSION_KEY,
+    };
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    unsafe {
+        let mut session: u32 = 0;
+        let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
+        RmStartSession(&mut session, 0, PWSTR(key.as_mut_ptr()))
+            .ok()
+            .map_err(|e| PlatError::Failed(format!("RmStartSession: {e}")))?;
+        let result = (|| -> PlatResult<Vec<Pid>> {
+            let path_w = wide(path);
+            let paths = [PCWSTR(path_w.as_ptr())];
+            RmRegisterResources(session, Some(&paths), None, None)
+                .ok()
+                .map_err(|e| PlatError::Failed(format!("RmRegisterResources: {e}")))?;
+            // RmGetList is two-phase: the first call reports how many
+            // entries are needed (ERROR_MORE_DATA), the second fills them.
+            let mut needed: u32 = 0;
+            let mut count: u32 = 0;
+            let mut reasons: u32 = 0;
+            let mut buf: Vec<RM_PROCESS_INFO> = Vec::new();
+            let res = RmGetList(session, &mut needed, &mut count, Some(buf.as_mut_ptr()), &mut reasons);
+            if res == ERROR_MORE_DATA {
+                buf = vec![RM_PROCESS_INFO::default(); needed as usize];
+                count = needed;
+                RmGetList(session, &mut needed, &mut count, Some(buf.as_mut_ptr()), &mut reasons)
+                    .ok()
+                    .map_err(|e| PlatError::Failed(format!("RmGetList: {e}")))?;
+            } else {
+                res.ok()
+                    .map_err(|e| PlatError::Failed(format!("RmGetList: {e}")))?;
+            }
+            buf.truncate(count as usize);
+            Ok(buf
+                .into_iter()
+                .map(|info| info.Process.dwProcessId as Pid)
+                .collect())
+        })();
+        RmEndSession(session);
+        result
+    }
+}
+
 // ---------- PowerShell helpers ----------
 
 /// Minimal base64 (standard alphabet, padding) for -EncodedCommand.
@@ -349,7 +407,7 @@ impl Platform for Windows {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            file_lookup: false, // needs Sysinternals handle.exe; warn instead
+            file_lookup: cfg!(windows), // Restart Manager
             env: false,
         }
     }
@@ -402,10 +460,18 @@ impl Platform for Windows {
         netstat_snapshot(false)
     }
 
-    fn file_to_pids(&self, _path: &str) -> PlatResult<Vec<Pid>> {
-        Err(PlatError::Unsupported(
-            "file holders need Sysinternals handle.exe; not supported by witr-rs".into(),
-        ))
+    fn file_to_pids(&self, path: &str) -> PlatResult<Vec<Pid>> {
+        #[cfg(windows)]
+        {
+            rm_file_pids(path)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Err(PlatError::Unsupported(
+                "file holders need a Windows host (Restart Manager)".into(),
+            ))
+        }
     }
 
     fn container_of(&self, pid: Pid) -> Option<Source> {

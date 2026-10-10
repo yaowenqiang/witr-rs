@@ -558,6 +558,14 @@ pub fn render_export(reports: &[TargetReport]) -> String {
             }
             kv(&mut out, "exe", line);
         }
+        if let Some(b) = &r.binary {
+            if let Some(h) = &b.sha256 {
+                kv(&mut out, "sha256", h.clone());
+            }
+            if let Some(sig) = &b.signature {
+                kv(&mut out, "signature", sig.clone());
+            }
+        }
         if !m.cmdline.is_empty() {
             kv(&mut out, "cmd", m.command_line());
         }
