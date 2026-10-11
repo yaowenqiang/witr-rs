@@ -125,7 +125,7 @@ fn rm_file_pids(path: &str) -> PlatResult<Vec<Pid>> {
                 .map(|info| info.Process.dwProcessId as Pid)
                 .collect())
         })();
-        RmEndSession(session);
+        let _ = RmEndSession(session);
         result
     }
 }
@@ -400,6 +400,49 @@ fn parse_tasklist_mem(text: &str) -> HashMap<Pid, u64> {
     map
 }
 
+/// pid → cumulative CPU milliseconds, from one PowerShell pass over
+/// Get-Process. ToolHelp32 carries no CPU accounting, so this is what feeds
+/// the TUI's instantaneous-CPU% column (the sampling history in
+/// history.rs takes the delta between refreshes). A failed probe (no
+/// PowerShell, broken host) is cached for the process lifetime so the
+/// refresh loop never pays for it twice.
+fn cpu_time_map() -> Option<HashMap<Pid, u64>> {
+    static UNAVAILABLE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if UNAVAILABLE.get().is_some() {
+        return None;
+    }
+    let script = "Get-Process | Select-Object Id, \
+                  @{n='cpuMs';e={[long]$_.TotalProcessorTime.TotalMilliseconds}} \
+                  | ConvertTo-Json -Compress";
+    match run("powershell", &["-NoProfile", "-Command", script], PS_TIMEOUT) {
+        Ok(out) => parse_cpu_times(&out),
+        Err(_) => {
+            let _ = UNAVAILABLE.set(());
+            None
+        }
+    }
+}
+
+/// `{"Id":123,"cpuMs":4567}` (or an array of those; PowerShell emits a bare
+/// object for a single element, and `cpuMs` is null for protected
+/// processes) → pid → cpu ms.
+fn parse_cpu_times(json: &str) -> Option<HashMap<Pid, u64>> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let items: Vec<serde_json::Value> = match v {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(_) => vec![v],
+        _ => return None,
+    };
+    let mut map = HashMap::new();
+    for it in items {
+        let Some(pid) = it.get("Id").and_then(|p| p.as_i64()) else { continue };
+        if let Some(ms) = it.get("cpuMs").and_then(|m| m.as_u64()) {
+            map.insert(pid as Pid, ms);
+        }
+    }
+    Some(map)
+}
+
 impl Platform for Windows {
     fn name(&self) -> &'static str {
         "windows"
@@ -419,6 +462,7 @@ impl Platform for Windows {
             .output()
             .map(|o| parse_tasklist_mem(&String::from_utf8_lossy(&o.stdout)))
             .unwrap_or_default();
+        let cpu = cpu_time_map().unwrap_or_default();
         Ok(snap
             .into_iter()
             .map(|s| Process {
@@ -426,6 +470,7 @@ impl Platform for Windows {
                 ppid: Some(s.ppid),
                 name: basename(&s.exe),
                 mem_kb: mem.get(&s.pid).copied(),
+                cpu_time_ms: cpu.get(&s.pid).copied(),
                 ..Default::default()
             })
             .collect())
@@ -597,6 +642,20 @@ mod tests {
         assert_eq!(rows[0].1, 1234);
         assert_eq!(rows[0].2, vec!["SvcA", "SvcB"]);
         assert!(rows[1].2.is_empty());
+    }
+
+    #[test]
+    fn cpu_times_json_shapes() {
+        // multi-object array
+        let m = parse_cpu_times(r#"[{"Id":123,"cpuMs":4567},{"Id":9,"cpuMs":null}]"#).unwrap();
+        assert_eq!(m.get(&123), Some(&4567));
+        assert!(!m.contains_key(&9)); // null cpuMs (protected process) skipped
+        // single object (PowerShell drops the array for one element)
+        let m = parse_cpu_times(r#"{"Id":55,"cpuMs":12}"#).unwrap();
+        assert_eq!(m.get(&55), Some(&12));
+        // garbage
+        assert!(parse_cpu_times("not json").is_none());
+        assert!(parse_cpu_times("null").is_none());
     }
 
     #[test]

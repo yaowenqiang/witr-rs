@@ -4,6 +4,7 @@ mod cli;
 mod gpu;
 mod history;
 mod k8s;
+mod logs;
 mod model;
 mod pipeline;
 mod platform;
@@ -136,6 +137,45 @@ fn main() {
         std::process::exit(4);
     }
 
+    // --events-log records the TUI sampler; anywhere else it's a no-op
+    let no_target_tui = specs.is_empty()
+        && std::io::stdout().is_terminal()
+        && std::io::stdin().is_terminal()
+        && !cli.list
+        && cli.watch.is_none()
+        && recent_secs.is_none();
+    if cli.events_log.is_some() && !cli.interactive && !no_target_tui {
+        eprintln!("--events-log records the TUI event sampler; run without targets (or with -i) on a terminal");
+        std::process::exit(4);
+    }
+    if cli.replay.is_some() && !cli.interactive && !specs.is_empty() {
+        eprintln!("--replay opens the TUI; drop the targets or use -i");
+        std::process::exit(4);
+    }
+
+    // --replay: load a recorded --events-log JSONL and open the TUI on the
+    // Events tab (live sampling continues on top)
+    let replayed = match &cli.replay {
+        Some(path) => {
+            if !(std::io::stdout().is_terminal() && std::io::stdin().is_terminal()) {
+                eprintln!("--replay opens the TUI; it needs a terminal");
+                std::process::exit(4);
+            }
+            match history::load_events_log(path) {
+                Ok(events) if !events.is_empty() => events,
+                Ok(_) => {
+                    eprintln!("--replay {path}: no valid events found");
+                    std::process::exit(4);
+                }
+                Err(e) => {
+                    eprintln!("--replay {path}: {e}");
+                    std::process::exit(4);
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+
     // Keep the recent processes only (listing mode + --watch).
     let recent_only = |procs: Vec<Process>| -> Vec<Process> {
         match recent_secs {
@@ -156,9 +196,11 @@ fn main() {
             );
             std::process::exit(4);
         }
-        let seed = tui::Seed::from_targets(
+        let mut seed = tui::Seed::from_targets(
             &cli.names, &cli.pids, &cli.ports, &cli.files, &cli.containers,
         );
+        seed.events_log = cli.events_log.clone();
+        seed.replayed = replayed;
         if let Err(e) = tui::run(seed) {
             eprintln!("tui error: {}", e);
             std::process::exit(5);
@@ -176,7 +218,10 @@ fn main() {
             && cli.watch.is_none()
             && recent_secs.is_none();
         if interactive {
-            if let Err(e) = tui::run(tui::Seed::default()) {
+            let mut seed = tui::Seed::default();
+            seed.events_log = cli.events_log.clone();
+            seed.replayed = replayed;
+            if let Err(e) = tui::run(seed) {
                 eprintln!("tui error: {}", e);
                 std::process::exit(5);
             }
@@ -305,6 +350,42 @@ fn main() {
     let color = !no_color && std::io::stdout().is_terminal() && format != render::Format::Json;
 
     write_out(&render::render(&reports, format, color));
+
+    // --logs: tail the first match's logs; when the container's process
+    // isn't visible on this host (VM-backed runtime), fall back to the
+    // runtime-side container view the report carries
+    if let Some(n) = cli.logs {
+        let resolved = reports.iter().find_map(|r| {
+            if let Some(p) = r.matches.first() {
+                return Some((logs::LogSource::for_process(p), format!("pid {}", p.pid)));
+            }
+            r.container.as_ref().map(|c| (
+                logs::LogSource::Container { runtime: c.runtime.clone(), ref_: c.id.clone() },
+                format!("container {}", c.name),
+            ))
+        });
+        match resolved {
+            Some((src, what)) => {
+                write_out("");
+                write_out(&format!("== recent logs · {} ({what}) ==", src.describe()));
+                match logs::fetch(&src, n.max(1) as usize) {
+                    Ok(lines) if lines.is_empty() => {
+                        write_out("(no log entries found for this process)");
+                    }
+                    Ok(lines) => {
+                        for l in lines {
+                            write_out(&l);
+                        }
+                    }
+                    Err(e) => write_out(&format!("⚠ {e}")),
+                }
+            }
+            None => {
+                eprintln!("--logs: no matched process to fetch logs for");
+                std::process::exit(4);
+            }
+        }
+    }
 
     // exit codes mirror witr: 0 clean, 1 warnings, 2 not found, 3
     // permission, 4 invalid input (handled above), 5 internal error,

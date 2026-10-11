@@ -97,4 +97,25 @@ pub struct Cli {
         default_missing_value = "2"
     )]
     pub watch: Option<u64>,
+
+    /// Print the last N log lines (default 100) of the matched process:
+    /// container logs when attributed to one, else journald (Linux) or the
+    /// unified log (macOS).
+    #[arg(
+        long = "logs",
+        value_name = "N",
+        num_args = 0..=1,
+        default_missing_value = "100"
+    )]
+    pub logs: Option<u64>,
+
+    /// Append every TUI event (started/exited/restarted) as JSON lines to
+    /// this file — a durable record you can --replay later. TUI only.
+    #[arg(long = "events-log", value_name = "FILE")]
+    pub events_log: Option<String>,
+
+    /// Open the TUI on the Events tab replaying a recorded --events-log
+    /// file; live sampling continues on top of the imported history.
+    #[arg(long = "replay", value_name = "FILE")]
+    pub replay: Option<String>,
 }

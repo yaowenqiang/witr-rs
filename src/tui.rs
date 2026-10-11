@@ -188,6 +188,15 @@ struct TuiApp {
     /// newest-first to match the ring's natural order)
     event_sort: EventSort,
     event_sort_desc: bool,
+    /// Logs page ('l'): what we asked for, the fetched lines, scroll offset,
+    /// and the in-flight background fetch (log tools take seconds)
+    logs_for: Option<String>,
+    logs_lines: Vec<String>,
+    logs_scroll: u16,
+    logs_rx: Option<std::sync::mpsc::Receiver<std::result::Result<Vec<String>, String>>>,
+    /// --events-log sink: every event the sampler generates is appended as
+    /// one JSON line (single writer — the event loop thread)
+    events_log: Option<std::fs::File>,
     /// container enumeration runs on a background thread (a hung runtime
     /// CLI must not freeze the UI); results arrive via this channel
     containers_loading: bool,
@@ -210,6 +219,7 @@ enum Page {
     Detail,
     PortDetail,
     ContainerDetail,
+    Logs,
 }
 
 /// Locks-tab sort columns — keys p/n/t/m/f, matching the Go witr.
@@ -264,6 +274,11 @@ pub struct Seed {
     pub file: Option<String>,
     /// targets past the first of each type — the TUI shows one per type
     pub skipped: Vec<String>,
+    /// --events-log: append every sampled event as JSON lines to this file
+    pub events_log: Option<String>,
+    /// --replay: pre-recorded events (newest first) loaded into the ring
+    /// before the live sampler starts
+    pub replayed: Vec<crate::history::TuiEvent>,
 }
 
 impl Seed {
@@ -409,6 +424,11 @@ impl TuiApp {
             event_state: TableState::default(),
             event_sort: EventSort::Time,
             event_sort_desc: true,
+            logs_for: None,
+            logs_lines: Vec::new(),
+            logs_scroll: 0,
+            logs_rx: None,
+            events_log: None,
             containers_loading: false,
             containers_loaded: false,
             containers_rx: None,
@@ -452,6 +472,17 @@ impl TuiApp {
                 seed.skipped.join(", ")
             );
         }
+        if let Some(path) = &seed.events_log {
+            match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                Ok(f) => app.events_log = Some(f),
+                Err(e) => app.status = format!("--events-log {path}: {e}"),
+            }
+        }
+        if !seed.replayed.is_empty() {
+            app.hist.events = seed.replayed;
+            app.switch_tab(Tab::Events);
+            app.rebuild_event_view();
+        }
         app.update_details(); // cold start: no debounce for the first fill
         app
     }
@@ -490,7 +521,18 @@ impl TuiApp {
         if let Ok(mut p) = self.platform.list_processes() {
             crate::gpu::enrich(&mut p);
             self.procs = p;
-            self.hist.update(&self.procs);
+            let fresh = self.hist.update(&self.procs);
+            if !fresh.is_empty() {
+                if let Some(f) = self.events_log.as_mut() {
+                    use std::io::Write as _;
+                    for e in &fresh {
+                        if let Ok(json) = serde_json::to_string(e) {
+                            let _ = writeln!(f, "{json}");
+                        }
+                    }
+                    let _ = f.flush();
+                }
+            }
         }
         if self.tab == Tab::Ports {
             self.load_sockets();
@@ -543,6 +585,65 @@ impl TuiApp {
             self.containers_loaded = true;
             self.containers_rx = None;
             self.rebuild_container_view();
+        }
+    }
+
+    /// Open the Logs page for a resolved source, fetching in the background
+    /// (journalctl / log show / docker logs all take seconds).
+    fn open_logs(&mut self, src: crate::logs::LogSource) {
+        let header = src.describe();
+        self.logs_for = Some(header);
+        self.logs_lines.clear();
+        self.logs_scroll = 0;
+        self.page = Page::Logs;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.logs_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::logs::fetch(&src, 200));
+        });
+    }
+
+    /// Logs for whatever the process-detail cursor is on: the attribution's
+    /// container source (cgroup) wins when present, then the container
+    /// identity line, then the platform log system.
+    fn open_logs_for_detail(&mut self) {
+        let source = self.detail_report.as_ref().and_then(|r| {
+            if r.source.as_ref().is_some_and(|s| s.kind == "container") {
+                let s = r.source.as_ref().unwrap();
+                let runtime = s
+                    .detail
+                    .as_deref()
+                    .and_then(|d| d.strip_prefix("runtime: "))
+                    .unwrap_or("docker")
+                    .to_string();
+                let ref_ = s.label.clone().unwrap_or_default();
+                if !ref_.is_empty() {
+                    return Some(crate::logs::LogSource::Container { runtime, ref_ });
+                }
+            }
+            r.matches.first().map(crate::logs::LogSource::for_process)
+        });
+        match source {
+            Some(src) => self.open_logs(src),
+            None => self.status = "no process selected".into(),
+        }
+    }
+
+    /// Collect the pending logs fetch, if it finished.
+    fn poll_logs(&mut self) {
+        let Some(rx) = &self.logs_rx else { return };
+        let arrived = rx.try_recv().ok();
+        if let Some(res) = arrived {
+            self.logs_rx = None;
+            match res {
+                Ok(mut lines) => {
+                    if lines.is_empty() {
+                        lines.push("(no log entries found — the process may not log to this source)".into());
+                    }
+                    self.logs_lines = lines;
+                }
+                Err(e) => self.logs_lines = vec![format!("⚠ {e}")],
+            }
         }
     }
 
@@ -1136,6 +1237,7 @@ impl TuiApp {
             },
             Page::ContainerDetail if self.cd_pane_info => self.container_info_lines(),
             Page::ContainerDetail => self.container_proc_lines(),
+            Page::Logs => self.logs_lines.iter().map(|l| Line::from(l.clone())).collect(),
             Page::Browse => Vec::new(),
         };
         lines.iter().map(line_to_string).collect::<Vec<_>>().join("\n")
@@ -2209,7 +2311,7 @@ fn ui_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
     } else if app.env_search_mode {
         "Search env: Enter: apply — Esc: cancel".to_string()
     } else {
-        "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | z: Zoom | /: Search Env | a: Actions | Esc/q: Back | c: Copy"
+        "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | z: Zoom | /: Search Env | a: Actions | l: Logs | Esc/q: Back | c: Copy"
             .to_string()
     };
     if !app.status.is_empty() {
@@ -2454,7 +2556,73 @@ fn ui_container_detail_page(app: &mut TuiApp, f: &mut Frame<'_>) {
         p_inner,
     );
 
-    let mut footer = "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | Esc/q: Back | c: Copy".to_string();
+    let mut footer = "j/k/d/u/g/G/b-f: Scroll | Tab: Focus | l: Logs | Esc/q: Back | c: Copy".to_string();
+    if !app.status.is_empty() {
+        footer.push_str(&format!("  ·  {}", app.status));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(styled(Style::new().fg(MID), footer))),
+        v[3],
+    );
+}
+
+/// Full-page recent-logs view ('l' from the detail / events pages): header
+/// naming the source, the fetched lines (or a loading note), key hints.
+fn ui_logs_page(app: &mut TuiApp, f: &mut Frame<'_>) {
+    let outer = Block::bordered().border_style(Style::new().fg(GRAY));
+    f.render_widget(&outer, f.area());
+    let inner = outer.inner(f.area());
+    let v = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Length(1),
+        Constraint::Min(6),    // log lines
+        Constraint::Length(1), // footer
+    ])
+    .split(inner);
+
+    let title = app.logs_for.clone().unwrap_or_else(|| "Logs".into());
+    let header = Line::from(vec![
+        styled(Style::new().bg(PURPLE).fg(Color::White).bold(), " witr-rs "),
+        Span::raw("  "),
+        styled(Style::new().fg(ACCENT).bold(), format!("Recent Logs — {title}")),
+    ]);
+    f.render_widget(Paragraph::new(header), v[0]);
+
+    app.tab_rect = None;
+    app.table_rect = Some(v[2]);
+    app.detail_rect = Some(v[2]);
+
+    if app.logs_rx.is_some() {
+        placeholder(v[2], f, "  fetching logs… (journalctl / log show can take several seconds)");
+    } else {
+        let lines: Vec<Line<'static>> = app
+            .logs_lines
+            .iter()
+            .map(|l| {
+                if l.starts_with('⚠') {
+                    Line::from(styled(Style::new().fg(Color::Yellow), l.clone()))
+                } else {
+                    Line::from(l.clone())
+                }
+            })
+            .collect();
+        let count = lines.len() as u16;
+        let block = Block::bordered()
+            .title(Line::from(styled(
+                Style::new().fg(ACCENT).bold(),
+                format!("Logs{}", TuiApp::scroll_indicator(app.logs_scroll, count, v[2].height)),
+            )))
+            .border_style(Style::new().fg(GRAY));
+        let area = block.inner(v[2]);
+        f.render_widget(block, v[2]);
+        let scroll = app.logs_scroll.min(count.saturating_sub(1));
+        f.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+            area,
+        );
+    }
+
+    let mut footer = "j/k/d/u/g/G/b-f: Scroll | Esc/q: Back | c: Copy".to_string();
     if !app.status.is_empty() {
         footer.push_str(&format!("  ·  {}", app.status));
     }
@@ -2476,6 +2644,7 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
         Page::Detail => ui_detail_page(app, f),
         Page::PortDetail => ui_port_detail_page(app, f),
         Page::ContainerDetail => ui_container_detail_page(app, f),
+        Page::Logs => ui_logs_page(app, f),
         Page::Browse => {}
     }
     if app.page != Page::Browse {
@@ -2743,6 +2912,7 @@ fn focused_scroll_mut(app: &mut TuiApp) -> Option<&mut u16> {
         (Page::PortDetail, _, false, _) => Some(&mut app.port_owner_scroll),
         (Page::ContainerDetail, _, _, true) => Some(&mut app.cd_scroll),
         (Page::ContainerDetail, _, _, false) => Some(&mut app.cdp_scroll),
+        (Page::Logs, _, _, _) => Some(&mut app.logs_scroll),
         (Page::Browse, _, _, _) => None,
     }
 }
@@ -2874,7 +3044,7 @@ fn on_click(app: &mut TuiApp, x: u16, y: u16) {
                     Page::Detail => app.detail_pane = false,
                     Page::PortDetail => app.port_pane_conn = false,
                     Page::ContainerDetail => app.cd_pane_info = false,
-                    Page::Browse => {}
+                    _ => {}
                 }
                 return;
             }
@@ -2885,7 +3055,7 @@ fn on_click(app: &mut TuiApp, x: u16, y: u16) {
                     Page::Detail => app.detail_pane = true,
                     Page::PortDetail => app.port_pane_conn = true,
                     Page::ContainerDetail => app.cd_pane_info = true,
-                    Page::Browse => {}
+                    _ => {}
                 }
             }
         }
@@ -3055,7 +3225,22 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                 Page::Detail => app.detail_pane = !app.detail_pane,
                 Page::PortDetail => app.port_pane_conn = !app.port_pane_conn,
                 Page::ContainerDetail => app.cd_pane_info = !app.cd_pane_info,
-                Page::Browse => {}
+                _ => {}
+            }
+            return true;
+        }
+        // 'l': recent logs of the traced process (detail page / port owner)
+        if key == KeyCode::Char('l') && app.page == Page::Detail {
+            app.open_logs_for_detail();
+            return true;
+        }
+        if key == KeyCode::Char('l') && app.page == Page::ContainerDetail {
+            if let Some(c) = &app.container_detail {
+                let src = crate::logs::LogSource::Container {
+                    runtime: c.runtime.clone(),
+                    ref_: c.id.clone(),
+                };
+                app.open_logs(src);
             }
             return true;
         }
@@ -3368,6 +3553,29 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         }
 
         KeyCode::Enter => open_selection(app),
+        // Events rows: 'l' pulls recent logs for the event's process — the
+        // natural follow-up when the row says "restarted"
+        KeyCode::Char('l') if app.tab == Tab::Events && app.focus == Focus::Table => {
+            let ev = app
+                .event_state
+                .selected()
+                .and_then(|i| app.event_view.get(i))
+                .and_then(|&ei| app.hist.events.get(ei))
+                .cloned();
+            if let Some(ev) = ev {
+                match app.procs.iter().find(|p| p.pid == ev.pid) {
+                    Some(p) => app.open_logs(crate::logs::LogSource::for_process(p)),
+                    None => {
+                        let src = if app.platform.name() == "macos" {
+                            crate::logs::LogSource::UnifiedLog { name: ev.name }
+                        } else {
+                            crate::logs::LogSource::Journald { pid: ev.pid }
+                        };
+                        app.open_logs(src);
+                    }
+                }
+            }
+        }
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('x') => {
             if let Some(pid) = app.selected_pid() {
@@ -3423,6 +3631,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()>
             app.refresh();
         }
         app.poll_containers();
+        app.poll_logs();
         // selection debounce: recompute details 500ms after the cursor
         // stopped moving (mirrors selectionDebounce in the Go witr)
         if let Some(since) = app.detail_pending_since {
@@ -4286,6 +4495,8 @@ mod tests {
                 container: None,
                 file: None,
                 skipped: vec!["pid 99".into()],
+                events_log: None,
+                replayed: Vec::new(),
             },
         );
         // port seed wins the tab, filter prefilled, extras reported

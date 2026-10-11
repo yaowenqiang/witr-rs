@@ -33,10 +33,11 @@ Vim-style browsing (aligned with the Go witr):
 | `p` `n` `t` `m` `f` | Locks tab: sort by PID / process / type / mode / path |
 | `t` `e` `p` `n` | Events tab: sort by time / event / PID / process (time defaults newest-first; press again to flip direction) |
 | `a` | Ports tab: listening-only ↔ all socket states; Locks tab: locks ↔ all open files; Processes tab: actions bar (`k` kill / `t` term / `p` pause / `r` resume / `n` renice) |
+| `l` | Detail page / Events tab: pull the process's recent logs (container logs / journalctl / macOS unified log) into a full-screen scrollable Logs page |
 | `z` | Zoom: the focused pane temporarily fills the row (tmux-style) |
 | `x` | Kill the selected process (y/n confirm) |
 | `r` | Refresh now |
-| In detail pages | `j/k` scroll, `d/u` half page, `g/G` top/bottom, `b/f` page, `Tab` switch panes, `a` actions bar, `/` search env vars, `z` zoom, `c` copy pane text, `Esc/q` back |
+| In detail pages | `j/k` scroll, `d/u` half page, `g/G` top/bottom, `b/f` page, `Tab` switch panes, `a` actions bar, `l` recent logs, `/` search env vars, `z` zoom, `c` copy pane text, `Esc/q` back |
 | Mouse | Wheel scrolls the list / detail panes; click switches tabs, selects rows, focuses panes; double-click opens the detail |
 | `q` / `Esc` | Quit |
 
@@ -60,7 +61,9 @@ Details of the selected process refresh 500ms after the cursor stops moving (deb
 
 **Container health**: the Containers tab colors the state cell (healthy/running green, unhealthy red, restarting/starting yellow); the container detail page and `-c` targets show the `inspect` RestartCount (annotated "restart policy fired" when > 0).
 
-**`--export`**: `witr-rs --pid <N> --export` prints a paste-ready plain-text diagnostic report (including environment variable values, the open-files list, and the binary's sha256 + signature verdict).
+**Crash log correlation**: `l` on the detail page or the Events tab pulls the process's recent logs (container logs via `docker/podman/nerdctl logs`, `journalctl _PID=<pid>` on Linux, the unified log via `log show --predicate` on macOS) — after the Events tab flags a crash loop, `l` is where "why does it keep restarting" usually answers itself. Fetching runs on a background thread (`log show` can take seconds; the UI never freezes) and lands on a full-screen, scrollable Logs page. CLI twin: `witr-rs --pid 1234 --logs [N]` (100 lines by default).
+
+**Event persistence + replay**: `witr-rs --events-log events.jsonl` makes the TUI append every started/exited/restarted event the sampler produces as JSONL — the record survives the TUI, answering "what happened while I was away". `witr-rs --replay events.jsonl` reads it back and opens straight onto the Events tab (imported history + live sampling layered on top, original timestamps preserved).
 
 **Containers tab**: enumerates containers via runtime CLIs on PATH (docker / podman / nerdctl), showing Runtime / ID / State / Status / (Pod) / Image / Name, with the state cell colored by health; `/` filters by name/image/ID/runtime/state, `i/n/r/g/s` sorts. Enumeration runs on a background thread (a hung runtime CLI never freezes the UI) and auto-refreshes every 3s; refreshes keep the stale table visible so nothing flashes — the loading placeholder only shows on first load. **`Enter` opens the container detail page**: container attributes on the left (Name/Runtime/ID/Image/State/Status/Ports/Restarts), in-container process list on the right (matched via cgroups on Linux; on macOS/Windows container processes live in a VM and a note is shown).
 
@@ -130,6 +133,9 @@ witr-rs --port 8080 --watch 5 # re-trace this target every 5 seconds
 witr-rs --recent 5m           # only processes started within the last 5 minutes
 witr-rs nginx --warnings      # only the warnings
 witr-rs --pid 1234 --export   # paste-ready plain-text diagnostic report
+witr-rs --pid 1234 --logs 50  # the process's last 50 log lines (container/journal/unified log)
+witr-rs --events-log ev.jsonl # record TUI events to disk (JSONL, append)
+witr-rs --replay ev.jsonl     # replay a recording, opening on the Events tab
 witr-rs -i --port 8080        # TUI seeded to that port (-i, see above)
 witr-rs nginx --pid 1         # mix multiple targets (divided per target)
 NO_COLOR=1 witr-rs nginx      # disable colors (--no-color does the same)
@@ -185,6 +191,7 @@ src/
 ├── tui.rs          interactive UI (ratatui/crossterm): five tabs + detail panes + mouse + 3s auto-refresh
 ├── render.rs       standard / tree / short / json / env / warnings / export renderers
 ├── history.rs      sampling history: instantaneous cpu, sparklines, restart detection, event feed
+├── logs.rs         crash log correlation: container logs / journalctl / macOS unified log
 ├── risk.rs         0–10 risk scoring (temp-dir binary, curl|sh, injections, public peers, bad signatures …)
 ├── binary_id.rs    binary sha256 + code-signature verdict (codesign / Authenticode)
 ├── gpu.rs          nvidia-smi pmon sampling → per-process GPU column
@@ -200,11 +207,12 @@ src/
 
 Attribution priority: container > ssh session > interactive shell > service manager (systemd/launchd/SCM) > keep-alive supervisor (supervisord/runc etc., incl. cmdline token matching) > cron > init catch-all (pid 1 with no shell in between — system daemons). When the Linux `service_source` falls back to "init" the pipeline drops it and tries the generic detectors instead.
 
-## Known limitations (v0.4)
+## Known limitations (v0.5)
 
 - TUI Ports/Containers/detail pages are snapshots from when they opened — `r` refreshes manually
-- Windows process details rely on batched PowerShell queries (one call per target, 20s timeout guard)
-- The CPU% column is empty for Windows in the TUI (tasklist doesn't provide it)
+- Windows process details rely on batched PowerShell queries (one call per target, 20s timeout guard); the Windows CPU% column comes from `Get-Process` sampling deltas between refreshes (empty when PowerShell is unavailable)
+- Log correlation (`l` / `--logs`) covers container logs / Linux journald / the macOS unified log; Windows has no equivalent single log source yet
+- Event persistence (`--events-log`/`--replay`) is TUI-only (the sampler lives with the TUI); processes born and gone inside one 3s window are invisible
 - Container attribution is Linux-only (container processes behind colima/Docker Desktop on macOS are not attributed, though `-c` targets get a runtime-side fallback view)
 - Windows has `--file` (Restart Manager) but no Locks data
 - macOS `launchctl list` only covers the current user domain; system daemons need sudo to be labeled. macOS file locks are approximated from `lsof` flags — the kernel exports no lock table there
