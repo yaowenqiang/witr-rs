@@ -4,7 +4,8 @@ pub type Pid = i32;
 
 /// Everything we know about one process. Fields are optional because
 /// each platform fills in a different subset (and permissions limit more).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Process {
     pub pid: Pid,
     pub ppid: Option<Pid>,

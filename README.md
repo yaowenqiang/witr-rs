@@ -10,6 +10,16 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **Events 事件页（TUI）**：以 3 秒采样记录进程的 出现 / 退出 / 重启 事件流（保留最近 500 条），`/` 可按 事件类型/PID/进程名/详情 过滤，选中事件按 `Enter` 直接跳到对应进程的详情页（已退出则提示）。配合采样历史实现 **崩溃重启检测**：同一进程身份换新 pid 即记一次重启，`Rst` 列显示总次数，5 分钟内 ≥2 次时详情页黄色告警。
 
+**树形视图（`T`，Processes 页）**：一键把平铺进程表变成 父→子 树（`└─` 缩进嵌套，排序键决定同级顺序）；搜索时自动回退平铺视图，再按 `T` 切回。
+
+**CPU 历史大图（详情页）**：详情面板把最近约 10 分钟的瞬时 CPU 采样画成块字符图（按窗口峰值归一化）——突发负载和空闲段一眼可见。
+
+**磁盘 I/O 列（Linux）**：进程表新增 IO 列（由 `/proc/<pid>/io` 字节差分算出的每秒读写速率），详情页显示累计读写字节数与系统调用次数；macOS/Windows 无每进程 I/O 数据源，该列自动隐藏。
+
+**快照 diff（`--snap` / `--diff`）**：`witr-rs --snap before.json` 把整张进程表落成 JSON；之后 `witr-rs --diff before.json` 报告变化——**new**（新出现）、**gone**（消失）、**restarted**（同一程序身份换了新 pid 回来，与 TUI 崩溃重启检测同一套身份判定）、**changed**（同 pid 但命令行变了）。有变化时退出码 1，无变化 0，适合脚本。
+
+**跨重启跟踪（`--follow`）**：`witr-rs --pid 1234 --follow` 在目标死后继续追——进程表里重找同名同程序身份（name+exe+user），切到新 pid 继续溯源（隐含 `--watch`；身份连续 3 个刷新周期找不到才放弃）。多个同名实例并存时取最新启动的那个。
+
 **`--watch [秒]`**：常驻观察模式——带目标时每 N 秒重跑一次溯源管线并重绘（默认 2 秒），不带目标时刷新进程表；配合 `--recent`/`--json` 等原有选项工作，Ctrl-C 退出。
 
 **对端归因（TUI 详情页）**：进程的每条 ESTABLISHED 连接会反查对端套接字的属主，在详情页显示 `talking to: 进程名 (pid N) — k 条连接`；对端不在本机时显示远端地址。
@@ -32,6 +42,8 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | `i` `n` `r` `g` `s` | Containers 页按 ID / 名称 / 运行时 / 镜像 / 状态 排序 |
 | `p` `n` `t` `m` `f` | Locks 页按 PID / 进程 / 类型 / 模式 / 路径 排序 |
 | `t` `e` `p` `n` | Events 页按 时间 / 事件 / PID / 进程 排序（时间默认最新在前，重复按切换升降序） |
+| `T` | Processes 页：树形视图 ↔ 平铺表格（子进程嵌在父进程下；搜索时显示平铺） |
+| `F` | Logs 页（容器来源）：切换实时 `logs -f` 日志流 |
 | `a` | Ports 页：切换 仅监听 ↔ 全部状态；Locks 页：切换 锁 ↔ 全部打开文件；Processes 页：打开操作栏（`k` kill / `t` term / `p` 暂停 / `r` 恢复 / `n` renice） |
 | `l` | 详情页 / Events 页：拉取该进程最近的日志（容器日志 / journalctl / macOS 统一日志），全屏 Logs 页滚动查看 |
 | `z` | 缩放：聚焦面板临时占满整行（tmux 风格） |
@@ -61,7 +73,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **容器健康**：Containers 页状态列着色（healthy/running 绿、unhealthy 红、restarting/starting 黄）；容器详情页与 `-c` 目标输出 `inspect` 的 RestartCount（>0 时标注 "restart policy fired"）。
 
-**崩溃关联日志**：详情页与 Events 页按 `l` 拉取该进程最近的日志（容器走 `docker/podman/nerdctl logs`，Linux 走 `journalctl _PID=<pid>`，macOS 走统一日志 `log show --predicate`）——Events 页看到 crash loop 之后按 `l`，"它为什么一直重启"的答案通常就在最近这几行里。日志在后台线程获取（`log show` 可能要跑好几秒，界面不冻结），全屏 Logs 页滚动查看。CLI 同款：`witr-rs --pid 1234 --logs [N]`（默认 100 行）。
+**崩溃关联日志**：详情页与 Events 页按 `l` 拉取该进程最近的日志（容器走 `docker/podman/nerdctl logs`，Linux 走 `journalctl _PID=<pid>`，macOS 走统一日志 `log show --predicate`）——Events 页看到 crash loop 之后按 `l`，"它为什么一直重启"的答案通常就在最近这几行里。日志在后台线程获取（`log show` 可能要跑好几秒，界面不冻结），全屏 Logs 页滚动查看。容器来源的 Logs 页按 `F` 可切换**实时流**（`runtime logs -f`）：停在底部时自动跟随滚动，最多保留最近 500 行，离开页面或退出 TUI 时自动杀掉子进程。CLI 同款：`witr-rs --pid 1234 --logs [N]`（默认 100 行）。
 
 **事件持久化与回放**：`witr-rs --events-log events.jsonl` 让 TUI 把事件采样器产出的每条 started/exited/restarted 以 JSONL 追加落盘——TUI 关了记录还在，回答"我不在的这段时间发生了什么"。`witr-rs --replay events.jsonl` 读回文件、直接落在 Events 页（旧事件 + 实时采样继续叠加），时间列按原始时间戳显示。
 
@@ -84,6 +96,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | 容器归因 | cgroup（docker/containerd/podman/lxc） | ✗ | ✗ |
 | nohup/disown 检测 | ✓（`/proc/<pid>/status` SigIgn SIGHUP 位，计入告警） | ✗ | ✗ |
 | 环境变量（`--env` / TUI 详情页） | ✓ `/proc/<pid>/environ`（同用户） | ✓ 同用户进程走 `ps -E`（其余受 SIP 限制，面板会提示） | ✗ |
+| 每进程磁盘 I/O（TUI IO 列 + 详情累计值） | ✓ `/proc/<pid>/io`（字节差分 → 速率） | ✗ | ✗ |
 | 启动时间 | btime + starttime | `ps etime` | CIM CreationDate |
 
 跨平台可选增强（三端一致，缺依赖时静默跳过）：`nvidia-smi`（GPU 列）、`kubectl`（K8s Pod 归因）、`docker`/`podman`/`nerdctl`（Containers 页）。
@@ -92,7 +105,13 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/yaowenqiang/witr-rs/releases) 下载对应平台的压缩包（含 sha256 校验文件），解开即用。打 `v*` 标签时 CI 会自动构建全部平台：
+一行安装（macOS / Linux——自动下载对应平台的发行包、校验 sha256 并装到 `~/.local/bin`，可用 `WITR_INSTALL_DIR` 覆盖）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yaowenqiang/witr-rs/main/install.sh | sh
+```
+
+或从 [GitHub Releases](https://github.com/yaowenqiang/witr-rs/releases) 下载对应平台的压缩包（sha256 校验见 `sha256sums.txt`），解开即用。打 `v*` 标签时 CI 会自动构建全部平台：
 
 | 文件 | 平台 |
 |---|---|
@@ -136,9 +155,19 @@ witr-rs --pid 1234 --export   # 可直接贴 issue 的纯文本排查报告
 witr-rs --pid 1234 --logs 50  # 该进程最近 50 行日志（容器/journal/统一日志）
 witr-rs --events-log ev.jsonl # TUI 事件采样落盘（JSONL，追加写）
 witr-rs --replay ev.jsonl     # 回放事件记录，落在 Events 页
+witr-rs --snap before.json    # 进程表快照落盘（JSON）后退出
+witr-rs --diff before.json    # 对比快照：new / gone / restarted / changed（有变化退出码 1）
+witr-rs --pid 1234 --follow   # 跨重启跟踪目标（同程序换新 pid 继续追）
+witr-rs --completions zsh     # 输出 shell 补全脚本（bash|zsh|fish|powershell）
 witr-rs -i --port 8080        # 进 TUI 并直接落到该端口（-i 预置，见上）
 witr-rs nginx --pid 1         # 多目标混用（各目标间以分隔线输出）
 NO_COLOR=1 witr-rs nginx      # 禁用着色（--no-color 同理）
+```
+
+shell 补全（按所用 shell 选一条）：
+
+```bash
+witr-rs --completions bash >> ~/.bashrc      # zsh → ~/.zshrc；fish → ~/.config/fish/completions/witr-rs.fish
 ```
 
 ### 退出码
@@ -146,7 +175,7 @@ NO_COLOR=1 witr-rs nginx      # 禁用着色（--no-color 同理）
 | 码 | 含义 |
 |---|---|
 | 0 | 正常且无告警 |
-| 1 | 找到了，但有告警（root 运行、监听所有网卡、二进制已删除、LD_PRELOAD 等） |
+| 1 | 找到了，但有告警（root 运行、监听所有网卡、二进制已删除、LD_PRELOAD、僵尸进程等） |
 | 2 | 目标未找到 |
 | 3 | 权限不足（如需要 root 的查询） |
 | 4 | 参数无效 |
@@ -191,6 +220,7 @@ src/
 ├── tui.rs          交互界面（ratatui/crossterm）：五标签页 + 详情面板 + 鼠标 + 3s 自动刷新
 ├── render.rs       standard / tree / short / json / env / warnings / export 渲染
 ├── history.rs      采样历史：瞬时 CPU、sparkline、重启检测、Events 事件流
+├── snapshot.rs     --snap / --diff：全表快照与 new/gone/restarted/changed 对比
 ├── logs.rs         崩溃关联日志：容器日志 / journalctl / macOS 统一日志
 ├── risk.rs         0–10 风险评分（临时目录二进制、curl|sh、注入、公网对端、无效签名等）
 ├── binary_id.rs    二进制 sha256 + 代码签名结论（codesign / Authenticode）
@@ -206,12 +236,14 @@ src/
 
 归因优先级：容器 > ssh 会话 > 交互 shell > 服务管理器（systemd/launchd/SCM）> 保活 supervisor（supervisord/runc 等，含 cmdline 令牌匹配）> cron > init 兜底（pid 1 直启且链上无 shell，如系统 daemon）。Linux 的 service_source 返回 "init" 兜底时会被 pipeline 放弃，转而走通用归因。
 
-## v0.5 已知限制
+## v0.6 已知限制
 
 - TUI 的 Ports/Containers/详情页均为打开瞬间快照，`r` 手动刷新
 - Windows 进程详情依赖 PowerShell 批量查询（每个目标一次调用，20s 超时保护）；CPU% 列来自 `Get-Process` 采样的刷新间差值（PowerShell 不可用时该列回退为空）
-- 日志关联（`l` / `--logs`）覆盖 容器日志 / Linux journald / macOS 统一日志；Windows 暂无对应的单一日志源
+- 日志关联（`l` / `--logs`）覆盖 容器日志 / Linux journald / macOS 统一日志；Windows 暂无对应的单一日志源。实时流 `F` 仅容器来源（journald/统一日志未接 follow）；Windows 也无每进程 I/O，IO 列同样缺席
 - 事件持久化（`--events-log`/`--replay`）仅 TUI（采样器随 TUI 生灭），3 秒粒度内生灭的进程不可见
+- `--follow` 按程序身份（name+exe+user）匹配：同一程序并行跑多份时，重启可能落在"最新的兄弟实例"而非严格意义上的继任者
+- `--snap`/`--diff` 对比整张表——两次快照之间 pid 被无关进程复用时显示为 changed / new+gone，而非 restarted
 - 容器归因目前仅 Linux（macOS 上 colima/Docker Desktop 的容器进程未归因，但 `-c` 目标有运行时侧兜底视图）
 - Windows 有 `--file`（Restart Manager）但无 Locks 页数据
 - macOS `launchctl list` 只覆盖当前用户域，系统域 daemon 需要 sudo 才能标注；文件锁来自 `lsof` 标志近似，内核未导出锁表

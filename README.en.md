@@ -10,6 +10,16 @@ A Rust implementation of [pranshuparmar/witr](https://github.com/pranshuparmar/w
 
 **Events tab (TUI)**: a 3-second sampler records processes appearing, exiting and restarting (last 500 events kept); `/` filters by event type / PID / process / detail, and `Enter` on an event jumps to that process's detail page (with a notice if it has exited). Together with the sampling history this drives the **crash-loop detection**: the same process identity reappearing under a new pid counts as one restart; the `Rst` column shows the total, and ≥2 restarts within 5 minutes raise a yellow warning in the detail panes.
 
+**Tree view (`T`, Processes tab)**: flips the flat table into a parent→child tree (`└─` nesting, sort keys order the siblings); a live search falls back to the flat list. Press `T` again to go back.
+
+**CPU history chart (detail page)**: the detail panes draw the last ~10 minutes of instantaneous CPU samples as a block-char chart normalized to the window peak — bursts and idle phases visible at a glance, no configuration.
+
+**Disk I/O column (Linux)**: the process table gains an IO column (read+write bytes per refresh interval) computed from `/proc/<pid>/io` deltas; the detail page shows the cumulative read/write bytes and syscall counts. The column hides itself on macOS/Windows, which don't expose per-process I/O.
+
+**Snapshot diff (`--snap` / `--diff`)**: `witr-rs --snap before.json` writes the whole process table as JSON; later `witr-rs --diff before.json` reports what changed — **new** processes, **gone** ones, **restarted** (same program identity back under a new pid, like the TUI's crash-loop detector) and **changed** (same pid, different command line). Exit code 1 when anything changed, 0 otherwise — script-friendly.
+
+**Follow across restarts (`--follow`)**: `witr-rs --pid 1234 --follow` keeps tracing the target after it dies — when the pid exits, the process table is re-scanned for the same program identity (name+exe+user) and the trace continues under the new pid (implies `--watch`; gives up after the identity stays missing for 3 refreshes). Multi-instance ambiguity resolves to the most recently started match.
+
 **`--watch [seconds]`**: live mode — with targets it re-runs the trace pipeline and re-renders every N seconds (default 2); without targets it refreshes the process table. Composes with `--recent`/`--json` etc.; Ctrl-C exits.
 
 **Peer attribution (TUI detail page)**: each ESTABLISHED connection is reverse-matched against the peer socket's owner and the detail page shows `talking to: <process> (pid N) — k connection(s)`; when the peer lives elsewhere you get the remote address.
@@ -32,6 +42,8 @@ Vim-style browsing (aligned with the Go witr):
 | `i` `n` `r` `g` `s` | Containers tab: sort by ID / name / runtime / image / status |
 | `p` `n` `t` `m` `f` | Locks tab: sort by PID / process / type / mode / path |
 | `t` `e` `p` `n` | Events tab: sort by time / event / PID / process (time defaults newest-first; press again to flip direction) |
+| `T` | Processes tab: tree view ↔ flat table (children nest under their parent; a live search shows flat) |
+| `F` | Logs page (container source): toggle the live `logs -f` stream |
 | `a` | Ports tab: listening-only ↔ all socket states; Locks tab: locks ↔ all open files; Processes tab: actions bar (`k` kill / `t` term / `p` pause / `r` resume / `n` renice) |
 | `l` | Detail page / Events tab: pull the process's recent logs (container logs / journalctl / macOS unified log) into a full-screen scrollable Logs page |
 | `z` | Zoom: the focused pane temporarily fills the row (tmux-style) |
@@ -61,7 +73,7 @@ Details of the selected process refresh 500ms after the cursor stops moving (deb
 
 **Container health**: the Containers tab colors the state cell (healthy/running green, unhealthy red, restarting/starting yellow); the container detail page and `-c` targets show the `inspect` RestartCount (annotated "restart policy fired" when > 0).
 
-**Crash log correlation**: `l` on the detail page or the Events tab pulls the process's recent logs (container logs via `docker/podman/nerdctl logs`, `journalctl _PID=<pid>` on Linux, the unified log via `log show --predicate` on macOS) — after the Events tab flags a crash loop, `l` is where "why does it keep restarting" usually answers itself. Fetching runs on a background thread (`log show` can take seconds; the UI never freezes) and lands on a full-screen, scrollable Logs page. CLI twin: `witr-rs --pid 1234 --logs [N]` (100 lines by default).
+**Crash log correlation**: `l` on the detail page or the Events tab pulls the process's recent logs (container logs via `docker/podman/nerdctl logs`, `journalctl _PID=<pid>` on Linux, the unified log via `log show --predicate` on macOS) — after the Events tab flags a crash loop, `l` is where "why does it keep restarting" usually answers itself. Fetching runs on a background thread (`log show` can take seconds; the UI never freezes) and lands on a full-screen, scrollable Logs page. On a container source, `F` toggles a **live stream** (`runtime logs -f`) rendered into the same page — autoscrolling while you're at the bottom, capped at the last 500 lines, and the child CLI is killed when you leave the page or quit. CLI twin: `witr-rs --pid 1234 --logs [N]` (100 lines by default).
 
 **Event persistence + replay**: `witr-rs --events-log events.jsonl` makes the TUI append every started/exited/restarted event the sampler produces as JSONL — the record survives the TUI, answering "what happened while I was away". `witr-rs --replay events.jsonl` reads it back and opens straight onto the Events tab (imported history + live sampling layered on top, original timestamps preserved).
 
@@ -84,6 +96,7 @@ Details of the selected process refresh 500ms after the cursor stops moving (deb
 | Container attribution | cgroups (docker/containerd/podman/lxc) | ✗ | ✗ |
 | nohup/disown detection | ✓ (SIGHUP bit of `/proc/<pid>/status` SigIgn, surfaced as a warning) | ✗ | ✗ |
 | Environment variables (`--env` / TUI detail page) | ✓ `/proc/<pid>/environ` (same user) | ✓ same-user processes via `ps -E` (the rest are SIP-limited; the pane says so) | ✗ |
+| Per-process disk I/O (TUI IO column + detail totals) | ✓ `/proc/<pid>/io` (byte deltas → rate) | ✗ | ✗ |
 | Start time | btime + starttime | `ps etime` | CIM CreationDate |
 
 Optional cross-platform extras (identical on all three; silently skipped when the dependency is missing): `nvidia-smi` (GPU column), `kubectl` (K8s pod attribution), `docker`/`podman`/`nerdctl` (Containers tab).
@@ -92,7 +105,13 @@ External commands required: Linux — none strictly (systemctl/docker optional);
 
 ## Install
 
-Grab the archive for your platform from [GitHub Releases](https://github.com/yaowenqiang/witr-rs/releases) (sha256 checksum files included). Pushing a `v*` tag makes CI build every target automatically:
+One-liner (macOS / Linux — downloads the release archive for your platform, verifies its sha256 and installs to `~/.local/bin`, override with `WITR_INSTALL_DIR`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yaowenqiang/witr-rs/main/install.sh | sh
+```
+
+Or grab the archive for your platform from [GitHub Releases](https://github.com/yaowenqiang/witr-rs/releases) (sha256 checksums in `sha256sums.txt`). Pushing a `v*` tag makes CI build every target automatically:
 
 | File | Platform |
 |---|---|
@@ -136,9 +155,19 @@ witr-rs --pid 1234 --export   # paste-ready plain-text diagnostic report
 witr-rs --pid 1234 --logs 50  # the process's last 50 log lines (container/journal/unified log)
 witr-rs --events-log ev.jsonl # record TUI events to disk (JSONL, append)
 witr-rs --replay ev.jsonl     # replay a recording, opening on the Events tab
+witr-rs --snap before.json    # write the process table as JSON and exit
+witr-rs --diff before.json    # new / gone / restarted / changed vs a snapshot (exit 1 on change)
+witr-rs --pid 1234 --follow   # keep tracing across restarts (new pid, same program)
+witr-rs --completions zsh     # shell completion script (bash|zsh|fish|powershell)
 witr-rs -i --port 8080        # TUI seeded to that port (-i, see above)
 witr-rs nginx --pid 1         # mix multiple targets (divided per target)
 NO_COLOR=1 witr-rs nginx      # disable colors (--no-color does the same)
+```
+
+Shell completions (pick your shell):
+
+```bash
+witr-rs --completions bash >> ~/.bashrc      # or zsh → ~/.zshrc, fish → ~/.config/fish/completions/witr-rs.fish
 ```
 
 ### Exit codes
@@ -146,7 +175,7 @@ NO_COLOR=1 witr-rs nginx      # disable colors (--no-color does the same)
 | Code | Meaning |
 |---|---|
 | 0 | OK, no warnings |
-| 1 | Found, but with warnings (running as root, listening on all interfaces, deleted binary, LD_PRELOAD, …) |
+| 1 | Found, but with warnings (running as root, listening on all interfaces, deleted binary, LD_PRELOAD, zombie, …) |
 | 2 | Target not found |
 | 3 | Not enough permissions (e.g. a root-only query) |
 | 4 | Invalid arguments |
@@ -191,6 +220,7 @@ src/
 ├── tui.rs          interactive UI (ratatui/crossterm): five tabs + detail panes + mouse + 3s auto-refresh
 ├── render.rs       standard / tree / short / json / env / warnings / export renderers
 ├── history.rs      sampling history: instantaneous cpu, sparklines, restart detection, event feed
+├── snapshot.rs     --snap / --diff: full-table snapshots + new/gone/restarted/changed comparison
 ├── logs.rs         crash log correlation: container logs / journalctl / macOS unified log
 ├── risk.rs         0–10 risk scoring (temp-dir binary, curl|sh, injections, public peers, bad signatures …)
 ├── binary_id.rs    binary sha256 + code-signature verdict (codesign / Authenticode)
@@ -207,12 +237,14 @@ src/
 
 Attribution priority: container > ssh session > interactive shell > service manager (systemd/launchd/SCM) > keep-alive supervisor (supervisord/runc etc., incl. cmdline token matching) > cron > init catch-all (pid 1 with no shell in between — system daemons). When the Linux `service_source` falls back to "init" the pipeline drops it and tries the generic detectors instead.
 
-## Known limitations (v0.5)
+## Known limitations (v0.6)
 
 - TUI Ports/Containers/detail pages are snapshots from when they opened — `r` refreshes manually
 - Windows process details rely on batched PowerShell queries (one call per target, 20s timeout guard); the Windows CPU% column comes from `Get-Process` sampling deltas between refreshes (empty when PowerShell is unavailable)
-- Log correlation (`l` / `--logs`) covers container logs / Linux journald / the macOS unified log; Windows has no equivalent single log source yet
+- Log correlation (`l` / `--logs`) covers container logs / Linux journald / the macOS unified log; Windows has no equivalent single log source yet. The live `F` stream is container-only (journald/unified log have no follow wired up); Windows keeps no per-process I/O either, so no IO column there
 - Event persistence (`--events-log`/`--replay`) is TUI-only (the sampler lives with the TUI); processes born and gone inside one 3s window are invisible
+- `--follow` matches by program identity (name+exe+user): a restart of a script that runs under several parallel instances may attach to a sibling rather than "the" successor (the most recently started instance wins)
+- `--snap`/`--diff` compare full tables — between two snaps, a restart of a program with no pid change (impossible) or a pid that was recycled by an unrelated process shows as `changed`/`new`+`gone` rather than `restarted`
 - Container attribution is Linux-only (container processes behind colima/Docker Desktop on macOS are not attributed, though `-c` targets get a runtime-side fallback view)
 - Windows has `--file` (Restart Manager) but no Locks data
 - macOS `launchctl list` only covers the current user domain; system daemons need sudo to be labeled. macOS file locks are approximated from `lsof` flags — the kernel exports no lock table there

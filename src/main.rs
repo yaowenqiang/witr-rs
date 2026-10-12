@@ -10,6 +10,7 @@ mod pipeline;
 mod platform;
 mod render;
 mod risk;
+mod snapshot;
 mod tui;
 mod util;
 
@@ -17,7 +18,7 @@ use clap::Parser as _;
 use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
-use model::{Process, TargetReport, TargetSpec};
+use model::{Pid, Process, TargetReport, TargetSpec};
 
 /// Print and ignore write errors — a closed pipe (`| head`) must not panic.
 fn write_out(s: &str) {
@@ -89,6 +90,82 @@ fn format_for(cli: &cli::Cli) -> render::Format {
     }
 }
 
+/// --follow bookkeeping: the pid currently traced, its program identity
+/// (name+exe+user hash, learned from the first successful trace), how
+/// many consecutive refreshes the identity has been missing, and the
+/// last move note (kept sticky so each re-render shows it).
+#[derive(Default)]
+struct FollowState {
+    pid: Pid,
+    identity: Option<u64>,
+    missing: u32,
+    note: Option<String>,
+}
+
+enum FollowStep {
+    None,
+    /// The identity came back under a new pid (note text explains).
+    Moved(Pid, String),
+    /// Identity missing for 3 consecutive refreshes — give up.
+    Gone,
+}
+
+/// One --follow iteration: learn the identity from a successful trace,
+/// rescan the process table when the pid vanished, move the spec to the
+/// new pid or count down to giving up.
+fn follow_step(
+    reports: &[TargetReport],
+    st: &mut FollowState,
+    live_specs: &mut Vec<TargetSpec>,
+    platform: &dyn platform::Platform,
+) -> FollowStep {
+    let Some(r) = reports.first() else { return FollowStep::None };
+    if r.found {
+        if let Some(m) = r.matches.first() {
+            st.pid = m.pid;
+            st.identity = Some(snapshot::identity(m));
+            st.missing = 0;
+        }
+        return FollowStep::None;
+    }
+    // the traced pid is gone this pass
+    st.missing += 1;
+    let Some(want) = st.identity else { return FollowStep::None };
+    let Ok(procs) = platform.list_processes() else { return FollowStep::None };
+    // identity matches can be ambiguous when the same program runs in
+    // several instances — prefer the most recently started one, which is
+    // the restart rather than an older sibling
+    let mut best: Option<&Process> = None;
+    for p in procs.iter().filter(|p| p.pid != st.pid && snapshot::identity(p) == want) {
+        let take = match best {
+            None => true,
+            Some(b) => match (p.started, b.started) {
+                (Some(s), Some(bs)) => s > bs,
+                (Some(_), None) => true,
+                (None, _) => false,
+            },
+        };
+        if take {
+            best = Some(p);
+        }
+    }
+    if let Some(nu) = best {
+        let old = st.pid;
+        st.pid = nu.pid;
+        st.missing = 0;
+        st.note = Some(format!(
+            "pid {} exited — same program continues as pid {} ({})",
+            old, nu.pid, nu.name
+        ));
+        *live_specs = vec![TargetSpec::Pid { pid: nu.pid }];
+        return FollowStep::Moved(old, st.note.clone().unwrap_or_default());
+    }
+    if st.missing >= 3 {
+        return FollowStep::Gone;
+    }
+    FollowStep::None
+}
+
 fn main() {
     let cli = match cli::Cli::try_parse() {
         Ok(c) => c,
@@ -99,6 +176,26 @@ fn main() {
         }
     };
     let no_color = cli.no_color || std::env::var_os("NO_COLOR").is_some();
+
+    // --completions: emit the shell script and exit (before anything else —
+    // it must work everywhere, including without a process table)
+    if let Some(shell) = cli.completions {
+        use clap::CommandFactory as _;
+        use clap_complete::Shell as CompShell;
+        let comp = match shell {
+            cli::Shell::Bash => CompShell::Bash,
+            cli::Shell::Zsh => CompShell::Zsh,
+            cli::Shell::Fish => CompShell::Fish,
+            cli::Shell::PowerShell => CompShell::PowerShell,
+        };
+        clap_complete::generate(
+            comp,
+            &mut cli::Cli::command(),
+            "witr-rs",
+            &mut std::io::stdout(),
+        );
+        std::process::exit(0);
+    }
 
     // --recent: parse the window up front and keep it a listing-only filter
     let recent_secs = match &cli.recent {
@@ -134,6 +231,10 @@ fn main() {
     }
     if recent_secs.is_some() && !specs.is_empty() {
         eprintln!("--recent filters the process listing and cannot be combined with targets");
+        std::process::exit(4);
+    }
+    if cli.follow && !matches!(specs.as_slice(), [TargetSpec::Pid { .. }]) {
+        eprintln!("--follow tracks one pid across restarts: use exactly one --pid target");
         std::process::exit(4);
     }
 
@@ -175,6 +276,60 @@ fn main() {
         }
         None => Vec::new(),
     };
+
+    // --snap / --diff: whole-process-table snapshots, listing operations —
+    // incompatible with targets and the TUI.
+    if cli.snap.is_some() || cli.diff.is_some() {
+        if cli.snap.is_some() && cli.diff.is_some() {
+            eprintln!("--snap and --diff are separate operations; use one at a time");
+            std::process::exit(4);
+        }
+        if !specs.is_empty() || cli.interactive {
+            eprintln!("--snap/--diff snapshot the whole process table; drop the targets or -i");
+            std::process::exit(4);
+        }
+        let platform = platform::get();
+        let mut procs = match platform.list_processes() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cannot list processes: {}", e);
+                std::process::exit(5);
+            }
+        };
+        gpu::enrich(&mut procs);
+        if let Some(path) = &cli.snap {
+            if let Err(e) = snapshot::save(path, &procs) {
+                eprintln!("--snap {path}: {e}");
+                std::process::exit(5);
+            }
+            write_out(&format!("snapshot: {} processes → {}", procs.len(), path));
+            std::process::exit(0);
+        }
+        let path = cli.diff.as_deref().unwrap_or_default();
+        let old = match snapshot::load(path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("--diff {path}: {e}");
+                std::process::exit(4);
+            }
+        };
+        let entries = snapshot::diff(&old, &procs);
+        if cli.json {
+            write_out(&serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".into()));
+        } else {
+            write_out(&format!(
+                "diff vs {} · {} new / {} gone / {} restarted / {} changed",
+                path,
+                entries.iter().filter(|e| e.kind == "new").count(),
+                entries.iter().filter(|e| e.kind == "gone").count(),
+                entries.iter().filter(|e| e.kind == "restarted").count(),
+                entries.iter().filter(|e| e.kind == "changed").count(),
+            ));
+            write_out(&snapshot::render(&entries));
+        }
+        // script-friendly: 0 = no changes, 1 = something changed
+        std::process::exit(i32::from(!entries.is_empty()));
+    }
 
     // Keep the recent processes only (listing mode + --watch).
     let recent_only = |procs: Vec<Process>| -> Vec<Process> {
@@ -309,19 +464,41 @@ fn main() {
     };
 
     // --watch with targets: re-run the pipeline and re-render every N
-    // seconds until Ctrl-C.
-    if let Some(secs) = cli.watch {
+    // seconds until Ctrl-C. With --follow the pid spec is re-acquired
+    // across restarts (same name+exe+user identity under a new pid).
+    let watch_secs = cli.watch.or_else(|| cli.follow.then_some(2));
+    if let Some(secs) = watch_secs {
         let interval = secs.max(1);
         let color = !no_color && std::io::stdout().is_terminal() && !cli.json;
+        let mut live_specs = specs.clone();
+        let mut follow = FollowState::default();
         loop {
-            let reports = pipeline::run(platform.as_ref(), specs.clone(), &opts);
+            let reports = pipeline::run(platform.as_ref(), live_specs.clone(), &opts);
             write_out("\x1b[2J\x1b[1;1H");
             let now = util::fmt_time(util::now_unix());
+            let mode = if cli.follow { " · follow" } else { "" };
             write_out(&format!(
-                "witr-rs watch · every {}s · {} · Ctrl-C to stop",
+                "witr-rs watch{mode} · every {}s · {} · Ctrl-C to stop",
                 interval, now
             ));
             write_out(&render::render(&reports, format_for(&cli), color));
+            if cli.follow {
+                match follow_step(&reports, &mut follow, &mut live_specs, platform.as_ref()) {
+                    FollowStep::None => {}
+                    FollowStep::Moved(pid, note) => {
+                        write_out(&format!("↻ pid {} — {}", pid, note));
+                    }
+                    FollowStep::Gone => {
+                        write_out("target gone and its program (name+exe+user) not seen again — stopping");
+                        std::process::exit(2);
+                    }
+                }
+                // the ↻ note would be wiped by the next re-render — repeat
+                // it under the header so it stays visible
+                if let Some(note) = &follow.note {
+                    write_out(&format!("↻ following restart: {note}"));
+                }
+            }
             std::thread::sleep(Duration::from_secs(interval));
         }
     }

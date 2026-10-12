@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -295,6 +296,19 @@ pub fn strip_deleted_suffix(p: &str) -> (&str, bool) {
 
 pub fn basename(p: &str) -> String {
     p.rsplit('/').next().unwrap_or(p).to_string()
+}
+
+/// Stable program identity across restarts: (name, basename(exe), user).
+/// exe is reduced to its basename because listings and detail views report
+/// it differently (ps comm gives "sleep", lsof gives "/bin/sleep") — a
+/// restart must not look like a different program just because one view
+/// resolved the path.
+pub fn identity(p: &crate::model::Process) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.name.hash(&mut h);
+    p.exe.as_deref().map(basename).hash(&mut h);
+    p.user.hash(&mut h);
+    h.finish()
 }
 
 /// "1.2.3.4:80", "[::]:443", "*:22" → (addr, port)

@@ -1,4 +1,13 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// Shell for `--completions`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum Shell {
+    Bash,
+    Zsh,
+    Fish,
+    PowerShell,
+}
 
 /// Why is this running? — trace processes, ports and files back to what
 /// started them. A Rust rewrite inspired by pranshuparmar/witr.
@@ -118,4 +127,27 @@ pub struct Cli {
     /// file; live sampling continues on top of the imported history.
     #[arg(long = "replay", value_name = "FILE")]
     pub replay: Option<String>,
+
+    /// Write every visible process as JSON to this file and exit — a
+    /// snapshot to --diff against later.
+    #[arg(long = "snap", value_name = "FILE")]
+    pub snap: Option<String>,
+
+    /// Compare the current process table against a --snap file: new /
+    /// gone / restarted (same program, new pid) / changed (cmdline).
+    #[arg(long = "diff", value_name = "FILE")]
+    pub diff: Option<String>,
+
+    /// With one --pid target: when the traced pid exits, keep going —
+    /// re-acquire the same program (name+exe+user) under its new pid.
+    /// Implies --watch; stops once the identity stays gone for 3
+    /// consecutive refreshes.
+    #[arg(short = 'o', long = "follow")]
+    pub follow: bool,
+
+    /// Print the shell completion script for the given shell and exit:
+    /// source it from your rc file, e.g.
+    /// `witr-rs --completions zsh >> ~/.zshrc`
+    #[arg(long = "completions", value_name = "SHELL")]
+    pub completions: Option<Shell>,
 }

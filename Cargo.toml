@@ -1,12 +1,13 @@
 [package]
 name = "witr-rs"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Why is this running? — trace processes, ports and files back to what started them (Rust, inspired by pranshuparmar/witr)"
 license = "Apache-2.0"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 crossterm = "0.28"
 glob = "0.3"
 ratatui = "0.29"

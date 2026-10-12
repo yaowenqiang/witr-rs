@@ -64,6 +64,7 @@ impl Tab {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+#[derive(Debug)]
 enum SortKey {
     Pid,
     Name,
@@ -89,6 +90,11 @@ struct TuiApp {
     locks_supported: bool,
     /// indices into `procs` after filter + sort
     view: Vec<usize>,
+    /// parallel to `view`: DFS depth of each row in tree mode ('T');
+    /// empty in flat mode or while a search filter is active
+    view_depth: Vec<usize>,
+    /// Processes-tab tree mode: children nest under their parent
+    tree_mode: bool,
     sort_key: SortKey,
     sort_desc: bool,
     search: String,
@@ -194,6 +200,14 @@ struct TuiApp {
     logs_lines: Vec<String>,
     logs_scroll: u16,
     logs_rx: Option<std::sync::mpsc::Receiver<std::result::Result<Vec<String>, String>>>,
+    /// what the Logs page was opened on — 'F' follow needs the container
+    logs_src: Option<crate::logs::LogSource>,
+    /// live `runtime logs -f` stream: line receiver + child to kill
+    follow_rx: Option<std::sync::mpsc::Receiver<String>>,
+    follow_child: Option<std::process::Child>,
+    /// follow autoscroll: pane height + line count at the previous poll
+    logs_pane_h: u16,
+    follow_prev_len: usize,
     /// --events-log sink: every event the sampler generates is appended as
     /// one JSON line (single writer — the event loop thread)
     events_log: Option<std::fs::File>,
@@ -352,6 +366,14 @@ impl Tab {
     }
 }
 
+/// Quitting the TUI kills a running `logs -f` child so the runtime CLI
+/// doesn't outlive the UI.
+impl Drop for TuiApp {
+    fn drop(&mut self) {
+        self.stop_logs_follow();
+    }
+}
+
 impl TuiApp {
     fn new(platform: Box<dyn Platform>, seed: Seed) -> Self {
         let locks_supported = matches!(platform.name(), "linux" | "macos");
@@ -368,6 +390,8 @@ impl TuiApp {
             lock_sort_desc: false,
             locks_total: 0,
             view: Vec::new(),
+            view_depth: Vec::new(),
+            tree_mode: false,
             sort_key: SortKey::Mem,
             sort_desc: true,
             search: String::new(),
@@ -428,6 +452,11 @@ impl TuiApp {
             logs_lines: Vec::new(),
             logs_scroll: 0,
             logs_rx: None,
+            logs_src: None,
+            follow_rx: None,
+            follow_child: None,
+            logs_pane_h: 0,
+            follow_prev_len: 0,
             events_log: None,
             containers_loading: false,
             containers_loaded: false,
@@ -593,6 +622,7 @@ impl TuiApp {
     fn open_logs(&mut self, src: crate::logs::LogSource) {
         let header = src.describe();
         self.logs_for = Some(header);
+        self.logs_src = Some(src.clone());
         self.logs_lines.clear();
         self.logs_scroll = 0;
         self.page = Page::Logs;
@@ -644,6 +674,104 @@ impl TuiApp {
                 }
                 Err(e) => self.logs_lines = vec![format!("⚠ {e}")],
             }
+        }
+    }
+
+    /// 'F' on the Logs page: stream the container's logs live (`runtime
+    /// logs -f`). Toggles — pressing F again (or leaving the page) stops
+    /// the stream and kills the child runtime CLI.
+    fn toggle_logs_follow(&mut self) {
+        if self.follow_child.is_some() {
+            self.stop_logs_follow();
+            self.status = "follow stopped".into();
+            return;
+        }
+        let Some(src) = self.logs_src.clone() else {
+            self.status = "no log source for this view".into();
+            return;
+        };
+        // only container sources stream; journald/unified log have no -f
+        // equivalent wired up here
+        let crate::logs::LogSource::Container { runtime, ref_ } = src else {
+            self.status = "live follow works for container logs only".into();
+            return;
+        };
+        if self.logs_rx.is_some() {
+            self.status = "still fetching the initial tail… try again in a moment".into();
+            return;
+        }
+        match std::process::Command::new(&runtime)
+            .args(["logs", "-f", "--tail", "100", &ref_])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                self.logs_lines.clear();
+                self.logs_scroll = 0;
+                self.follow_prev_len = 0;
+                let (tx, rx) = std::sync::mpsc::channel();
+                // both pipes carry container output (the runtime CLI writes
+                // the container's stderr down its own)
+                let streams: Vec<Box<dyn std::io::Read + Send>> = [
+                    child.stdout.take().map(|s| Box::new(s) as _),
+                    child.stderr.take().map(|s| Box::new(s) as _),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                for stream in streams {
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        use std::io::BufRead as _;
+                        let reader = std::io::BufReader::new(stream);
+                        for line in reader.lines().map_while(Result::ok) {
+                            if tx.send(line).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+                self.follow_rx = Some(rx);
+                self.follow_child = Some(child);
+                self.status = format!("following {runtime} logs — F/Esc to stop");
+            }
+            Err(e) => self.status = format!("follow: {e}"),
+        }
+    }
+
+    /// Kill the streaming child (page exit, toggle off, TUI shutdown).
+    fn stop_logs_follow(&mut self) {
+        if let Some(mut child) = self.follow_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.follow_rx = None;
+    }
+
+    /// Drain new lines from the live stream into the view (capped), pinning
+    /// the scroll to the bottom while the user is already near it.
+    fn poll_follow_logs(&mut self) {
+        let Some(rx) = &self.follow_rx else { return };
+        const FOLLOW_CAP: usize = 500;
+        let prev_count = self.follow_prev_len;
+        let mut got = false;
+        while let Ok(line) = rx.try_recv() {
+            self.logs_lines.push(line);
+            got = true;
+        }
+        if self.logs_lines.len() > FOLLOW_CAP {
+            let excess = self.logs_lines.len() - FOLLOW_CAP;
+            self.logs_lines.drain(0..excess);
+        }
+        if got {
+            let count = self.logs_lines.len() as u16;
+            let h = self.logs_pane_h.max(1);
+            // was the viewport at (or within a few lines of) the bottom?
+            if self.logs_scroll + h + 3 >= prev_count as u16 {
+                self.logs_scroll = count.saturating_sub(h);
+            }
+            self.follow_prev_len = self.logs_lines.len();
         }
     }
 
@@ -879,7 +1007,17 @@ impl TuiApp {
             };
             if desc { ord.reverse() } else { ord }
         });
-        self.view = idx;
+        // tree mode ('T'): re-order the sorted indices depth-first so
+        // children sit directly under their parent; a live search keeps the
+        // flat order (an arbitrary subset has no meaningful tree shape)
+        if self.tree_mode && needle.is_empty() {
+            let (order, depth) = tree_order(procs, &idx);
+            self.view = order;
+            self.view_depth = depth;
+        } else {
+            self.view = idx;
+            self.view_depth.clear();
+        }
         if self.view.is_empty() {
             self.table_state.select(None);
         } else {
@@ -1471,6 +1609,27 @@ fn fmt_mem(kb: Option<u64>) -> String {
     }
 }
 
+/// Byte count with a K/M/G suffix ("45M", "1.2G"); plain bytes below 1K.
+fn fmt_bytes(b: u64) -> String {
+    if b >= 1024 * 1024 * 1024 {
+        format!("{:.1}G", b as f64 / 1024.0 / 1024.0 / 1024.0)
+    } else if b >= 1024 * 1024 {
+        format!("{:.1}M", b as f64 / 1024.0 / 1024.0)
+    } else if b >= 1024 {
+        format!("{:.0}K", b as f64 / 1024.0)
+    } else {
+        format!("{b}B")
+    }
+}
+
+/// Per-second rate ("12K/s") for the IO column (read+write combined).
+fn fmt_rate(bps: f64) -> String {
+    if bps < 0.5 {
+        return "0B/s".into();
+    }
+    format!("{}/s", fmt_bytes(bps as u64))
+}
+
 fn fmt_age_short(started: Option<i64>) -> String {
     match started {
         None => "-".into(),
@@ -1553,6 +1712,54 @@ fn push_peer_lines(
     }
 }
 
+/// Tree-mode ordering for the Processes tab: DFS over the ppid relation,
+/// siblings kept in the caller's (sorted) order. Roots are rows whose
+/// parent isn't in the table; cycles are cut by visiting each row once.
+/// Returns row indices in display order with their depth (0 = root).
+fn tree_order(procs: &[Process], sorted: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let pids: std::collections::HashSet<Pid> = sorted.iter().map(|&i| procs[i].pid).collect();
+    let mut children: HashMap<Pid, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for &i in sorted {
+        match procs[i].ppid {
+            Some(pp) if pids.contains(&pp) && pp != procs[i].pid => {
+                children.entry(pp).or_default().push(i)
+            }
+            _ => roots.push(i),
+        }
+    }
+    let mut order = Vec::with_capacity(sorted.len());
+    let mut depth = Vec::with_capacity(sorted.len());
+    // explicit stack of (index, depth); pushed reversed so the first
+    // sibling ends up on top
+    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|&i| (i, 0)).collect();
+    let mut seen: std::collections::HashSet<Pid> = std::collections::HashSet::new();
+    while let Some((i, d)) = stack.pop() {
+        if !seen.insert(procs[i].pid) {
+            continue;
+        }
+        order.push(i);
+        depth.push(d);
+        if let Some(kids) = children.get(&procs[i].pid) {
+            for &k in kids.iter().rev() {
+                stack.push((k, d + 1));
+            }
+        }
+    }
+    // ppid cycles (or any row unreachable from a root) would be dropped by
+    // the DFS — append them so the table never loses rows
+    if order.len() < sorted.len() {
+        let placed: std::collections::HashSet<usize> = order.iter().copied().collect();
+        for &i in sorted {
+            if !placed.contains(&i) {
+                order.push(i);
+                depth.push(0);
+            }
+        }
+    }
+    (order, depth)
+}
+
 fn push_history_lines(lines: &mut Vec<Line<'static>>, hist: &crate::history::History, pid: Pid) {
     if let Some(n) = hist.recent_restarts(pid) {
         if n >= 2 {
@@ -1567,6 +1774,16 @@ fn push_history_lines(lines: &mut Vec<Line<'static>>, hist: &crate::history::His
         lines.push(Line::from(styled(
             Style::new().fg(MID),
             format!("total {total} restarts since TUI start"),
+        )));
+    }
+    // CPU history over the last ~10 min of TUI samples (needs 2+ samples,
+    // so a freshly opened TUI stays quiet until the second refresh)
+    if let Some(chart) = hist.cpu_chart(pid, 80) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("CPU history:", Style::new().bold())));
+        lines.push(Line::from(Span::styled(
+            format!("  {chart}"),
+            Style::new().fg(GREEN),
         )));
     }
 }
@@ -1888,8 +2105,10 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
     };
     let (k, d) = (app.sort_key, app.sort_desc);
     // GPU column only when the host actually reports NVIDIA usage — it
-    // would be dead width everywhere else.
+    // would be dead width everywhere else. Same idea for IO (Linux fills
+    // the cumulative counters; macOS/Windows never do).
     let has_gpu = app.procs.iter().any(crate::gpu::has_gpu_data);
+    let has_io = app.procs.iter().any(|p| p.io_read_bytes.is_some() || p.io_write_bytes.is_some());
     let mut header: Vec<Cell> = vec![
         Cell::from(format!("PID{}", arrow(k, SortKey::Pid, d))),
         Cell::from(format!("User{}", arrow(k, SortKey::User, d))),
@@ -1906,6 +2125,10 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
         Constraint::Length(8),
         Constraint::Length(8),
     ];
+    if has_io {
+        header.push(Cell::from("IO"));
+        widths.push(Constraint::Length(8));
+    }
     if has_gpu {
         header.push(Cell::from("GPU"));
         widths.push(Constraint::Length(9));
@@ -1916,21 +2139,42 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
     widths.push(Constraint::Length(9));
     let header = Row::new(header).style(Style::new().fg(ACCENT).bold());
 
+    let tree = app.tree_mode && !app.view_depth.is_empty();
     let rows: Vec<Row> = app
         .view
         .iter()
-        .filter_map(|&i| app.procs.get(i))
-        .map(|p| {
+        .enumerate()
+        .filter_map(|(vi, &i)| app.procs.get(i).map(|p| (vi, p)))
+        .map(|(vi, p)| {
             let cpu = app.hist.display_cpu(p);
             let rst = app.hist.total_restarts(p.pid);
+            // tree mode: nest the name under its parent with a branch glyph
+            let name = if tree {
+                let d = app.view_depth.get(vi).copied().unwrap_or(0);
+                if d == 0 {
+                    p.name.clone()
+                } else {
+                    format!("{}└─ {}", "  ".repeat(d - 1), p.name)
+                }
+            } else {
+                p.name.clone()
+            };
             let mut cells = vec![
                 Cell::from(p.pid.to_string()),
                 Cell::from(p.user.clone().unwrap_or_else(|| "-".into())),
-                Cell::from(p.name.clone()),
+                Cell::from(name),
                 Cell::from(cpu.map(|c| format!("{:.1}", c)).unwrap_or_else(|| "-".into())),
                 Cell::from(app.hist.spark(p.pid).unwrap_or("").to_string()),
                 Cell::from(fmt_mem(p.mem_kb)),
             ];
+            if has_io {
+                let cell = app
+                    .hist
+                    .io_rate_of(p.pid)
+                    .map(|(r, w)| fmt_rate(r + w))
+                    .unwrap_or_else(|| "-".into());
+                cells.push(Cell::from(cell));
+            }
             if has_gpu {
                 cells.push(Cell::from(crate::gpu::cell(p)));
             }
@@ -2591,6 +2835,7 @@ fn ui_logs_page(app: &mut TuiApp, f: &mut Frame<'_>) {
     app.tab_rect = None;
     app.table_rect = Some(v[2]);
     app.detail_rect = Some(v[2]);
+    app.logs_pane_h = v[2].height;
 
     if app.logs_rx.is_some() {
         placeholder(v[2], f, "  fetching logs… (journalctl / log show can take several seconds)");
@@ -2622,7 +2867,17 @@ fn ui_logs_page(app: &mut TuiApp, f: &mut Frame<'_>) {
         );
     }
 
-    let mut footer = "j/k/d/u/g/G/b-f: Scroll | Esc/q: Back | c: Copy".to_string();
+    let container_src = matches!(
+        app.logs_src,
+        Some(crate::logs::LogSource::Container { .. })
+    );
+    let mut footer = if container_src && app.follow_child.is_some() {
+        "F: Stop Follow | j/k/d/u/g/G/b-f: Scroll | Esc/q: Back | c: Copy".to_string()
+    } else if container_src {
+        "F: Follow Stream | j/k/d/u/g/G/b-f: Scroll | Esc/q: Back | c: Copy".to_string()
+    } else {
+        "j/k/d/u/g/G/b-f: Scroll | Esc/q: Back | c: Copy".to_string()
+    };
     if !app.status.is_empty() {
         footer.push_str(&format!("  ·  {}", app.status));
     }
@@ -2804,8 +3059,9 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
     };
     let mut footer = match app.tab {
         Tab::Processes => format!(
-            "Total: {} | Enter: Detail | a: Actions | /: Search | z: Zoom | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
-            total
+            "Total: {} | Enter: Detail | a: Actions | /: Search | z: Zoom | T: Tree{} | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
+            total,
+            if app.tree_mode { " (on)" } else { "" }
         ),
         Tab::Ports => format!(
             "Total: {} | Enter: Detail | a: All States | p/t/n/s: Sort | /: Search | h-l: Tab | r: Refresh | q: Quit",
@@ -3208,8 +3464,18 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                 app.env_scroll = 0;
                 return true;
             }
+            // leaving the Logs page stops a live `logs -f` stream
+            if app.page == Page::Logs {
+                app.stop_logs_follow();
+            }
             app.page = Page::Browse;
             app.actions_open = false;
+            return true;
+        }
+        // 'F' on the Logs page: toggle the live container-log stream
+        // (uppercase — lowercase f scrolls down)
+        if key == KeyCode::Char('F') && app.page == Page::Logs {
+            app.toggle_logs_follow();
             return true;
         }
         if key == KeyCode::Char('c') {
@@ -3587,6 +3853,19 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                 let tab = t;
                 app.switch_tab(tab);
             } else if app.tab == Tab::Processes {
+                // uppercase 'T' (lowercase 't' sorts by start time) flips
+                // the Processes tab between the flat table and the
+                // parent→child tree; a live search falls back to flat
+                if c == 'T' {
+                    app.tree_mode = !app.tree_mode;
+                    app.status = if app.tree_mode {
+                        "tree view on (children nest under their parent; a search shows flat)".into()
+                    } else {
+                        "tree view off".into()
+                    };
+                    app.rebuild_view();
+                    return true;
+                }
                 let k = match c {
                     'p' => Some(SortKey::Pid),
                     'n' => Some(SortKey::Name),
@@ -3632,6 +3911,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()>
         }
         app.poll_containers();
         app.poll_logs();
+        app.poll_follow_logs();
         // selection debounce: recompute details 500ms after the cursor
         // stopped moving (mirrors selectionDebounce in the Go witr)
         if let Some(since) = app.detail_pending_since {
@@ -3712,6 +3992,64 @@ mod tests {
         assert_eq!(app.table_state.selected(), Some(20.min(n - 1)));
         on_key(&mut app, KeyCode::Char('b'));
         assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn tree_order_nests_children_under_parents() {
+        // family: 1 → (2 → 4), 1 → 3; a stray root 9 whose parent is absent
+        let mk = |pid: Pid, ppid: Option<Pid>| Process {
+            pid,
+            ppid,
+            name: format!("p{pid}"),
+            ..Default::default()
+        };
+        let procs = vec![mk(1, None), mk(2, Some(1)), mk(3, Some(1)), mk(4, Some(2)), mk(9, Some(7))];
+        let sorted: Vec<usize> = (0..procs.len()).collect();
+        let (order, depth) = tree_order(&procs, &sorted);
+        let pids: Vec<Pid> = order.iter().map(|&i| procs[i].pid).collect();
+        assert_eq!(pids, vec![1, 2, 4, 3, 9], "DFS: children directly under parent");
+        assert_eq!(depth, vec![0, 1, 2, 1, 0]);
+        // cycle guard: ppid pointing back at a visited pid doesn't loop
+        let cyc = vec![mk(5, Some(6)), mk(6, Some(5))];
+        let (o2, _) = tree_order(&cyc, &vec![0, 1]);
+        assert_eq!(o2.len(), 2, "cycle terminates with every row present");
+    }
+
+    #[test]
+    fn tree_mode_toggle_orders_and_search_falls_back_to_flat() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        on_key(&mut app, KeyCode::Char('T'));
+        assert!(app.tree_mode);
+        assert!(!app.view_depth.is_empty(), "tree mode fills the depth column");
+        // depth-0 rows exist and children follow parents (pid adjacency)
+        let first_root = app.view_depth[0];
+        assert_eq!(first_root, 0);
+        // 'T' again → back to flat
+        on_key(&mut app, KeyCode::Char('T'));
+        assert!(!app.tree_mode);
+        assert!(app.view_depth.is_empty());
+        // lowercase 't' still sorts by start time (not the tree toggle)
+        on_key(&mut app, KeyCode::Char('t'));
+        assert!(!app.tree_mode);
+        assert_eq!(app.sort_key, SortKey::Started);
+    }
+
+    #[test]
+    fn logs_follow_state_transitions() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        // non-container source: F explains itself and spawns nothing
+        app.logs_src = Some(crate::logs::LogSource::Journald { pid: 1 });
+        app.toggle_logs_follow();
+        assert!(app.follow_child.is_none());
+        assert!(app.status.contains("container logs only"));
+        // no source at all
+        app.logs_src = None;
+        app.toggle_logs_follow();
+        assert!(app.follow_child.is_none());
+        assert!(app.status.contains("no log source"));
+        // stop without a running stream is a safe no-op
+        app.stop_logs_follow();
+        assert!(app.follow_rx.is_none());
     }
 
     #[test]

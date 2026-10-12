@@ -46,18 +46,18 @@ TUI 主循环（每 3s，tui.rs REFRESH）
 判定"换了 pid 的同一个程序"不能看 pid（pid 正是变化的量），也不能直接存结构体做相等比较。实现用三元组哈希：
 
 ```rust
-fn identity(p: &Process) -> u64 {          // history.rs
-    (p.name, p.exe, p.user) 三者依次 hash   // DefaultHasher
+pub fn identity(p: &Process) -> u64 {      // util.rs（history/snapshot/--follow 共用）
+    (p.name, basename(p.exe), p.user) hash  // DefaultHasher
 }
 ```
 
 选这三个字段的理由：
 
-- **exe**：最能代表"同一个程序"——nginx 崩溃重启后路径不变
+- **exe**：最能代表"同一个程序"——nginx 崩溃重启后路径不变；取 basename 是因为列表视图（ps comm 给 `sleep`）与详情视图（lsof 给 `/bin/sleep`）报的粒度不同，全路径哈希会让重启被误判成新程序
 - **name**：exe 拿不到时（权限/已删除）的兜底
 - **user**：区分"同一路径被不同用户各跑一份"——那不是重启，是两个实例
 
-不进哈希的字段：cmdline（参数变化会打碎身份）、启动时间（每次重启都变）。`identity_of: HashMap<Pid, u64>` 记录"每个 pid 当前归属哪个身份"，是 `Rst` 列和详情页告警从 pid 反查重启状态的桥。
+不进哈希的字段：cmdline（参数变化会打碎身份）、启动时间（每次重启都变）。`identity_of: HashMap<Pid, u64>` 记录"每个 pid 当前归属哪个身份"，是 `Rst` 列和详情页告警从 pid 反查重启状态的桥。`--diff` 的 restarted 判定与 `--follow` 的跨重启跟踪复用同一个函数。
 
 `RestartState`（按身份存储）：
 
@@ -78,6 +78,7 @@ struct RestartState {
 - **间隔 < 50ms 保留旧值**——两次采样贴太近时 delta 噪声放大
 - **上限 400%**——多线程进程合法地超过 100%，但要封顶防止采样抖动产出荒谬值
 - 每个 pid 保留最近 8 个样本 → 8 级 sparkline（`▁▂▃▄▅▆▇█`，按百分比映射）
+- 同一套差分机制还喂三处：详情页 **CPU history 大图**（独立 120 样本窗口，按窗口峰值归一化并裁到面板宽度）、Linux 的**磁盘 I/O 速率**（`/proc/<pid>/io` 字节差分 ÷ 采样间隔，进程表 IO 列）、`--follow` 的身份重捕获
 
 Events 页的 `Time` 列排序键 `at_unix` 与此无关——那是事件产生时的墙钟秒数，表格里显示为相对年龄（`23s`）。
 
@@ -125,6 +126,6 @@ Events 页的 `Time` 列排序键 `at_unix` 与此无关——那是事件产生
 
 ## 10. 测试锚点
 
-`src/history.rs`：`restart_detection`（换 pid 计数、不同身份隔离）、`events_feed_start_exit_restart`（三种事件的顺序与 detail、500 上限）、`cpu_delta_sampling`（首样本无值、delta 计算）、`vanished_processes_are_pruned`、`events_update_returns_fresh_and_round_trips`（update 返回新事件、JSONL 往返）。
+`src/history.rs`：`restart_detection`（换 pid 计数、不同身份隔离）、`events_feed_start_exit_restart`（三种事件的顺序与 detail、500 上限）、`cpu_delta_sampling`（首样本无值、delta 计算）、`cpu_chart_builds_and_thins`（大图需两个 delta、按宽度裁剪）、`io_rate_sampling`（首样本无值、速率计算、消失即清）、`vanished_processes_are_pruned`、`events_update_returns_fresh_and_round_trips`（update 返回新事件、JSONL 往返）。
 `src/tui.rs`：`events_tab_filter_and_selection`（过滤与光标隔离）、`events_tab_sort_keys`（四列排序 + 降序翻转）。
 `src/logs.rs`：`container_identity_parses`、`tail_keeps_last_n_and_skips_blank`、`predicate_is_sanitized` 等纯函数测试。

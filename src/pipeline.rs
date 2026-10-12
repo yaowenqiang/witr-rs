@@ -453,6 +453,17 @@ fn inspect_risks(p: &Process, sockets: &[crate::model::Socket], warnings: &mut V
     if p.uid == Some(0) {
         warnings.push(format!("pid {} runs as root", p.pid));
     }
+    // zombie: exited but the parent hasn't reaped it — worth flagging
+    // because it usually means the parent is stuck or missing its wait()
+    if p.state.as_deref() == Some("Z") {
+        match p.ppid {
+            Some(pp) => warnings.push(format!(
+                "pid {} is a zombie (defunct) — parent pid {pp} hasn't reaped it",
+                p.pid
+            )),
+            None => warnings.push(format!("pid {} is a zombie (defunct)", p.pid)),
+        }
+    }
     if p.exe_deleted {
         warnings.push(format!(
             "the binary of pid {} has been deleted from disk (updated in place?)",
@@ -838,6 +849,22 @@ mod tests {
 
     fn p(pid: Pid, name: &str) -> Process {
         Process { pid, name: name.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn zombie_warning() {
+        let mut z = p(50, "defunct-helper");
+        z.state = Some("Z".into());
+        z.ppid = Some(20);
+        let mut w = Vec::new();
+        inspect_risks(&z, &[], &mut w);
+        assert!(w.iter().any(|x| x.contains("zombie") && x.contains("parent pid 20")));
+        // live process: no warning
+        let mut live = p(51, "helper");
+        live.state = Some("S".into());
+        let mut w2 = Vec::new();
+        inspect_risks(&live, &[], &mut w2);
+        assert!(w2.iter().all(|x| !x.contains("zombie")));
     }
 
     #[test]

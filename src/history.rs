@@ -2,14 +2,14 @@
 //! (delta of cumulative CPU time), sparklines, and crash-loop detection
 //! (same process identity reappearing under a new pid).
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use crate::model::{Pid, Process};
 
 const SAMPLES: usize = 8;
+/// Detail-page CPU chart window (~10 min at the 3s TUI refresh).
+const BIG_SAMPLES: usize = 120;
 const RESTART_WINDOW: Duration = Duration::from_secs(5 * 60);
 const PRUNE_AFTER: Duration = Duration::from_secs(10 * 60);
 const SPARK_LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -47,9 +47,16 @@ pub struct History {
     cpu_prev: HashMap<Pid, (u64, Instant)>,
     /// pid → instantaneous percent (valid for pids in the last update)
     pub cpu_now: HashMap<Pid, f64>,
+    /// pid → (read bytes, write bytes at last sample, sampled at)
+    io_prev: HashMap<Pid, (u64, u64, Instant)>,
+    /// pid → (read bytes/s, write bytes/s) from cumulative io deltas
+    /// (Linux /proc/<pid>/io; empty on platforms that don't report it)
+    pub io_rate: HashMap<Pid, (f64, f64)>,
     /// pid → last SAMPLES instantaneous percents as a sparkline
     pub sparks: HashMap<Pid, String>,
     samples: HashMap<Pid, VecDeque<f64>>,
+    /// pid → last BIG_SAMPLES instantaneous percents (detail-page chart)
+    big: HashMap<Pid, VecDeque<f64>>,
     /// pid → identity hash
     identity_of: HashMap<Pid, u64>,
     restarts: HashMap<u64, RestartState>,
@@ -57,14 +64,6 @@ pub struct History {
     pub events: Vec<TuiEvent>,
     /// pid → name at the previous refresh (for appear/exit deltas).
     prev_seen: HashMap<Pid, String>,
-}
-
-fn identity(p: &Process) -> u64 {
-    let mut h = DefaultHasher::new();
-    p.name.hash(&mut h);
-    p.exe.hash(&mut h);
-    p.user.hash(&mut h);
-    h.finish()
 }
 
 impl History {
@@ -92,7 +91,7 @@ impl History {
             if p.kernel_thread {
                 continue;
             }
-            let h = identity(p);
+            let h = crate::util::identity(p);
             self.identity_of.insert(p.pid, h);
 
             // instantaneous cpu from cumulative cpu-time deltas
@@ -112,6 +111,23 @@ impl History {
                     _ => {}
                 }
                 self.cpu_prev.insert(p.pid, (ms, now));
+            }
+
+            // instantaneous disk I/O from cumulative byte deltas (only the
+            // Linux /proc listing fills these fields)
+            if p.io_read_bytes.is_some() || p.io_write_bytes.is_some() {
+                let (rb, wb) = (p.io_read_bytes.unwrap_or(0), p.io_write_bytes.unwrap_or(0));
+                if let Some((prb, pwb, at)) = self.io_prev.get(&p.pid) {
+                    let wall = now.duration_since(*at).as_millis() as f64;
+                    if wall >= 50.0 && rb >= *prb && wb >= *pwb {
+                        let s = wall / 1000.0;
+                        self.io_rate.insert(
+                            p.pid,
+                            ((rb - prb) as f64 / s, (wb - pwb) as f64 / s),
+                        );
+                    }
+                }
+                self.io_prev.insert(p.pid, (rb, wb, now));
             }
 
             // restart bookkeeping: same identity, different pid
@@ -155,7 +171,10 @@ impl History {
         self.cpu_now.retain(|pid, _| seen.contains(pid));
         self.sparks.retain(|pid, _| seen.contains(pid));
         self.samples.retain(|pid, _| seen.contains(pid));
+        self.big.retain(|pid, _| seen.contains(pid));
         self.cpu_prev.retain(|pid, _| seen.contains(pid));
+        self.io_rate.retain(|pid, _| seen.contains(pid));
+        self.io_prev.retain(|pid, _| seen.contains(pid));
         self.identity_of.retain(|pid, _| seen.contains(pid));
         self.restarts.retain(|_, rs| {
             rs.last_seen
@@ -182,6 +201,11 @@ impl History {
             })
             .collect();
         self.sparks.insert(pid, spark);
+        let big = self.big.entry(pid).or_default();
+        big.push_back(v);
+        while big.len() > BIG_SAMPLES {
+            big.pop_front();
+        }
     }
 
     /// Restarts of `pid`'s identity within the tracking window (5 min).
@@ -209,6 +233,39 @@ impl History {
     /// Sparkline for the last samples; None when there aren't any yet.
     pub fn spark(&self, pid: Pid) -> Option<&str> {
         self.sparks.get(&pid).map(|s| s.as_str())
+    }
+
+    /// (read bytes/s, write bytes/s) from the last two samples; None until
+    /// two samples exist (first refresh has no delta to diff).
+    pub fn io_rate_of(&self, pid: Pid) -> Option<(f64, f64)> {
+        self.io_rate.get(&pid).copied()
+    }
+
+    /// Block-char CPU chart over the long sample window, normalized to the
+    /// window max and thinned to `width` columns, plus the peak. None until
+    /// a couple of samples exist.
+    pub fn cpu_chart(&self, pid: Pid, width: usize) -> Option<String> {
+        let dq = self.big.get(&pid)?;
+        if dq.len() < 2 {
+            return None;
+        }
+        let vals: Vec<f64> = if dq.len() > width {
+            let stride = dq.len() as f64 / width as f64;
+            (0..width)
+                .map(|i| dq[(i as f64 * stride) as usize])
+                .collect()
+        } else {
+            dq.iter().copied().collect()
+        };
+        let peak = vals.iter().copied().fold(0.0f64, f64::max);
+        let bars: String = vals
+            .iter()
+            .map(|v| {
+                let idx = ((v / peak.max(1.0)).clamp(0.0, 0.999) * 8.0) as usize;
+                SPARK_LEVELS[idx]
+            })
+            .collect();
+        Some(format!("{bars}  peak {peak:.0}%"))
     }
 }
 
@@ -268,6 +325,56 @@ mod tests {
         let v = h.cpu_now.get(&10).copied().unwrap_or(-1.0);
         assert!(v > 40.0, "expected high instantaneous cpu, got {v}");
         assert!(h.spark(10).is_some());
+    }
+
+    #[test]
+    fn io_rate_sampling() {
+        let mut h = History::new();
+        let mut p = proc(10, "/bin/w", None);
+        p.io_read_bytes = Some(1_000);
+        p.io_write_bytes = Some(500);
+        h.update(&[p.clone()]);
+        assert!(h.io_rate_of(10).is_none(), "first sample has no delta");
+        std::thread::sleep(Duration::from_millis(120));
+        p.io_read_bytes = Some(13_000);
+        p.io_write_bytes = Some(500);
+        h.update(&[p]);
+        // 12KB read in ~120ms → ~100KB/s read, 0 write
+        let (r, w) = h.io_rate_of(10).unwrap_or((0.0, 0.0));
+        assert!(r > 50_000.0, "expected ~100KB/s read, got {r}");
+        assert_eq!(w, 0.0);
+        // vanished → pruned
+        h.update(&[]);
+        assert!(h.io_rate_of(10).is_none());
+    }
+
+    #[test]
+    fn cpu_chart_builds_and_thins() {
+        let mut h = History::new();
+        h.update(&[proc(10, "/bin/w", Some(0))]);
+        assert!(h.cpu_chart(10, 80).is_none(), "needs 2+ samples");
+        // the first delta lands on the second update, the chart (which
+        // needs two deltas) on the third
+        std::thread::sleep(Duration::from_millis(120));
+        h.update(&[proc(10, "/bin/w", Some(1_000))]);
+        assert!(h.cpu_chart(10, 80).is_none(), "one delta is not a chart");
+        std::thread::sleep(Duration::from_millis(120));
+        h.update(&[proc(10, "/bin/w", Some(2_000))]);
+        // then a quiet sample: 1000/120 → ~400% (capped), then ~50%
+        std::thread::sleep(Duration::from_millis(120));
+        h.update(&[proc(10, "/bin/w", Some(2_060))]);
+        let chart = h.cpu_chart(10, 80).unwrap();
+        let bars = chart.split_whitespace().next().unwrap();
+        let last = bars.chars().last().unwrap();
+        assert!(
+            "▁▂▃".contains(last),
+            "quiet sample renders as a low bar: {chart}"
+        );
+        assert!(chart.contains("peak"), "chart carries the peak: {chart}");
+        // thinning to a tiny window still works
+        let small = h.cpu_chart(10, 4).unwrap();
+        let bars = small.split_whitespace().next().unwrap();
+        assert!(bars.chars().count() <= 4, "thinned to width 4: {small}");
     }
 
     #[test]
