@@ -14,7 +14,9 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **CPU 历史大图（详情页）**：详情面板把最近约 10 分钟的瞬时 CPU 采样画成块字符图（按窗口峰值归一化）——突发负载和空闲段一眼可见。
 
-**磁盘 I/O 列（Linux）**：进程表新增 IO 列（由 `/proc/<pid>/io` 字节差分算出的每秒读写速率），详情页显示累计读写字节数与系统调用次数；macOS/Windows 无每进程 I/O 数据源，该列自动隐藏。
+**磁盘 I/O 列（三平台）**：进程表新增 IO 列（由每秒读写字节差分算出的速率），详情页显示累计读写字节数与系统调用次数。数据源：Linux `/proc/<pid>/io`、macOS `proc_pid_rusage`、Windows PowerShell `IO_COUNTERS`（受保护的系统进程取不到时该行留空）。
+
+**内存趋势 + 泄漏嫌疑（详情页）**：详情面板把最近约 10 分钟的 RSS 采样画成绿色块字符图（绝对刻度，标注窗口峰值）；当 RSS 在窗口内增长 ≥20MB 且 ≥70% 的采样段单调上升时，追加黄色"疑似内存泄漏"告警——区分真实泄漏与锯齿状的正常分配回收。
 
 **快照 diff（`--snap` / `--diff`）**：`witr-rs --snap before.json` 把整张进程表落成 JSON；之后 `witr-rs --diff before.json` 报告变化——**new**（新出现）、**gone**（消失）、**restarted**（同一程序身份换了新 pid 回来，与 TUI 崩溃重启检测同一套身份判定）、**changed**（同 pid 但命令行变了）。有变化时退出码 1，无变化 0，适合脚本。
 
@@ -23,6 +25,14 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 **`--watch [秒]`**：常驻观察模式——带目标时每 N 秒重跑一次溯源管线并重绘（默认 2 秒），不带目标时刷新进程表；配合 `--recent`/`--json` 等原有选项工作，Ctrl-C 退出。
 
 **对端归因（TUI 详情页）**：进程的每条 ESTABLISHED 连接会反查对端套接字的属主，在详情页显示 `talking to: 进程名 (pid N) — k 条连接`；对端不在本机时显示远端地址。
+
+**Ports 总览页（`o`，Ports 页）**：把逐 socket 的明细表切换成按 (端口, 属主进程) 聚合的总览——列 Port / Proto(s) / Process / PID / User / Addrs（该端口绑定的地址数，tcp+tcp6 合并显示为一行），默认按端口排序，`/` 搜索照常生效，`Enter` 直接跳到属主进程的详情页。"这台机器上谁在对外服务"一屏可见。
+
+**退出即取证（crash forensics）**：进程退出事件发生的瞬间自动后台抓取它最后的日志行（macOS 统一日志按进程名 / Linux journald 按 `_PID=`，最多 25 行，缓存最近 50 个），Events 页选中 exited/restarted 事件按 `l` **立即**显示"最后的话"——不用再和日志轮转赛跑，crash 现场定格在退出那一刻。
+
+**桌面通知（`--notify` / `!`）**：TUI 里目标进程重启即弹系统通知；同名进程本会话内重启 ≥2 次后，其普通退出也通知（crash loop 提示）。macOS 走 `osascript`、Linux 走 `notify-send`，后台线程发送不卡采样；`--notify` 预开启，TUI 内 `!` 随时开关（页脚有指示）。
+
+**暂停采样（`P`）**：一键冻结 TUI 采样——不刷新、不产生事件、不发通知，页脚显示 `⏸ paused`；再按恢复。看清单、拷贝现场时数据不再从眼前流走。
 
 ## TUI 按键
 
@@ -45,7 +55,10 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | `T` | Processes 页：树形视图 ↔ 平铺表格（子进程嵌在父进程下；搜索时显示平铺） |
 | `F` | Logs 页（容器来源）：切换实时 `logs -f` 日志流 |
 | `a` | Ports 页：切换 仅监听 ↔ 全部状态；Locks 页：切换 锁 ↔ 全部打开文件；Processes 页：打开操作栏（`k` kill / `t` term / `p` 暂停 / `r` 恢复 / `n` renice） |
-| `l` | 详情页 / Events 页：拉取该进程最近的日志（容器日志 / journalctl / macOS 统一日志），全屏 Logs 页滚动查看 |
+| `o` | Ports 页：逐 socket 明细 ↔ 按 (端口, 属主) 聚合的总览（`Enter` 跳属主进程详情） |
+| `l` | 详情页 / Events 页：拉取该进程最近的日志（容器日志 / journalctl / macOS 统一日志），全屏 Logs 页滚动查看；Events 页已退出的进程优先显示退出瞬间自动捕获的最后日志 |
+| `P` | 暂停 / 恢复采样（全局冻结，页脚 `⏸ paused` 指示；Events 页 pid 降序改按 `p` 两次） |
+| `!` | 桌面通知开关（`--notify` 预开启，页脚有指示） |
 | `z` | 缩放：聚焦面板临时占满整行（tmux 风格） |
 | `x` | 杀掉选中进程（y/n 确认） |
 | `r` | 立即刷新 |
@@ -96,7 +109,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | 容器归因 | cgroup（docker/containerd/podman/lxc） | ✗ | ✗ |
 | nohup/disown 检测 | ✓（`/proc/<pid>/status` SigIgn SIGHUP 位，计入告警） | ✗ | ✗ |
 | 环境变量（`--env` / TUI 详情页） | ✓ `/proc/<pid>/environ`（同用户） | ✓ 同用户进程走 `ps -E`（其余受 SIP 限制，面板会提示） | ✗ |
-| 每进程磁盘 I/O（TUI IO 列 + 详情累计值） | ✓ `/proc/<pid>/io`（字节差分 → 速率） | ✗ | ✗ |
+| 每进程磁盘 I/O（TUI IO 列 + 详情累计值） | ✓ `/proc/<pid>/io`（字节差分 → 速率） | ✓ `proc_pid_rusage` | ✓ PowerShell IO_COUNTERS |
 | 启动时间 | btime + starttime | `ps etime` | CIM CreationDate |
 
 跨平台可选增强（三端一致，缺依赖时静默跳过）：`nvidia-smi`（GPU 列）、`kubectl`（K8s Pod 归因）、`docker`/`podman`/`nerdctl`（Containers 页）。
@@ -158,6 +171,8 @@ witr-rs --replay ev.jsonl     # 回放事件记录，落在 Events 页
 witr-rs --snap before.json    # 进程表快照落盘（JSON）后退出
 witr-rs --diff before.json    # 对比快照：new / gone / restarted / changed（有变化退出码 1）
 witr-rs --pid 1234 --follow   # 跨重启跟踪目标（同程序换新 pid 继续追）
+witr-rs --pid 1234 --follow --on-exit 'say gone'  # watch/follow 下目标消失时执行一次命令（follow 彻底跟丢后 exit 2）
+witr-rs --notify              # TUI 桌面通知：重启必弹，crash loop 的退出也弹
 witr-rs --completions zsh     # 输出 shell 补全脚本（bash|zsh|fish|powershell）
 witr-rs -i --port 8080        # 进 TUI 并直接落到该端口（-i 预置，见上）
 witr-rs nginx --pid 1         # 多目标混用（各目标间以分隔线输出）
@@ -219,7 +234,7 @@ src/
 ├── pipeline.rs     目标解析（name/pid/port/file/container → pid）、归因优先级、风险告警
 ├── tui.rs          交互界面（ratatui/crossterm）：五标签页 + 详情面板 + 鼠标 + 3s 自动刷新
 ├── render.rs       standard / tree / short / json / env / warnings / export 渲染
-├── history.rs      采样历史：瞬时 CPU、sparkline、重启检测、Events 事件流
+├── history.rs      采样历史：瞬时 CPU、sparkline、内存趋势 + 泄漏嫌疑、重启检测、Events 事件流
 ├── snapshot.rs     --snap / --diff：全表快照与 new/gone/restarted/changed 对比
 ├── logs.rs         崩溃关联日志：容器日志 / journalctl / macOS 统一日志
 ├── risk.rs         0–10 风险评分（临时目录二进制、curl|sh、注入、公网对端、无效签名等）
@@ -236,11 +251,12 @@ src/
 
 归因优先级：容器 > ssh 会话 > 交互 shell > 服务管理器（systemd/launchd/SCM）> 保活 supervisor（supervisord/runc 等，含 cmdline 令牌匹配）> cron > init 兜底（pid 1 直启且链上无 shell，如系统 daemon）。Linux 的 service_source 返回 "init" 兜底时会被 pipeline 放弃，转而走通用归因。
 
-## v0.6 已知限制
+## 已知限制
 
 - TUI 的 Ports/Containers/详情页均为打开瞬间快照，`r` 手动刷新
 - Windows 进程详情依赖 PowerShell 批量查询（每个目标一次调用，20s 超时保护）；CPU% 列来自 `Get-Process` 采样的刷新间差值（PowerShell 不可用时该列回退为空）
-- 日志关联（`l` / `--logs`）覆盖 容器日志 / Linux journald / macOS 统一日志；Windows 暂无对应的单一日志源。实时流 `F` 仅容器来源（journald/统一日志未接 follow）；Windows 也无每进程 I/O，IO 列同样缺席
+- 日志关联（`l` / `--logs`）覆盖 容器日志 / Linux journald / macOS 统一日志；Windows 暂无对应的单一日志源（退出即取证在 Windows 同样缺席）。实时流 `F` 仅容器来源（journald/统一日志未接 follow）
+- 桌面通知仅 macOS（osascript）/ Linux（notify-send）；Windows 暂无通知通道；Windows 也无每进程 I/O，IO 列同样缺席
 - 事件持久化（`--events-log`/`--replay`）仅 TUI（采样器随 TUI 生灭），3 秒粒度内生灭的进程不可见
 - `--follow` 按程序身份（name+exe+user）匹配：同一程序并行跑多份时，重启可能落在"最新的兄弟实例"而非严格意义上的继任者
 - `--snap`/`--diff` 对比整张表——两次快照之间 pid 被无关进程复用时显示为 changed / new+gone，而非 restarted

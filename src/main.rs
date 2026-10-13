@@ -166,6 +166,26 @@ fn follow_step(
     FollowStep::None
 }
 
+/// True only on the present→absent edge: armed by the first sighting,
+/// fires once per disappearance, re-arms when it comes back.
+fn on_exit_edge(had: &mut bool, present: bool) -> bool {
+    let fire = *had && !present;
+    if present {
+        *had = true;
+    } else if fire {
+        *had = false;
+    }
+    fire
+}
+
+/// Best-effort `--on-exit` runner: sh -c on Unix, cmd /C on Windows.
+fn run_on_exit(cmd: &str) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("cmd").args(["/C", cmd]).status();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("sh").args(["-c", cmd]).status();
+}
+
 fn main() {
     let cli = match cli::Cli::try_parse() {
         Ok(c) => c,
@@ -251,6 +271,14 @@ fn main() {
     }
     if cli.replay.is_some() && !cli.interactive && !specs.is_empty() {
         eprintln!("--replay opens the TUI; drop the targets or use -i");
+        std::process::exit(4);
+    }
+    if cli.on_exit.is_some() && cli.watch.is_none() && !cli.follow {
+        eprintln!("--on-exit fires in watch/follow mode; add --watch or --follow");
+        std::process::exit(4);
+    }
+    if cli.on_exit.is_some() && specs.is_empty() {
+        eprintln!("--on-exit watches a target; give a process name, --pid, --port or --file");
         std::process::exit(4);
     }
 
@@ -351,11 +379,14 @@ fn main() {
             );
             std::process::exit(4);
         }
-        let mut seed = tui::Seed::from_targets(
-            &cli.names, &cli.pids, &cli.ports, &cli.files, &cli.containers,
-        );
-        seed.events_log = cli.events_log.clone();
-        seed.replayed = replayed;
+        let seed = tui::Seed {
+            events_log: cli.events_log.clone(),
+            notify: cli.notify,
+            replayed,
+            ..tui::Seed::from_targets(
+                &cli.names, &cli.pids, &cli.ports, &cli.files, &cli.containers,
+            )
+        };
         if let Err(e) = tui::run(seed) {
             eprintln!("tui error: {}", e);
             std::process::exit(5);
@@ -373,9 +404,12 @@ fn main() {
             && cli.watch.is_none()
             && recent_secs.is_none();
         if interactive {
-            let mut seed = tui::Seed::default();
-            seed.events_log = cli.events_log.clone();
-            seed.replayed = replayed;
+            let seed = tui::Seed {
+                events_log: cli.events_log.clone(),
+                notify: cli.notify,
+                replayed,
+                ..tui::Seed::default()
+            };
             if let Err(e) = tui::run(seed) {
                 eprintln!("tui error: {}", e);
                 std::process::exit(5);
@@ -472,6 +506,9 @@ fn main() {
         let color = !no_color && std::io::stdout().is_terminal() && !cli.json;
         let mut live_specs = specs.clone();
         let mut follow = FollowState::default();
+        // --on-exit: armed once the target has been seen, fires on the
+        // present→absent edge, re-arms if it comes back
+        let mut had_target = false;
         loop {
             let reports = pipeline::run(platform.as_ref(), live_specs.clone(), &opts);
             write_out("\x1b[2J\x1b[1;1H");
@@ -490,6 +527,9 @@ fn main() {
                     }
                     FollowStep::Gone => {
                         write_out("target gone and its program (name+exe+user) not seen again — stopping");
+                        if let Some(cmd) = &cli.on_exit {
+                            run_on_exit(cmd);
+                        }
                         std::process::exit(2);
                     }
                 }
@@ -498,6 +538,14 @@ fn main() {
                 if let Some(note) = &follow.note {
                     write_out(&format!("↻ following restart: {note}"));
                 }
+            }
+            // --on-exit edge detection (after the follow match, so the
+            // final-Gone path above fires it exactly once, then exits)
+            let present = reports.iter().any(|r| !r.matches.is_empty());
+            if on_exit_edge(&mut had_target, present) && cli.on_exit.is_some() {
+                let cmd = cli.on_exit.as_deref().unwrap_or_default();
+                write_out(&format!("on-exit: running `{cmd}`"));
+                run_on_exit(cmd);
             }
             std::thread::sleep(Duration::from_secs(interval));
         }
@@ -568,4 +616,26 @@ fn main() {
     // permission, 4 invalid input (handled above), 5 internal error,
     // 6 cause unknown
     std::process::exit(overall_exit(&reports, platform.name()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn on_exit_edge_fires_once_per_disappearance() {
+        let mut had = false;
+        // never seen: no fire even though absent
+        assert!(!on_exit_edge(&mut had, false));
+        assert!(!on_exit_edge(&mut had, false));
+        // first sighting arms (no fire)
+        assert!(!on_exit_edge(&mut had, true));
+        assert!(!on_exit_edge(&mut had, true));
+        // present→absent fires exactly once
+        assert!(on_exit_edge(&mut had, false));
+        assert!(!on_exit_edge(&mut had, false));
+        // comeback re-arms, next disappearance fires again
+        assert!(!on_exit_edge(&mut had, true));
+        assert!(on_exit_edge(&mut had, false));
+    }
 }

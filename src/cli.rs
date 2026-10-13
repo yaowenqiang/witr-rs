@@ -128,6 +128,19 @@ pub struct Cli {
     #[arg(long = "replay", value_name = "FILE")]
     pub replay: Option<String>,
 
+    /// Desktop notifications when a process restarts, or exits repeatedly
+    /// (crash loop): macOS osascript / Linux notify-send. TUI only; the
+    /// '!' key toggles it live.
+    #[arg(long = "notify")]
+    pub notify: bool,
+
+    /// Run this shell command once whenever a watched/followed target
+    /// disappears (watch/follow mode only) — e.g. `--on-exit 'say gone'`.
+    /// In --follow mode the loop still exits 2 when the program never
+    /// comes back under a new pid.
+    #[arg(long = "on-exit", value_name = "CMD")]
+    pub on_exit: Option<String>,
+
     /// Write every visible process as JSON to this file and exit — a
     /// snapshot to --diff against later.
     #[arg(long = "snap", value_name = "FILE")]

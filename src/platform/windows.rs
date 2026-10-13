@@ -443,6 +443,50 @@ fn parse_cpu_times(json: &str) -> Option<HashMap<Pid, u64>> {
     Some(map)
 }
 
+/// pid → (cumulative read bytes, cumulative write bytes), from one
+/// PowerShell pass over Get-Process. PowerShell's extended type system
+/// surfaces the Win32 IO_COUNTERS on Process objects as
+/// ReadTransferCount/WriteTransferCount (null for protected processes).
+/// A failed probe is cached for the process lifetime, like cpu_time_map.
+fn io_transfer_map() -> Option<HashMap<Pid, (u64, u64)>> {
+    static UNAVAILABLE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if UNAVAILABLE.get().is_some() {
+        return None;
+    }
+    let script = "Get-Process | Select-Object Id, \
+                  @{n='rb';e={[long]$_.ReadTransferCount}}, \
+                  @{n='wb';e={[long]$_.WriteTransferCount}} \
+                  | ConvertTo-Json -Compress";
+    match run("powershell", &["-NoProfile", "-Command", script], PS_TIMEOUT) {
+        Ok(out) => parse_io_transfers(&out),
+        Err(_) => {
+            let _ = UNAVAILABLE.set(());
+            None
+        }
+    }
+}
+
+/// `{"Id":123,"rb":456,"wb":789}` (or an array; `rb`/`wb` are null for
+/// protected processes and those entries are skipped) → pid → (r, w).
+fn parse_io_transfers(json: &str) -> Option<HashMap<Pid, (u64, u64)>> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let items: Vec<serde_json::Value> = match v {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(_) => vec![v],
+        _ => return None,
+    };
+    let mut map = HashMap::new();
+    for it in items {
+        let Some(pid) = it.get("Id").and_then(|p| p.as_i64()) else { continue };
+        let rb = it.get("rb").and_then(|m| m.as_u64());
+        let wb = it.get("wb").and_then(|m| m.as_u64());
+        if let (Some(rb), Some(wb)) = (rb, wb) {
+            map.insert(pid as Pid, (rb, wb));
+        }
+    }
+    Some(map)
+}
+
 impl Platform for Windows {
     fn name(&self) -> &'static str {
         "windows"
@@ -474,6 +518,21 @@ impl Platform for Windows {
                 ..Default::default()
             })
             .collect())
+    }
+
+    /// Listing pass for the TUI IO column: one PowerShell pass over
+    /// Get-Process. Kept out of [`Self::list_processes`] so CLI listings
+    /// don't pay for a counter the table doesn't show.
+    fn enrich_listing(&self, procs: &mut [Process]) {
+        let Some(map) = io_transfer_map() else {
+            return;
+        };
+        for p in procs.iter_mut() {
+            if let Some((r, w)) = map.get(&p.pid) {
+                p.io_read_bytes = Some(*r);
+                p.io_write_bytes = Some(*w);
+            }
+        }
     }
 
     fn detail(&self, brief: &Process, _want_env: bool) -> Process {
@@ -656,6 +715,18 @@ mod tests {
         // garbage
         assert!(parse_cpu_times("not json").is_none());
         assert!(parse_cpu_times("null").is_none());
+    }
+
+    #[test]
+    fn io_transfers_json_shapes() {
+        let m =
+            parse_io_transfers(r#"[{"Id":100,"rb":4096,"wb":8192},{"Id":9,"rb":null,"wb":5}]"#)
+                .unwrap();
+        assert_eq!(m.get(&100), Some(&(4096, 8192)));
+        assert!(!m.contains_key(&9)); // null read counter (protected) skipped
+        let m = parse_io_transfers(r#"{"Id":55,"rb":1,"wb":2}"#).unwrap();
+        assert_eq!(m.get(&55), Some(&(1, 2)));
+        assert!(parse_io_transfers("not json").is_none());
     }
 
     #[test]

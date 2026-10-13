@@ -237,6 +237,26 @@ fn comm_of(pid: Pid) -> String {
         .unwrap_or_default()
 }
 
+/// Read cumulative disk counters out of a /proc/<pid>/io file into `p`.
+/// Missing keys / unreadable file leave the fields untouched (None).
+fn fill_io_from_proc(io_path: &Path, p: &mut Process) {
+    let Ok(io) = std::fs::read_to_string(io_path) else {
+        return;
+    };
+    for line in io.lines() {
+        if let Some((k, v)) = line.split_once(": ") {
+            let val = v.trim().parse().ok();
+            match k {
+                "read_bytes" => p.io_read_bytes = val,
+                "syscr" => p.io_read_ops = val,
+                "write_bytes" => p.io_write_bytes = val,
+                "syscw" => p.io_write_ops = val,
+                _ => {}
+            }
+        }
+    }
+}
+
 /// (open fds, soft "Max open files" limit) from procfs. None when either
 /// file is unreadable (other user's process without root).
 fn fd_usage(pid: Pid) -> Option<(u64, u64)> {
@@ -557,23 +577,23 @@ impl Platform for Linux {
             }
         }
         // disk I/O (same-user only; kernel threads and other users -> None)
-        if let Ok(io) = std::fs::read_to_string(base.join("io")) {
-            for line in io.lines() {
-                if let Some((k, v)) = line.split_once(": ") {
-                    let val = v.trim().parse().ok();
-                    match k {
-                        "read_bytes" => p.io_read_bytes = val,
-                        "syscr" => p.io_read_ops = val,
-                        "write_bytes" => p.io_write_bytes = val,
-                        "syscw" => p.io_write_ops = val,
-                        _ => {}
-                    }
-                }
-            }
-        }
+        fill_io_from_proc(&base.join("io"), &mut p);
         p.capabilities = self.process_capabilities(brief.pid);
         p.hup_ignored = sigign_hup(brief.pid);
         p
+    }
+
+    /// Listing pass for the TUI IO column: read each pid's cumulative disk
+    /// counters straight from /proc/<pid>/io (a tiny file per pid). Same-user
+    /// processes succeed; under ptrace_scope other users' io files are
+    /// unreadable and stay `None`, which the column treats as "no data".
+    fn enrich_listing(&self, procs: &mut [Process]) {
+        for p in procs.iter_mut() {
+            fill_io_from_proc(
+                &Path::new("/proc").join(p.pid.to_string()).join("io"),
+                p,
+            );
+        }
     }
 
     /// Effective capabilities from /proc/<pid>/status CapEff, decoded to the
@@ -1100,6 +1120,29 @@ mod tests {
         assert_eq!(parse_max_open_files(limits), Some(1024));
         assert_eq!(parse_max_open_files("Max stack size 8388608 unlimited"), None);
         assert_eq!(parse_max_open_files(""), None);
+    }
+
+    #[test]
+    fn proc_io_fill() {
+        let dir = std::env::temp_dir().join(format!("witr-io-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let io = dir.join("io");
+        std::fs::write(
+            &io,
+            "rchar: 100\nwchar: 200\nsyscr: 10\nsyscw: 20\nread_bytes: 4096\nwrite_bytes: 8192\n",
+        )
+        .unwrap();
+        let mut p = Process::default();
+        fill_io_from_proc(&io, &mut p);
+        assert_eq!(p.io_read_bytes, Some(4096));
+        assert_eq!(p.io_write_bytes, Some(8192));
+        assert_eq!(p.io_read_ops, Some(10));
+        assert_eq!(p.io_write_ops, Some(20));
+        // unreadable path leaves fields untouched
+        let mut q = Process::default();
+        fill_io_from_proc(&dir.join("nonexistent"), &mut q);
+        assert_eq!(q.io_read_bytes, None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

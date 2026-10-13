@@ -159,6 +159,16 @@ pub trait Platform {
     /// from [`list_processes`] for the same pid.
     fn detail(&self, brief: &Process, want_env: bool) -> Process;
 
+    /// Optional second pass over a fresh listing that fills per-process
+    /// cumulative disk-I/O counters (`io_read_bytes`/`io_write_bytes`).
+    /// The TUI calls this once per refresh so the sampling history can
+    /// diff the counters into read/write rates for the IO column.
+    /// Best-effort: entries the platform can't measure stay `None` and
+    /// the column hides itself. Default: not measured.
+    fn enrich_listing(&self, procs: &mut [Process]) {
+        let _ = procs;
+    }
+
     /// All sockets whose local port equals `port` (any proto), with owning
     /// pid where resolvable.
     fn port_to_sockets(&self, port: u16) -> PlatResult<Vec<Socket>>;

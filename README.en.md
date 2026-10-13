@@ -14,7 +14,9 @@ A Rust implementation of [pranshuparmar/witr](https://github.com/pranshuparmar/w
 
 **CPU history chart (detail page)**: the detail panes draw the last ~10 minutes of instantaneous CPU samples as a block-char chart normalized to the window peak — bursts and idle phases visible at a glance, no configuration.
 
-**Disk I/O column (Linux)**: the process table gains an IO column (read+write bytes per refresh interval) computed from `/proc/<pid>/io` deltas; the detail page shows the cumulative read/write bytes and syscall counts. The column hides itself on macOS/Windows, which don't expose per-process I/O.
+**Disk I/O column (all platforms)**: the process table gains an IO column (read+write bytes per refresh interval) and the detail page shows cumulative read/write bytes and syscall counts. Sources: Linux `/proc/<pid>/io`, macOS `proc_pid_rusage`, Windows PowerShell `IO_COUNTERS` (protected system processes report nothing and show blanks).
+
+**Memory trend + leak suspicion (detail page)**: the detail panel draws the last ~10 minutes of RSS samples as a green block-char chart on an absolute scale, annotated with the window peak; when RSS grows ≥20 MB over the window with ≥70% monotonically rising segments, a yellow "possible memory leak" warning appears — separating real leaks from sawtoothed allocate/free cycles.
 
 **Snapshot diff (`--snap` / `--diff`)**: `witr-rs --snap before.json` writes the whole process table as JSON; later `witr-rs --diff before.json` reports what changed — **new** processes, **gone** ones, **restarted** (same program identity back under a new pid, like the TUI's crash-loop detector) and **changed** (same pid, different command line). Exit code 1 when anything changed, 0 otherwise — script-friendly.
 
@@ -23,6 +25,14 @@ A Rust implementation of [pranshuparmar/witr](https://github.com/pranshuparmar/w
 **`--watch [seconds]`**: live mode — with targets it re-runs the trace pipeline and re-renders every N seconds (default 2); without targets it refreshes the process table. Composes with `--recent`/`--json` etc.; Ctrl-C exits.
 
 **Peer attribution (TUI detail page)**: each ESTABLISHED connection is reverse-matched against the peer socket's owner and the detail page shows `talking to: <process> (pid N) — k connection(s)`; when the peer lives elsewhere you get the remote address.
+
+**Ports overview (`o`, Ports tab)**: flips the per-socket table into an aggregate keyed by (port, owning process) — columns Port / Proto(s) / Process / PID / User / Addrs (how many addresses the port is bound on; tcp+tcp6 merge into one row), sorted by port, with `/` search and `Enter` jumping to the owner's process detail page. "Who is serving what on this machine" at a glance.
+
+**Crash forensics (exit-time capture)**: the moment an exit event fires, the TUI grabs the dying process's last log lines in the background (macOS unified log by process name / Linux journald by `_PID=`, up to 25 lines, the most recent 50 cached); `l` on an exited/restarted Events row shows these "last words" **instantly** — no racing the log rotation, the crash scene is frozen at exit time.
+
+**Desktop notifications (`--notify` / `!`)**: the TUI fires a system notification whenever a target process restarts; once the same name has restarted ≥2 times this session, its plain exits notify too (crash-loop alerts). macOS uses `osascript`, Linux `notify-send`, sent from a background thread so sampling never stalls; `--notify` pre-enables it and `!` toggles live (footer shows the state).
+
+**Pause sampling (`P`)**: freezes TUI sampling — no refresh, no new events, no notifications, footer shows `⏸ paused`; press again to resume. Read the list or copy a scene without the data flowing past you.
 
 ## TUI keys
 
@@ -45,7 +55,10 @@ Vim-style browsing (aligned with the Go witr):
 | `T` | Processes tab: tree view ↔ flat table (children nest under their parent; a live search shows flat) |
 | `F` | Logs page (container source): toggle the live `logs -f` stream |
 | `a` | Ports tab: listening-only ↔ all socket states; Locks tab: locks ↔ all open files; Processes tab: actions bar (`k` kill / `t` term / `p` pause / `r` resume / `n` renice) |
-| `l` | Detail page / Events tab: pull the process's recent logs (container logs / journalctl / macOS unified log) into a full-screen scrollable Logs page |
+| `o` | Ports tab: per-socket detail ↔ aggregate overview keyed by (port, owner) (`Enter` opens the owner's process detail) |
+| `l` | Detail page / Events tab: pull the process's recent logs (container logs / journalctl / macOS unified log) into a full-screen scrollable Logs page; on exited Events rows the auto-captured last words appear instantly |
+| `P` | Pause / resume sampling (global freeze, footer shows `⏸ paused`; on Events, pid-descending sort is now `p` twice) |
+| `!` | Toggle desktop notifications (`--notify` pre-enables; footer shows the state) |
 | `z` | Zoom: the focused pane temporarily fills the row (tmux-style) |
 | `x` | Kill the selected process (y/n confirm) |
 | `r` | Refresh now |
@@ -96,7 +109,7 @@ Details of the selected process refresh 500ms after the cursor stops moving (deb
 | Container attribution | cgroups (docker/containerd/podman/lxc) | ✗ | ✗ |
 | nohup/disown detection | ✓ (SIGHUP bit of `/proc/<pid>/status` SigIgn, surfaced as a warning) | ✗ | ✗ |
 | Environment variables (`--env` / TUI detail page) | ✓ `/proc/<pid>/environ` (same user) | ✓ same-user processes via `ps -E` (the rest are SIP-limited; the pane says so) | ✗ |
-| Per-process disk I/O (TUI IO column + detail totals) | ✓ `/proc/<pid>/io` (byte deltas → rate) | ✗ | ✗ |
+| Per-process disk I/O (TUI IO column + detail totals) | ✓ `/proc/<pid>/io` (byte deltas → rate) | ✓ `proc_pid_rusage` | ✓ PowerShell IO_COUNTERS |
 | Start time | btime + starttime | `ps etime` | CIM CreationDate |
 
 Optional cross-platform extras (identical on all three; silently skipped when the dependency is missing): `nvidia-smi` (GPU column), `kubectl` (K8s pod attribution), `docker`/`podman`/`nerdctl` (Containers tab).
@@ -158,6 +171,8 @@ witr-rs --replay ev.jsonl     # replay a recording, opening on the Events tab
 witr-rs --snap before.json    # write the process table as JSON and exit
 witr-rs --diff before.json    # new / gone / restarted / changed vs a snapshot (exit 1 on change)
 witr-rs --pid 1234 --follow   # keep tracing across restarts (new pid, same program)
+witr-rs --pid 1234 --follow --on-exit 'say gone'  # run a command once when a watched target disappears (follow then exits 2 when truly gone)
+witr-rs --notify              # TUI desktop notifications: restarts always, crash-loop exits too
 witr-rs --completions zsh     # shell completion script (bash|zsh|fish|powershell)
 witr-rs -i --port 8080        # TUI seeded to that port (-i, see above)
 witr-rs nginx --pid 1         # mix multiple targets (divided per target)
@@ -219,7 +234,7 @@ src/
 ├── pipeline.rs     target resolution (name/pid/port/file/container → pid), attribution priority, warnings
 ├── tui.rs          interactive UI (ratatui/crossterm): five tabs + detail panes + mouse + 3s auto-refresh
 ├── render.rs       standard / tree / short / json / env / warnings / export renderers
-├── history.rs      sampling history: instantaneous cpu, sparklines, restart detection, event feed
+├── history.rs      sampling history: instantaneous cpu, sparklines, memory trend + leak suspicion, restart detection, event feed
 ├── snapshot.rs     --snap / --diff: full-table snapshots + new/gone/restarted/changed comparison
 ├── logs.rs         crash log correlation: container logs / journalctl / macOS unified log
 ├── risk.rs         0–10 risk scoring (temp-dir binary, curl|sh, injections, public peers, bad signatures …)
@@ -237,11 +252,12 @@ src/
 
 Attribution priority: container > ssh session > interactive shell > service manager (systemd/launchd/SCM) > keep-alive supervisor (supervisord/runc etc., incl. cmdline token matching) > cron > init catch-all (pid 1 with no shell in between — system daemons). When the Linux `service_source` falls back to "init" the pipeline drops it and tries the generic detectors instead.
 
-## Known limitations (v0.6)
+## Known limitations
 
 - TUI Ports/Containers/detail pages are snapshots from when they opened — `r` refreshes manually
 - Windows process details rely on batched PowerShell queries (one call per target, 20s timeout guard); the Windows CPU% column comes from `Get-Process` sampling deltas between refreshes (empty when PowerShell is unavailable)
-- Log correlation (`l` / `--logs`) covers container logs / Linux journald / the macOS unified log; Windows has no equivalent single log source yet. The live `F` stream is container-only (journald/unified log have no follow wired up); Windows keeps no per-process I/O either, so no IO column there
+- Log correlation (`l` / `--logs`) covers container logs / Linux journald / the macOS unified log; Windows has no equivalent single log source yet (crash forensics is likewise absent on Windows). The live `F` stream is container-only (journald/unified log have no follow wired up)
+- Desktop notifications exist on macOS (osascript) and Linux (notify-send) only; Windows has no notification channel yet
 - Event persistence (`--events-log`/`--replay`) is TUI-only (the sampler lives with the TUI); processes born and gone inside one 3s window are invisible
 - `--follow` matches by program identity (name+exe+user): a restart of a script that runs under several parallel instances may attach to a sibling rather than "the" successor (the most recently started instance wins)
 - `--snap`/`--diff` compare full tables — between two snaps, a restart of a program with no pid change (impossible) or a pid that was recycled by an unrelated process shows as `changed`/`new`+`gone` rather than `restarted`

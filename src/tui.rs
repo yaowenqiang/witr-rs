@@ -26,6 +26,10 @@ use crate::pipeline;
 use crate::platform::Platform;
 
 const REFRESH: Duration = Duration::from_secs(3);
+/// Crash forensics: lines fetched per dead process, and how many dead
+/// processes keep their "last words" cached.
+const DEATH_LINES: usize = 25;
+const DEATH_CAP: usize = 50;
 const PURPLE: Color = Color::Rgb(125, 86, 243);
 const GREEN: Color = Color::Rgb(34, 170, 34);
 const GRAY: Color = Color::Rgb(88, 88, 88);
@@ -153,6 +157,11 @@ struct TuiApp {
     /// Ports-tab sort column ('p/t/n/s', Go witr parity) + direction
     port_sort: PortSort,
     port_sort_desc: bool,
+    /// Ports-tab 'o' toggle: aggregate view — one row per (port, owner)
+    /// instead of one row per socket
+    ports_overview: bool,
+    /// overview rows rebuilt from the filtered socket view every refresh
+    port_overview_view: Vec<PortOverviewRow>,
     containers: Vec<Container>,
     container_search: String,
     /// indices into `containers` after the filter
@@ -208,9 +217,21 @@ struct TuiApp {
     /// follow autoscroll: pane height + line count at the previous poll
     logs_pane_h: u16,
     follow_prev_len: usize,
+    /// crash forensics: the moment a process exits, its last log lines are
+    /// fetched in the background and parked here (oldest first, capped) so
+    /// the Events tab's 'l' can show "last words" instantly — a live re-query
+    /// minutes later often misses the window (macOS `log show --last 10m`)
+    death_logs: std::collections::VecDeque<(Pid, Vec<String>)>,
+    /// the one in-flight death-logs fetch
+    death_rx: Option<std::sync::mpsc::Receiver<(Pid, std::result::Result<Vec<String>, String>)>>,
     /// --events-log sink: every event the sampler generates is appended as
     /// one JSON line (single writer — the event loop thread)
     events_log: Option<std::fs::File>,
+    /// desktop notifications enabled (--notify, '!' toggles)
+    notify: bool,
+    /// process name → restart count seen this session; a name that has
+    /// restarted ≥2 times is a crash looper — its plain exits notify too
+    restart_tally: HashMap<String, u32>,
     /// container enumeration runs on a background thread (a hung runtime
     /// CLI must not freeze the UI); results arrive via this channel
     containers_loading: bool,
@@ -223,6 +244,8 @@ struct TuiApp {
     /// open files fetched when the full detail page opens
     open_files: Option<Vec<String>>,
     last_refresh: Instant,
+    /// 'P' freezes sampling: no refresh, no event deltas, no pings
+    paused: bool,
     status: String,
     confirm_kill: Option<Pid>,
 }
@@ -293,6 +316,9 @@ pub struct Seed {
     /// --replay: pre-recorded events (newest first) loaded into the ring
     /// before the live sampler starts
     pub replayed: Vec<crate::history::TuiEvent>,
+    /// --notify: desktop notifications on restarts / repeated exits
+    /// ('!' toggles live inside the TUI)
+    pub notify: bool,
 }
 
 impl Seed {
@@ -430,6 +456,8 @@ impl TuiApp {
             ports_show_all: false,
             port_sort: PortSort::Port,
             port_sort_desc: false,
+            ports_overview: false,
+            port_overview_view: Vec::new(),
             containers: Vec::new(),
             container_search: String::new(),
             container_view: Vec::new(),
@@ -457,13 +485,18 @@ impl TuiApp {
             follow_child: None,
             logs_pane_h: 0,
             follow_prev_len: 0,
+            death_logs: std::collections::VecDeque::new(),
+            death_rx: None,
             events_log: None,
+            notify: false,
+            restart_tally: HashMap::new(),
             containers_loading: false,
             containers_loaded: false,
             containers_rx: None,
             hist: crate::history::History::new(),
             open_files: None,
             last_refresh: Instant::now() - REFRESH, // force first refresh
+            paused: false,
             status: String::new(),
             confirm_kill: None,
         };
@@ -512,6 +545,7 @@ impl TuiApp {
             app.switch_tab(Tab::Events);
             app.rebuild_event_view();
         }
+        app.notify = seed.notify;
         app.update_details(); // cold start: no debounce for the first fill
         app
     }
@@ -549,6 +583,7 @@ impl TuiApp {
     fn refresh(&mut self) {
         if let Ok(mut p) = self.platform.list_processes() {
             crate::gpu::enrich(&mut p);
+            self.platform.enrich_listing(&mut p);
             self.procs = p;
             let fresh = self.hist.update(&self.procs);
             if !fresh.is_empty() {
@@ -560,6 +595,18 @@ impl TuiApp {
                         }
                     }
                     let _ = f.flush();
+                }
+                // crash forensics: an exit is the only moment a "last words"
+                // query is guaranteed to still hit — kick off one background
+                // fetch for the dying process (restarted implies an exited
+                // for the old pid, so `exited` alone covers both)
+                for e in fresh.iter().filter(|e| e.kind == "exited") {
+                    self.request_death_logs(e.pid, &e.name);
+                }
+                // desktop pings: restarts always, repeated exits (crash
+                // loop) when --notify / '!' is on
+                for body in self.notify_picks(&fresh) {
+                    send_desktop_notify("witr-rs", &body);
                 }
             }
         }
@@ -657,6 +704,86 @@ impl TuiApp {
             Some(src) => self.open_logs(src),
             None => self.status = "no process selected".into(),
         }
+    }
+
+    /// Crash forensics: is there room to start a death-logs fetch for `pid`?
+    /// One in-flight fetch at a time; processes already captured are skipped.
+    fn death_fetch_needed(&self, pid: Pid) -> bool {
+        self.death_rx.is_none() && !self.death_logs.iter().any(|(p, _)| *p == pid)
+    }
+
+    /// Kick off the background "last words" fetch for a process that just
+    /// exited. Best-effort and throttled to one at a time — a mass exit
+    /// (crashed supervisor) captures the first victim, which shares the
+    /// crash anyway.
+    fn request_death_logs(&mut self, pid: Pid, name: &str) {
+        if !self.death_fetch_needed(pid) {
+            return;
+        }
+        let src = death_log_source(self.platform.name(), pid, name);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.death_rx = Some(rx);
+        std::thread::spawn(move || {
+            let res = crate::logs::fetch(&src, DEATH_LINES);
+            let _ = tx.send((pid, res));
+        });
+    }
+
+    /// Collect a finished death-logs fetch into the forensics cache.
+    fn poll_death_logs(&mut self) {
+        let Some(rx) = &self.death_rx else { return };
+        if let Ok((pid, res)) = rx.try_recv() {
+            self.death_rx = None;
+            if let Ok(lines) = res {
+                if !lines.is_empty() {
+                    if self.death_logs.len() >= DEATH_CAP {
+                        self.death_logs.pop_front();
+                    }
+                    self.death_logs.push_back((pid, lines));
+                }
+            }
+        }
+    }
+
+    /// Which fresh events deserve a desktop notification, updating the
+    /// per-name restart tally: every restart notifies; a plain exit only
+    /// notifies once its name has restarted ≥2 times this session (a
+    /// crash loop in progress).
+    fn notify_picks(&mut self, fresh: &[crate::history::TuiEvent]) -> Vec<String> {
+        if !self.notify {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for e in fresh {
+            match e.kind.as_str() {
+                "restarted" => {
+                    *self.restart_tally.entry(e.name.clone()).or_insert(0) += 1;
+                    out.push(format!("{} restarted — now pid {}", e.name, e.pid));
+                }
+                "exited" => {
+                    let looped = self.restart_tally.get(&e.name).copied().unwrap_or(0) >= 2;
+                    if looped {
+                        out.push(format!("{} (pid {}) exited again — crash loop?", e.name, e.pid));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Events tab 'l' on an exited/restarted row: show the captured last
+    /// words when we have them (instant), else fall back to a live fetch.
+    fn open_death_logs(&mut self, ev: &crate::history::TuiEvent) {
+        if let Some((_, lines)) = self.death_logs.iter().find(|(p, _)| *p == ev.pid) {
+            self.logs_for = Some(format!("last words — {} (pid {})", ev.name, ev.pid));
+            self.logs_lines = lines.clone();
+            self.logs_scroll = 0;
+            self.logs_src = None;
+            self.page = Page::Logs;
+            return;
+        }
+        self.open_logs(death_log_source(self.platform.name(), ev.pid, &ev.name));
     }
 
     /// Collect the pending logs fetch, if it finished.
@@ -845,6 +972,26 @@ impl TuiApp {
                 .unwrap_or(0)
                 .min(self.socket_view.len() - 1);
             self.table_state.select(Some(cur));
+        }
+        // overview ('o') aggregates the same filtered socket list, so the
+        // port search narrows it too
+        let filtered: Vec<Socket> = self
+            .socket_view
+            .iter()
+            .filter_map(|&i| self.sockets.get(i).cloned())
+            .collect();
+        self.port_overview_view = port_overview_rows(&filtered, &self.procs);
+        if self.ports_overview {
+            if self.port_overview_view.is_empty() {
+                self.table_state.select(None);
+            } else {
+                let cur = self
+                    .table_state
+                    .selected()
+                    .unwrap_or(0)
+                    .min(self.port_overview_view.len() - 1);
+                self.table_state.select(Some(cur));
+            }
         }
     }
 
@@ -1561,6 +1708,73 @@ fn filter_sockets(
         .collect()
 }
 
+/// One aggregated row of the Ports-tab overview ('o'): every distinct
+/// (port, owner) pair among listening tcp + bound udp sockets, with the
+/// owning process, its user, the protocols bound there and how many
+/// distinct addresses that port is reachable on.
+#[derive(Debug, Clone, PartialEq)]
+struct PortOverviewRow {
+    port: u16,
+    pid: Option<Pid>,
+    name: String,
+    user: String,
+    protos: String,
+    addrs: usize,
+}
+
+/// Accumulated overview data per (port, owner): protocols seen, and the
+/// distinct local addr:port endpoints the port is reachable on.
+type PortGroup = (Vec<String>, std::collections::HashSet<String>);
+
+/// Group sockets into overview rows: listening tcp (any state spelled
+/// "LISTEN") plus bound udp (port != 0), keyed by (local_port, pid).
+/// Sorted by port, then pid; unknown owners show up as "-".
+fn port_overview_rows(sockets: &[Socket], procs: &[Process]) -> Vec<PortOverviewRow> {
+    let mut order: Vec<(u16, Option<Pid>)> = Vec::new();
+    let mut acc: HashMap<(u16, Option<Pid>), PortGroup> = HashMap::new();
+    for s in sockets {
+        let keep = s.state.eq_ignore_ascii_case("LISTEN")
+            || (s.proto.starts_with("udp") && s.local_port != 0);
+        if !keep {
+            continue;
+        }
+        let key = (s.local_port, s.pid);
+        let e = acc.entry(key).or_insert_with(|| {
+            order.push(key);
+            (Vec::new(), std::collections::HashSet::new())
+        });
+        if !e.0.contains(&s.proto) {
+            e.0.push(s.proto.clone());
+        }
+        e.1.insert(format!("{}:{}", s.local_addr, s.local_port));
+    }
+    order.sort();
+    order
+        .into_iter()
+        .map(|(port, pid)| {
+            let (mut protos, addrs) = acc.remove(&(port, pid)).unwrap_or_default();
+            protos.sort();
+            let (name, user) = pid
+                .and_then(|p| procs.iter().find(|pr| pr.pid == p))
+                .map(|pr| {
+                    (
+                        pr.name.clone(),
+                        pr.user.clone().unwrap_or_else(|| "-".into()),
+                    )
+                })
+                .unwrap_or_else(|| ("-".into(), "-".into()));
+            PortOverviewRow {
+                port,
+                pid,
+                name,
+                user,
+                protos: protos.join("/"),
+                addrs: addrs.len(),
+            }
+        })
+        .collect()
+}
+
 /// Filter locks: substring match over type, mode, pid, process and path.
 fn filter_locks(locks: &[LockEntry], needle: &str) -> Vec<usize> {
     if needle.is_empty() {
@@ -1760,6 +1974,58 @@ fn tree_order(procs: &[Process], sorted: &[usize]) -> (Vec<usize>, Vec<usize>) {
     (order, depth)
 }
 
+/// Best-effort log source for a DEAD process: journald matches historical
+/// entries by _PID (works after exit within the current boot); the macOS
+/// unified log can only be queried by process name. Takes the platform
+/// name (not cfg!) so every branch compiles — and tests — on every host.
+fn death_log_source(platform_name: &str, pid: Pid, name: &str) -> crate::logs::LogSource {
+    if platform_name == "macos" {
+        crate::logs::LogSource::UnifiedLog {
+            name: name.to_string(),
+        }
+    } else {
+        crate::logs::LogSource::Journald { pid }
+    }
+}
+
+/// The desktop-notification command for a given OS — macOS speaks
+/// osascript, Linux notify-send, everything else has no story yet.
+/// Split from the fire step so tests can assert the exact argv.
+fn notify_command_for(os: &str, title: &str, body: &str) -> Option<(String, Vec<String>)> {
+    match os {
+        "macos" => Some((
+            "osascript".to_string(),
+            vec![
+                "-e".to_string(),
+                format!(
+                    "display notification \"{}\" with title \"{}\"",
+                    body.replace('"', "'"),
+                    title.replace('"', "'")
+                ),
+            ],
+        )),
+        "linux" => Some((
+            "notify-send".to_string(),
+            vec![title.to_string(), body.to_string()],
+        )),
+        _ => None,
+    }
+}
+
+/// Fire-and-forget desktop notification for this host — spawned on a
+/// throwaway thread so a slow osascript never stalls a refresh tick.
+fn send_desktop_notify(title: &str, body: &str) {
+    if let Some((prog, args)) = notify_command_for(std::env::consts::OS, title, body) {
+        let _ = std::thread::spawn(move || {
+            let _ = std::process::Command::new(prog)
+                .args(&args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
+    }
+}
+
 fn push_history_lines(lines: &mut Vec<Line<'static>>, hist: &crate::history::History, pid: Pid) {
     if let Some(n) = hist.recent_restarts(pid) {
         if n >= 2 {
@@ -1784,6 +2050,22 @@ fn push_history_lines(lines: &mut Vec<Line<'static>>, hist: &crate::history::His
         lines.push(Line::from(Span::styled(
             format!("  {chart}"),
             Style::new().fg(GREEN),
+        )));
+    }
+    // RSS history on the same window, absolute scale; a slow monotonic
+    // climb surfaces as a leak suspicion line
+    if let Some(chart) = hist.mem_chart(pid, 80) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Memory history:", Style::new().bold())));
+        lines.push(Line::from(Span::styled(
+            format!("  {chart}"),
+            Style::new().fg(GREEN),
+        )));
+    }
+    if let Some(w) = hist.leak_suspicion(pid, REFRESH.as_secs_f64()) {
+        lines.push(Line::from(Span::styled(
+            format!("  ⚠ {w}"),
+            Style::new().fg(Color::Yellow),
         )));
     }
 }
@@ -2192,6 +2474,10 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
 }
 
 fn ports_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
+    if app.ports_overview {
+        ports_overview_table(app, area, f);
+        return;
+    }
     let header = Row::new(["Proto", "Local", "State", "PID", "Process"])
         .style(Style::new().fg(ACCENT).bold());
     let name_by_pid: HashMap<Pid, String> =
@@ -2220,6 +2506,41 @@ fn ports_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>
         Constraint::Length(14),
         Constraint::Length(9),
         Constraint::Min(24),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(3)
+        .row_highlight_style(Style::new().bg(PURPLE).fg(Color::White).bold());
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+/// The Ports-tab overview ('o'): one row per (port, owner) instead of one
+/// row per socket — answers "who is serving what" at a glance. Enter jumps
+/// to the owning process's detail page.
+fn ports_overview_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
+    let header = Row::new(["Port", "Proto(s)", "Process", "PID", "User", "Addrs"])
+        .style(Style::new().fg(ACCENT).bold());
+    let rows: Vec<Row> = app
+        .port_overview_view
+        .iter()
+        .map(|r| {
+            Row::new([
+                Cell::from(r.port.to_string()),
+                Cell::from(r.protos.clone()),
+                Cell::from(r.name.clone()),
+                Cell::from(r.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
+                Cell::from(r.user.clone()),
+                Cell::from(r.addrs.to_string()),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(8),
+        Constraint::Length(12),
+        Constraint::Min(24),
+        Constraint::Length(9),
+        Constraint::Length(16),
+        Constraint::Length(8),
     ];
     let table = Table::new(rows, widths)
         .header(header)
@@ -3026,7 +3347,9 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
     let total = match app.tab {
         Tab::Processes => app.view.len().to_string(),
         Tab::Ports => {
-            if app.port_search.is_empty() {
+            if app.ports_overview {
+                app.port_overview_view.len().to_string()
+            } else if app.port_search.is_empty() {
                 app.sockets.len().to_string()
             } else {
                 format!("{}/{}", app.socket_view.len(), app.sockets.len())
@@ -3059,13 +3382,15 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
     };
     let mut footer = match app.tab {
         Tab::Processes => format!(
-            "Total: {} | Enter: Detail | a: Actions | /: Search | z: Zoom | T: Tree{} | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
+            "Total: {} | Enter: Detail | a: Actions | /: Search | z: Zoom | T: Tree{} | !: Notify{} | P: Pause | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
             total,
-            if app.tree_mode { " (on)" } else { "" }
+            if app.tree_mode { " (on)" } else { "" },
+            if app.notify { " (on)" } else { "" }
         ),
         Tab::Ports => format!(
-            "Total: {} | Enter: Detail | a: All States | p/t/n/s: Sort | /: Search | h-l: Tab | r: Refresh | q: Quit",
-            total
+            "Total: {} | Enter: Detail | o: Overview{} | a: All States | p/t/n/s: Sort | /: Search | h-l: Tab | r: Refresh | q: Quit",
+            total,
+            if app.ports_overview { " (on)" } else { "" }
         ),
         Tab::Containers => format!(
             "Total: {} | Enter: Detail | i/n/r/g/s: Sort | /: Search | h-l: Tab | r: Refresh | q: Quit",
@@ -3079,11 +3404,14 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
             )
         }
         Tab::Events => format!(
-            "Total: {} | Enter: Open Process | t/e/p/n: Sort | /: Search | j-k/g-G: Move | h-l: Tab | r: Refresh | q: Quit",
+            "Total: {} | Enter: Open Process | l: Logs | t/e/p/n: Sort | /: Search | j-k/g-G: Move | h-l: Tab | r: Refresh | q: Quit",
             total
         ),
     };
     footer = format!("witr-rs v{} · {}", env!("CARGO_PKG_VERSION"), footer);
+    if app.paused {
+        footer.push_str("  ·  ⏸ paused");
+    }
     if !app.status.is_empty() {
         footer.push_str(&format!("  ·  {}", app.status));
     }
@@ -3091,6 +3419,25 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
 }
 
 fn move_selection(app: &mut TuiApp, delta: i32) {
+    if app.tab == Tab::Ports {
+        // the Ports table's cursor sits over socket_view — or the overview
+        // rows when the 'o' aggregate view is active
+        let len = if app.ports_overview {
+            app.port_overview_view.len()
+        } else {
+            app.socket_view.len()
+        };
+        if len == 0 {
+            return;
+        }
+        let len = len as i32;
+        let cur = app.table_state.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, len - 1);
+        if next != cur {
+            app.table_state.select(Some(next as usize));
+        }
+        return;
+    }
     if app.tab == Tab::Locks {
         // the Locks table keeps its own cursor over lock_view
         if app.lock_view.is_empty() {
@@ -3132,6 +3479,20 @@ fn move_selection(app: &mut TuiApp, delta: i32) {
 }
 
 fn select_edge(app: &mut TuiApp, first: bool) {
+    if app.tab == Tab::Ports {
+        // g/G over the Ports table: bound by the active view's length
+        let len = if app.ports_overview {
+            app.port_overview_view.len()
+        } else {
+            app.socket_view.len()
+        };
+        if len == 0 {
+            return;
+        }
+        let next = if first { 0 } else { len - 1 };
+        app.table_state.select(Some(next));
+        return;
+    }
     if app.tab == Tab::Locks {
         if app.lock_view.is_empty() {
             return;
@@ -3178,7 +3539,28 @@ fn focused_scroll_mut(app: &mut TuiApp) -> Option<&mut u16> {
 fn open_selection(app: &mut TuiApp) {
     match app.tab {
         Tab::Processes => app.open_detail_page(),
-        Tab::Ports => app.open_port_detail_page(),
+        Tab::Ports => {
+            // overview rows point at an owning process, not a socket
+            if app.ports_overview {
+                if let Some(row) = app
+                    .table_state
+                    .selected()
+                    .and_then(|i| app.port_overview_view.get(i))
+                {
+                    match row.pid {
+                        Some(pid) if app.procs.iter().any(|p| p.pid == pid) => {
+                            app.open_detail_page_for(pid);
+                        }
+                        Some(pid) => {
+                            app.status = format!("pid {pid} has exited — details unavailable");
+                        }
+                        None => app.status = "no owning process for this port".into(),
+                    }
+                }
+            } else {
+                app.open_port_detail_page();
+            }
+        }
         Tab::Containers => app.open_container_detail_page(),
         // "from the lock back to the process": jump straight into the
         // holder's detail page
@@ -3203,6 +3585,18 @@ fn open_selection(app: &mut TuiApp) {
 
 /// Move the tab's table cursor to an absolute row (used by mouse clicks).
 fn select_row(app: &mut TuiApp, row: usize) {
+    if app.tab == Tab::Ports {
+        // clicks map onto the active Ports view (sockets or overview rows)
+        let len = if app.ports_overview {
+            app.port_overview_view.len()
+        } else {
+            app.socket_view.len()
+        };
+        if row < len {
+            app.table_state.select(Some(row));
+        }
+        return;
+    }
     if app.tab == Tab::Locks {
         if row < app.lock_view.len() {
             app.lock_state.select(Some(row));
@@ -3652,6 +4046,25 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         KeyCode::Char('z') if app.tab == Tab::Processes => {
             app.browse_zoom = !app.browse_zoom;
         }
+        // desktop notifications on/off (--notify seeds it)
+        KeyCode::Char('!') => {
+            app.notify = !app.notify;
+            app.status = if app.notify {
+                "desktop notifications on".into()
+            } else {
+                "desktop notifications off".into()
+            };
+        }
+        // freeze/unfreeze sampling ('P'; Events' pid-sort-desc is still
+        // reachable as p-p there)
+        KeyCode::Char('P') => {
+            app.paused = !app.paused;
+            app.status = if app.paused {
+                "sampling paused — data frozen".into()
+            } else {
+                "sampling resumed".into()
+            };
+        }
 
         // ---- cursor movement ----
         KeyCode::Down if app.focus == Focus::Table => move_selection(app, 1),
@@ -3660,10 +4073,14 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         KeyCode::Char('k') if app.focus == Focus::Table => move_selection(app, -1),
         KeyCode::Char('g') if app.focus == Focus::Table => select_edge(app, true),
         KeyCode::Char('G') if app.focus == Focus::Table => select_edge(app, false),
-        // ---- Ports tab: 'a' widens to every socket state, p/t/n/s sort
-        // (Go witr parity) ----
+        // ---- Ports tab: 'a' widens to every socket state, 'o' flips to
+        // the per-port overview, p/t/n/s sort (Go witr parity) ----
         KeyCode::Char('a') if app.tab == Tab::Ports && app.focus == Focus::Table => {
             app.ports_show_all = !app.ports_show_all;
+            app.rebuild_socket_view();
+        }
+        KeyCode::Char('o') if app.tab == Tab::Ports && app.focus == Focus::Table => {
+            app.ports_overview = !app.ports_overview;
             app.rebuild_socket_view();
         }
         KeyCode::Char(c)
@@ -3770,6 +4187,26 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         KeyCode::Char(' ') if app.focus == Focus::Table => move_selection(app, 20),
         KeyCode::Char('b') if app.focus == Focus::Table => move_selection(app, -20),
 
+        // Events rows: 'l' pulls recent logs for the event's process — the
+        // natural follow-up when the row says "restarted". Must precede the
+        // generic 'l' tab-switch below. Exited/restarted rows hit the crash
+        // forensics cache first ("last words" captured at exit time).
+        KeyCode::Char('l') if app.tab == Tab::Events && app.focus == Focus::Table => {
+            let ev = app
+                .event_state
+                .selected()
+                .and_then(|i| app.event_view.get(i))
+                .and_then(|&ei| app.hist.events.get(ei))
+                .cloned();
+            if let Some(ev) = ev {
+                if ev.kind == "exited" || ev.kind == "restarted" {
+                    app.open_death_logs(&ev);
+                } else if let Some(p) = app.procs.iter().find(|p| p.pid == ev.pid) {
+                    app.open_logs(crate::logs::LogSource::for_process(p));
+                }
+            }
+        }
+
         // ---- tabs: h/l (and left/right) ----
         KeyCode::Char('h') if app.focus == Focus::Table => {
             let t = app.tab.prev();
@@ -3819,29 +4256,6 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         }
 
         KeyCode::Enter => open_selection(app),
-        // Events rows: 'l' pulls recent logs for the event's process — the
-        // natural follow-up when the row says "restarted"
-        KeyCode::Char('l') if app.tab == Tab::Events && app.focus == Focus::Table => {
-            let ev = app
-                .event_state
-                .selected()
-                .and_then(|i| app.event_view.get(i))
-                .and_then(|&ei| app.hist.events.get(ei))
-                .cloned();
-            if let Some(ev) = ev {
-                match app.procs.iter().find(|p| p.pid == ev.pid) {
-                    Some(p) => app.open_logs(crate::logs::LogSource::for_process(p)),
-                    None => {
-                        let src = if app.platform.name() == "macos" {
-                            crate::logs::LogSource::UnifiedLog { name: ev.name }
-                        } else {
-                            crate::logs::LogSource::Journald { pid: ev.pid }
-                        };
-                        app.open_logs(src);
-                    }
-                }
-            }
-        }
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('x') => {
             if let Some(pid) = app.selected_pid() {
@@ -3891,6 +4305,14 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
     true
 }
 
+/// One sampling tick when due — a no-op while paused ('P'): no refresh,
+/// no new events, no notifications.
+fn tick_refresh(app: &mut TuiApp) {
+    if !app.paused && app.last_refresh.elapsed() >= REFRESH {
+        app.refresh();
+    }
+}
+
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()> {
     let mut app = TuiApp::new(crate::platform::get(), seed);
     loop {
@@ -3906,11 +4328,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()>
                 _ => {}
             }
         }
-        if app.last_refresh.elapsed() >= REFRESH {
-            app.refresh();
-        }
+        tick_refresh(&mut app);
         app.poll_containers();
         app.poll_logs();
+        app.poll_death_logs();
         app.poll_follow_logs();
         // selection debounce: recompute details 500ms after the cursor
         // stopped moving (mirrors selectionDebounce in the Go witr)
@@ -3967,6 +4388,113 @@ mod tests {
         assert_eq!(wrapped_count(&exact, 10), 1);
         // zero width degrades to 1 char per row
         assert_eq!(wrapped_count(&lines, 0), 31);
+    }
+
+    #[test]
+    fn port_overview_groups_listeners() {
+        let mk = |proto: &str, addr: &str, port: u16, state: &str, pid: Option<Pid>| Socket {
+            proto: proto.into(),
+            local_addr: addr.into(),
+            local_port: port,
+            peer_addr: None,
+            peer_port: None,
+            state: state.into(),
+            pid,
+        };
+        let procs = vec![Process {
+            pid: 100,
+            name: "nginx".into(),
+            user: Some("root".into()),
+            ..Default::default()
+        }];
+        let sockets = vec![
+            mk("tcp", "0.0.0.0", 8080, "LISTEN", Some(100)),
+            mk("tcp6", "::", 8080, "LISTEN", Some(100)), // same port+pid → one row
+            mk("tcp", "127.0.0.1", 9000, "ESTABLISHED", Some(100)), // dropped: not serving
+            mk("udp", "0.0.0.0", 5353, "UNCONNECTED", Some(100)), // bound udp kept
+            mk("udp", "0.0.0.0", 0, "UNCONNECTED", None), // ephemeral udp dropped
+            mk("tcp", "0.0.0.0", 22, "LISTEN", None),     // unknown owner
+        ];
+        let rows = port_overview_rows(&sockets, &procs);
+        assert_eq!(rows.len(), 3, "8080 merges, 9000/udp0 drop, 22+5353 stay");
+        assert_eq!(rows[0].port, 22);
+        assert_eq!(rows[0].pid, None);
+        assert_eq!(rows[0].name, "-");
+        assert_eq!(rows[0].user, "-");
+        assert_eq!(rows[1].port, 5353);
+        assert_eq!(rows[1].protos, "udp");
+        assert_eq!(rows[2].port, 8080);
+        assert_eq!(rows[2].protos, "tcp/tcp6");
+        assert_eq!(rows[2].name, "nginx");
+        assert_eq!(rows[2].user, "root");
+        assert_eq!(rows[2].addrs, 2, "v4 + v6 listener both counted");
+    }
+
+    #[test]
+    fn ports_overview_toggle_and_enter_opens_owner() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        on_key(&mut app, KeyCode::Char('2')); // Ports tab
+        // inject a controlled socket table (switch_tab already refetched
+        // the real one) — pid 1 is always alive, 999_999 never is
+        app.sockets = vec![
+            Socket {
+                proto: "tcp".into(),
+                local_addr: "127.0.0.1".into(),
+                local_port: 8080,
+                peer_addr: None,
+                peer_port: None,
+                state: "LISTEN".into(),
+                pid: Some(1),
+            },
+            Socket {
+                proto: "tcp".into(),
+                local_addr: "127.0.0.1".into(),
+                local_port: 9999,
+                peer_addr: None,
+                peer_port: None,
+                state: "LISTEN".into(),
+                pid: Some(999_999),
+            },
+        ];
+        app.rebuild_socket_view();
+        assert!(!app.ports_overview);
+        on_key(&mut app, KeyCode::Char('o'));
+        assert!(app.ports_overview);
+        assert_eq!(app.port_overview_view.len(), 2);
+        assert_eq!(app.port_overview_view[0].port, 8080);
+        // Enter on the live owner jumps to its process detail page
+        on_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.page, Page::Detail);
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Browse);
+        // dead owner: stays put and says why
+        on_key(&mut app, KeyCode::Char('j'));
+        on_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.page, Page::Browse);
+        assert!(app.status.contains("999999 has exited"));
+        // toggle off returns to the raw per-socket list
+        on_key(&mut app, KeyCode::Char('o'));
+        assert!(!app.ports_overview);
+        assert!(!app.socket_view.is_empty());
+    }
+
+    #[test]
+    fn pause_freezes_the_sampling_tick() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        assert!(!app.paused);
+        on_key(&mut app, KeyCode::Char('P'));
+        assert!(app.paused);
+        assert!(app.status.contains("paused"));
+        // a due tick while paused is skipped: last_refresh untouched
+        app.last_refresh = Instant::now() - REFRESH;
+        tick_refresh(&mut app);
+        assert!(app.last_refresh.elapsed() >= REFRESH, "paused tick skipped");
+        // resume ('P' again): the next due tick fires a real refresh
+        on_key(&mut app, KeyCode::Char('P'));
+        assert!(!app.paused);
+        assert!(app.status.contains("resumed"));
+        tick_refresh(&mut app);
+        assert!(app.last_refresh.elapsed() < REFRESH, "resumed tick refreshed");
     }
 
     #[test]
@@ -4061,13 +4589,150 @@ mod tests {
         assert_eq!(app.tab, Tab::Locks);
         on_key(&mut app, KeyCode::Char('l'));
         assert_eq!(app.tab, Tab::Events);
+        // 'l' on the Events tab is the logs key now (previously a dead arm —
+        // the generic tab-switch shadowed it): the seeded "started" event's
+        // process is alive, so logs open for it instead of switching tabs
         on_key(&mut app, KeyCode::Char('l'));
-        assert_eq!(app.tab, Tab::Processes);
-        on_key(&mut app, KeyCode::Char('l'));
-        assert_eq!(app.tab, Tab::Ports);
-        // digit jump
+        assert_eq!(app.page, Page::Logs);
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Browse);
+        // digit jump still lands on Events
         on_key(&mut app, KeyCode::Char('5'));
         assert_eq!(app.tab, Tab::Events);
+    }
+
+    #[test]
+    fn death_log_source_branches() {
+        assert_eq!(
+            death_log_source("macos", 9, "nginx"),
+            crate::logs::LogSource::UnifiedLog { name: "nginx".into() }
+        );
+        assert_eq!(
+            death_log_source("linux", 9, "nginx"),
+            crate::logs::LogSource::Journald { pid: 9 }
+        );
+    }
+
+    #[test]
+    fn notify_command_platform_shapes() {
+        // macOS: quoted AppleScript, embedded quotes neutralized
+        let (prog, args) = notify_command_for("macos", "witr-rs", "nginx said \"hi\"").unwrap();
+        assert_eq!(prog, "osascript");
+        assert_eq!(args[0], "-e");
+        assert_eq!(
+            args[1],
+            "display notification \"nginx said 'hi'\" with title \"witr-rs\""
+        );
+        // Linux: plain notify-send title body
+        let (prog, args) = notify_command_for("linux", "witr-rs", "nginx restarted").unwrap();
+        assert_eq!(prog, "notify-send");
+        assert_eq!(args, vec!["witr-rs", "nginx restarted"]);
+        // elsewhere: nothing to call
+        assert!(notify_command_for("windows", "witr-rs", "x").is_none());
+    }
+
+    #[test]
+    fn notify_picks_restarts_and_crash_loops() {
+        let ev = |kind: &str, pid: Pid, name: &str| crate::history::TuiEvent {
+            at_unix: crate::util::now_unix(),
+            kind: kind.into(),
+            pid,
+            name: name.into(),
+            detail: String::new(),
+        };
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        // toggle off: nothing fires, tally still not touched
+        let fresh = [ev("restarted", 5, "nginx"), ev("exited", 6, "nginx")];
+        assert!(app.notify_picks(&fresh).is_empty());
+        app.notify = true;
+        // first cycle: restart notifies, plain exit does not
+        let fresh = [ev("started", 1, "nginx"), ev("restarted", 2, "nginx")];
+        assert_eq!(app.notify_picks(&fresh).len(), 1);
+        // second restart of the same name → tally 2, its exit now notifies
+        let fresh = [ev("restarted", 3, "nginx")];
+        assert_eq!(app.notify_picks(&fresh).len(), 1);
+        let fresh = [ev("exited", 3, "nginx")];
+        let picks = app.notify_picks(&fresh);
+        assert_eq!(picks.len(), 1);
+        assert!(picks[0].contains("nginx (pid 3) exited again — crash loop?"));
+        // a different name's first exit stays quiet
+        let fresh = [ev("exited", 9, "busybox")];
+        assert!(app.notify_picks(&fresh).is_empty());
+    }
+
+    #[test]
+    fn death_logs_cache_round_trip() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        // a finished fetch lands in the cache and frees the in-flight slot
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.death_rx = Some(rx);
+        tx.send((5, Ok(vec!["panic: boom".into()]))).unwrap();
+        app.poll_death_logs();
+        assert!(app.death_rx.is_none());
+        assert!(app.death_fetch_needed(9), "another pid can fetch");
+        assert!(!app.death_fetch_needed(5), "captured pid is not re-fetched");
+        assert_eq!(
+            app.death_logs.front().map(|(p, l)| (p, l.as_slice())),
+            Some((&5, &["panic: boom".to_string()][..]))
+        );
+        // empty and error results are not cached
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.death_rx = Some(rx);
+        tx.send((6, Ok(vec![]))).unwrap();
+        app.poll_death_logs();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.death_rx = Some(rx);
+        tx.send((8, Err("log show: timed out".into()))).unwrap();
+        app.poll_death_logs();
+        assert!(!app.death_logs.iter().any(|(p, _)| *p == 6 || *p == 8));
+        // the cache is bounded: oldest entries evict first
+        for i in 0..(DEATH_CAP as Pid + 3) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.death_rx = Some(rx);
+            tx.send((1000 + i, Ok(vec!["x".into()]))).unwrap();
+            app.poll_death_logs();
+        }
+        assert_eq!(app.death_logs.len(), DEATH_CAP);
+        assert_eq!(app.death_logs.front().map(|(p, _)| *p), Some(1003));
+    }
+
+    #[test]
+    fn events_l_shows_cached_death_logs() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        app.hist.events.insert(
+            0,
+            crate::history::TuiEvent {
+                at_unix: crate::util::now_unix(),
+                kind: "exited".into(),
+                pid: 42,
+                name: "worker".into(),
+                detail: String::new(),
+            },
+        );
+        app.death_logs.push_back((42, vec!["panic: nil map".into()]));
+        app.rebuild_event_view();
+        app.event_state.select(Some(0));
+        app.tab = Tab::Events;
+        on_key(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.page, Page::Logs, "cached death logs open instantly");
+        assert!(app.logs_for.as_deref().is_some_and(|h| h.contains("last words")));
+        assert_eq!(app.logs_lines, vec!["panic: nil map".to_string()]);
+        // a started event goes through the live path instead (no cached logs)
+        app.hist.events.insert(
+            0,
+            crate::history::TuiEvent {
+                at_unix: crate::util::now_unix(),
+                kind: "started".into(),
+                pid: 1,
+                name: "init-ish".into(),
+                detail: String::new(),
+            },
+        );
+        app.page = Page::Browse;
+        app.rebuild_event_view();
+        app.event_state.select(Some(0));
+        on_key(&mut app, KeyCode::Char('l'));
+        assert_ne!(app.logs_lines, vec!["panic: nil map".to_string()]);
     }
 
     #[test]
@@ -4166,12 +4831,13 @@ mod tests {
         on_key(&mut app, KeyCode::Char('t'));
         assert!(!app.event_sort_desc);
         assert_eq!(app.event_view, vec![0, 2, 1]);
-        // pid ascending / descending
+        // pid ascending / descending ('P' is the global pause now, so the
+        // desc direction comes from pressing the same key twice)
         on_key(&mut app, KeyCode::Char('p'));
         assert_eq!(app.event_sort, EventSort::Pid);
         assert!(!app.event_sort_desc);
         assert_eq!(app.event_view, vec![1, 2, 0]);
-        on_key(&mut app, KeyCode::Char('P'));
+        on_key(&mut app, KeyCode::Char('p'));
         assert!(app.event_sort_desc);
         assert_eq!(app.event_view, vec![0, 2, 1]);
         // process name ascending: nginx < node < zsh
@@ -4835,6 +5501,7 @@ mod tests {
                 skipped: vec!["pid 99".into()],
                 events_log: None,
                 replayed: Vec::new(),
+                notify: false,
             },
         );
         // port seed wins the tab, filter prefilled, extras reported

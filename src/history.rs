@@ -13,6 +13,11 @@ const BIG_SAMPLES: usize = 120;
 const RESTART_WINDOW: Duration = Duration::from_secs(5 * 60);
 const PRUNE_AFTER: Duration = Duration::from_secs(10 * 60);
 const SPARK_LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Leak suspicion: RSS up at least this many MB across this many trailing
+/// samples, rising at least this fraction of the time.
+const LEAK_SAMPLES: usize = 60; // ~5 min at the 3s TUI refresh
+const LEAK_MB: f64 = 20.0;
+const LEAK_FRACTION: f64 = 0.7;
 
 #[derive(Default, Clone)]
 struct RestartState {
@@ -57,6 +62,9 @@ pub struct History {
     samples: HashMap<Pid, VecDeque<f64>>,
     /// pid → last BIG_SAMPLES instantaneous percents (detail-page chart)
     big: HashMap<Pid, VecDeque<f64>>,
+    /// pid → last BIG_SAMPLES RSS values in KiB (detail-page memory chart
+    /// and leak suspicion)
+    mem_big: HashMap<Pid, VecDeque<u64>>,
     /// pid → identity hash
     identity_of: HashMap<Pid, u64>,
     restarts: HashMap<u64, RestartState>,
@@ -115,6 +123,13 @@ impl History {
 
             // instantaneous disk I/O from cumulative byte deltas (only the
             // Linux /proc listing fills these fields)
+            if let Some(kb) = p.mem_kb {
+                let dq = self.mem_big.entry(p.pid).or_default();
+                dq.push_back(kb);
+                while dq.len() > BIG_SAMPLES {
+                    dq.pop_front();
+                }
+            }
             if p.io_read_bytes.is_some() || p.io_write_bytes.is_some() {
                 let (rb, wb) = (p.io_read_bytes.unwrap_or(0), p.io_write_bytes.unwrap_or(0));
                 if let Some((prb, pwb, at)) = self.io_prev.get(&p.pid) {
@@ -175,6 +190,7 @@ impl History {
         self.cpu_prev.retain(|pid, _| seen.contains(pid));
         self.io_rate.retain(|pid, _| seen.contains(pid));
         self.io_prev.retain(|pid, _| seen.contains(pid));
+        self.mem_big.retain(|pid, _| seen.contains(pid));
         self.identity_of.retain(|pid, _| seen.contains(pid));
         self.restarts.retain(|_, rs| {
             rs.last_seen
@@ -266,6 +282,63 @@ impl History {
             })
             .collect();
         Some(format!("{bars}  peak {peak:.0}%"))
+    }
+
+    /// Block-char RSS chart over the long window, normalized to the window
+    /// peak and thinned to `width` columns. Unlike the CPU chart this is an
+    /// absolute scale (the peak is reported in MB) — a flat line at 2 GB is
+    /// the interesting case, not a boring one. None until two samples exist.
+    pub fn mem_chart(&self, pid: Pid, width: usize) -> Option<String> {
+        let dq = self.mem_big.get(&pid)?;
+        if dq.len() < 2 {
+            return None;
+        }
+        let vals: Vec<f64> = if dq.len() > width {
+            let stride = dq.len() as f64 / width as f64;
+            (0..width)
+                .map(|i| dq[(i as f64 * stride) as usize] as f64)
+                .collect()
+        } else {
+            dq.iter().copied().map(|kb| kb as f64).collect()
+        };
+        let peak = vals.iter().copied().fold(0.0f64, f64::max);
+        let bars: String = vals
+            .iter()
+            .map(|v| {
+                let idx = ((v / peak.max(1.0)).clamp(0.0, 0.999) * 8.0) as usize;
+                SPARK_LEVELS[idx]
+            })
+            .collect();
+        Some(format!("{bars}  peak {:.1} MB", peak / 1024.0))
+    }
+
+    /// Leak suspicion over the trailing [`LEAK_SAMPLES`] RSS samples: grew
+    /// by at least [`LEAK_MB`] while rising at least [`LEAK_FRACTION`] of
+    /// the time. `sample_secs` is the per-refresh interval, used only to
+    /// phrase the elapsed time. Returns a human summary, None otherwise.
+    pub fn leak_suspicion(&self, pid: Pid, sample_secs: f64) -> Option<String> {
+        let dq = self.mem_big.get(&pid)?;
+        let tail_len = dq.len().min(LEAK_SAMPLES);
+        if tail_len < 8 {
+            return None;
+        }
+        let start = dq.len() - tail_len;
+        let tail: Vec<u64> = dq.iter().skip(start).copied().collect();
+        let first = tail[0] as f64;
+        let last = *tail.last().unwrap() as f64;
+        let grew_mb = (last - first) / 1024.0;
+        if grew_mb < LEAK_MB {
+            return None;
+        }
+        let ups = tail.windows(2).filter(|w| w[1] > w[0]).count();
+        let pairs = tail_len - 1;
+        if (ups as f64 / pairs as f64) < LEAK_FRACTION {
+            return None;
+        }
+        let mins = (pairs as f64 * sample_secs) / 60.0;
+        Some(format!(
+            "RSS +{grew_mb:.1} MB over the last {mins:.0} min, steadily increasing — possible leak"
+        ))
     }
 }
 
@@ -375,6 +448,63 @@ mod tests {
         let small = h.cpu_chart(10, 4).unwrap();
         let bars = small.split_whitespace().next().unwrap();
         assert!(bars.chars().count() <= 4, "thinned to width 4: {small}");
+    }
+
+    #[test]
+    fn mem_chart_and_leak_suspicion() {
+        let mut h = History::new();
+        let mut p = proc(10, "/bin/leaky", None);
+        p.mem_kb = Some(100 * 1024);
+        h.update(&[p.clone()]);
+        assert!(h.mem_chart(10, 80).is_none(), "needs 2+ samples");
+        // climb 10 MB per round: 100 → 130 MB
+        for kb in [110u64, 120, 130] {
+            p.mem_kb = Some(kb * 1024);
+            h.update(&[p.clone()]);
+        }
+        let chart = h.mem_chart(10, 80).unwrap();
+        assert!(chart.contains("peak 130.0 MB"), "absolute-scale peak: {chart}");
+        let bars = chart.split_whitespace().next().unwrap();
+        let last = bars.chars().last().unwrap();
+        assert_eq!(last, '█', "monotonic climb ends at the top bar: {chart}");
+        // thinning works like the CPU chart
+        let thin = h.mem_chart(10, 2).unwrap();
+        assert_eq!(thin.split_whitespace().next().unwrap().chars().count(), 2);
+
+        // leak suspicion needs a window (8+ samples): climb on to 144 MB
+        for kb in [132u64, 136, 140, 144] {
+            p.mem_kb = Some(kb * 1024);
+            h.update(&[p.clone()]);
+        }
+        let msg = h.leak_suspicion(10, 3.0).unwrap();
+        assert!(msg.contains("+44.0 MB"), "summary carries the growth: {msg}");
+        assert!(msg.contains("possible leak"));
+
+        // below the MB threshold: quiet
+        let mut h2 = History::new();
+        for kb in [100u64, 105, 110] {
+            let mut q = proc(10, "/bin/leaky", None);
+            q.mem_kb = Some(kb * 1024);
+            h2.update(&[q]);
+        }
+        assert!(h2.leak_suspicion(10, 3.0).is_none(), "+10 MB is not a leak");
+
+        // big but oscillating: rises only half the time → not "steady"
+        let mut h3 = History::new();
+        for kb in [100u64, 120, 105, 125, 110, 130, 115, 135] {
+            let mut q = proc(10, "/bin/leaky", None);
+            q.mem_kb = Some(kb * 1024);
+            h3.update(&[q]);
+        }
+        assert!(
+            h3.leak_suspicion(10, 3.0).is_none(),
+            "sawtooth growth is not flagged"
+        );
+
+        // a process that vanished leaves no data behind
+        h3.update(&[]);
+        assert!(h3.mem_chart(10, 80).is_none());
+        assert!(h3.leak_suspicion(10, 3.0).is_none());
     }
 
     #[test]
