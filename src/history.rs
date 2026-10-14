@@ -45,6 +45,159 @@ pub struct TuiEvent {
 
 /// Cap on the in-memory event ring (newest first).
 const EVENT_CAP: usize = 500;
+/// Board sizes for the session summary (spikes / climbers / chains).
+const SUMMARY_CAP: usize = 8;
+
+/// One row of the summary CPU-spike board.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SpikeRow {
+    pub pid: Pid,
+    pub name: String,
+    /// Peak instantaneous CPU percent across the sampled window.
+    pub peak: f64,
+}
+
+/// One row of the summary memory-climber board.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ClimbRow {
+    pub pid: Pid,
+    pub name: String,
+    /// RSS growth from the first to the last sample, in MB.
+    pub grew_mb: f64,
+}
+
+/// A program that restarted in-window, with the count.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ChainRow {
+    pub name: String,
+    pub count: u32,
+}
+
+/// The "what happened" digest behind `--since` and the TUI summary page
+/// ('S'): appear/exit/restart activity inside the window, restart chains,
+/// and the CPU-spike / memory-climber boards. Boards are built from the
+/// live sample buffers, which only cover processes alive at the last
+/// refresh — a replayed events log digests activity counts only.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+pub struct SessionSummary {
+    /// Window length in seconds (`u64::MAX` = whole session).
+    pub since_secs: u64,
+    pub started: usize,
+    pub exited: usize,
+    pub restarted: usize,
+    /// Restart chains in-window, hottest first, capped.
+    pub chains: Vec<ChainRow>,
+    /// Peak CPU per sampled pid, hottest first, capped.
+    pub spikes: Vec<SpikeRow>,
+    /// RSS growth per sampled pid, fastest first, capped.
+    pub climbers: Vec<ClimbRow>,
+}
+
+/// `12345` → `3h25m45s` (summary windows and headers).
+pub fn human_secs(secs: u64) -> String {
+    let (d, rem) = (secs / 86400, secs % 86400);
+    let (h, rem) = (rem / 3600, rem % 3600);
+    let (m, s) = (rem / 60, rem % 60);
+    let mut out = String::new();
+    if d > 0 {
+        out.push_str(&format!("{d}d"));
+    }
+    if h > 0 {
+        out.push_str(&format!("{h}h"));
+    }
+    if m > 0 {
+        out.push_str(&format!("{m}m"));
+    }
+    if s > 0 || out.is_empty() {
+        out.push_str(&format!("{s}s"));
+    }
+    out
+}
+
+/// Earliest event second still inside the window.
+fn cutoff_for(now_unix: i64, since_secs: u64) -> i64 {
+    now_unix.saturating_sub(since_secs.min(i64::MAX as u64) as i64)
+}
+
+/// Activity counts + restart chains from a newest-first event ring,
+/// windowed by `cutoff`.
+fn activity_from_events(events: &[TuiEvent], cutoff: i64) -> (usize, usize, usize, Vec<ChainRow>) {
+    let (mut started, mut exited, mut restarted) = (0usize, 0usize, 0usize);
+    let mut chains: HashMap<String, u32> = HashMap::new();
+    for e in events {
+        if e.at_unix < cutoff {
+            continue;
+        }
+        match e.kind.as_str() {
+            "started" => started += 1,
+            "exited" => exited += 1,
+            "restarted" => {
+                restarted += 1;
+                *chains.entry(e.name.clone()).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+    let mut rows: Vec<ChainRow> = chains
+        .into_iter()
+        .map(|(name, count)| ChainRow { name, count })
+        .collect();
+    rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    rows.truncate(SUMMARY_CAP);
+    (started, exited, restarted, rows)
+}
+
+/// Digest a recorded event ring (`--since` + `--replay`): activity counts
+/// and restart chains only — the file carries no CPU/memory samples.
+pub fn summary_from_events(events: &[TuiEvent], since_secs: u64) -> SessionSummary {
+    let cutoff = cutoff_for(crate::util::now_unix(), since_secs);
+    let (started, exited, restarted, chains) = activity_from_events(events, cutoff);
+    SessionSummary {
+        since_secs,
+        started,
+        exited,
+        restarted,
+        chains,
+        ..Default::default()
+    }
+}
+
+impl SessionSummary {
+    /// Plain-text digest (the CLI `--since` output; the TUI page renders
+    /// its own styled version from the same fields).
+    pub fn to_text(&self) -> String {
+        let window = if self.since_secs >= i64::MAX as u64 {
+            "whole session".to_string()
+        } else {
+            format!("last {}", human_secs(self.since_secs))
+        };
+        let mut lines = vec![format!(
+            "Session summary ({window}): started {} · exited {} · restarted {}",
+            self.started, self.exited, self.restarted
+        )];
+        if !self.chains.is_empty() {
+            let list: Vec<String> = self
+                .chains
+                .iter()
+                .map(|c| format!("{} ×{}", c.name, c.count))
+                .collect();
+            lines.push(format!("  restart chains: {}", list.join(", ")));
+        }
+        if !self.spikes.is_empty() {
+            lines.push("  CPU spikes:".into());
+            for s in &self.spikes {
+                lines.push(format!("    {} (pid {}) peak {:.0}%", s.name, s.pid, s.peak));
+            }
+        }
+        if !self.climbers.is_empty() {
+            lines.push("  memory climbers:".into());
+            for c in &self.climbers {
+                lines.push(format!("    {} (pid {}) +{:.1} MB", c.name, c.pid, c.grew_mb));
+            }
+        }
+        lines.join("\n")
+    }
+}
 
 #[derive(Default)]
 pub struct History {
@@ -284,6 +437,58 @@ impl History {
         Some(format!("{bars}  peak {peak:.0}%"))
     }
 
+    /// The session digest for the TUI summary page ('S'): windowed
+    /// activity from the event ring plus the CPU-spike / memory-climber
+    /// boards from the sample buffers. Only processes alive at the last
+    /// refresh have samples (dead pids are pruned), so a spike-then-exit
+    /// shows up in the counts, not on the boards.
+    pub fn summary(&self, since_secs: u64) -> SessionSummary {
+        let cutoff = cutoff_for(crate::util::now_unix(), since_secs);
+        let (started, exited, restarted, chains) = activity_from_events(&self.events, cutoff);
+
+        let mut spikes: Vec<SpikeRow> = self
+            .big
+            .iter()
+            .filter_map(|(pid, dq)| {
+                let peak = dq.iter().copied().fold(0.0f64, f64::max);
+                (peak > 0.0).then(|| SpikeRow {
+                    pid: *pid,
+                    name: self.prev_seen.get(pid).cloned().unwrap_or_else(|| "?".into()),
+                    peak,
+                })
+            })
+            .collect();
+        spikes.sort_by(|a, b| b.peak.total_cmp(&a.peak));
+        spikes.truncate(SUMMARY_CAP);
+
+        let mut climbers: Vec<ClimbRow> = self
+            .mem_big
+            .iter()
+            .filter_map(|(pid, dq)| {
+                let first = dq.front().copied()? as f64;
+                let last = dq.back().copied()? as f64;
+                let grew_mb = (last - first) / 1024.0;
+                (grew_mb > 0.5).then(|| ClimbRow {
+                    pid: *pid,
+                    name: self.prev_seen.get(pid).cloned().unwrap_or_else(|| "?".into()),
+                    grew_mb,
+                })
+            })
+            .collect();
+        climbers.sort_by(|a, b| b.grew_mb.total_cmp(&a.grew_mb));
+        climbers.truncate(SUMMARY_CAP);
+
+        SessionSummary {
+            since_secs,
+            started,
+            exited,
+            restarted,
+            chains,
+            spikes,
+            climbers,
+        }
+    }
+
     /// Block-char RSS chart over the long window, normalized to the window
     /// peak and thinned to `width` columns. Unlike the CPU chart this is an
     /// absolute scale (the peak is reported in MB) — a flat line at 2 GB is
@@ -339,6 +544,22 @@ impl History {
         Some(format!(
             "RSS +{grew_mb:.1} MB over the last {mins:.0} min, steadily increasing — possible leak"
         ))
+    }
+
+    /// Record a threshold alert in the event ring (kind "alert", newest
+    /// first, same cap) and return it so callers can persist it to
+    /// `--events-log`. Alerts are TUI-generated — `update` never emits them.
+    pub fn push_alert(&mut self, pid: Pid, name: &str, detail: &str) -> TuiEvent {
+        let e = TuiEvent {
+            at_unix: crate::util::now_unix(),
+            kind: "alert".into(),
+            pid,
+            name: name.to_string(),
+            detail: detail.to_string(),
+        };
+        self.events.insert(0, e.clone());
+        self.events.truncate(EVENT_CAP);
+        e
     }
 }
 
@@ -505,6 +726,80 @@ mod tests {
         h3.update(&[]);
         assert!(h3.mem_chart(10, 80).is_none());
         assert!(h3.leak_suspicion(10, 3.0).is_none());
+    }
+
+    #[test]
+    fn summary_boards_rank_spikes_and_climbers() {
+        let mut h = History::new();
+        h.update(&[proc(10, "/bin/busy", Some(0)), proc(20, "/bin/idle", Some(0))]);
+        std::thread::sleep(Duration::from_millis(120));
+        h.update(&[proc(10, "/bin/busy", Some(1_200)), proc(20, "/bin/idle", Some(10))]);
+        // memory climber: +30 MB over three refreshes
+        for kb in [100u64, 115, 130] {
+            let mut p = proc(30, "/bin/leaky", None);
+            p.mem_kb = Some(kb * 1024);
+            h.update(&[proc(10, "/bin/busy", Some(1_200)), proc(20, "/bin/idle", Some(10)), p]);
+        }
+        let s = h.summary(u64::MAX);
+        assert_eq!(s.since_secs, u64::MAX);
+        assert!(
+            s.spikes.first().is_some_and(|r| r.pid == 10 && r.peak > 40.0),
+            "busy pid tops the spike board: {:?}",
+            s.spikes
+        );
+        assert!(
+            s.climbers.first().is_some_and(|r| r.pid == 30 && r.grew_mb > 25.0),
+            "leaky pid tops the climber board: {:?}",
+            s.climbers
+        );
+        // a flat or shrinking series makes no board
+        assert!(s.climbers.iter().all(|r| r.pid != 20), "idle pid never climbs");
+        // text form carries the boards (the proc helper names everything
+        // "worker"; pids disambiguate)
+        let text = s.to_text();
+        assert!(text.contains("CPU spikes:"));
+        assert!(text.contains("worker (pid 10)"));
+        assert!(text.contains("memory climbers:"));
+    }
+
+    #[test]
+    fn summary_counts_windowed_activity() {
+        let mut h = History::new();
+        h.update(&[proc(1, "/bin/worker", None)]);
+        h.update(&[]);
+        h.update(&[proc(2, "/bin/worker", None)]);
+        h.update(&[proc(2, "/bin/worker", None), proc(9, "/bin/one-off", None)]);
+        let s = h.summary(u64::MAX);
+        assert_eq!((s.started, s.exited, s.restarted), (2, 1, 1));
+        assert_eq!(s.chains, vec![ChainRow { name: "worker".into(), count: 1 }]);
+        assert!(s.to_text().starts_with("Session summary (whole session): started 2"));
+        // windowing math itself is pinned by summary_from_events (synthetic
+        // timestamps); live events can't be backdated
+    }
+
+    #[test]
+    fn summary_from_events_round_trips_text() {
+        let now = crate::util::now_unix();
+        let events = vec![
+            TuiEvent { at_unix: now, kind: "restarted".into(), pid: 2, name: "worker".into(), detail: String::new() },
+            TuiEvent { at_unix: now - 3600, kind: "exited".into(), pid: 1, name: "worker".into(), detail: String::new() },
+            TuiEvent { at_unix: now - 7200, kind: "started".into(), pid: 1, name: "worker".into(), detail: String::new() },
+        ];
+        let s = summary_from_events(&events, 5 * 60);
+        assert_eq!((s.started, s.exited, s.restarted), (0, 0, 1), "only in-window events count");
+        assert_eq!(s.chains.len(), 1);
+        assert!(s.spikes.is_empty() && s.climbers.is_empty(), "no samples in a file digest");
+        let text = s.to_text();
+        assert!(text.contains("last 5m"));
+        assert!(text.contains("restart chains: worker ×1"));
+    }
+
+    #[test]
+    fn human_secs_formats() {
+        assert_eq!(human_secs(45), "45s");
+        assert_eq!(human_secs(300), "5m");
+        assert_eq!(human_secs(3661), "1h1m1s");
+        assert_eq!(human_secs(2 * 86400), "2d");
     }
 
     #[test]

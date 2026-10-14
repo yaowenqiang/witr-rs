@@ -34,6 +34,12 @@ A Rust implementation of [pranshuparmar/witr](https://github.com/pranshuparmar/w
 
 **Pause sampling (`P`)**: freezes TUI sampling — no refresh, no new events, no notifications, footer shows `⏸ paused`; press again to resume. Read the list or copy a scene without the data flowing past you.
 
+**Session digest (`--since` / `S`)**: `witr-rs --replay ev.jsonl --since 1h` skips the UI — it prints a "what happened" digest of the recorded window and exits (pipe-friendly): started / exited / restarted counts plus restart chains (which program restarted how many times). In the TUI, `S` opens the same digest as a full page: activity counts, restart chains, and two boards — **CPU spikes** (highest instantaneous peak per process in the window) and **memory climbers** (fastest RSS growth); `--since` presets the window (30, 30s, 5m, 2h, 1d — default: whole session), `r` recomputes. Answers "what has this machine been busy with for the last half hour".
+
+**Threshold alerts (`--alert-cpu` / `--alert-mem`)**: `witr-rs --alert-cpu 90 --alert-mem 2048` — when a process exceeds the threshold for 5 consecutive samples (~15 seconds): a desktop notification fires, the Events tab records an alert, and the row highlights red. One notification per excursion, re-armed once usage drops back under — no alert storms.
+
+**Config file**: `~/.config/witr-rs/config.toml` (macOS: `~/Library/Application Support/witr-rs/`, Windows: `%APPDATA%\witr-rs\`) — four keys, `refresh_secs` (sampling interval) / `sort` (default sort) / `notify` / `paused`, acting as defaults for the CLI flags: the file loads first, the command line always wins. Bad lines are skipped with a warning; no file changes nothing.
+
 ## TUI keys
 
 Vim-style browsing (aligned with the Go witr):
@@ -57,6 +63,7 @@ Vim-style browsing (aligned with the Go witr):
 | `a` | Ports tab: listening-only ↔ all socket states; Locks tab: locks ↔ all open files; Processes tab: actions bar (`k` kill / `t` term / `p` pause / `r` resume / `n` renice) |
 | `o` | Ports tab: per-socket detail ↔ aggregate overview keyed by (port, owner) (`Enter` opens the owner's process detail) |
 | `l` | Detail page / Events tab: pull the process's recent logs (container logs / journalctl / macOS unified log) into a full-screen scrollable Logs page; on exited Events rows the auto-captured last words appear instantly |
+| `S` | Open the session summary page (activity counts / restart chains / CPU-spike board / memory climbers; window from `--since`), `r` recompute, `Esc` back |
 | `P` | Pause / resume sampling (global freeze, footer shows `⏸ paused`; on Events, pid-descending sort is now `p` twice) |
 | `!` | Toggle desktop notifications (`--notify` pre-enables; footer shows the state) |
 | `z` | Zoom: the focused pane temporarily fills the row (tmux-style) |
@@ -168,6 +175,8 @@ witr-rs --pid 1234 --export   # paste-ready plain-text diagnostic report
 witr-rs --pid 1234 --logs 50  # the process's last 50 log lines (container/journal/unified log)
 witr-rs --events-log ev.jsonl # record TUI events to disk (JSONL, append)
 witr-rs --replay ev.jsonl     # replay a recording, opening on the Events tab
+witr-rs --replay ev.jsonl --since 1h # "what happened" digest of the recording: counts + restart chains, printed and exit
+witr-rs --alert-cpu 90 --alert-mem 2048 # sustained threshold breach → notification + Events record + red row highlight
 witr-rs --snap before.json    # write the process table as JSON and exit
 witr-rs --diff before.json    # new / gone / restarted / changed vs a snapshot (exit 1 on change)
 witr-rs --pid 1234 --follow   # keep tracing across restarts (new pid, same program)
@@ -234,7 +243,8 @@ src/
 ├── pipeline.rs     target resolution (name/pid/port/file/container → pid), attribution priority, warnings
 ├── tui.rs          interactive UI (ratatui/crossterm): five tabs + detail panes + mouse + 3s auto-refresh
 ├── render.rs       standard / tree / short / json / env / warnings / export renderers
-├── history.rs      sampling history: instantaneous cpu, sparklines, memory trend + leak suspicion, restart detection, event feed
+├── history.rs      sampling history: instantaneous cpu, sparklines, memory trend + leak suspicion, restart detection, event feed, session summary
+├── config.rs       user config file (flat toml subset: refresh_secs/sort/notify/paused; CLI overrides)
 ├── snapshot.rs     --snap / --diff: full-table snapshots + new/gone/restarted/changed comparison
 ├── logs.rs         crash log correlation: container logs / journalctl / macOS unified log
 ├── risk.rs         0–10 risk scoring (temp-dir binary, curl|sh, injections, public peers, bad signatures …)
@@ -259,6 +269,7 @@ Attribution priority: container > ssh session > interactive shell > service mana
 - Log correlation (`l` / `--logs`) covers container logs / Linux journald / the macOS unified log; Windows has no equivalent single log source yet (crash forensics is likewise absent on Windows). The live `F` stream is container-only (journald/unified log have no follow wired up)
 - Desktop notifications exist on macOS (osascript) and Linux (notify-send) only; Windows has no notification channel yet
 - Event persistence (`--events-log`/`--replay`) is TUI-only (the sampler lives with the TUI); processes born and gone inside one 3s window are invisible
+- The session-digest (`--since`/`S`) CPU-spike and memory-climber boards only cover processes alive at the last refresh (dead pids are pruned) — a spike-then-exit shows up in the activity counts, not on the boards; the `--replay` file digest carries activity counts and restart chains only (recordings hold no samples)
 - `--follow` matches by program identity (name+exe+user): a restart of a script that runs under several parallel instances may attach to a sibling rather than "the" successor (the most recently started instance wins)
 - `--snap`/`--diff` compare full tables — between two snaps, a restart of a program with no pid change (impossible) or a pid that was recycled by an unrelated process shows as `changed`/`new`+`gone` rather than `restarted`
 - Container attribution is Linux-only (container processes behind colima/Docker Desktop on macOS are not attributed, though `-c` targets get a runtime-side fallback view)

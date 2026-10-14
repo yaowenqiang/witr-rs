@@ -124,6 +124,20 @@ pub struct Container {
     pub restarts: Option<u32>,
 }
 
+/// One service-manager unit: a systemd unit (Linux), a launchd job (macOS)
+/// or a Windows service (SCM). The Services tab lists these; `pid` links a
+/// running unit into the process tables (systemd resolves MainPID lazily,
+/// on Enter).
+#[derive(Debug, Clone, Serialize)]
+pub struct Service {
+    pub manager: String, // systemd / launchd / scm
+    pub name: String,    // unit name / launchd label / service name
+    pub state: String,   // active/running · exited · failed · stopped…
+    pub desc: String,    // unit description / service display name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<Pid>,
+}
+
 impl Container {
     /// The bracketed state/health tag: healthy when reported healthy, the
     /// health verdict otherwise, else the state when it isn't "running".

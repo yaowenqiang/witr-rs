@@ -4,7 +4,8 @@
 //! Sources, in priority order: a container identity (runtime CLI `logs`)
 //! when the process is attributed to one, then the platform log system
 //! (journald filtered by `_PID=` on Linux, the unified log filtered by
-//! process name on macOS). Windows has no equivalent single source yet.
+//! process name on macOS, the Application+System event logs filtered by
+//! pid/name on Windows).
 
 use std::time::Duration;
 
@@ -25,6 +26,9 @@ pub enum LogSource {
     /// macOS unified log, filtered by process name (log show is slow —
     /// 2–10 s wall time, hence the longer timeout).
     UnifiedLog { name: String },
+    /// Windows Application+System event logs (warnings and errors of the
+    /// last 30 minutes mentioning the pid or the process name).
+    EventLog { pid: Pid, name: String },
 }
 
 impl LogSource {
@@ -36,7 +40,9 @@ impl LogSource {
         }
         #[cfg(target_os = "macos")]
         return LogSource::UnifiedLog { name: p.name.clone() };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        return LogSource::EventLog { pid: p.pid, name: p.name.clone() };
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         return LogSource::Journald { pid: p.pid };
     }
 
@@ -48,6 +54,9 @@ impl LogSource {
             }
             LogSource::Journald { pid } => format!("journalctl (_PID={pid})"),
             LogSource::UnifiedLog { name } => format!("unified log (process {name})"),
+            LogSource::EventLog { pid, name } => {
+                format!("event log (pid {pid} / {name})")
+            }
         }
     }
 }
@@ -68,10 +77,27 @@ fn short_id(s: &str) -> String {
 
 /// Strip characters that would break the `log show` predicate string
 /// (names come from the process table, but be defensive anyway).
-fn sanitize_predicate(name: &str) -> String {
+pub(crate) fn sanitize_predicate(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
         .collect()
+}
+
+/// PowerShell one-liner behind [`LogSource::EventLog`]: the last 30
+/// minutes of Application+System warnings/errors that mention the pid or
+/// the process name, rendered as `HH:mm:ss [level] one-line message`.
+/// Built here (not inline) so tests can pin the exact command.
+fn event_log_script(pid: Pid, name: &str) -> String {
+    let name = sanitize_predicate(name);
+    format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         Get-WinEvent -FilterHashtable @{{LogName=@('Application','System'); \
+         Level=@(1,2,3); StartTime=(Get-Date).AddMinutes(-30)}} -MaxEvents 300 | \
+         Where-Object {{ $_.Message -match '\\b{pid}\\b' -or $_.Message -like '*{name}*' }} | \
+         Select-Object -First 25 | \
+         ForEach-Object {{ '{{0:HH:mm:ss}} [{{1}}] {{2}}' -f $_.TimeCreated, \
+         $_.LevelDisplayName, ($_.Message -replace '\\s+',' ') }}"
+    )
 }
 
 /// Last `n` non-empty lines of `out`.
@@ -127,6 +153,16 @@ pub fn fetch(src: &LogSource, n: usize) -> Result<Vec<String>, String> {
                 .cloned()
                 .collect())
         }
+        LogSource::EventLog { pid, name } => {
+            let script = event_log_script(*pid, name);
+            let out = run(
+                "powershell",
+                &["-NoProfile", "-Command", &script],
+                FETCH_TIMEOUT,
+            )
+            .map_err(|e| format!("Get-WinEvent: {e}"))?;
+            Ok(tail_lines(&out, n))
+        }
     }
 }
 
@@ -169,7 +205,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn source_prefers_container_then_journal() {
         let p = proc(Some("podman: db (id deadbeef1234)"), "postgres", 7);
@@ -179,6 +215,43 @@ mod tests {
         );
         let bare = proc(None, "nginx", 9);
         assert_eq!(LogSource::for_process(&bare), LogSource::Journald { pid: 9 });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn source_prefers_container_then_event_log() {
+        let p = proc(Some("docker: web (id deadbeef1234)"), "nginx", 7);
+        assert_eq!(
+            LogSource::for_process(&p),
+            LogSource::Container { runtime: "docker".into(), ref_: "deadbeef1234".into() }
+        );
+        let bare = proc(None, "nginx", 9);
+        assert_eq!(
+            LogSource::for_process(&bare),
+            LogSource::EventLog { pid: 9, name: "nginx".into() }
+        );
+    }
+
+    #[test]
+    fn event_log_script_shape() {
+        let s = event_log_script(1234, "nginx-worker");
+        assert!(s.starts_with("$ErrorActionPreference='SilentlyContinue';"));
+        assert!(s.contains("LogName=@('Application','System')"));
+        assert!(s.contains("\\b1234\\b"));
+        assert!(s.contains("-like '*nginx-worker*'"));
+        assert!(s.contains("AddMinutes(-30)"));
+        // hostile names are neutralized before entering the query string
+        let evil = event_log_script(1, "bad\"name;x'");
+        assert!(evil.contains("-like '*badnamex*'"));
+        assert!(!evil.contains("bad\"name"));
+    }
+
+    #[test]
+    fn event_log_describe() {
+        assert_eq!(
+            LogSource::EventLog { pid: 42, name: "nginx".into() }.describe(),
+            "event log (pid 42 / nginx)"
+        );
     }
 
     #[test]

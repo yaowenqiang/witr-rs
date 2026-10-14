@@ -43,6 +43,7 @@ enum Tab {
     Containers,
     Locks,
     Events,
+    Services,
 }
 
 impl Tab {
@@ -53,6 +54,7 @@ impl Tab {
             Tab::Containers => "3. Containers",
             Tab::Locks => "4. Locks",
             Tab::Events => "5. Events",
+            Tab::Services => "6. Services",
         }
     }
     fn from_digit(c: char) -> Option<Self> {
@@ -62,6 +64,7 @@ impl Tab {
             '3' => Some(Tab::Containers),
             '4' => Some(Tab::Locks),
             '5' => Some(Tab::Events),
+            '6' => Some(Tab::Services),
             _ => None,
         }
     }
@@ -82,6 +85,39 @@ enum SortKey {
 enum Focus {
     Table,
     Details,
+}
+
+/// Consecutive over-threshold samples before an alert fires (~15s at the
+/// default 3s refresh) — one transient spike shouldn't page anyone.
+const ALERT_CYCLES: u32 = 5;
+
+/// One pid's threshold-alert bookkeeping: how many consecutive samples
+/// each metric has been over its limit, and whether an alert for that
+/// excursion already fired (one per excursion — re-arms when it drops
+/// back under).
+#[derive(Default)]
+struct AlertTrack {
+    cpu_streak: u32,
+    cpu_firing: bool,
+    mem_streak: u32,
+    mem_firing: bool,
+}
+
+/// Advance one metric's alert cycle by one sample. Returns true exactly
+/// when the streak first reaches [`ALERT_CYCLES`] on a not-yet-firing
+/// excursion; a sample under the threshold resets both counters.
+fn alert_cycle(streak: &mut u32, firing: &mut bool, over: bool) -> bool {
+    if over {
+        *streak += 1;
+        if *streak >= ALERT_CYCLES && !*firing {
+            *firing = true;
+            return true;
+        }
+    } else {
+        *streak = 0;
+        *firing = false;
+    }
+    false
 }
 
 struct TuiApp {
@@ -203,6 +239,16 @@ struct TuiApp {
     /// newest-first to match the ring's natural order)
     event_sort: EventSort,
     event_sort_desc: bool,
+    /// Services tab: units from the platform service manager, enumerated
+    /// on a background thread (systemctl can take a second)
+    services: Vec<crate::model::Service>,
+    services_loading: bool,
+    services_rx: Option<std::sync::mpsc::Receiver<Vec<crate::model::Service>>>,
+    service_search: String,
+    service_view: Vec<usize>,
+    /// Services-tab sort column ('n/m/s/p') + direction
+    service_sort: Option<ServiceSort>,
+    service_sort_desc: bool,
     /// Logs page ('l'): what we asked for, the fetched lines, scroll offset,
     /// and the in-flight background fetch (log tools take seconds)
     logs_for: Option<String>,
@@ -246,8 +292,22 @@ struct TuiApp {
     last_refresh: Instant,
     /// 'P' freezes sampling: no refresh, no event deltas, no pings
     paused: bool,
+    /// Processes-tab 'B' aggregation mode + the aggregated rows
+    group_mode: GroupMode,
+    group_view: Vec<GroupRow>,
+    /// 'S' session digest (computed when the page opens) + its window
+    summary: Option<crate::history::SessionSummary>,
+    summary_window: u64,
+    /// sampling interval (config refresh_secs, built-in default REFRESH)
+    refresh: Duration,
     status: String,
     confirm_kill: Option<Pid>,
+    /// --alert-cpu / --alert-mem thresholds (None = that metric unchecked)
+    alert_cpu: Option<f64>,
+    /// --alert-mem in MB (mem_kb is KiB)
+    alert_mem: Option<u64>,
+    /// pid → per-metric streak/firing state (pruned to live pids)
+    alert_state: HashMap<Pid, AlertTrack>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -257,6 +317,7 @@ enum Page {
     PortDetail,
     ContainerDetail,
     Logs,
+    Summary,
 }
 
 /// Locks-tab sort columns — keys p/n/t/m/f, matching the Go witr.
@@ -297,6 +358,15 @@ enum EventSort {
     Process,
 }
 
+/// Services-tab sort columns — keys n/m/s/p.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ServiceSort {
+    Name,
+    Manager,
+    State,
+    Pid,
+}
+
 const DEBOUNCE: Duration = Duration::from_millis(500);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
@@ -319,6 +389,18 @@ pub struct Seed {
     /// --notify: desktop notifications on restarts / repeated exits
     /// ('!' toggles live inside the TUI)
     pub notify: bool,
+    /// --since: 'S' summary-page window in seconds (None = whole session)
+    pub since: Option<u64>,
+    /// config refresh_secs — the TUI sampling interval (None = built-in 3s)
+    pub refresh_secs: Option<u64>,
+    /// config sort — default Processes-tab sort (pid/name/user/cpu/mem/started)
+    pub sort: Option<String>,
+    /// config paused — start with sampling frozen ('P' state)
+    pub paused: bool,
+    /// --alert-cpu: CPU%% threshold; sustained excess → alert
+    pub alert_cpu: Option<f64>,
+    /// --alert-mem: RSS threshold in MB; sustained excess → alert
+    pub alert_mem: Option<u64>,
 }
 
 impl Seed {
@@ -378,16 +460,18 @@ impl Tab {
             Tab::Ports => Tab::Containers,
             Tab::Containers => Tab::Locks,
             Tab::Locks => Tab::Events,
-            Tab::Events => Tab::Processes,
+            Tab::Events => Tab::Services,
+            Tab::Services => Tab::Processes,
         }
     }
     fn prev(self) -> Self {
         match self {
-            Tab::Processes => Tab::Events,
+            Tab::Processes => Tab::Services,
             Tab::Ports => Tab::Processes,
             Tab::Containers => Tab::Ports,
             Tab::Locks => Tab::Containers,
             Tab::Events => Tab::Locks,
+            Tab::Services => Tab::Events,
         }
     }
 }
@@ -403,6 +487,7 @@ impl Drop for TuiApp {
 impl TuiApp {
     fn new(platform: Box<dyn Platform>, seed: Seed) -> Self {
         let locks_supported = matches!(platform.name(), "linux" | "macos");
+        let refresh = Duration::from_secs(seed.refresh_secs.unwrap_or(REFRESH.as_secs()).max(1));
         let mut app = TuiApp {
             platform,
             tab: Tab::Processes,
@@ -466,6 +551,9 @@ impl TuiApp {
             renice_input: None,
             last_click: None,
             tab_rect: None,
+            alert_cpu: seed.alert_cpu,
+            alert_mem: seed.alert_mem,
+            alert_state: HashMap::new(),
             table_rect: None,
             detail_rect: None,
             lock_search: String::new(),
@@ -497,6 +585,18 @@ impl TuiApp {
             open_files: None,
             last_refresh: Instant::now() - REFRESH, // force first refresh
             paused: false,
+            group_mode: GroupMode::Off,
+            group_view: Vec::new(),
+            services: Vec::new(),
+            services_loading: false,
+            services_rx: None,
+            service_search: String::new(),
+            service_view: Vec::new(),
+            service_sort: None,
+            service_sort_desc: false,
+            summary: None,
+            summary_window: seed.since.unwrap_or(u64::MAX),
+            refresh,
             status: String::new(),
             confirm_kill: None,
         };
@@ -546,6 +646,17 @@ impl TuiApp {
             app.rebuild_event_view();
         }
         app.notify = seed.notify;
+        // config defaults: start frozen, and sort the process table
+        if seed.paused {
+            app.paused = true;
+            app.status = "sampling paused (config) — 'P' resumes".into();
+        }
+        if let Some(sort) = &seed.sort {
+            if let Some(k) = sort_key_from_str(sort) {
+                app.sort_key = k;
+                app.rebuild_view();
+            }
+        }
         app.update_details(); // cold start: no debounce for the first fill
         app
     }
@@ -559,6 +670,9 @@ impl TuiApp {
         }
         if tab == Tab::Containers {
             self.request_containers();
+        }
+        if tab == Tab::Services {
+            self.request_services();
         }
         if tab == Tab::Locks && self.locks_supported {
             self.load_locks();
@@ -609,6 +723,22 @@ impl TuiApp {
                     send_desktop_notify("witr-rs", &body);
                 }
             }
+            // threshold alerts (--alert-cpu / --alert-mem): a metric over
+            // its limit for ALERT_CYCLES samples fires once per excursion —
+            // ring record, --events-log line, desktop ping. Always notifies:
+            // the flag IS the opt-in.
+            for (pid, name, detail) in self.alert_picks() {
+                let e = self.hist.push_alert(pid, &name, &detail);
+                if let Some(f) = self.events_log.as_mut() {
+                    use std::io::Write as _;
+                    if let Ok(json) = serde_json::to_string(&e) {
+                        let _ = writeln!(f, "{json}");
+                        let _ = f.flush();
+                    }
+                }
+                send_desktop_notify("witr-rs", &format!("{name}: {detail}"));
+                self.status = format!("ALERT {name} — {detail}");
+            }
         }
         if self.tab == Tab::Ports {
             self.load_sockets();
@@ -616,6 +746,9 @@ impl TuiApp {
         }
         if self.tab == Tab::Containers {
             self.request_containers();
+        }
+        if self.tab == Tab::Services {
+            self.request_services();
         }
         // Locks: Linux re-reads /proc/locks every cycle (a cheap file
         // read); macOS would re-run a full `lsof` scan (1-2s), so its
@@ -664,6 +797,56 @@ impl TuiApp {
         }
     }
 
+    /// Kick off a background service enumeration (no-op while one is in
+    /// flight) — systemctl list-units can take a second on loaded hosts.
+    fn request_services(&mut self) {
+        if self.services_loading {
+            return;
+        }
+        self.services_loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::platform::enumerate_services());
+        });
+        self.services_rx = Some(rx);
+    }
+
+    /// Pick up finished service enumeration, if any.
+    fn poll_services(&mut self) {
+        if !self.services_loading {
+            return;
+        }
+        let arrived = self.services_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(ss) = arrived {
+            self.services = ss;
+            self.services_loading = false;
+            self.services_rx = None;
+            self.rebuild_service_view();
+        }
+    }
+
+    /// Enter on a Services row: jump into the unit's main process. launchd
+    /// / SCM listings carry the pid inline; systemd resolves MainPID on
+    /// demand (one quick `systemctl show` call).
+    fn open_service_detail(&mut self) {
+        let Some(svc) = self
+            .table_state
+            .selected()
+            .and_then(|i| self.service_view.get(i))
+            .map(|&i| self.services[i].clone())
+        else {
+            return;
+        };
+        let pid = svc.pid.or_else(|| crate::platform::service_pid_of(&svc));
+        match pid {
+            Some(pid) if self.procs.iter().any(|p| p.pid == pid) => {
+                self.open_detail_page_for(pid);
+            }
+            Some(pid) => self.status = format!("pid {pid} has exited — details unavailable"),
+            None => self.status = format!("{} is not running (no main pid)", svc.name),
+        }
+    }
+
     /// Open the Logs page for a resolved source, fetching in the background
     /// (journalctl / log show / docker logs all take seconds).
     fn open_logs(&mut self, src: crate::logs::LogSource) {
@@ -678,6 +861,14 @@ impl TuiApp {
         std::thread::spawn(move || {
             let _ = tx.send(crate::logs::fetch(&src, 200));
         });
+    }
+
+    /// Compute the session digest and open the summary page ('S'). The
+    /// snapshot is taken at open time — 'r' on the page re-computes.
+    fn open_summary(&mut self) {
+        self.summary = Some(self.hist.summary(self.summary_window));
+        self.logs_scroll = 0;
+        self.page = Page::Summary;
     }
 
     /// Logs for whatever the process-detail cursor is on: the attribution's
@@ -772,6 +963,47 @@ impl TuiApp {
         out
     }
 
+    /// Check every visible process against the alert thresholds. Returns
+    /// (pid, name, detail) for excursions that just crossed ALERT_CYCLES.
+    /// CPU comes from the sampler's instantaneous percents; RSS straight
+    /// from the current listing (mem_kb is KiB, thresholds are MB). Also
+    /// prunes bookkeeping for pids that left the table.
+    fn alert_picks(&mut self) -> Vec<(Pid, String, String)> {
+        if self.alert_cpu.is_none() && self.alert_mem.is_none() {
+            return Vec::new();
+        }
+        let secs = ALERT_CYCLES as u64 * self.refresh.max(Duration::from_secs(1)).as_secs();
+        let mut out = Vec::new();
+        for p in &self.procs {
+            let track = self.alert_state.entry(p.pid).or_default();
+            if let Some(limit) = self.alert_cpu {
+                let now = self.hist.cpu_now.get(&p.pid).copied();
+                let over = now.is_some_and(|c| c > limit);
+                if alert_cycle(&mut track.cpu_streak, &mut track.cpu_firing, over) {
+                    out.push((
+                        p.pid,
+                        p.name.clone(),
+                        format!("CPU {:.0}% above {limit:.0}% for {secs}s", now.unwrap_or(0.0)),
+                    ));
+                }
+            }
+            if let Some(limit_mb) = self.alert_mem {
+                let mb = p.mem_kb.map(|kb| kb / 1024);
+                let over = mb.is_some_and(|m| m > limit_mb);
+                if alert_cycle(&mut track.mem_streak, &mut track.mem_firing, over) {
+                    out.push((
+                        p.pid,
+                        p.name.clone(),
+                        format!("RSS {} MB above {limit_mb} MB for {secs}s", mb.unwrap_or(0)),
+                    ));
+                }
+            }
+        }
+        let seen: std::collections::HashSet<Pid> = self.procs.iter().map(|p| p.pid).collect();
+        self.alert_state.retain(|pid, _| seen.contains(pid));
+        out
+    }
+
     /// Events tab 'l' on an exited/restarted row: show the captured last
     /// words when we have them (instant), else fall back to a live fetch.
     fn open_death_logs(&mut self, ev: &crate::history::TuiEvent) {
@@ -804,9 +1036,10 @@ impl TuiApp {
         }
     }
 
-    /// 'F' on the Logs page: stream the container's logs live (`runtime
-    /// logs -f`). Toggles — pressing F again (or leaving the page) stops
-    /// the stream and kills the child runtime CLI.
+    /// 'F' on the Logs page: stream the source's logs live — container
+    /// `logs -f`, `journalctl -f _PID=`, or macOS `log stream
+    /// --predicate`. Toggles — pressing F again (or leaving the page)
+    /// stops the stream and kills the child CLI.
     fn toggle_logs_follow(&mut self) {
         if self.follow_child.is_some() {
             self.stop_logs_follow();
@@ -817,18 +1050,62 @@ impl TuiApp {
             self.status = "no log source for this view".into();
             return;
         };
-        // only container sources stream; journald/unified log have no -f
-        // equivalent wired up here
-        let crate::logs::LogSource::Container { runtime, ref_ } = src else {
-            self.status = "live follow works for container logs only".into();
-            return;
-        };
         if self.logs_rx.is_some() {
             self.status = "still fetching the initial tail… try again in a moment".into();
             return;
         }
-        match std::process::Command::new(&runtime)
-            .args(["logs", "-f", "--tail", "100", &ref_])
+        // the follow command per source (Windows has no streaming
+        // equivalent for the event log)
+        let (prog, args, label) = match src {
+            crate::logs::LogSource::Container { runtime, ref_ } => {
+                let label = format!("{runtime} logs");
+                (
+                    runtime,
+                    vec![
+                        "logs".to_string(),
+                        "-f".to_string(),
+                        "--tail".to_string(),
+                        "100".to_string(),
+                        ref_,
+                    ],
+                    label,
+                )
+            }
+            crate::logs::LogSource::Journald { pid } => (
+                "journalctl".to_string(),
+                vec![
+                    "--no-pager".to_string(),
+                    "-f".to_string(),
+                    "-n".to_string(),
+                    "100".to_string(),
+                    format!("_PID={pid}"),
+                ],
+                format!("journal (_PID={pid})"),
+            ),
+            crate::logs::LogSource::UnifiedLog { name } => {
+                let pred = format!(
+                    "process == \"{}\"",
+                    crate::logs::sanitize_predicate(&name)
+                );
+                (
+                    "log".to_string(),
+                    vec![
+                        "stream".to_string(),
+                        "--style".to_string(),
+                        "compact".to_string(),
+                        "--predicate".to_string(),
+                        pred,
+                    ],
+                    format!("unified log (process {name})"),
+                )
+            }
+            crate::logs::LogSource::EventLog { .. } => {
+                self.status = "live follow has no Windows event-log equivalent".into();
+                return;
+            }
+        };
+        match std::process::Command::new(&prog)
+            .args(&args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -838,8 +1115,7 @@ impl TuiApp {
                 self.logs_scroll = 0;
                 self.follow_prev_len = 0;
                 let (tx, rx) = std::sync::mpsc::channel();
-                // both pipes carry container output (the runtime CLI writes
-                // the container's stderr down its own)
+                // both pipes carry output (CLIs write diagnostics down stderr)
                 let streams: Vec<Box<dyn std::io::Read + Send>> = [
                     child.stdout.take().map(|s| Box::new(s) as _),
                     child.stderr.take().map(|s| Box::new(s) as _),
@@ -861,7 +1137,7 @@ impl TuiApp {
                 }
                 self.follow_rx = Some(rx);
                 self.follow_child = Some(child);
-                self.status = format!("following {runtime} logs — F/Esc to stop");
+                self.status = format!("following {label} — F/Esc to stop");
             }
             Err(e) => self.status = format!("follow: {e}"),
         }
@@ -930,6 +1206,37 @@ impl TuiApp {
                 .selected()
                 .unwrap_or(0)
                 .min(self.container_view.len() - 1);
+            self.table_state.select(Some(cur));
+        }
+    }
+
+    /// Apply the Services-tab filter (name / manager / state / description
+    /// / pid) + sort ('n/m/s/p'), keeping the selection in range.
+    fn rebuild_service_view(&mut self) {
+        let needle = self.service_search.to_lowercase();
+        let mut view = filter_services(&self.services, &needle);
+        if let Some(col) = self.service_sort {
+            let desc = self.service_sort_desc;
+            let ss = &self.services;
+            view.sort_by(|&a, &b| {
+                let ord = match col {
+                    ServiceSort::Name => ss[a].name.to_lowercase().cmp(&ss[b].name.to_lowercase()),
+                    ServiceSort::Manager => ss[a].manager.cmp(&ss[b].manager),
+                    ServiceSort::State => ss[a].state.cmp(&ss[b].state),
+                    ServiceSort::Pid => ss[a].pid.cmp(&ss[b].pid),
+                };
+                if desc { ord.reverse() } else { ord }
+            });
+        }
+        self.service_view = view;
+        if self.service_view.is_empty() {
+            self.table_state.select(None);
+        } else {
+            let cur = self
+                .table_state
+                .selected()
+                .unwrap_or(0)
+                .min(self.service_view.len() - 1);
             self.table_state.select(Some(cur));
         }
     }
@@ -1175,9 +1482,34 @@ impl TuiApp {
                 .min(self.view.len() - 1);
             self.table_state.select(Some(cur));
         }
+        // group mode ('B'): aggregate the filtered view into group rows —
+        // the cursor now indexes group_view instead of view
+        if self.group_mode == GroupMode::Off {
+            self.group_view.clear();
+        } else {
+            self.group_view = group_rows(procs, &self.view, self.group_mode, &self.hist, key);
+            if self.group_view.is_empty() {
+                self.table_state.select(None);
+            } else {
+                let cur = self
+                    .table_state
+                    .selected()
+                    .unwrap_or(0)
+                    .min(self.group_view.len() - 1);
+                self.table_state.select(Some(cur));
+            }
+        }
     }
 
     fn selected_pid(&self) -> Option<Pid> {
+        // grouped mode: the "selection" is the group's busiest member
+        if self.group_mode != GroupMode::Off {
+            return self
+                .table_state
+                .selected()
+                .and_then(|i| self.group_view.get(i))
+                .map(|g| g.top_pid);
+        }
         self.table_state
             .selected()
             .and_then(|i| self.view.get(i))
@@ -1523,6 +1855,11 @@ impl TuiApp {
             Page::ContainerDetail if self.cd_pane_info => self.container_info_lines(),
             Page::ContainerDetail => self.container_proc_lines(),
             Page::Logs => self.logs_lines.iter().map(|l| Line::from(l.clone())).collect(),
+            Page::Summary => self
+                .summary
+                .as_ref()
+                .map(|s| s.to_text().lines().map(|l| Line::from(l.to_string())).collect())
+                .unwrap_or_default(),
             Page::Browse => Vec::new(),
         };
         lines.iter().map(line_to_string).collect::<Vec<_>>().join("\n")
@@ -1726,6 +2063,122 @@ struct PortOverviewRow {
 /// distinct local addr:port endpoints the port is reachable on.
 type PortGroup = (Vec<String>, std::collections::HashSet<String>);
 
+/// Processes-tab 'B' grouping: aggregate the (search-filtered) table into
+/// one row per program name / user / container instead of per process —
+/// "all Chrome helpers summed up" at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GroupMode {
+    #[default]
+    Off,
+    Name,
+    User,
+    Container,
+}
+
+impl GroupMode {
+    fn next(self) -> Self {
+        match self {
+            GroupMode::Off => GroupMode::Name,
+            GroupMode::Name => GroupMode::User,
+            GroupMode::User => GroupMode::Container,
+            GroupMode::Container => GroupMode::Off,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            GroupMode::Off => "",
+            GroupMode::Name => "name",
+            GroupMode::User => "user",
+            GroupMode::Container => "container",
+        }
+    }
+}
+
+/// One aggregated row of the grouped process table.
+#[derive(Debug, Clone, PartialEq)]
+struct GroupRow {
+    key: String,
+    count: usize,
+    cpu: f64,
+    mem_kb: u64,
+    io_bps: f64,
+    /// the member to open on Enter — the busiest (cpu, then mem) one
+    top_pid: Pid,
+}
+
+/// Aggregate the given process indices into group rows. The current sort
+/// key picks the group order (cpu/mem sort → summed value descending,
+/// anything else → key ascending).
+fn group_rows(
+    procs: &[Process],
+    indices: &[usize],
+    mode: GroupMode,
+    hist: &crate::history::History,
+    sort_key: SortKey,
+) -> Vec<GroupRow> {
+    let key_of = |p: &Process| -> String {
+        match mode {
+            GroupMode::Off => p.name.clone(),
+            GroupMode::Name => p.name.clone(),
+            GroupMode::User => p.user.clone().unwrap_or_else(|| "-".into()),
+            GroupMode::Container => p
+                .container
+                .as_ref()
+                .map(|c| {
+                    // "docker: web (id abc123) [running]" → "web"
+                    c.split_once(": ")
+                        .and_then(|(_, rest)| rest.split(" (id").next())
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_else(|| c.clone())
+                })
+                .unwrap_or_else(|| "-".into()),
+        }
+    };
+    let mut order: Vec<String> = Vec::new();
+    let mut acc: HashMap<String, GroupRow> = HashMap::new();
+    for &i in indices {
+        let Some(p) = procs.get(i) else { continue };
+        let k = key_of(p);
+        let cpu = hist.display_cpu(p).unwrap_or(0.0);
+        let io = hist.io_rate_of(p.pid).map(|(r, w)| r + w).unwrap_or(0.0);
+        let e = acc.entry(k.clone()).or_insert_with(|| {
+            order.push(k.clone());
+            GroupRow {
+                key: k,
+                count: 0,
+                cpu: 0.0,
+                mem_kb: 0,
+                io_bps: 0.0,
+                top_pid: p.pid,
+            }
+        });
+        e.count += 1;
+        e.cpu += cpu;
+        e.mem_kb += p.mem_kb.unwrap_or(0);
+        e.io_bps += io;
+        let top = procs
+            .iter()
+            .find(|q| q.pid == e.top_pid)
+            .map(|q| (hist.display_cpu(q).unwrap_or(0.0), q.mem_kb.unwrap_or(0)))
+            .unwrap_or((0.0, 0));
+        if (cpu, p.mem_kb.unwrap_or(0)) > top {
+            e.top_pid = p.pid;
+        }
+    }
+    order.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    let mut rows: Vec<GroupRow> = order
+        .into_iter()
+        .filter_map(|k| acc.remove(&k))
+        .collect();
+    match sort_key {
+        SortKey::Cpu => rows.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal)),
+        SortKey::Mem => rows.sort_by(|a, b| b.mem_kb.cmp(&a.mem_kb)),
+        _ => {}
+    }
+    rows
+}
+
 /// Group sockets into overview rows: listening tcp (any state spelled
 /// "LISTEN") plus bound udp (port != 0), keyed by (local_port, pid).
 /// Sorted by port, then pid; unknown owners show up as "-".
@@ -1809,6 +2262,25 @@ fn filter_containers(containers: &[Container], needle: &str) -> Vec<usize> {
                 || c.id.to_lowercase().contains(needle)
                 || c.runtime.to_lowercase().contains(needle)
                 || c.state.to_lowercase().contains(needle)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Services-tab filter over every visible column.
+fn filter_services(services: &[crate::model::Service], needle: &str) -> Vec<usize> {
+    if needle.is_empty() {
+        return (0..services.len()).collect();
+    }
+    services
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.name.to_lowercase().contains(needle)
+                || s.manager.to_lowercase().contains(needle)
+                || s.state.to_lowercase().contains(needle)
+                || s.desc.to_lowercase().contains(needle)
+                || s.pid.is_some_and(|p| p.to_string().contains(needle))
         })
         .map(|(i, _)| i)
         .collect()
@@ -1979,12 +2451,15 @@ fn tree_order(procs: &[Process], sorted: &[usize]) -> (Vec<usize>, Vec<usize>) {
 /// unified log can only be queried by process name. Takes the platform
 /// name (not cfg!) so every branch compiles — and tests — on every host.
 fn death_log_source(platform_name: &str, pid: Pid, name: &str) -> crate::logs::LogSource {
-    if platform_name == "macos" {
-        crate::logs::LogSource::UnifiedLog {
+    match platform_name {
+        "macos" => crate::logs::LogSource::UnifiedLog {
             name: name.to_string(),
-        }
-    } else {
-        crate::logs::LogSource::Journald { pid }
+        },
+        "windows" => crate::logs::LogSource::EventLog {
+            pid,
+            name: name.to_string(),
+        },
+        _ => crate::logs::LogSource::Journald { pid },
     }
 }
 
@@ -2273,7 +2748,14 @@ fn tab_bar(app: &TuiApp) -> Line<'static> {
         styled(Style::new().bg(PURPLE).fg(Color::White).bold(), " witr-rs "),
         Span::raw("  "),
     ];
-    for t in [Tab::Processes, Tab::Ports, Tab::Containers, Tab::Locks, Tab::Events] {
+    for t in [
+        Tab::Processes,
+        Tab::Ports,
+        Tab::Containers,
+        Tab::Locks,
+        Tab::Events,
+        Tab::Services,
+    ] {
         if app.tab == t {
             spans.push(styled(
                 Style::new().bg(GREEN).fg(Color::White).bold(),
@@ -2360,6 +2842,11 @@ fn search_line(app: &TuiApp) -> Line<'static> {
             app.event_search.clone(),
             "Search Event, PID, Process, Detail...",
         )
+    } else if app.tab == Tab::Services {
+        (
+            app.service_search.clone(),
+            "Search Name, Manager, State, PID...",
+        )
     } else {
         (app.search.clone(), "Search PID, Name, User...")
     };
@@ -2378,6 +2865,10 @@ fn search_line(app: &TuiApp) -> Line<'static> {
 }
 
 fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
+    if app.group_mode != GroupMode::Off {
+        groups_table(app, area, f);
+        return;
+    }
     let arrow = |cur: SortKey, key: SortKey, desc: bool| {
         if cur == key {
             if desc { " ↓" } else { " ↑" }
@@ -2441,10 +2932,20 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
             } else {
                 p.name.clone()
             };
+            // a pid with an active (un-rearmed) threshold alert glows red
+            let name = if app
+                .alert_state
+                .get(&p.pid)
+                .is_some_and(|t| t.cpu_firing || t.mem_firing)
+            {
+                Cell::from(name).style(Style::new().fg(Color::Red).bold())
+            } else {
+                Cell::from(name)
+            };
             let mut cells = vec![
                 Cell::from(p.pid.to_string()),
                 Cell::from(p.user.clone().unwrap_or_else(|| "-".into())),
-                Cell::from(name),
+                name,
                 Cell::from(cpu.map(|c| format!("{:.1}", c)).unwrap_or_else(|| "-".into())),
                 Cell::from(app.hist.spark(p.pid).unwrap_or("").to_string()),
                 Cell::from(fmt_mem(p.mem_kb)),
@@ -2469,6 +2970,46 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
+        .row_highlight_style(Style::new().bg(PURPLE).fg(Color::White).bold());
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+/// The grouped process table ('B'): one row per program/user/container
+/// with the members' CPU/mem/IO summed. Enter opens the busiest member.
+fn groups_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
+    let header = Row::new(["Group", "Procs", "CPU%", "Mem", "IO"])
+        .style(Style::new().fg(ACCENT).bold());
+    let rows: Vec<Row> = app
+        .group_view
+        .iter()
+        .map(|g| {
+            Row::new([
+                Cell::from(g.key.clone()),
+                Cell::from(g.count.to_string()),
+                Cell::from(if g.cpu > 0.0 {
+                    format!("{:.1}", g.cpu)
+                } else {
+                    "-".into()
+                }),
+                Cell::from(fmt_mem(Some(g.mem_kb))),
+                Cell::from(if g.io_bps > 0.0 {
+                    fmt_rate(g.io_bps)
+                } else {
+                    "-".into()
+                }),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Min(28),
+        Constraint::Length(6),
+        Constraint::Length(7),
+        Constraint::Length(9),
+        Constraint::Length(9),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(3)
         .row_highlight_style(Style::new().bg(PURPLE).fg(Color::White).bold());
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
@@ -2615,6 +3156,67 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
+/// Green for running units, red for failed, dim elsewhere.
+fn service_state_style(s: &crate::model::Service) -> Style {
+    let st = s.state.to_ascii_lowercase();
+    if st.contains("fail") {
+        Style::new().fg(Color::Red).bold()
+    } else if st.starts_with("active") || st.starts_with("running") {
+        Style::new().fg(Color::Green)
+    } else {
+        Style::new().fg(MID)
+    }
+}
+
+/// The Services table: Name | Manager | State | PID | Description, with
+/// the sort key shown in each header (n:Name, m:Manager, s:State, p:PID).
+fn services_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
+    let cols = [
+        ("n", "Name", ServiceSort::Name),
+        ("m", "Manager", ServiceSort::Manager),
+        ("s", "State", ServiceSort::State),
+        ("p", "PID", ServiceSort::Pid),
+    ];
+    let header = Row::new(
+        cols.iter()
+            .map(|(key, name, col)| {
+                let mut title = format!("{key}:{name}");
+                if app.service_sort == Some(*col) {
+                    title.push_str(if app.service_sort_desc { " ↓" } else { " ↑" });
+                }
+                Cell::from(title)
+            })
+            .chain(std::iter::once(Cell::from("Description")))
+            .collect::<Vec<_>>(),
+    )
+    .style(Style::new().fg(ACCENT).bold());
+    let rows: Vec<Row> = app
+        .service_view
+        .iter()
+        .filter_map(|&i| app.services.get(i))
+        .map(|s| {
+            Row::new([
+                Cell::from(s.name.clone()),
+                Cell::from(s.manager.clone()),
+                Cell::from(s.state.clone()).style(service_state_style(s)),
+                Cell::from(s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
+                Cell::from(s.desc.clone()),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Min(28),
+        Constraint::Length(9),
+        Constraint::Length(16),
+        Constraint::Length(8),
+        Constraint::Min(24),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(3)
+        .row_highlight_style(Style::new().bg(PURPLE).fg(Color::White).bold());
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
 /// The Locks table (live selection — j/k moves, Enter jumps to the holder).
 /// Column layout mirrors the Go witr: PID | Process | Type | Mode | Path,
 /// with the sort key shown in each header (p:PID, n:Process, ...) and a
@@ -2689,11 +3291,19 @@ fn events_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_
             let kind = match e.kind.as_str() {
                 "started" => "started",
                 "exited" => "exited",
+                "alert" => "ALERT",
                 _ => "restarted",
+            };
+            // alert rows stand out: red kind cell, the detail column
+            // carries the metric that tripped
+            let kind_cell = if e.kind == "alert" {
+                Cell::from(kind).style(Style::new().fg(Color::Red).bold())
+            } else {
+                Cell::from(kind)
             };
             Row::new([
                 Cell::from(fmt_age_short(Some(e.at_unix))),
-                Cell::from(kind.to_string()),
+                kind_cell,
                 Cell::from(e.pid.to_string()),
                 Cell::from(e.name.clone()),
                 Cell::from(e.detail.clone()),
@@ -3188,13 +3798,19 @@ fn ui_logs_page(app: &mut TuiApp, f: &mut Frame<'_>) {
         );
     }
 
-    let container_src = matches!(
+    // follow streams container logs, journald and the unified log (the
+    // Windows event log has no streaming equivalent)
+    let followable = matches!(
         app.logs_src,
-        Some(crate::logs::LogSource::Container { .. })
+        Some(
+            crate::logs::LogSource::Container { .. }
+                | crate::logs::LogSource::Journald { .. }
+                | crate::logs::LogSource::UnifiedLog { .. }
+        )
     );
-    let mut footer = if container_src && app.follow_child.is_some() {
+    let mut footer = if followable && app.follow_child.is_some() {
         "F: Stop Follow | j/k/d/u/g/G/b-f: Scroll | Esc/q: Back | c: Copy".to_string()
-    } else if container_src {
+    } else if followable {
         "F: Follow Stream | j/k/d/u/g/G/b-f: Scroll | Esc/q: Back | c: Copy".to_string()
     } else {
         "j/k/d/u/g/G/b-f: Scroll | Esc/q: Back | c: Copy".to_string()
@@ -3215,12 +3831,126 @@ fn placeholder(area: ratatui::prelude::Rect, f: &mut Frame<'_>, msg: &str) {
     );
 }
 
+/// Full-page "what happened" digest ('S'): windowed activity counts,
+/// restart chains, the CPU-spike board and the memory climbers. Computed
+/// when the page opens; 'r' re-computes from the live history.
+fn ui_summary_page(app: &mut TuiApp, f: &mut Frame<'_>) {
+    let outer = Block::bordered().border_style(Style::new().fg(GRAY));
+    f.render_widget(&outer, f.area());
+    let inner = outer.inner(f.area());
+    let v = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Length(1),
+        Constraint::Min(6),    // digest
+        Constraint::Length(1), // footer
+    ])
+    .split(inner);
+
+    let window = if app.summary_window >= i64::MAX as u64 {
+        "whole session".to_string()
+    } else {
+        format!("last {}", crate::history::human_secs(app.summary_window))
+    };
+    let header = Line::from(vec![
+        styled(Style::new().bg(PURPLE).fg(Color::White).bold(), " witr-rs "),
+        Span::raw("  "),
+        styled(Style::new().fg(ACCENT).bold(), format!("Session Summary — {window}")),
+    ]);
+    f.render_widget(Paragraph::new(header), v[0]);
+
+    app.tab_rect = None;
+    app.table_rect = Some(v[2]);
+    app.detail_rect = Some(v[2]);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match &app.summary {
+        None => lines.push(Line::from(styled(
+            Style::new().fg(MID),
+            "no digest yet — press r to compute",
+        ))),
+        Some(s) => {
+            lines.push(Line::from(vec![
+                Span::styled("activity  ", Style::new().bold()),
+                Span::raw(format!(
+                    "started {} · exited {} · restarted {}",
+                    s.started, s.exited, s.restarted
+                )),
+            ]));
+            if s.chains.is_empty()
+                && s.spikes.is_empty()
+                && s.climbers.is_empty()
+                && s.started + s.exited + s.restarted == 0
+            {
+                lines.push(Line::from(styled(
+                    Style::new().fg(MID),
+                    "nothing recorded in this window yet — the sampler needs a few refreshes",
+                )));
+            }
+            if !s.chains.is_empty() {
+                lines.push(Line::from(Span::styled("restart chains", Style::new().bold())));
+                for c in &s.chains {
+                    lines.push(Line::from(styled(
+                        Style::new().fg(Color::Yellow),
+                        format!("  {} ×{}", c.name, c.count),
+                    )));
+                }
+            }
+            if !s.spikes.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "CPU spikes (while watched)",
+                    Style::new().bold(),
+                )));
+                for sp in &s.spikes {
+                    lines.push(Line::from(format!(
+                        "  {} (pid {}) peak {:.0}%",
+                        sp.name, sp.pid, sp.peak
+                    )));
+                }
+            }
+            if !s.climbers.is_empty() {
+                lines.push(Line::from(Span::styled("memory climbers", Style::new().bold())));
+                for c in &s.climbers {
+                    lines.push(Line::from(styled(
+                        Style::new().fg(Color::Yellow),
+                        format!("  {} (pid {}) +{:.1} MB", c.name, c.pid, c.grew_mb),
+                    )));
+                }
+            }
+        }
+    }
+    app.detail_height = lines.len() as u16;
+    let count = lines.len() as u16;
+    let block = Block::bordered()
+        .title(Line::from(styled(
+            Style::new().fg(ACCENT).bold(),
+            format!("Digest{}", TuiApp::scroll_indicator(app.logs_scroll, count, v[2].height)),
+        )))
+        .border_style(Style::new().fg(GRAY));
+    let area = block.inner(v[2]);
+    f.render_widget(block, v[2]);
+    let scroll = app.logs_scroll.min(count.saturating_sub(1));
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+        area,
+    );
+
+    let mut footer = "r: Recompute | j/k/d/u/g/G/b-f: Scroll | Esc/q: Back | c: Copy".to_string();
+    if !app.status.is_empty() {
+        footer.push_str(&format!("  ·  {}", app.status));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(styled(Style::new().fg(MID), footer))),
+        v[3],
+    );
+}
+
 fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
     match app.page {
         Page::Detail => ui_detail_page(app, f),
         Page::PortDetail => ui_port_detail_page(app, f),
         Page::ContainerDetail => ui_container_detail_page(app, f),
         Page::Logs => ui_logs_page(app, f),
+        Page::Summary => ui_summary_page(app, f),
         Page::Browse => {}
     }
     if app.page != Page::Browse {
@@ -3336,6 +4066,23 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
                 events_table(app, v[6], f);
             }
         }
+        Tab::Services => {
+            if app.services_loading && app.services.is_empty() {
+                placeholder(
+                    v[6],
+                    f,
+                    "  loading services… (systemctl / launchctl / Get-CimInstance can take a second)",
+                );
+            } else if app.services.is_empty() {
+                placeholder(
+                    v[6],
+                    f,
+                    "  no services found — needs systemd (Linux), launchd (macOS) or the SCM (Windows)",
+                );
+            } else {
+                services_table(app, v[6], f);
+            }
+        }
     }
 
     let sep = Line::from(styled(
@@ -3345,7 +4092,13 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
     f.render_widget(Paragraph::new(sep), v[7]);
 
     let total = match app.tab {
-        Tab::Processes => app.view.len().to_string(),
+        Tab::Processes => {
+            if app.group_mode != GroupMode::Off {
+                format!("{}/{}", app.group_view.len(), app.view.len())
+            } else {
+                app.view.len().to_string()
+            }
+        }
         Tab::Ports => {
             if app.ports_overview {
                 app.port_overview_view.len().to_string()
@@ -3379,12 +4132,24 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
                 format!("{}/{}", app.event_view.len(), app.hist.events.len())
             }
         }
+        Tab::Services => {
+            if app.service_search.is_empty() {
+                app.services.len().to_string()
+            } else {
+                format!("{}/{}", app.service_view.len(), app.services.len())
+            }
+        }
     };
     let mut footer = match app.tab {
         Tab::Processes => format!(
-            "Total: {} | Enter: Detail | a: Actions | /: Search | z: Zoom | T: Tree{} | !: Notify{} | P: Pause | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
+            "Total: {} | Enter: Detail | a: Actions | /: Search | z: Zoom | T: Tree{} | B: Group{} | S: Summary | !: Notify{} | P: Pause | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
             total,
             if app.tree_mode { " (on)" } else { "" },
+            if app.group_mode != GroupMode::Off {
+                format!(" ({})", app.group_mode.label())
+            } else {
+                String::new()
+            },
             if app.notify { " (on)" } else { "" }
         ),
         Tab::Ports => format!(
@@ -3404,7 +4169,11 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
             )
         }
         Tab::Events => format!(
-            "Total: {} | Enter: Open Process | l: Logs | t/e/p/n: Sort | /: Search | j-k/g-G: Move | h-l: Tab | r: Refresh | q: Quit",
+            "Total: {} | Enter: Open Process | l: Logs | S: Summary | t/e/p/n: Sort | /: Search | j-k/g-G: Move | h-l: Tab | r: Refresh | q: Quit",
+            total
+        ),
+        Tab::Services => format!(
+            "Total: {} | Enter: Open Process | n/m/s/p: Sort | /: Search | j-k/g-G: Move | h-l: Tab | r: Refresh | q: Quit",
             total
         ),
     };
@@ -3464,10 +4233,29 @@ fn move_selection(app: &mut TuiApp, delta: i32) {
         }
         return;
     }
+    if app.tab == Tab::Services {
+        // and for the Services table (shared table_state over service_view)
+        if app.service_view.is_empty() {
+            return;
+        }
+        let len = app.service_view.len() as i32;
+        let cur = app.table_state.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, len - 1);
+        if next != cur {
+            app.table_state.select(Some(next as usize));
+        }
+        return;
+    }
     if app.view.is_empty() {
         return;
     }
-    let len = app.view.len() as i32;
+    // grouped mode ('B'): the cursor walks the aggregate rows
+    let len = if app.tab == Tab::Processes && app.group_mode != GroupMode::Off {
+        app.group_view.len()
+    } else {
+        app.view.len()
+    };
+    let len = len as i32;
     let cur = app.table_state.selected().unwrap_or(0) as i32;
     let next = (cur + delta).clamp(0, len - 1);
     if next != cur {
@@ -3509,10 +4297,26 @@ fn select_edge(app: &mut TuiApp, first: bool) {
         app.event_state.select(Some(next));
         return;
     }
+    if app.tab == Tab::Services {
+        if app.service_view.is_empty() {
+            return;
+        }
+        let next = if first { 0 } else { app.service_view.len() - 1 };
+        app.table_state.select(Some(next));
+        return;
+    }
     if app.view.is_empty() {
         return;
     }
-    let next = if first { 0 } else { app.view.len() - 1 };
+    let len = if app.tab == Tab::Processes && app.group_mode != GroupMode::Off {
+        app.group_view.len()
+    } else {
+        app.view.len()
+    };
+    if len == 0 {
+        return;
+    }
+    let next = if first { 0 } else { len - 1 };
     app.table_state.select(Some(next));
     app.detail_pid = None;
     app.detail_scroll = 0;
@@ -3530,6 +4334,7 @@ fn focused_scroll_mut(app: &mut TuiApp) -> Option<&mut u16> {
         (Page::ContainerDetail, _, _, true) => Some(&mut app.cd_scroll),
         (Page::ContainerDetail, _, _, false) => Some(&mut app.cdp_scroll),
         (Page::Logs, _, _, _) => Some(&mut app.logs_scroll),
+        (Page::Summary, _, _, _) => Some(&mut app.logs_scroll),
         (Page::Browse, _, _, _) => None,
     }
 }
@@ -3580,6 +4385,9 @@ fn open_selection(app: &mut TuiApp) {
                 }
             }
         }
+        // "from the service back to its process": launchd/SCM list pids
+        // inline; systemd resolves MainPID on demand
+        Tab::Services => app.open_service_detail(),
     }
 }
 
@@ -3609,7 +4417,18 @@ fn select_row(app: &mut TuiApp, row: usize) {
         }
         return;
     }
-    if row < app.view.len() {
+    if app.tab == Tab::Services {
+        if row < app.service_view.len() {
+            app.table_state.select(Some(row));
+        }
+        return;
+    }
+    let len = if app.tab == Tab::Processes && app.group_mode != GroupMode::Off {
+        app.group_view.len()
+    } else {
+        app.view.len()
+    };
+    if row < len {
         app.table_state.select(Some(row));
         app.detail_pid = None;
         app.detail_scroll = 0;
@@ -3636,7 +4455,14 @@ fn in_rect(r: Rect, x: u16, y: u16) -> bool {
 /// span widths tab_bar() renders (" witr-rs " + gap, then " title " + gap).
 fn tab_at_x(x: u16) -> Option<Tab> {
     let mut cx = 9 + 2; // " witr-rs " + "  "
-    for t in [Tab::Processes, Tab::Ports, Tab::Containers, Tab::Locks, Tab::Events] {
+    for t in [
+        Tab::Processes,
+        Tab::Ports,
+        Tab::Containers,
+        Tab::Locks,
+        Tab::Events,
+        Tab::Services,
+    ] {
         let w = t.title().chars().count() as u16 + 2;
         if x >= cx && x < cx + w {
             return Some(t);
@@ -3872,6 +4698,11 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
             app.toggle_logs_follow();
             return true;
         }
+        // 'r' on the summary page: recompute from the live history
+        if key == KeyCode::Char('r') && app.page == Page::Summary {
+            app.open_summary();
+            return true;
+        }
         if key == KeyCode::Char('c') {
             let text = app.focused_pane_text();
             app.status = match crate::util::clipboard_copy(&text) {
@@ -3962,6 +4793,10 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                         app.event_search.push(c);
                         app.rebuild_event_view();
                     }
+                    Tab::Services => {
+                        app.service_search.push(c);
+                        app.rebuild_service_view();
+                    }
                     _ => {
                         app.search.push(c);
                         app.rebuild_view();
@@ -3985,6 +4820,10 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                     Tab::Events => {
                         app.event_search.pop();
                         app.rebuild_event_view();
+                    }
+                    Tab::Services => {
+                        app.service_search.pop();
+                        app.rebuild_service_view();
                     }
                     _ => {
                         app.search.pop();
@@ -4026,6 +4865,9 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
             } else if app.tab == Tab::Events && !app.event_search.is_empty() {
                 app.event_search.clear();
                 app.rebuild_event_view();
+            } else if app.tab == Tab::Services && !app.service_search.is_empty() {
+                app.service_search.clear();
+                app.rebuild_service_view();
             } else if !app.search.is_empty() {
                 app.search.clear();
                 app.rebuild_view();
@@ -4046,6 +4888,17 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         KeyCode::Char('z') if app.tab == Tab::Processes => {
             app.browse_zoom = !app.browse_zoom;
         }
+        // Processes tab 'B': cycle grouping off → name → user → container
+        // (mutually exclusive with the tree view)
+        KeyCode::Char('B') if app.tab == Tab::Processes && app.focus == Focus::Table => {
+            app.tree_mode = false;
+            app.group_mode = app.group_mode.next();
+            app.rebuild_view();
+            app.status = match app.group_mode {
+                GroupMode::Off => "grouping off".into(),
+                m => format!("grouped by {} — Enter opens the busiest member", m.label()),
+            };
+        }
         // desktop notifications on/off (--notify seeds it)
         KeyCode::Char('!') => {
             app.notify = !app.notify;
@@ -4064,6 +4917,10 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
             } else {
                 "sampling resumed".into()
             };
+        }
+        // 'S': session summary — what happened in the watched window
+        KeyCode::Char('S') => {
+            app.open_summary();
         }
 
         // ---- cursor movement ----
@@ -4122,6 +4979,26 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                 app.container_sort_desc = false;
             }
             app.rebuild_container_view();
+        }
+        // ---- Services tab: n/m/s/p sort ----
+        KeyCode::Char(c)
+            if app.tab == Tab::Services
+                && app.focus == Focus::Table
+                && matches!(c.to_ascii_lowercase(), 'n' | 'm' | 's' | 'p') =>
+        {
+            let col = match c.to_ascii_lowercase() {
+                'n' => ServiceSort::Name,
+                'm' => ServiceSort::Manager,
+                's' => ServiceSort::State,
+                _ => ServiceSort::Pid,
+            };
+            if app.service_sort == Some(col) {
+                app.service_sort_desc = !app.service_sort_desc;
+            } else {
+                app.service_sort = Some(col);
+                app.service_sort_desc = false;
+            }
+            app.rebuild_service_view();
         }
         // ---- Processes tab: 'a' opens the actions bar on the selection ----
         KeyCode::Char('a') if app.tab == Tab::Processes && app.focus == Focus::Table => {
@@ -4272,6 +5149,9 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                 // parent→child tree; a live search falls back to flat
                 if c == 'T' {
                     app.tree_mode = !app.tree_mode;
+                    if app.tree_mode {
+                        app.group_mode = GroupMode::Off;
+                    }
                     app.status = if app.tree_mode {
                         "tree view on (children nest under their parent; a search shows flat)".into()
                     } else {
@@ -4308,8 +5188,21 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
 /// One sampling tick when due — a no-op while paused ('P'): no refresh,
 /// no new events, no notifications.
 fn tick_refresh(app: &mut TuiApp) {
-    if !app.paused && app.last_refresh.elapsed() >= REFRESH {
+    if !app.paused && app.last_refresh.elapsed() >= app.refresh {
         app.refresh();
+    }
+}
+
+/// Config `sort = "..."` → a sort column; unknown names are ignored.
+fn sort_key_from_str(s: &str) -> Option<SortKey> {
+    match s.to_ascii_lowercase().as_str() {
+        "pid" => Some(SortKey::Pid),
+        "name" => Some(SortKey::Name),
+        "user" => Some(SortKey::User),
+        "cpu" => Some(SortKey::Cpu),
+        "mem" => Some(SortKey::Mem),
+        "started" | "age" | "time" => Some(SortKey::Started),
+        _ => None,
     }
 }
 
@@ -4330,6 +5223,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()>
         }
         tick_refresh(&mut app);
         app.poll_containers();
+        app.poll_services();
         app.poll_logs();
         app.poll_death_logs();
         app.poll_follow_logs();
@@ -4376,6 +5270,30 @@ fn settle_details(app: &mut TuiApp) {
 mod tests {
     use super::*;
     use crate::model::TargetReport;
+
+    #[test]
+    fn refresh_produces_alert_events_when_seeded() {
+        // live-platform loop: with a 0 MB floor every process is over, so
+        // five refreshes must land alert events in the ring
+        let mut app = TuiApp::new(
+            crate::platform::get(),
+            Seed {
+                alert_mem: Some(0),
+                ..Seed::default()
+            },
+        );
+        assert_eq!(app.alert_mem, Some(0), "seed propagates");
+        for _ in 0..6 {
+            app.refresh();
+        }
+        let alerts: Vec<&crate::history::TuiEvent> = app
+            .hist
+            .events
+            .iter()
+            .filter(|e| e.kind == "alert")
+            .collect();
+        assert!(!alerts.is_empty(), "expected alerts after 6 refreshes");
+    }
 
     #[test]
     fn wrapped_count_ceil() {
@@ -4498,6 +5416,169 @@ mod tests {
     }
 
     #[test]
+    fn group_rows_aggregate_and_sort() {
+        use crate::history::History;
+        let mk = |pid: Pid, name: &str, user: Option<&str>, mem_mb: u64| Process {
+            pid,
+            name: name.into(),
+            user: user.map(String::from),
+            mem_kb: Some(mem_mb * 1024),
+            ..Default::default()
+        };
+        let mut hist = History::new();
+        let procs = vec![
+            mk(1, "Chrome Helper", Some("yao"), 100),
+            mk(2, "Chrome Helper", Some("yao"), 300),
+            mk(3, "nginx", Some("root"), 50),
+        ];
+        let all = vec![0, 1, 2];
+        // name mode merges the two Chrome Helpers; order by name asc
+        let rows = group_rows(&procs, &all, GroupMode::Name, &hist, SortKey::Name);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].key, "Chrome Helper");
+        assert_eq!(rows[0].count, 2);
+        assert_eq!(rows[0].mem_kb, 400 * 1024);
+        assert_eq!(rows[0].top_pid, 2, "cpu tie → the bigger member wins");
+        assert_eq!(rows[1].key, "nginx");
+        // user mode
+        let rows = group_rows(&procs, &all, GroupMode::User, &hist, SortKey::Name);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].key, "root");
+        assert_eq!(rows[0].count, 1);
+        assert_eq!(rows[1].key, "yao");
+        assert_eq!(rows[1].count, 2);
+        // mem sort key → biggest group first
+        let rows = group_rows(&procs, &all, GroupMode::Name, &hist, SortKey::Mem);
+        assert_eq!(rows[0].key, "Chrome Helper");
+        // empty selection → no rows
+        assert!(group_rows(&procs, &[], GroupMode::Name, &hist, SortKey::Name).is_empty());
+        let _ = &mut hist;
+    }
+
+    #[test]
+    fn group_mode_cycles_selection_and_gone_status() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        assert_eq!(app.group_mode, GroupMode::Off);
+        // inject a controlled table (two same-name processes + a stranger)
+        let mk = |pid: Pid, name: &str, mem_mb: u64| Process {
+            pid,
+            name: name.into(),
+            mem_kb: Some(mem_mb * 1024),
+            ..Default::default()
+        };
+        app.procs = vec![
+            mk(910, "zz-test-a", 100),
+            mk(911, "zz-test-a", 300),
+            mk(912, "zz-test-b", 50),
+        ];
+        app.rebuild_view();
+        on_key(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.group_mode, GroupMode::Name);
+        assert_eq!(app.group_view.len(), 2);
+        assert_eq!(app.group_view[0].key, "zz-test-a");
+        assert_eq!(app.group_view[0].count, 2);
+        // the selection maps to the group's busiest member (mem tiebreak)
+        assert_eq!(app.selected_pid(), Some(911));
+        // Enter opens that member — a fake pid deterministically reports gone
+        on_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.page, Page::Browse);
+        assert!(app.status.contains("911 is gone"));
+        // cycle: user → container → off (un-attributed procs group under "-")
+        on_key(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.group_mode, GroupMode::User);
+        on_key(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.group_mode, GroupMode::Container);
+        assert!(app.group_view.iter().any(|g| g.key == "-"));
+        on_key(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.group_mode, GroupMode::Off);
+        assert!(app.group_view.is_empty());
+        // tree and grouping are mutually exclusive
+        on_key(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.group_mode, GroupMode::Name);
+        on_key(&mut app, KeyCode::Char('T'));
+        assert!(app.tree_mode);
+        assert_eq!(app.group_mode, GroupMode::Off);
+    }
+
+    #[test]
+    fn summary_page_opens_counts_and_closes() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        assert_eq!(app.page, Page::Browse);
+        // default window covers the whole session
+        assert_eq!(app.summary_window, u64::MAX);
+        // synthetic event ring (TuiApp::new's live seeding would flood the
+        // 500-cap ring with table churn — inject, don't update)
+        let ev = |kind: &str, pid: Pid| crate::history::TuiEvent {
+            at_unix: crate::util::now_unix(),
+            kind: kind.into(),
+            pid,
+            name: "zz-summary".into(),
+            detail: String::new(),
+        };
+        app.hist.events = vec![ev("restarted", 881), ev("exited", 880), ev("started", 880)];
+        on_key(&mut app, KeyCode::Char('S'));
+        assert_eq!(app.page, Page::Summary);
+        let s = app.summary.as_ref().expect("digest computed on open");
+        assert_eq!((s.started, s.exited, s.restarted), (1, 1, 1));
+        assert_eq!(
+            s.chains,
+            vec![crate::history::ChainRow { name: "zz-summary".into(), count: 1 }]
+        );
+        // 'r' recomputes in place; Esc returns to browse
+        on_key(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.page, Page::Summary);
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Browse);
+        // --since seeds a narrower window
+        let app = TuiApp::new(
+            crate::platform::get(),
+            Seed {
+                since: Some(300),
+                ..Seed::default()
+            },
+        );
+        assert_eq!(app.summary_window, 300);
+    }
+
+    #[test]
+    fn config_seed_applies_sort_pause_and_interval() {
+        let app = TuiApp::new(
+            crate::platform::get(),
+            Seed {
+                refresh_secs: Some(7),
+                sort: Some("cpu".into()),
+                paused: true,
+                ..Seed::default()
+            },
+        );
+        assert_eq!(app.refresh, Duration::from_secs(7));
+        assert_eq!(app.sort_key, SortKey::Cpu);
+        assert!(app.paused, "config paused starts frozen");
+        // unknown sort names fall back to the built-in default
+        let app = TuiApp::new(
+            crate::platform::get(),
+            Seed {
+                sort: Some("bogus".into()),
+                ..Seed::default()
+            },
+        );
+        assert_eq!(app.sort_key, SortKey::Mem);
+        assert_eq!(app.refresh, REFRESH);
+        // sort_key_from_str accepts every documented name
+        for (name, key) in [
+            ("pid", SortKey::Pid),
+            ("name", SortKey::Name),
+            ("user", SortKey::User),
+            ("cpu", SortKey::Cpu),
+            ("mem", SortKey::Mem),
+            ("started", SortKey::Started),
+        ] {
+            assert_eq!(sort_key_from_str(name), Some(key), "{name}");
+        }
+        assert_eq!(sort_key_from_str("wat"), None);
+    }
+
+    #[test]
     fn vim_navigation() {
         let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         if app.view.len() < 3 {
@@ -4565,11 +5646,14 @@ mod tests {
     #[test]
     fn logs_follow_state_transitions() {
         let mut app = TuiApp::new(crate::platform::get(), Seed::default());
-        // non-container source: F explains itself and spawns nothing
-        app.logs_src = Some(crate::logs::LogSource::Journald { pid: 1 });
+        // Windows event log: F explains itself and spawns nothing
+        app.logs_src = Some(crate::logs::LogSource::EventLog {
+            pid: 1,
+            name: "nginx".into(),
+        });
         app.toggle_logs_follow();
         assert!(app.follow_child.is_none());
-        assert!(app.status.contains("container logs only"));
+        assert!(app.status.contains("no Windows event-log equivalent"));
         // no source at all
         app.logs_src = None;
         app.toggle_logs_follow();
@@ -4580,9 +5664,39 @@ mod tests {
         assert!(app.follow_rx.is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn logs_follow_follows_journald_and_unified_sources() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        // journald: journalctl -f exists on Linux; on macOS the spawn fails
+        // but the code path is identical — assert on the attempt, not the
+        // result
+        app.logs_src = Some(crate::logs::LogSource::Journald { pid: 1 });
+        app.toggle_logs_follow();
+        if app.follow_child.is_some() {
+            app.stop_logs_follow();
+            assert!(app.follow_rx.is_none());
+            assert!(app.status.contains("follow stopped"));
+        } else {
+            assert!(app.status.starts_with("follow:"));
+        }
+        // unified log source routes to `log stream` (same attempt pattern)
+        app.logs_src = Some(crate::logs::LogSource::UnifiedLog { name: "launchd".into() });
+        app.toggle_logs_follow();
+        if app.follow_child.is_some() {
+            app.stop_logs_follow();
+        } else {
+            assert!(app.status.starts_with("follow:"));
+        }
+        // toggling twice never stacks two children
+        assert!(app.follow_child.is_none());
+    }
+
     #[test]
     fn h_l_switch_tabs() {
         let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        on_key(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.tab, Tab::Services);
         on_key(&mut app, KeyCode::Char('h'));
         assert_eq!(app.tab, Tab::Events);
         on_key(&mut app, KeyCode::Char('h'));
@@ -4596,9 +5710,11 @@ mod tests {
         assert_eq!(app.page, Page::Logs);
         on_key(&mut app, KeyCode::Esc);
         assert_eq!(app.page, Page::Browse);
-        // digit jump still lands on Events
+        // digit jump still lands on Events, and '6' reaches Services
         on_key(&mut app, KeyCode::Char('5'));
         assert_eq!(app.tab, Tab::Events);
+        on_key(&mut app, KeyCode::Char('6'));
+        assert_eq!(app.tab, Tab::Services);
     }
 
     #[test]
@@ -4610,6 +5726,10 @@ mod tests {
         assert_eq!(
             death_log_source("linux", 9, "nginx"),
             crate::logs::LogSource::Journald { pid: 9 }
+        );
+        assert_eq!(
+            death_log_source("windows", 9, "nginx"),
+            crate::logs::LogSource::EventLog { pid: 9, name: "nginx".into() }
         );
     }
 
@@ -4658,6 +5778,70 @@ mod tests {
         // a different name's first exit stays quiet
         let fresh = [ev("exited", 9, "busybox")];
         assert!(app.notify_picks(&fresh).is_empty());
+    }
+
+    #[test]
+    fn alert_cycle_fires_once_per_excursion() {
+        let mut streak = 0u32;
+        let mut firing = false;
+        // four hot samples: quiet; the fifth fires exactly once
+        for _ in 0..4 {
+            assert!(!alert_cycle(&mut streak, &mut firing, true));
+        }
+        assert!(alert_cycle(&mut streak, &mut firing, true));
+        assert_eq!(streak, 5);
+        // still hot: stays quiet (already fired for this excursion)
+        assert!(!alert_cycle(&mut streak, &mut firing, true));
+        // drops under: re-arms
+        assert!(!alert_cycle(&mut streak, &mut firing, false));
+        assert_eq!(streak, 0);
+        // a fresh excursion needs the full run again
+        for _ in 0..4 {
+            assert!(!alert_cycle(&mut streak, &mut firing, true));
+        }
+        assert!(alert_cycle(&mut streak, &mut firing, true));
+    }
+
+    #[test]
+    fn alert_picks_fire_after_sustained_over_and_rearm() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        app.alert_cpu = Some(50.0);
+        app.alert_mem = Some(100);
+        let mk = |pid: Pid, kb: Option<u64>| crate::model::Process {
+            pid,
+            name: format!("p{pid}"),
+            mem_kb: kb,
+            ..Default::default()
+        };
+        // pid 1: cpu hot; pid 2: huge RSS; pid 3: quiet
+        app.procs = vec![mk(1, Some(10 * 1024)), mk(2, Some(500 * 1024)), mk(3, None)];
+        app.hist.cpu_now.insert(1, 90.0);
+        app.hist.cpu_now.insert(3, 5.0);
+        // cycles 1-4: nothing yet
+        for _ in 0..4 {
+            assert!(app.alert_picks().is_empty(), "below cycle threshold");
+        }
+        // cycle 5: both fire, each with its metric named
+        let picks = app.alert_picks();
+        assert_eq!(picks.len(), 2);
+        assert!(picks.iter().any(|(pid, _, d)| *pid == 1 && d.contains("CPU")));
+        assert!(picks.iter().any(|(pid, _, d)| *pid == 2 && d.contains("RSS")));
+        // cycle 6: still over but already fired → quiet
+        assert!(app.alert_picks().is_empty());
+        // both drop under → re-arm; then another full run fires again
+        app.hist.cpu_now.insert(1, 1.0);
+        app.procs[1].mem_kb = Some(10 * 1024);
+        assert!(app.alert_picks().is_empty());
+        app.hist.cpu_now.insert(1, 99.0);
+        app.procs[1].mem_kb = Some(900 * 1024);
+        for _ in 0..4 {
+            assert!(app.alert_picks().is_empty());
+        }
+        assert_eq!(app.alert_picks().len(), 2);
+        // bookkeeping for a vanished pid is pruned
+        app.procs = vec![mk(3, None)];
+        app.alert_picks();
+        assert!(!app.alert_state.contains_key(&1));
     }
 
     #[test]
@@ -5502,6 +6686,12 @@ mod tests {
                 events_log: None,
                 replayed: Vec::new(),
                 notify: false,
+                since: None,
+                refresh_secs: None,
+                sort: None,
+                paused: false,
+                alert_cpu: None,
+                alert_mem: None,
             },
         );
         // port seed wins the tab, filter prefilled, extras reported

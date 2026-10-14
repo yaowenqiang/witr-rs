@@ -128,11 +128,29 @@ pub struct Cli {
     #[arg(long = "replay", value_name = "FILE")]
     pub replay: Option<String>,
 
+    /// Session digest window (30, 30s, 5m, 2h, 1d): with --replay FILE,
+    /// print a "what happened" digest of the recorded events and exit;
+    /// with the TUI it sets the 'S' summary-page window.
+    #[arg(long = "since", value_name = "DURATION")]
+    pub since: Option<String>,
+
     /// Desktop notifications when a process restarts, or exits repeatedly
     /// (crash loop): macOS osascript / Linux notify-send. TUI only; the
     /// '!' key toggles it live.
     #[arg(long = "notify")]
     pub notify: bool,
+
+    /// Alert when a process exceeds this CPU%% for 5 consecutive samples
+    /// (~15s): desktop notification + Events-tab record + red row highlight.
+    /// One alert per excursion — re-arms when usage drops back under.
+    /// TUI only.
+    #[arg(long = "alert-cpu", value_name = "PCT")]
+    pub alert_cpu: Option<f64>,
+
+    /// Alert when a process exceeds this RSS in MB for 5 consecutive
+    /// samples (~15s) — same behavior as --alert-cpu. TUI only.
+    #[arg(long = "alert-mem", value_name = "MB")]
+    pub alert_mem: Option<u64>,
 
     /// Run this shell command once whenever a watched/followed target
     /// disappears (watch/follow mode only) — e.g. `--on-exit 'say gone'`.

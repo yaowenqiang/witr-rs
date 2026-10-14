@@ -1,6 +1,7 @@
 mod ancestry;
 mod binary_id;
 mod cli;
+mod config;
 mod gpu;
 mod history;
 mod k8s;
@@ -197,6 +198,9 @@ fn main() {
     };
     let no_color = cli.no_color || std::env::var_os("NO_COLOR").is_some();
 
+    // user config (flat toml subset): defaults only — CLI flags win
+    let cfg = config::Config::load();
+
     // --completions: emit the shell script and exit (before anything else —
     // it must work everywhere, including without a process table)
     if let Some(shell) = cli.completions {
@@ -223,6 +227,17 @@ fn main() {
             Some(secs) => Some(secs),
             None => {
                 eprintln!("invalid --recent duration {:?} (try 30s, 5m, 2h, 1d)", raw);
+                std::process::exit(4);
+            }
+        },
+        None => None,
+    };
+    // --since: session-digest window (replay digest or TUI summary page)
+    let since_secs = match &cli.since {
+        Some(raw) => match util::parse_duration(raw) {
+            Some(secs) => Some(secs as u64),
+            None => {
+                eprintln!("invalid --since duration {:?} (try 30s, 5m, 2h, 1d)", raw);
                 std::process::exit(4);
             }
         },
@@ -273,6 +288,10 @@ fn main() {
         eprintln!("--replay opens the TUI; drop the targets or use -i");
         std::process::exit(4);
     }
+    if since_secs.is_some() && !specs.is_empty() {
+        eprintln!("--since digests a recorded events log or sets the TUI summary window; it does not filter targets");
+        std::process::exit(4);
+    }
     if cli.on_exit.is_some() && cli.watch.is_none() && !cli.follow {
         eprintln!("--on-exit fires in watch/follow mode; add --watch or --follow");
         std::process::exit(4);
@@ -282,28 +301,46 @@ fn main() {
         std::process::exit(4);
     }
 
-    // --replay: load a recorded --events-log JSONL and open the TUI on the
-    // Events tab (live sampling continues on top)
+    // --replay: load a recorded --events-log JSONL — either to digest it
+    // (`--since`, works piped) or to open the TUI on the Events tab (live
+    // sampling continues on top of the imported history)
     let replayed = match &cli.replay {
-        Some(path) => {
-            if !(std::io::stdout().is_terminal() && std::io::stdin().is_terminal()) {
-                eprintln!("--replay opens the TUI; it needs a terminal");
+        Some(path) => match history::load_events_log(path) {
+            Ok(events) if !events.is_empty() => events,
+            Ok(_) => {
+                eprintln!("--replay {path}: no valid events found");
                 std::process::exit(4);
             }
-            match history::load_events_log(path) {
-                Ok(events) if !events.is_empty() => events,
-                Ok(_) => {
-                    eprintln!("--replay {path}: no valid events found");
-                    std::process::exit(4);
-                }
-                Err(e) => {
-                    eprintln!("--replay {path}: {e}");
-                    std::process::exit(4);
-                }
+            Err(e) => {
+                eprintln!("--replay {path}: {e}");
+                std::process::exit(4);
             }
-        }
+        },
         None => Vec::new(),
     };
+    // --since + --replay without -i: print the recorded-activity digest
+    // and exit (no terminal needed — the digest is plain text)
+    if let Some(secs) = since_secs {
+        if cli.replay.is_some() && !cli.interactive {
+            let summary = history::summary_from_events(&replayed, secs);
+            write_out(&summary.to_text());
+            std::process::exit(0);
+        }
+    } else if cli.replay.is_some()
+        && !cli.interactive
+        && !(std::io::stdout().is_terminal() && std::io::stdin().is_terminal())
+    {
+        eprintln!("--replay opens the TUI; it needs a terminal (or add --since for a piped digest)");
+        std::process::exit(4);
+    }
+    if since_secs.is_some() && cli.replay.is_none() && !cli.interactive {
+        let on_tui_terminal =
+            std::io::stdout().is_terminal() && std::io::stdin().is_terminal() && specs.is_empty();
+        if !on_tui_terminal {
+            eprintln!("--since needs --replay FILE for a CLI digest, or the TUI (-i) for the live summary page");
+            std::process::exit(4);
+        }
+    }
 
     // --snap / --diff: whole-process-table snapshots, listing operations —
     // incompatible with targets and the TUI.
@@ -381,8 +418,14 @@ fn main() {
         }
         let seed = tui::Seed {
             events_log: cli.events_log.clone(),
-            notify: cli.notify,
+            notify: cli.notify || cfg.notify.unwrap_or(false),
             replayed,
+            since: since_secs,
+            refresh_secs: cfg.refresh_secs,
+            sort: cfg.sort.clone(),
+            paused: cfg.paused.unwrap_or(false),
+            alert_cpu: cli.alert_cpu,
+            alert_mem: cli.alert_mem,
             ..tui::Seed::from_targets(
                 &cli.names, &cli.pids, &cli.ports, &cli.files, &cli.containers,
             )
@@ -406,8 +449,14 @@ fn main() {
         if interactive {
             let seed = tui::Seed {
                 events_log: cli.events_log.clone(),
-                notify: cli.notify,
+                notify: cli.notify || cfg.notify.unwrap_or(false),
                 replayed,
+                since: since_secs,
+                refresh_secs: cfg.refresh_secs,
+                sort: cfg.sort.clone(),
+                paused: cfg.paused.unwrap_or(false),
+                alert_cpu: cli.alert_cpu,
+                alert_mem: cli.alert_mem,
                 ..tui::Seed::default()
             };
             if let Err(e) = tui::run(seed) {

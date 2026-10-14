@@ -8,7 +8,7 @@ pub mod macos;
 #[allow(dead_code)]
 pub mod windows;
 
-use crate::model::{Container, FileOverview, LockEntry, Pid, Process, Socket, Source};
+use crate::model::{Container, FileOverview, LockEntry, Pid, Process, Service, Socket, Source};
 use crate::util::Users;
 
 #[derive(Debug)]
@@ -146,6 +146,185 @@ pub struct Capabilities {
     pub env: bool,
 }
 
+/// Enumerate services from the platform's service manager in one CLI call:
+/// systemd (Linux), launchctl (macOS), SCM via PowerShell (Windows). A
+/// missing or failing manager yields an empty list — the tab shows its
+/// "not available" note.
+pub fn enumerate_services() -> Vec<Service> {
+    #[cfg(target_os = "linux")]
+    return systemd_services();
+    #[cfg(target_os = "macos")]
+    return launchd_services();
+    #[cfg(windows)]
+    return scm_services();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    return Vec::new();
+}
+
+/// Main pid of a service whose listing didn't carry one (systemd resolves
+/// `MainPID` on demand — one fast call when Enter is pressed).
+pub fn service_pid_of(svc: &Service) -> Option<Pid> {
+    if svc.manager != "systemd" {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    return systemd_unit_pid(&svc.name);
+    #[cfg(not(target_os = "linux"))]
+    return None;
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_services() -> Vec<Service> {
+    let Ok(text) = crate::util::run(
+        "systemctl",
+        &[
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-legend",
+            "--no-pager",
+            "--plain",
+        ],
+        std::time::Duration::from_secs(8),
+    ) else {
+        return Vec::new();
+    };
+    parse_systemctl_units(&text)
+}
+
+/// `ssh.service  loaded active running  OpenBSD Secure Shell server` — the
+/// no-legend `list-units` row: UNIT LOAD ACTIVE SUB DESCRIPTION (a leading
+/// `●` marks units with queued jobs; DESCRIPTION may be absent).
+#[allow(dead_code)] // every parse fn is unit-tested on all platforms
+pub fn parse_systemctl_units(text: &str) -> Vec<Service> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let mut parts = l.trim_start_matches('●').split_whitespace();
+            let unit = parts.next()?.to_string();
+            let _load = parts.next()?;
+            let active = parts.next()?;
+            let sub = parts.next()?;
+            let desc = parts.collect::<Vec<_>>().join(" ");
+            (unit.ends_with(".service")).then(|| Service {
+                manager: "systemd".into(),
+                name: unit,
+                state: if active == "active" {
+                    format!("active/{sub}")
+                } else {
+                    active.to_string()
+                },
+                desc,
+                pid: None,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_unit_pid(unit: &str) -> Option<Pid> {
+    let out = crate::util::run(
+        "systemctl",
+        &["show", "-p", "MainPID", "--value", unit],
+        std::time::Duration::from_secs(5),
+    )
+    .ok()?;
+    out.trim().parse().ok().filter(|p| *p > 0)
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_services() -> Vec<Service> {
+    let Ok(text) = crate::util::run(
+        "launchctl",
+        &["list"],
+        std::time::Duration::from_secs(8),
+    ) else {
+        return Vec::new();
+    };
+    parse_launchctl_list(&text)
+}
+
+/// `launchctl list` rows: `PID\tStatus\tLabel`, PID "-" when the job isn't
+/// running; the header line ("PID\tStatus\tLabel") fails the pid parse and
+/// drops out naturally.
+#[allow(dead_code)]
+pub fn parse_launchctl_list(text: &str) -> Vec<Service> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let mut parts = l.split('\t').map(str::trim);
+            let pid = match parts.next()? {
+                "-" | "" => None,
+                s => {
+                    let p: Pid = s.parse().ok()?;
+                    (p > 0).then_some(p)
+                }
+            };
+            let _status = parts.next()?;
+            let label = parts.next()?;
+            (!label.is_empty()).then(|| Service {
+                manager: "launchd".into(),
+                name: label.to_string(),
+                state: if pid.is_some() {
+                    "running".into()
+                } else {
+                    "not running".into()
+                },
+                desc: String::new(),
+                pid,
+            })
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn scm_services() -> Vec<Service> {
+    let script = "$ErrorActionPreference='SilentlyContinue'; \
+                  Get-CimInstance Win32_Service | \
+                  Select-Object Name,State,DisplayName,ProcessId | \
+                  ConvertTo-Json -Compress";
+    let Ok(text) = crate::util::run(
+        "powershell",
+        &["-NoProfile", "-Command", script],
+        std::time::Duration::from_secs(15),
+    ) else {
+        return Vec::new();
+    };
+    parse_scm_services(&text)
+}
+
+/// Win32_Service JSON — `ConvertTo-Json` emits a bare object for one
+/// service and an array otherwise, so both shapes normalize here.
+#[allow(dead_code)]
+pub fn parse_scm_services(text: &str) -> Vec<Service> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+        return Vec::new();
+    };
+    let items = match v {
+        serde_json::Value::Array(a) => a,
+        obj @ serde_json::Value::Object(_) => vec![obj],
+        _ => return Vec::new(),
+    };
+    items
+        .iter()
+        .filter_map(|s| {
+            let get = |k: &str| s.get(k).and_then(|x| x.as_str()).unwrap_or_default();
+            let name = get("Name").to_string();
+            (!name.is_empty()).then(|| Service {
+                manager: "scm".into(),
+                state: get("State").to_string(),
+                name,
+                desc: get("DisplayName").to_string(),
+                pid: s
+                    .get("ProcessId")
+                    .and_then(|x| x.as_i64())
+                    .filter(|p| *p > 0)
+                    .map(|p| p as Pid),
+            })
+        })
+        .collect()
+}
+
 /// The single seam between pipeline logic and OS specifics.
 pub trait Platform {
     fn name(&self) -> &'static str;
@@ -268,5 +447,69 @@ pub fn get() -> Box<dyn Platform> {
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         compile_error!("witr-rs supports linux, macOS and Windows only")
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+
+    #[test]
+    fn systemctl_units_parse() {
+        let text = "\
+sys-devices-loaded.device loaded active plugged stub\
+\nssh.service               loaded active running OpenBSD Secure Shell server\
+\n● docker.service          loaded activating start-pre Docker Application Container Engine\
+\nnginx.service             loaded failed failed  web server\
+\nuser@1000.service         loaded active running User Manager for UID 1000\
+\n";
+        let ss = parse_systemctl_units(text);
+        let names: Vec<&str> = ss.iter().map(|s| s.name.as_str()).collect();
+        // non-.service rows (devices) drop out
+        assert_eq!(names, vec!["ssh.service", "docker.service", "nginx.service", "user@1000.service"]);
+        assert_eq!(ss[0].manager, "systemd");
+        assert_eq!(ss[0].state, "active/running");
+        assert_eq!(ss[0].desc, "OpenBSD Secure Shell server");
+        // activating shows the raw state, description still parsed
+        assert_eq!(ss[1].state, "activating");
+        // failed stands out (the tab paints it red)
+        assert_eq!(ss[2].state, "failed");
+        assert!(ss.iter().all(|s| s.pid.is_none()), "systemd resolves pids lazily");
+    }
+
+    #[test]
+    fn launchctl_list_parses() {
+        let text = "PID\tStatus\tLabel\n\
+                    501\t0\tcom.apple.Finder\n\
+                    -\t0\tcom.apple.coreservices.appleid.authentication\n\
+                    1234\t127\tbroken.job\n";
+        let ss = parse_launchctl_list(text);
+        assert_eq!(ss.len(), 3, "header drops out");
+        assert_eq!(ss[0].name, "com.apple.Finder");
+        assert_eq!(ss[0].manager, "launchd");
+        assert_eq!(ss[0].pid, Some(501));
+        assert_eq!(ss[0].state, "running");
+        assert_eq!(ss[1].pid, None);
+        assert_eq!(ss[1].state, "not running");
+        assert_eq!(ss[2].pid, Some(1234));
+    }
+
+    #[test]
+    fn scm_services_parse() {
+        let one = r#"{"Name":"wuauserv","State":"Running","DisplayName":"Windows Update","ProcessId":1234}"#;
+        assert_eq!(parse_scm_services(one)[0].pid, Some(1234));
+        let many = r#"[
+            {"Name":"Docker Desktop Service","State":"Running","DisplayName":"Docker Desktop Service","ProcessId":4321},
+            {"Name":"Spooler","State":"Stopped","DisplayName":"Print Spooler","ProcessId":0}
+        ]"#;
+        let ss = parse_scm_services(many);
+        assert_eq!(ss.len(), 2);
+        assert_eq!(ss[0].manager, "scm");
+        assert_eq!(ss[0].pid, Some(4321));
+        // pid 0 = stopped service → None
+        assert_eq!(ss[1].pid, None);
+        assert_eq!(ss[1].state, "Stopped");
+        // garbage in → empty out
+        assert!(parse_scm_services("not json").is_empty());
     }
 }

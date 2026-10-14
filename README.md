@@ -34,6 +34,12 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **暂停采样（`P`）**：一键冻结 TUI 采样——不刷新、不产生事件、不发通知，页脚显示 `⏸ paused`；再按恢复。看清单、拷贝现场时数据不再从眼前流走。
 
+**会话摘要（`--since` / `S`）**：`witr-rs --replay ev.jsonl --since 1h` 不进界面——直接打印这段录制时间"发生了什么"：出现 / 退出 / 重启计数，加上重启链（哪个程序重启了几次），管道里也能用。TUI 里按 `S` 打开同样的摘要页：活动计数、重启链，外加两张榜——**CPU 尖峰榜**（窗口内瞬时占用峰值最高的进程）与**内存爬升榜**（RSS 增长最快的进程）；`--since` 预设窗口（30、30s、5m、2h、1d，默认整个会话），`r` 重算。回答"刚这半小时机器上忙的是什么"。
+
+**阈值告警（`--alert-cpu` / `--alert-mem`）**：`witr-rs --alert-cpu 90 --alert-mem 2048`——进程连续 5 个采样（约 15 秒）超过阈值时：弹桌面通知、Events 页记一条 alert、进程表红色行高亮。每次越界只报一次，占用回落后重新武装，不会刷屏。
+
+**配置文件**：`~/.config/witr-rs/config.toml`（macOS 在 `~/Library/Application Support/witr-rs/`，Windows 在 `%APPDATA%\witr-rs\`）——`refresh_secs`（采样间隔）/ `sort`（默认排序）/ `notify` / `paused` 四个键，相当于 CLI 参数的默认值：文件先行，命令行始终覆盖。坏行跳过并给出警告，没有文件一切照旧。
+
 ## TUI 按键
 
 支持 vim 式浏览（与原版 witr 对齐）：
@@ -57,6 +63,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | `a` | Ports 页：切换 仅监听 ↔ 全部状态；Locks 页：切换 锁 ↔ 全部打开文件；Processes 页：打开操作栏（`k` kill / `t` term / `p` 暂停 / `r` 恢复 / `n` renice） |
 | `o` | Ports 页：逐 socket 明细 ↔ 按 (端口, 属主) 聚合的总览（`Enter` 跳属主进程详情） |
 | `l` | 详情页 / Events 页：拉取该进程最近的日志（容器日志 / journalctl / macOS 统一日志），全屏 Logs 页滚动查看；Events 页已退出的进程优先显示退出瞬间自动捕获的最后日志 |
+| `S` | 打开会话摘要页（活动计数 / 重启链 / CPU 尖峰榜 / 内存爬升榜，窗口由 `--since` 预设），`r` 重算，`Esc` 返回 |
 | `P` | 暂停 / 恢复采样（全局冻结，页脚 `⏸ paused` 指示；Events 页 pid 降序改按 `p` 两次） |
 | `!` | 桌面通知开关（`--notify` 预开启，页脚有指示） |
 | `z` | 缩放：聚焦面板临时占满整行（tmux 风格） |
@@ -168,6 +175,8 @@ witr-rs --pid 1234 --export   # 可直接贴 issue 的纯文本排查报告
 witr-rs --pid 1234 --logs 50  # 该进程最近 50 行日志（容器/journal/统一日志）
 witr-rs --events-log ev.jsonl # TUI 事件采样落盘（JSONL，追加写）
 witr-rs --replay ev.jsonl     # 回放事件记录，落在 Events 页
+witr-rs --replay ev.jsonl --since 1h # 录制内容"发生了什么"摘要：计数 + 重启链，直接打印退出
+witr-rs --alert-cpu 90 --alert-mem 2048 # 连续超阈值 → 桌面通知 + Events 记录 + 红色行高亮
 witr-rs --snap before.json    # 进程表快照落盘（JSON）后退出
 witr-rs --diff before.json    # 对比快照：new / gone / restarted / changed（有变化退出码 1）
 witr-rs --pid 1234 --follow   # 跨重启跟踪目标（同程序换新 pid 继续追）
@@ -234,7 +243,8 @@ src/
 ├── pipeline.rs     目标解析（name/pid/port/file/container → pid）、归因优先级、风险告警
 ├── tui.rs          交互界面（ratatui/crossterm）：五标签页 + 详情面板 + 鼠标 + 3s 自动刷新
 ├── render.rs       standard / tree / short / json / env / warnings / export 渲染
-├── history.rs      采样历史：瞬时 CPU、sparkline、内存趋势 + 泄漏嫌疑、重启检测、Events 事件流
+├── history.rs      采样历史：瞬时 CPU、sparkline、内存趋势 + 泄漏嫌疑、重启检测、Events 事件流、会话摘要
+├── config.rs       用户配置文件（flat toml 子集：refresh_secs/sort/notify/paused，CLI 覆盖）
 ├── snapshot.rs     --snap / --diff：全表快照与 new/gone/restarted/changed 对比
 ├── logs.rs         崩溃关联日志：容器日志 / journalctl / macOS 统一日志
 ├── risk.rs         0–10 风险评分（临时目录二进制、curl|sh、注入、公网对端、无效签名等）
@@ -258,6 +268,7 @@ src/
 - 日志关联（`l` / `--logs`）覆盖 容器日志 / Linux journald / macOS 统一日志；Windows 暂无对应的单一日志源（退出即取证在 Windows 同样缺席）。实时流 `F` 仅容器来源（journald/统一日志未接 follow）
 - 桌面通知仅 macOS（osascript）/ Linux（notify-send）；Windows 暂无通知通道；Windows 也无每进程 I/O，IO 列同样缺席
 - 事件持久化（`--events-log`/`--replay`）仅 TUI（采样器随 TUI 生灭），3 秒粒度内生灭的进程不可见
+- 会话摘要（`--since`/`S`）的 CPU 尖峰榜与内存爬升榜只覆盖最后一次刷新时仍存活的进程（死进程采样被剪枝）——尖峰后即退出的进程体现在活动计数里，不在榜单上；`--replay` 的文件摘要只有活动计数与重启链（录制里没有采样数据）
 - `--follow` 按程序身份（name+exe+user）匹配：同一程序并行跑多份时，重启可能落在"最新的兄弟实例"而非严格意义上的继任者
 - `--snap`/`--diff` 对比整张表——两次快照之间 pid 被无关进程复用时显示为 changed / new+gone，而非 restarted
 - 容器归因目前仅 Linux（macOS 上 colima/Docker Desktop 的容器进程未归因，但 `-c` 目标有运行时侧兜底视图）
