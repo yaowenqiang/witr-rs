@@ -298,6 +298,9 @@ struct TuiApp {
     /// 'S' session digest (computed when the page opens) + its window
     summary: Option<crate::history::SessionSummary>,
     summary_window: u64,
+    /// Latest whole-machine snapshot ('y' system page "now" column:
+    /// load / cores / swap live here, history rings only chart cpu+mem)
+    sys_stats: Option<crate::platform::SystemStats>,
     /// sampling interval (config refresh_secs, built-in default REFRESH)
     refresh: Duration,
     status: String,
@@ -318,6 +321,7 @@ enum Page {
     ContainerDetail,
     Logs,
     Summary,
+    System,
 }
 
 /// Locks-tab sort columns — keys p/n/t/m/f, matching the Go witr.
@@ -596,6 +600,7 @@ impl TuiApp {
             service_sort_desc: false,
             summary: None,
             summary_window: seed.since.unwrap_or(u64::MAX),
+            sys_stats: None,
             refresh,
             status: String::new(),
             confirm_kill: None,
@@ -740,6 +745,16 @@ impl TuiApp {
                 self.status = format!("ALERT {name} — {detail}");
             }
         }
+        // System page ('y'): Linux's three /proc reads are µs-cheap, so
+        // they sample every cycle and history is already there when the
+        // page opens. macOS (vm_stat spawn) and Windows (PowerShell) only
+        // sample while the page is open.
+        if self.page == Page::System || self.platform.name() == "linux" {
+            if let Some(s) = self.platform.system_stats() {
+                self.hist.update_system(s.clone());
+                self.sys_stats = Some(s);
+            }
+        }
         if self.tab == Tab::Ports {
             self.load_sockets();
             self.rebuild_socket_view();
@@ -869,6 +884,114 @@ impl TuiApp {
         self.summary = Some(self.hist.summary(self.summary_window));
         self.logs_scroll = 0;
         self.page = Page::Summary;
+    }
+
+    /// Open the system resources page ('y') with one immediate sample so
+    /// memory/load show at once — CPU is delta-based and arrives on the
+    /// next refresh (this call was the first of the two it needs).
+    fn open_system(&mut self) {
+        if let Some(s) = self.platform.system_stats() {
+            self.hist.update_system(s.clone());
+            self.sys_stats = Some(s);
+        }
+        self.logs_scroll = 0;
+        self.page = Page::System;
+    }
+
+    /// Lines for the system resources page ('y') — shared by the renderer
+    /// and the 'c' copy. Charts come from the history rings, "now" values
+    /// (load, swap, per-core grid) from the latest snapshot.
+    fn system_page_lines(&self) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let Some(stats) = self.sys_stats.as_ref() else {
+            lines.push(Line::from(styled(
+                Style::new().fg(MID),
+                "waiting for samples — the first refresh fills memory and load, the second draws CPU",
+            )));
+            return lines;
+        };
+        // cpu history (fixed 0–100 scale — the max is known)
+        let cpu = match self.hist.sys_cpu_chart(60) {
+            Some((bars, now, peak)) => Line::from(vec![
+                Span::styled("cpu     ", Style::new().bold()),
+                Span::raw(bars),
+                Span::raw(format!("  {now:.0}% now · window peak {peak:.0}%")),
+            ]),
+            None => Line::from(styled(
+                Style::new().fg(MID),
+                "cpu     one more refresh needed (usage is a delta between samples)",
+            )),
+        };
+        lines.push(cpu);
+        // load average
+        if stats.load1.is_some() {
+            let f = |v: Option<f64>| v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "–".into());
+            lines.push(Line::from(vec![
+                Span::styled("load    ", Style::new().bold()),
+                Span::raw(format!(
+                    "{} · {} · {}  (1/5/15 min)",
+                    f(stats.load1),
+                    f(stats.load5),
+                    f(stats.load15)
+                )),
+            ]));
+        }
+        // memory: now/total even before the chart has two samples
+        let mem_now = match (stats.mem_used_mb, stats.mem_total_mb) {
+            (Some(u), Some(t)) if t > 0 => format!(
+                "{} / {} used ({:.0}%)",
+                human_mb(u),
+                human_mb(t),
+                u as f64 / t as f64 * 100.0
+            ),
+            (Some(u), _) => format!("{} used", human_mb(u)),
+            _ => "unavailable".into(),
+        };
+        let mut mem_spans = vec![Span::styled("memory  ", Style::new().bold())];
+        match self.hist.sys_mem_chart(60) {
+            Some((bars, _, peak)) => {
+                mem_spans.push(Span::raw(format!("{}  ", human_mb(peak as u64))));
+                mem_spans.push(Span::raw(bars));
+                mem_spans.push(Span::raw(format!("  {mem_now}")));
+            }
+            None => mem_spans.push(Span::raw(mem_now)),
+        }
+        lines.push(Line::from(mem_spans));
+        // swap
+        if let (Some(u), Some(t)) = (stats.swap_used_mb, stats.swap_total_mb) {
+            lines.push(Line::from(vec![
+                Span::styled("swap    ", Style::new().bold()),
+                Span::raw(if t > 0 {
+                    format!("{} / {} used ({:.0}%)", human_mb(u), human_mb(t), u as f64 / t as f64 * 100.0)
+                } else {
+                    "0 B / 0 B".into()
+                }),
+            ]));
+        }
+        // per-core grid, two cores per row; saturated cores render red
+        if !stats.cores.is_empty() {
+            lines.push(Line::from(Span::styled("cores", Style::new().bold())));
+            for (row, pair) in stats.cores.chunks(2).enumerate() {
+                let mut spans = Vec::new();
+                for (col, pct) in pair.iter().enumerate() {
+                    let n = ((pct / 100.0).clamp(0.0, 0.999) * 10.0) as usize;
+                    let text = format!(
+                        "  {:>2} │{}{}│ {:>3.0}%  ",
+                        row * 2 + col,
+                        "█".repeat(n),
+                        "░".repeat(10 - n),
+                        pct
+                    );
+                    spans.push(if *pct >= 90.0 {
+                        Span::styled(text, Style::new().fg(Color::Red))
+                    } else {
+                        Span::raw(text)
+                    });
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        lines
     }
 
     /// Logs for whatever the process-detail cursor is on: the attribution's
@@ -1860,6 +1983,7 @@ impl TuiApp {
                 .as_ref()
                 .map(|s| s.to_text().lines().map(|l| Line::from(l.to_string())).collect())
                 .unwrap_or_default(),
+            Page::System => self.system_page_lines(),
             Page::Browse => Vec::new(),
         };
         lines.iter().map(line_to_string).collect::<Vec<_>>().join("\n")
@@ -3831,6 +3955,69 @@ fn placeholder(area: ratatui::prelude::Rect, f: &mut Frame<'_>, msg: &str) {
     );
 }
 
+/// `82944` → `81.0 GB` (system-page memory/swap lines).
+fn human_mb(mb: u64) -> String {
+    if mb >= 1024 {
+        format!("{:.1} GB", mb as f64 / 1024.0)
+    } else {
+        format!("{mb} MB")
+    }
+}
+
+/// Full-page system resources ('y'): machine-wide CPU/memory history
+/// charts, load average, swap and the per-core grid. Sampled in refresh()
+/// — Linux every cycle (a few /proc reads), the subprocess platforms only
+/// while this page is open.
+fn ui_system_page(app: &mut TuiApp, f: &mut Frame<'_>) {
+    let outer = Block::bordered().border_style(Style::new().fg(GRAY));
+    f.render_widget(&outer, f.area());
+    let inner = outer.inner(f.area());
+    let v = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Length(1),
+        Constraint::Min(6),    // meters
+        Constraint::Length(1), // footer
+    ])
+    .split(inner);
+
+    let header = Line::from(vec![
+        styled(Style::new().bg(PURPLE).fg(Color::White).bold(), " witr-rs "),
+        Span::raw("  "),
+        styled(Style::new().fg(ACCENT).bold(), "System Resources"),
+    ]);
+    f.render_widget(Paragraph::new(header), v[0]);
+
+    app.tab_rect = None;
+    app.table_rect = Some(v[2]);
+    app.detail_rect = Some(v[2]);
+
+    let lines = app.system_page_lines();
+    app.detail_height = lines.len() as u16;
+    let count = lines.len() as u16;
+    let block = Block::bordered()
+        .title(Line::from(styled(
+            Style::new().fg(ACCENT).bold(),
+            format!("Meters{}", TuiApp::scroll_indicator(app.logs_scroll, count, v[2].height)),
+        )))
+        .border_style(Style::new().fg(GRAY));
+    let area = block.inner(v[2]);
+    f.render_widget(block, v[2]);
+    let scroll = app.logs_scroll.min(count.saturating_sub(1));
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+        area,
+    );
+
+    let mut footer = "r: Refresh | j/k/d/u/g-G/b-f: Scroll | Esc/q: Back | c: Copy".to_string();
+    if !app.status.is_empty() {
+        footer.push_str(&format!("  ·  {}", app.status));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(styled(Style::new().fg(MID), footer))),
+        v[3],
+    );
+}
+
 /// Full-page "what happened" digest ('S'): windowed activity counts,
 /// restart chains, the CPU-spike board and the memory climbers. Computed
 /// when the page opens; 'r' re-computes from the live history.
@@ -3951,6 +4138,7 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
         Page::ContainerDetail => ui_container_detail_page(app, f),
         Page::Logs => ui_logs_page(app, f),
         Page::Summary => ui_summary_page(app, f),
+        Page::System => ui_system_page(app, f),
         Page::Browse => {}
     }
     if app.page != Page::Browse {
@@ -4142,7 +4330,7 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
     };
     let mut footer = match app.tab {
         Tab::Processes => format!(
-            "Total: {} | Enter: Detail | a: Actions | /: Search | z: Zoom | T: Tree{} | B: Group{} | S: Summary | !: Notify{} | P: Pause | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
+            "Total: {} | Enter: Detail | a: Actions | /: Search | z: Zoom | T: Tree{} | B: Group{} | S: Summary | Y: System | !: Notify{} | P: Pause | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
             total,
             if app.tree_mode { " (on)" } else { "" },
             if app.group_mode != GroupMode::Off {
@@ -4335,6 +4523,7 @@ fn focused_scroll_mut(app: &mut TuiApp) -> Option<&mut u16> {
         (Page::ContainerDetail, _, _, false) => Some(&mut app.cdp_scroll),
         (Page::Logs, _, _, _) => Some(&mut app.logs_scroll),
         (Page::Summary, _, _, _) => Some(&mut app.logs_scroll),
+        (Page::System, _, _, _) => Some(&mut app.logs_scroll),
         (Page::Browse, _, _, _) => None,
     }
 }
@@ -4703,6 +4892,11 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
             app.open_summary();
             return true;
         }
+        // 'r' on the system page: sample now instead of waiting for the tick
+        if key == KeyCode::Char('r') && app.page == Page::System {
+            app.refresh();
+            return true;
+        }
         if key == KeyCode::Char('c') {
             let text = app.focused_pane_text();
             app.status = match crate::util::clipboard_copy(&text) {
@@ -4921,6 +5115,10 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         // 'S': session summary — what happened in the watched window
         KeyCode::Char('S') => {
             app.open_summary();
+        }
+        // 'y': system resources — machine-wide cpu/memory/load meters
+        KeyCode::Char('y') => {
+            app.open_system();
         }
 
         // ---- cursor movement ----
@@ -5479,10 +5677,17 @@ mod tests {
         assert_eq!(app.group_view[0].count, 2);
         // the selection maps to the group's busiest member (mem tiebreak)
         assert_eq!(app.selected_pid(), Some(911));
-        // Enter opens that member — a fake pid deterministically reports gone
+        // Enter opens that member — with the busiest member's pid swapped for
+        // one no kernel can ever allocate (Linux pid_max ≤ 4 194 304, macOS
+        // ≤ 99 998) so "gone" is deterministic instead of racing with whatever
+        // happens to run on the test machine (pid 911 was taken once).
+        const GONE_PID: Pid = 4_194_305;
+        app.procs[1].pid = GONE_PID;
+        app.rebuild_view();
+        assert_eq!(app.selected_pid(), Some(GONE_PID));
         on_key(&mut app, KeyCode::Enter);
         assert_eq!(app.page, Page::Browse);
-        assert!(app.status.contains("911 is gone"));
+        assert!(app.status.contains("is gone"));
         // cycle: user → container → off (un-attributed procs group under "-")
         on_key(&mut app, KeyCode::Char('B'));
         assert_eq!(app.group_mode, GroupMode::User);
@@ -5538,6 +5743,26 @@ mod tests {
             },
         );
         assert_eq!(app.summary_window, 300);
+    }
+
+    #[test]
+    fn system_page_opens_samples_and_closes() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        assert_eq!(app.page, Page::Browse);
+        on_key(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.page, Page::System);
+        // opening took one sample — the "now" snapshot is there even on a
+        // platform whose first CPU delta is still empty
+        let stats = app.sys_stats.as_ref().expect("sampled on open");
+        let _ = stats;
+        // the copy text is non-empty (memory/load section renders from the
+        // snapshot alone)
+        assert!(!app.focused_pane_text().is_empty(), "page has meters");
+        // 'r' refreshes in place; Esc returns to browse
+        on_key(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.page, Page::System);
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Browse);
     }
 
     #[test]

@@ -40,6 +40,8 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **配置文件**：`~/.config/witr-rs/config.toml`（macOS 在 `~/Library/Application Support/witr-rs/`，Windows 在 `%APPDATA%\witr-rs\`）——`refresh_secs`（采样间隔）/ `sort`（默认排序）/ `notify` / `paused` 四个键，相当于 CLI 参数的默认值：文件先行，命令行始终覆盖。坏行跳过并给出警告，没有文件一切照旧。
 
+**系统资源页（`y`）**：整机仪表盘——CPU 占用历史图（固定 0–100 刻度，标注当前值与窗口峰值）、内存历史图（绝对刻度 + 峰值标注）、load average（1/5/15 分钟）、swap 用量、每核占用网格（≥90% 红色高亮）。Linux 直接读 `/proc`（微秒级，每周期采样，打开页面时历史已就绪）；macOS 走 Mach `host_processor_info` + `vm_stat`，Windows 走单次 PowerShell CIM 查询（这两个平台仅页面打开时采样）。回答"这台机器整体忙不忙、内存还剩多少"。
+
 ## TUI 按键
 
 支持 vim 式浏览（与原版 witr 对齐）：
@@ -64,6 +66,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | `o` | Ports 页：逐 socket 明细 ↔ 按 (端口, 属主) 聚合的总览（`Enter` 跳属主进程详情） |
 | `l` | 详情页 / Events 页：拉取该进程最近的日志（容器日志 / journalctl / macOS 统一日志），全屏 Logs 页滚动查看；Events 页已退出的进程优先显示退出瞬间自动捕获的最后日志 |
 | `S` | 打开会话摘要页（活动计数 / 重启链 / CPU 尖峰榜 / 内存爬升榜，窗口由 `--since` 预设），`r` 重算，`Esc` 返回 |
+| `y` | 打开系统资源页：整机 CPU/内存历史图表、load、swap、每核占用网格；`r` 立即采样，`Esc` 返回 |
 | `P` | 暂停 / 恢复采样（全局冻结，页脚 `⏸ paused` 指示；Events 页 pid 降序改按 `p` 两次） |
 | `!` | 桌面通知开关（`--notify` 预开启，页脚有指示） |
 | `z` | 缩放：聚焦面板临时占满整行（tmux 风格） |

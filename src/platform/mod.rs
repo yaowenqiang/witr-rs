@@ -325,6 +325,26 @@ pub fn parse_scm_services(text: &str) -> Vec<Service> {
         .collect()
 }
 
+/// One whole-machine resource snapshot for the system page ('y'). Every
+/// field is best-effort: platforms without a cheap source leave it `None`
+/// (or `cores` empty) and the page hides that section. CPU percents are
+/// delta-based, so a platform's very first call may report none.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SystemStats {
+    /// Total CPU busy percent across all cores (user+sys+nice).
+    pub cpu_percent: Option<f64>,
+    /// Per-core busy percent; empty when the platform has no per-core
+    /// source (the page hides the grid rather than showing blanks).
+    pub cores: Vec<f64>,
+    pub mem_used_mb: Option<u64>,
+    pub mem_total_mb: Option<u64>,
+    pub swap_used_mb: Option<u64>,
+    pub swap_total_mb: Option<u64>,
+    pub load1: Option<f64>,
+    pub load5: Option<f64>,
+    pub load15: Option<f64>,
+}
+
 /// The single seam between pipeline logic and OS specifics.
 pub trait Platform {
     fn name(&self) -> &'static str;
@@ -346,6 +366,13 @@ pub trait Platform {
     /// the column hides itself. Default: not measured.
     fn enrich_listing(&self, procs: &mut [Process]) {
         let _ = procs;
+    }
+
+    /// Whole-machine resources for the system page ('y'): total + per-core
+    /// CPU, memory/swap usage, load average. Best-effort — anything the
+    /// platform can't measure cheaply stays `None`. Default: unsupported.
+    fn system_stats(&self) -> Option<SystemStats> {
+        None
     }
 
     /// All sockets whose local port equals `port` (any proto), with owning

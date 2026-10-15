@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use crate::model::{FileOverview, LockEntry, Pid, Process, Socket, Source};
-use crate::platform::{Capabilities, PlatError, PlatResult, Platform, Users};
+use crate::platform::{Capabilities, PlatError, PlatResult, Platform, SystemStats, Users};
 use crate::util::{basename, now_unix, parse_etime_to_secs, run_ok, split_host_port};
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(8);
@@ -47,13 +47,185 @@ fn disk_io_of(_pid: Pid) -> Option<(u64, u64)> {
     None
 }
 
+// ---------- system resources (system page 'y') ----------
+//
+// CPU comes from host_processor_info (the same per-core tick buckets top(1)
+// shows), memory from `vm_stat` (page counts; no safe fixed-size Mach struct
+// to hand-roll), everything else from sysctl/getloadavg — all in libSystem,
+// no new dependencies. CPU% is a delta between calls, so the previous tick
+// snapshot rides in the platform struct (the TUI samples from one thread).
+
+/// Per-core tick buckets `[user, system, idle, nice]` (PROCESSOR_CPU_LOAD_INFO order).
+#[cfg(target_os = "macos")]
+fn host_cpu_ticks() -> Option<Vec<[u64; 4]>> {
+    extern "C" {
+        fn mach_host_self() -> u32;
+        fn host_processor_info(
+            host: u32,
+            flavor: i32,
+            count: *mut u32,
+            info: *mut *mut i32,
+            tick_count: *mut u32,
+        ) -> i32;
+        fn mig_deallocate(target: *mut std::ffi::c_void, size: u32) -> i32;
+    }
+    const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
+    unsafe {
+        let (mut count, mut ticks): (u32, u32) = (0, 0);
+        let mut loads: *mut i32 = std::ptr::null_mut();
+        if host_processor_info(
+            mach_host_self(),
+            PROCESSOR_CPU_LOAD_INFO,
+            &mut count,
+            &mut loads,
+            &mut ticks,
+        ) != 0
+        {
+            return None;
+        }
+        let per = ticks as usize; // 4 buckets
+        let mut out = Vec::with_capacity(count as usize);
+        for c in 0..count as usize {
+            let row = loads.add(c * per);
+            out.push([
+                *row as u64,
+                *row.add(1) as u64,
+                *row.add(2) as u64,
+                *row.add(3) as u64,
+            ]);
+        }
+        mig_deallocate(loads.cast(), count * ticks);
+        Some(out)
+    }
+}
+
+/// (total busy %, per-core busy %) between two tick snapshots. Pure so the
+/// math is pinned by tests.
+#[cfg(any(target_os = "macos", test))]
+fn cpu_busy_between(prev: &[[u64; 4]], cur: &[[u64; 4]]) -> (Option<f64>, Vec<f64>) {
+    let one = |p: [u64; 4], c: [u64; 4]| -> Option<f64> {
+        let busy = c[0].saturating_sub(p[0])
+            + c[1].saturating_sub(p[1])
+            + c[3].saturating_sub(p[3]);
+        let total = busy + c[2].saturating_sub(p[2]);
+        (total > 0).then(|| (busy as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+    };
+    let mut cores = Vec::new();
+    let mut tot_busy = 0u64;
+    let mut tot_all = 0u64;
+    for (p, c) in prev.iter().zip(cur) {
+        tot_busy += c[0].saturating_sub(p[0]) + c[1].saturating_sub(p[1]) + c[3].saturating_sub(p[3]);
+        tot_all += c[0].saturating_sub(p[0])
+            + c[1].saturating_sub(p[1])
+            + c[2].saturating_sub(p[2])
+            + c[3].saturating_sub(p[3]);
+        if let Some(pct) = one(*p, *c) {
+            cores.push(pct);
+        }
+    }
+    let total = (tot_all > 0).then(|| (tot_busy as f64 / tot_all as f64 * 100.0).clamp(0.0, 100.0));
+    (total, cores)
+}
+
+/// One sysctl value as a string (`vm.swapusage`, `hw.memsize`, `hw.pagesize`).
+#[cfg(target_os = "macos")]
+fn sysctl_str(name: &str) -> Option<String> {
+    extern "C" {
+        fn sysctlbyname(
+            name: *const i8,
+            oldp: *mut u8,
+            oldlenp: *mut usize,
+            newp: *mut u8,
+            newlen: usize,
+        ) -> i32;
+    }
+    let cname = std::ffi::CString::new(name).ok()?;
+    unsafe {
+        let mut len: usize = 0;
+        if sysctlbyname(cname.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) != 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        if sysctlbyname(cname.as_ptr(), buf.as_mut_ptr(), &mut len, std::ptr::null_mut(), 0) != 0 {
+            return None;
+        }
+        buf.truncate(len);
+        Some(String::from_utf8_lossy(&buf).trim_end_matches('\0').to_string())
+    }
+}
+
+/// (1, 5, 15-minute load) via getloadavg — empty on platforms without it.
+#[cfg(target_os = "macos")]
+fn loadavg() -> (Option<f64>, Option<f64>, Option<f64>) {
+    extern "C" {
+        fn getloadavg(avgs: *mut f64, nelem: i32) -> i32;
+    }
+    let mut a = [0f64; 3];
+    let n = unsafe { getloadavg(a.as_mut_ptr(), 3) };
+    match n {
+        3 => (Some(a[0]), Some(a[1]), Some(a[2])),
+        2 => (Some(a[0]), Some(a[1]), None),
+        1 => (Some(a[0]), None, None),
+        _ => (None, None, None),
+    }
+}
+
+/// Memory-in-use MB from `vm_stat` output: active + wired + compressor
+/// pages (the "Memory Used" Activity Monitor shows), scaled by `page_size`.
+#[cfg(any(target_os = "macos", test))]
+fn parse_vm_stat(text: &str, page_size: u64) -> Option<u64> {
+    let get = |label: &str| -> u64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(label))
+            .and_then(|rest| {
+                rest.trim_end_matches('.')
+                    .trim()
+                    .replace(',', "")
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0)
+    };
+    let used_pages = get("Pages active: ")
+        + get("Pages wired down: ")
+        + get("Pages occupied by compressor: ")
+        + get("Pages stored in compressor: "); // older label; the two never coexist
+    (used_pages > 0).then(|| used_pages * page_size / (1024 * 1024))
+}
+
+/// `total = 3072.00M used = 12.53M free = ... (encrypted)` → (used, total) MB.
+#[cfg(any(target_os = "macos", test))]
+fn parse_swapusage(text: &str) -> (Option<u64>, Option<u64>) {
+    let get = |key: &str| -> Option<u64> {
+        let idx = text.find(key)? + key.len();
+        let rest = &text[idx..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let v: f64 = rest[..end].parse().ok()?;
+        let mult = match rest[end..].chars().next()? {
+            'G' => 1024.0,
+            'K' => 1.0 / 1024.0,
+            _ => 1.0, // M and B both land here (B ≈ 0 MB, close enough)
+        };
+        Some((v * mult) as u64)
+    };
+    (get("used = "), get("total = "))
+}
+
 pub struct MacOs {
     users: Users,
+    /// Tick snapshot from the previous [`MacOs::system_stats`] call — CPU%
+    /// is a delta, so the first call reports memory/load only.
+    prev_cpu: std::cell::RefCell<Option<Vec<[u64; 4]>>>,
 }
 
 impl MacOs {
     pub fn new(users: Users) -> Self {
-        MacOs { users }
+        MacOs {
+            users,
+            prev_cpu: std::cell::RefCell::new(None),
+        }
     }
 
     /// One `lsof` run, stdout salvaged (it exits non-zero when it can't
@@ -496,6 +668,44 @@ impl Platform for MacOs {
                 p.io_write_bytes = Some(w);
             }
         }
+    }
+
+    /// One mach tick call + one `vm_stat` spawn + a few sysctls — ~50ms,
+    /// sampled only while the system page is open. CPU needs two calls
+    /// (tick delta); the first reports memory/load only. No per-core list
+    /// until the second call either.
+    fn system_stats(&self) -> Option<SystemStats> {
+        let mut out = SystemStats::default();
+
+        let cur = host_cpu_ticks()?;
+        let mut prev = self.prev_cpu.borrow_mut();
+        if let Some(p) = prev.as_ref() {
+            let (total, cores) = cpu_busy_between(p, &cur);
+            out.cpu_percent = total;
+            out.cores = cores;
+        }
+        *prev = Some(cur);
+        drop(prev);
+
+        let page_size: u64 = sysctl_str("hw.pagesize")
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(16384);
+        if let Ok(text) = crate::util::run("vm_stat", &[], CMD_TIMEOUT) {
+            out.mem_used_mb = parse_vm_stat(&text, page_size);
+        }
+        out.mem_total_mb = sysctl_str("hw.memsize")
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|b| b / (1024 * 1024));
+        if let Some(su) = sysctl_str("vm.swapusage") {
+            let (used, total) = parse_swapusage(&su);
+            out.swap_used_mb = used;
+            out.swap_total_mb = total;
+        }
+        let (l1, l5, l15) = loadavg();
+        out.load1 = l1;
+        out.load5 = l5;
+        out.load15 = l15;
+        Some(out)
     }
 
     fn open_files(&self, pid: Pid) -> Vec<String> {
@@ -1366,6 +1576,53 @@ mod tests {
         assert_eq!(pid, 350);
         assert_eq!(label, "org.example.nginx");
         assert!(parse_launchctl_pid_label("-\t0\tnot.running").is_none());
+    }
+
+    #[test]
+    fn cpu_busy_percent_math() {
+        // two cores; core 0 busy, core 1 idle
+        let prev = vec![[100u64, 50, 800, 10], [10, 5, 900, 0]];
+        let cur = vec![[150, 70, 850, 10], [10, 5, 950, 0]];
+        let (total, cores) = cpu_busy_between(&prev, &cur);
+        // core 0: busy delta 50+20+0=70 of 120 elapsed → 58.33%
+        assert!((cores[0] - 58.3333).abs() < 0.01, "{:?}", cores);
+        // core 1: only idle ticks elapsed → a real 0%, still on the grid
+        assert!(cores[1].abs() < 0.01, "{:?}", cores);
+        // aggregate: 70 busy of 170 elapsed ticks (core 1 contributes 50 idle)
+        let t = total.expect("ticks elapsed");
+        assert!((t - 70.0 / 170.0 * 100.0).abs() < 0.01, "{t}");
+        // no elapsed ticks anywhere → no percentages at all
+        let (total, cores) = cpu_busy_between(&cur, &cur);
+        assert!(total.is_none() && cores.is_empty());
+    }
+
+    #[test]
+    fn vm_stat_and_swapusage_parse() {
+        let text = "\
+Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages free:                               12345.
+Pages active:                           500000.
+Pages inactive:                         200000.
+Pages speculative:                       30000.
+Pages wired down:                       150000.
+Pages occupied by compressor:            75000.
+";
+        // used = active + wired + compressor = 725000 pages × 4096 B
+        // = 2969600000 bytes → 2832 MB
+        assert_eq!(parse_vm_stat(text, 4096), Some(2832));
+        // the older compressor label still counts
+        let old = text.replace("Pages occupied by compressor:", "Pages stored in compressor:");
+        assert_eq!(parse_vm_stat(&old, 4096), Some(2832));
+        // a broken read yields nothing rather than 0
+        assert_eq!(parse_vm_stat("Pages free: 1.", 4096), None);
+
+        let (used, total) = parse_swapusage("total = 3072.00M used = 12.53M free = 3059.47M (encrypted)");
+        assert_eq!((used, total), (Some(12), Some(3072)));
+        // gigabyte units scale up
+        let (used, total) = parse_swapusage("total = 2.00G used = 0B free = 2.00G");
+        assert_eq!((used, total), (Some(0), Some(2048)));
+        // garbage in → nothing out
+        assert_eq!(parse_swapusage("no numbers here"), (None, None));
     }
 }
 

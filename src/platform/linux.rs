@@ -8,18 +8,24 @@ use std::time::Duration;
 
 use crate::model::{FileOverview, LockEntry, Pid, Process, Socket, Source};
 use crate::util::{now_unix, run_ok, strip_deleted_suffix};
-use crate::platform::{Capabilities, PlatError, PlatResult, Platform, Users};
+use crate::platform::{Capabilities, PlatError, PlatResult, Platform, SystemStats, Users};
 
 const CLK_TCK: f64 = 100.0; // kernel CONFIG_HZ userspace value on effectively all distros
 const CMD_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Linux {
     users: Users,
+    /// /proc/stat tick snapshot from the previous [`Linux::system_stats`]
+    /// call — CPU% is a tick delta, so the first call reports no percents.
+    prev_stat: std::cell::RefCell<Option<StatSnapshot>>,
 }
 
 impl Linux {
     pub fn new(users: Users) -> Self {
-        Linux { users }
+        Linux {
+            users,
+            prev_stat: std::cell::RefCell::new(None),
+        }
     }
 
     fn boot_time(&self) -> Option<i64> {
@@ -39,6 +45,99 @@ fn read_ok(p: &Path) -> Option<String> {
 
 fn readlink_ok(p: &Path) -> Option<String> {
     std::fs::read_link(p).ok().map(|s| s.to_string_lossy().into_owned())
+}
+
+// ---------- system resources (system page 'y') ----------
+
+/// One cpu line's tick buckets from /proc/stat: `idle` includes iowait,
+/// everything else counts as busy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StatTicks {
+    idle: u64,
+    total: u64,
+}
+
+/// The aggregate `cpu` line plus every `cpuN` line of one /proc/stat read.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct StatSnapshot {
+    total: Option<StatTicks>,
+    cores: Vec<StatTicks>,
+}
+
+/// Tick buckets for one cpu line ("12 0 345 6789 0 0 0 0 0 0").
+fn sum_ticks(nums: &str) -> StatTicks {
+    let mut vals = nums
+        .split_whitespace()
+        .filter_map(|v| v.parse::<u64>().ok());
+    let user = vals.next().unwrap_or(0);
+    let nice = vals.next().unwrap_or(0);
+    let system = vals.next().unwrap_or(0);
+    let idle = vals.next().unwrap_or(0);
+    let iowait = vals.next().unwrap_or(0);
+    let mut total = user + nice + system + idle + iowait;
+    for extra in vals {
+        total += extra;
+    }
+    StatTicks {
+        idle: idle + iowait,
+        total,
+    }
+}
+
+/// (aggregate, per-core) from a /proc/stat body; the btime and intr lines
+/// don't start with "cpu" and drop out naturally.
+fn parse_stat_snapshot(text: &str) -> StatSnapshot {
+    let mut snap = StatSnapshot::default();
+    for line in text.lines() {
+        let Some(body) = line.strip_prefix("cpu") else {
+            continue;
+        };
+        if let Some(nums) = body.strip_prefix(' ') {
+            snap.total = Some(sum_ticks(nums));
+        } else if body.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            if let Some((_, nums)) = body.split_once(' ') {
+                snap.cores.push(sum_ticks(nums));
+            }
+        }
+    }
+    snap
+}
+
+/// Busy percent between two tick snapshots; None when no ticks elapsed
+/// or the counters went backwards (cpu hotplug reordering — rare).
+fn busy_between(prev: StatTicks, cur: StatTicks) -> Option<f64> {
+    let d_total = cur.total.checked_sub(prev.total)?;
+    let d_idle = cur.idle.checked_sub(prev.idle)?;
+    (d_total > 0).then(|| (1.0 - d_idle as f64 / d_total as f64).clamp(0.0, 1.0) * 100.0)
+}
+
+/// MemAvailable-based used (what free(1) reports) plus swap, from
+/// /proc/meminfo. Returns (mem_used, mem_total, swap_used, swap_total) KiB.
+fn parse_meminfo(
+    text: &str,
+) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+    let get_kb = |key: &str| -> Option<u64> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|rest| rest.trim_start().split_whitespace().next()?.parse().ok())
+    };
+    let mem_total = get_kb("MemTotal:");
+    let avail = get_kb("MemAvailable:").or_else(|| get_kb("MemFree:"));
+    let mem_used = mem_total.zip(avail).map(|(t, a)| t.saturating_sub(a));
+    let swap_total = get_kb("SwapTotal:");
+    let swap_free = get_kb("SwapFree:");
+    let swap_used = swap_total.zip(swap_free).map(|(t, f)| t.saturating_sub(f));
+    (mem_used, mem_total, swap_used, swap_total)
+}
+
+/// `0.52 0.58 0.59 2/1234 5678` → (1, 5, 15-minute load averages).
+fn parse_loadavg(text: &str) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let mut it = text.split_whitespace();
+    (
+        it.next().and_then(|v| v.parse().ok()),
+        it.next().and_then(|v| v.parse().ok()),
+        it.next().and_then(|v| v.parse().ok()),
+    )
 }
 
 /// Parse /proc/<pid>/stat: comm may contain spaces and parentheses, so
@@ -594,6 +693,45 @@ impl Platform for Linux {
                 p,
             );
         }
+    }
+
+    /// Three /proc file reads — microseconds, sampled every refresh. CPU
+    /// needs two calls (tick delta), so the first reports memory/load only.
+    fn system_stats(&self) -> Option<SystemStats> {
+        let stat = read_ok(Path::new("/proc/stat"))?;
+        let snapshot = parse_stat_snapshot(&stat);
+        let mut out = SystemStats::default();
+
+        let mut prev = self.prev_stat.borrow_mut();
+        if let Some(p) = prev.as_ref() {
+            out.cpu_percent = p
+                .total
+                .zip(snapshot.total)
+                .and_then(|(a, b)| busy_between(a, b));
+            out.cores = p
+                .cores
+                .iter()
+                .zip(&snapshot.cores)
+                .filter_map(|(a, b)| busy_between(*a, *b))
+                .collect();
+        }
+        *prev = Some(snapshot);
+        drop(prev);
+
+        if let Some(mi) = read_ok(Path::new("/proc/meminfo")) {
+            let (mu, mt, su, st) = parse_meminfo(&mi);
+            out.mem_used_mb = mu.map(|kb| kb / 1024);
+            out.mem_total_mb = mt.map(|kb| kb / 1024);
+            out.swap_used_mb = su.map(|kb| kb / 1024);
+            out.swap_total_mb = st.map(|kb| kb / 1024);
+        }
+        if let Some(la) = read_ok(Path::new("/proc/loadavg")) {
+            let (l1, l5, l15) = parse_loadavg(&la);
+            out.load1 = l1;
+            out.load5 = l5;
+            out.load15 = l15;
+        }
+        Some(out)
     }
 
     /// Effective capabilities from /proc/<pid>/status CapEff, decoded to the
@@ -1176,5 +1314,61 @@ mod tests {
         assert!(!hup_bit("0000000000000004")); // SIGINT ignored, HUP not
         assert!(!hup_bit("0000000000000000"));
         assert!(!hup_bit("not-hex"));
+    }
+
+    #[test]
+    fn proc_stat_parses_aggregate_and_cores() {
+        let text = "\
+cpu  100 0 50 800 10 0 10 5 0 0
+cpu0 60 0 30 400 10 0 5 5 0 0
+cpu1 40 0 20 400 0 0 5 0 0 0
+intr 12345
+btime 1700000000
+";
+        let snap = parse_stat_snapshot(text);
+        let t = snap.total.expect("aggregate cpu line");
+        // total = user+nice+sys+idle+iowait+irq+softirq+steal = 975
+        assert_eq!(t.total, 975);
+        // idle bucket includes iowait: 800+10
+        assert_eq!(t.idle, 810);
+        assert_eq!(snap.cores.len(), 2);
+        assert_eq!(snap.cores[0].total, 510);
+        // a header-only read still parses (empty snapshot)
+        assert_eq!(parse_stat_snapshot("intr 1\n").total, None);
+    }
+
+    #[test]
+    fn busy_percent_math() {
+        let prev = StatTicks { idle: 810, total: 975 };
+        let cur = StatTicks { idle: 900, total: 1175 };
+        // 200 new ticks, 90 idle → 55% busy
+        let p = busy_between(prev, cur).expect("delta");
+        assert!((p - 55.0).abs() < 0.01, "{p}");
+        // no elapsed ticks → None (not a fake 0%)
+        assert_eq!(busy_between(cur, cur), None);
+        // counters going backwards (hotplug) → None
+        assert_eq!(busy_between(cur, prev), None);
+    }
+
+    #[test]
+    fn meminfo_and_loadavg_parse() {
+        let text = "\
+MemTotal:       16384000 kB
+MemFree:         1024000 kB
+MemAvailable:    8192000 kB
+SwapTotal:       2048000 kB
+SwapFree:        1024000 kB
+HugePages_Total:       0
+";
+        let (mu, mt, su, st) = parse_meminfo(text);
+        // the parser reports KiB; system_stats does the /1024 to MB
+        assert_eq!(mt, Some(16_384_000));
+        assert_eq!(mu, Some(8_192_000), "used = total - MemAvailable");
+        // no MemAvailable → MemFree fallback
+        let fallback = text.replace("MemAvailable:    8192000 kB\n", "");
+        assert_eq!(parse_meminfo(&fallback).0, Some(15_360_000));
+        assert_eq!((su, st), (Some(1_024_000), Some(2_048_000)));
+        let (l1, l5, l15) = parse_loadavg("0.52 0.58 0.59 2/1234 5678\n");
+        assert_eq!((l1, l5, l15), (Some(0.52), Some(0.58), Some(0.59)));
     }
 }

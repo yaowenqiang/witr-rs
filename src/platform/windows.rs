@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::model::{Pid, Process, Socket, Source};
-use crate::platform::{Capabilities, PlatError, PlatResult, Platform, Users};
+use crate::platform::{Capabilities, PlatError, PlatResult, Platform, SystemStats, Users};
 use crate::util::{basename, run, split_host_port};
 
 const PS_TIMEOUT: Duration = Duration::from_secs(20);
@@ -22,6 +22,48 @@ impl Windows {
     pub fn new(users: Users) -> Self {
         Windows { users }
     }
+}
+
+// ---------- system resources (system page 'y') ----------
+
+/// Parse the [`Windows::system_stats`] script output: `cpu <name> <pct>`
+/// lines (name `_Total` or `0,1`) and one `mem <total_kib> <free_kib>`.
+/// The perf-counter values are already cooked percents — no delta state.
+fn parse_windows_system_stats(text: &str) -> SystemStats {
+    let mut out = SystemStats::default();
+    let mut total = 0u64;
+    let mut free = 0u64;
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("cpu") => {
+                let (name, pct) = match (it.next(), it.next()) {
+                    (Some(n), Some(p)) => (n, p),
+                    _ => continue,
+                };
+                let Ok(pct) = pct.parse::<f64>() else {
+                    continue;
+                };
+                if name == "_Total" {
+                    out.cpu_percent = Some(pct.clamp(0.0, 100.0));
+                } else if name.contains(',') {
+                    out.cores.push(pct.clamp(0.0, 100.0));
+                }
+            }
+            Some("mem") => {
+                if let (Some(t), Some(f)) = (it.next(), it.next()) {
+                    total = t.parse().unwrap_or(0);
+                    free = f.parse().unwrap_or(0);
+                }
+            }
+            _ => {}
+        }
+    }
+    if total > 0 {
+        out.mem_total_mb = Some(total / 1024);
+        out.mem_used_mb = Some(total.saturating_sub(free) / 1024);
+    }
+    out
 }
 
 // ---------- ToolHelp32 process snapshot ----------
@@ -535,6 +577,26 @@ impl Platform for Windows {
         }
     }
 
+    /// One PowerShell call: the OS class for memory, the formatted
+    /// perf-counter class for total + per-core CPU (cooked values — no
+    /// delta state needed). Only sampled while the system page is open;
+    /// load average doesn't exist on Windows.
+    fn system_stats(&self) -> Option<SystemStats> {
+        let script = concat!(
+            "$os = Get-CimInstance Win32_OperatingSystem\n",
+            "\"mem {0} {1}\" -f $os.TotalVisibleMemorySize, $os.FreePhysicalMemory\n",
+            "Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor | ",
+            "ForEach-Object { \"cpu {0} {1}\" -f $_.Name, $_.PercentProcessorTime }\n",
+        );
+        let text = run(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", script],
+            PS_TIMEOUT,
+        )
+        .ok()?;
+        Some(parse_windows_system_stats(&text))
+    }
+
     fn detail(&self, brief: &Process, _want_env: bool) -> Process {
         let mut p = brief.clone();
         let details = cim_details(&[brief.pid]);
@@ -741,5 +803,23 @@ mod tests {
             ps_datetime_to_unix(&serde_json::json!("/Date(1694494400123)/"))
         );
         assert_eq!(ps_datetime_to_unix(&serde_json::json!(null)), None);
+    }
+
+    #[test]
+    fn windows_system_stats_parse() {
+        let text = "\
+mem 16777216000 8388608000
+cpu _Total 42
+cpu 0,0 78
+cpu 0,1 21
+";
+        let s = parse_windows_system_stats(text);
+        assert_eq!(s.cpu_percent, Some(42.0));
+        assert_eq!(s.cores, vec![78.0, 21.0]);
+        assert_eq!(s.mem_total_mb, Some(16_384_000));
+        assert_eq!(s.mem_used_mb, Some(16_384_000 - 8_192_000));
+        // nothing usable → an all-empty stats struct (sections hide)
+        let s = parse_windows_system_stats("garbage");
+        assert_eq!(s, SystemStats::default());
     }
 }

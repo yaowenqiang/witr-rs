@@ -40,6 +40,8 @@ A Rust implementation of [pranshuparmar/witr](https://github.com/pranshuparmar/w
 
 **Config file**: `~/.config/witr-rs/config.toml` (macOS: `~/Library/Application Support/witr-rs/`, Windows: `%APPDATA%\witr-rs\`) — four keys, `refresh_secs` (sampling interval) / `sort` (default sort) / `notify` / `paused`, acting as defaults for the CLI flags: the file loads first, the command line always wins. Bad lines are skipped with a warning; no file changes nothing.
 
+**System resources page (`y`)**: a whole-machine dashboard — CPU history chart (fixed 0–100 scale, current value + window peak annotated), memory history chart (absolute scale + peak), load average (1/5/15 min), swap usage, and a per-core grid (cores ≥90% render red). Linux reads `/proc` directly (microsecond-cheap, sampled every cycle so history is already there when the page opens); macOS uses Mach `host_processor_info` + `vm_stat`, Windows a single PowerShell CIM query (those two sample only while the page is open). Answers "how busy is this machine overall, and how much memory is left".
+
 ## TUI keys
 
 Vim-style browsing (aligned with the Go witr):
@@ -64,6 +66,7 @@ Vim-style browsing (aligned with the Go witr):
 | `o` | Ports tab: per-socket detail ↔ aggregate overview keyed by (port, owner) (`Enter` opens the owner's process detail) |
 | `l` | Detail page / Events tab: pull the process's recent logs (container logs / journalctl / macOS unified log) into a full-screen scrollable Logs page; on exited Events rows the auto-captured last words appear instantly |
 | `S` | Open the session summary page (activity counts / restart chains / CPU-spike board / memory climbers; window from `--since`), `r` recompute, `Esc` back |
+| `y` | Open the system resources page: machine-wide CPU/memory history charts, load, swap, per-core grid; `r` sample now, `Esc` back |
 | `P` | Pause / resume sampling (global freeze, footer shows `⏸ paused`; on Events, pid-descending sort is now `p` twice) |
 | `!` | Toggle desktop notifications (`--notify` pre-enables; footer shows the state) |
 | `z` | Zoom: the focused pane temporarily fills the row (tmux-style) |

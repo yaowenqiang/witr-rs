@@ -199,6 +199,18 @@ impl SessionSummary {
     }
 }
 
+/// One whole-machine sample for the system page ('y'): the fields the
+/// page charts. Per-core percentages stay in the platform snapshot —
+/// only the current grid is shown, no history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SystemSample {
+    pub at_unix: i64,
+    pub cpu: Option<f64>,
+    pub mem_used_mb: Option<u64>,
+    pub swap_used_mb: Option<u64>,
+    pub load1: Option<f64>,
+}
+
 #[derive(Default)]
 pub struct History {
     /// pid → (cpu ms at last sample, sampled at)
@@ -225,6 +237,8 @@ pub struct History {
     pub events: Vec<TuiEvent>,
     /// pid → name at the previous refresh (for appear/exit deltas).
     prev_seen: HashMap<Pid, String>,
+    /// Whole-machine samples for the system page ('y'), oldest first.
+    sys: VecDeque<SystemSample>,
 }
 
 impl History {
@@ -517,6 +531,94 @@ impl History {
         Some(format!("{bars}  peak {:.1} MB", peak / 1024.0))
     }
 
+    /// Record a whole-machine sample (system page 'y'), oldest at the
+    /// back, capped like the per-process charts.
+    pub fn update_system(&mut self, s: crate::platform::SystemStats) {
+        self.sys.push_back(SystemSample {
+            at_unix: crate::util::now_unix(),
+            cpu: s.cpu_percent,
+            mem_used_mb: s.mem_used_mb,
+            swap_used_mb: s.swap_used_mb,
+            load1: s.load1,
+        });
+        while self.sys.len() > BIG_SAMPLES {
+            self.sys.pop_front();
+        }
+    }
+
+    /// The freshest system sample (page header's "now" values).
+    pub fn sys_latest(&self) -> Option<&SystemSample> {
+        self.sys.back()
+    }
+
+    /// System CPU chart on a fixed 0–100 scale (the max is known, unlike
+    /// the per-process charts) plus (current, peak). None until two
+    /// samples exist.
+    pub fn sys_cpu_chart(&self, width: usize) -> Option<(String, f64, f64)> {
+        let vals: Vec<f64> = self
+            .sys
+            .iter()
+            .filter_map(|s| s.cpu)
+            .collect();
+        if vals.len() < 2 {
+            return None;
+        }
+        let thinned: Vec<f64> = if vals.len() > width {
+            let stride = vals.len() as f64 / width as f64;
+            (0..width)
+                .map(|i| vals[(i as f64 * stride) as usize])
+                .collect()
+        } else {
+            vals
+        };
+        let peak = thinned.iter().copied().fold(0.0f64, f64::max);
+        let bars: String = thinned
+            .iter()
+            .map(|v| {
+                let idx = ((v / 100.0).clamp(0.0, 0.999) * 8.0) as usize;
+                SPARK_LEVELS[idx]
+            })
+            .collect();
+        let now = self.sys_latest().and_then(|s| s.cpu).unwrap_or(0.0);
+        Some((bars, now, peak))
+    }
+
+    /// System memory chart, absolute scale like the per-process mem chart
+    /// (peak annotated in GB/MB), plus (used, peak) MB. None until two
+    /// samples exist.
+    pub fn sys_mem_chart(&self, width: usize) -> Option<(String, f64, f64)> {
+        let vals: Vec<f64> = self
+            .sys
+            .iter()
+            .filter_map(|s| s.mem_used_mb)
+            .map(|mb| mb as f64)
+            .collect();
+        if vals.len() < 2 {
+            return None;
+        }
+        let thinned: Vec<f64> = if vals.len() > width {
+            let stride = vals.len() as f64 / width as f64;
+            (0..width)
+                .map(|i| vals[(i as f64 * stride) as usize])
+                .collect()
+        } else {
+            vals
+        };
+        let peak = thinned.iter().copied().fold(0.0f64, f64::max);
+        let bars: String = thinned
+            .iter()
+            .map(|v| {
+                let idx = ((v / peak.max(1.0)).clamp(0.0, 0.999) * 8.0) as usize;
+                SPARK_LEVELS[idx]
+            })
+            .collect();
+        let now = self
+            .sys_latest()
+            .and_then(|s| s.mem_used_mb)
+            .unwrap_or(0) as f64;
+        Some((bars, now, peak))
+    }
+
     /// Leak suspicion over the trailing [`LEAK_SAMPLES`] RSS samples: grew
     /// by at least [`LEAK_MB`] while rising at least [`LEAK_FRACTION`] of
     /// the time. `sample_secs` is the per-refresh interval, used only to
@@ -726,6 +828,42 @@ mod tests {
         h3.update(&[]);
         assert!(h3.mem_chart(10, 80).is_none());
         assert!(h3.leak_suspicion(10, 3.0).is_none());
+    }
+
+    #[test]
+    fn system_ring_feeds_both_charts() {
+        let mut h = History::new();
+        let stats = |cpu: f64, mem: u64| crate::platform::SystemStats {
+            cpu_percent: Some(cpu),
+            mem_used_mb: Some(mem),
+            ..Default::default()
+        };
+        // one sample: charts wait for a second
+        h.update_system(stats(10.0, 1000));
+        assert!(h.sys_cpu_chart(40).is_none());
+        assert!(h.sys_mem_chart(40).is_none());
+        h.update_system(stats(50.0, 2000));
+        h.update_system(stats(90.0, 1500));
+        let (bars, now, peak) = h.sys_cpu_chart(40).expect("cpu chart");
+        assert_eq!(bars.chars().count(), 3, "unthinned below width: {bars}");
+        assert_eq!(now, 90.0);
+        assert_eq!(peak, 90.0, "fixed 0-100 scale, peak is the window max");
+        assert!(bars.ends_with('█'), "90% renders near the top: {bars}");
+        let (bars, used, peak) = h.sys_mem_chart(40).expect("mem chart");
+        assert_eq!(bars.chars().count(), 3);
+        assert_eq!(used, 1500.0);
+        assert_eq!(peak, 2000.0);
+        assert!(!bars.is_empty());
+        // the ring caps like the per-process charts
+        for i in 0..(BIG_SAMPLES as u64 + 10) {
+            h.update_system(stats(i as f64, i));
+        }
+        assert_eq!(h.sys.len(), BIG_SAMPLES);
+        assert_eq!(
+            h.sys.front().map(|s| s.mem_used_mb),
+            Some(Some(10)),
+            "oldest samples dropped, not the newest"
+        );
     }
 
     #[test]
