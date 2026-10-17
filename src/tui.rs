@@ -275,6 +275,11 @@ struct TuiApp {
     events_log: Option<std::fs::File>,
     /// desktop notifications enabled (--notify, '!' toggles)
     notify: bool,
+    /// watchlist: persisted "name|exe_basename|user" identity keys (config
+    /// `watch`). Watched processes get a ★, pin to the top of the flat
+    /// Processes table, and stay watched across restarts — the pid is not
+    /// part of the key. 'w' toggles on the selection and writes the config.
+    watch: Vec<String>,
     /// process name → restart count seen this session; a name that has
     /// restarted ≥2 times is a crash looper — its plain exits notify too
     restart_tally: HashMap<String, u32>,
@@ -393,6 +398,8 @@ pub struct Seed {
     /// --notify: desktop notifications on restarts / repeated exits
     /// ('!' toggles live inside the TUI)
     pub notify: bool,
+    /// config watch — pre-seeded watchlist ("name|exe_basename|user" keys)
+    pub watch: Vec<String>,
     /// --since: 'S' summary-page window in seconds (None = whole session)
     pub since: Option<u64>,
     /// config refresh_secs — the TUI sampling interval (None = built-in 3s)
@@ -581,6 +588,7 @@ impl TuiApp {
             death_rx: None,
             events_log: None,
             notify: false,
+            watch: seed.watch,
             restart_tally: HashMap::new(),
             containers_loading: false,
             containers_loaded: false,
@@ -1584,6 +1592,12 @@ impl TuiApp {
             };
             if desc { ord.reverse() } else { ord }
         });
+        // watchlist ('w'): watched processes pin to the top, keeping the
+        // chosen sort within the pinned block (stable partition). Skipped in
+        // tree mode — pinning would tear children away from their parents.
+        if !self.watch.is_empty() && !(self.tree_mode && needle.is_empty()) {
+            idx.sort_by_key(|&i| !self.is_watched(&procs[i]));
+        }
         // tree mode ('T'): re-order the sorted indices depth-first so
         // children sit directly under their parent; a live search keeps the
         // flat order (an arbitrary subset has no meaningful tree shape)
@@ -1638,6 +1652,57 @@ impl TuiApp {
             .and_then(|i| self.view.get(i))
             .and_then(|&i| self.procs.get(i))
             .map(|p| p.pid)
+    }
+
+    fn is_watched(&self, p: &Process) -> bool {
+        let key = crate::util::identity_key(p);
+        self.watch.iter().any(|k| k == &key)
+    }
+
+    /// 'w' on the Processes table: toggle the selected process's watchlist
+    /// entry and persist it to the user config. Matching is by identity
+    /// (name + exe basename + user), never pid, so the star follows the
+    /// program across restarts.
+    fn toggle_watch(&mut self) {
+        let (added, name) = self.toggle_watch_in_memory();
+        if name.is_empty() {
+            return; // nothing selected — status already set
+        }
+        match crate::config::Config::save_watch(&self.watch) {
+            Ok(()) => {
+                self.status = if added {
+                    format!("★ watching {name} — pinned to top, survives restarts")
+                } else {
+                    format!("unwatched {name}")
+                };
+            }
+            Err(e) => self.status = format!("watchlist not saved: {e}"),
+        }
+    }
+
+    /// The in-memory half of [toggle_watch] (no config write — tests stay
+    /// hermetic): flips the selected process's entry, returns (added?, name).
+    fn toggle_watch_in_memory(&mut self) -> (bool, String) {
+        let Some(p) = self
+            .table_state
+            .selected()
+            .and_then(|i| self.view.get(i))
+            .and_then(|&i| self.procs.get(i))
+            .cloned()
+        else {
+            self.status = "no process selected".into();
+            return (false, String::new());
+        };
+        let key = crate::util::identity_key(&p);
+        let added = if let Some(pos) = self.watch.iter().position(|k| k == &key) {
+            self.watch.remove(pos);
+            false
+        } else {
+            self.watch.push(key);
+            true
+        };
+        self.rebuild_view();
+        (added, p.name)
     }
 
     /// Selection changed (or never computed): rebuild the details panel.
@@ -3056,6 +3121,13 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
             } else {
                 p.name.clone()
             };
+            // watchlist ('w'): star prefix — matches the config `watch` key,
+            // so the mark survives restarts under a new pid
+            let name = if app.is_watched(p) {
+                format!("★ {name}")
+            } else {
+                name
+            };
             // a pid with an active (un-rearmed) threshold alert glows red
             let name = if app
                 .alert_state
@@ -4330,8 +4402,13 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
     };
     let mut footer = match app.tab {
         Tab::Processes => format!(
-            "Total: {} | Enter: Detail | a: Actions | /: Search | z: Zoom | T: Tree{} | B: Group{} | S: Summary | Y: System | !: Notify{} | P: Pause | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
+            "Total: {} | Enter: Detail | w: Watch{} | a: Actions | /: Search | z: Zoom | T: Tree{} | B: Group{} | S: Summary | Y: System | !: Notify{} | P: Pause | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | r: Refresh | q: Quit",
             total,
+            if app.watch.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", app.watch.len())
+            },
             if app.tree_mode { " (on)" } else { "" },
             if app.group_mode != GroupMode::Off {
                 format!(" ({})", app.group_mode.label())
@@ -5204,6 +5281,11 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                 app.actions_open = true;
             }
         }
+        // ---- Processes tab: 'w' toggles the watchlist entry (pinned + ★,
+        // identity-matched so it survives restarts); persisted to the config ----
+        KeyCode::Char('w') if app.tab == Tab::Processes && app.focus == Focus::Table => {
+            app.toggle_watch();
+        }
         // ---- Locks tab: 'a' toggles the all-open-files view, p/n/t/m/f
         // sort (Go witr parity; there 'f' shadows page-down — use Space) ----
         KeyCode::Char(c)
@@ -5847,6 +5929,72 @@ mod tests {
         let cyc = vec![mk(5, Some(6)), mk(6, Some(5))];
         let (o2, _) = tree_order(&cyc, &vec![0, 1]);
         assert_eq!(o2.len(), 2, "cycle terminates with every row present");
+    }
+
+    /// A deterministic synthetic table (live refresh would race a proc
+    /// vanishing): big/mid/watched where the watched one sorts last by the
+    /// default Mem-desc key.
+    fn watch_test_app() -> TuiApp {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        let mk = |pid: Pid, mem_kb: u64, exe: &str| Process {
+            pid,
+            name: format!("p{pid}"),
+            mem_kb: Some(mem_kb),
+            user: Some("u".into()),
+            exe: Some(exe.into()),
+            ..Default::default()
+        };
+        app.procs = vec![mk(1, 999, "/bin/p1"), mk(2, 500, "/bin/p2"), mk(3, 1, "/bin/p3")];
+        app.rebuild_view();
+        app
+    }
+
+    #[test]
+    fn watch_toggle_pins_and_survives_pid_change() {
+        let mut app = watch_test_app();
+        // default sort is Mem desc → pid 3 (1 KiB) is the bottom row
+        let n = app.view.len();
+        app.table_state.select(Some(n - 1));
+        assert_eq!(app.procs[app.view[n - 1]].pid, 3);
+        assert!(!app.is_watched(&app.procs[app.view[n - 1]]));
+
+        let (added, name) = app.toggle_watch_in_memory();
+        assert!(added, "first 'w' watches");
+        assert_eq!(name, "p3");
+        assert_eq!(app.watch, vec!["p3|p3|u".to_string()]);
+        // pinned: the watched process now sits at the top of the view
+        assert_eq!(app.procs[app.view[0]].pid, 3, "watched process pins to top");
+
+        // restart under a new pid: the identity key ignores the pid
+        let top = app.view[0];
+        app.procs[top].pid = 424242;
+        assert!(app.is_watched(&app.procs[top]), "star follows the program, not the pid");
+
+        // toggle again on the (re-selected) top row → unwatched
+        app.table_state.select(Some(0));
+        app.rebuild_view();
+        app.table_state.select(Some(0));
+        let (added, _) = app.toggle_watch_in_memory();
+        assert!(!added, "second 'w' unwatches");
+        assert!(app.watch.is_empty());
+        assert_eq!(app.procs[app.view[0]].pid, 1, "pin released, Mem-desc order restored");
+    }
+
+    #[test]
+    fn seeded_watch_pins_from_config() {
+        let mut app = watch_test_app();
+        app.watch = vec![crate::util::identity_key(&app.procs[2])];
+        app.rebuild_view();
+        assert_eq!(app.procs[app.view[0]].pid, 3, "config-seeded watch pins at startup");
+
+        // search filters fine alongside the pin; tree mode skips pinning
+        app.search = "p".into();
+        app.rebuild_view();
+        assert_eq!(app.procs[app.view[0]].pid, 3, "pin survives filtering");
+        app.search.clear();
+        app.tree_mode = true;
+        app.rebuild_view();
+        assert_eq!(app.procs[app.view[0]].pid, 1, "tree mode keeps parent/child shape");
     }
 
     #[test]
@@ -6911,6 +7059,7 @@ mod tests {
                 events_log: None,
                 replayed: Vec::new(),
                 notify: false,
+                watch: Vec::new(),
                 since: None,
                 refresh_secs: None,
                 sort: None,

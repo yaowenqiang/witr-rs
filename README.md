@@ -38,7 +38,9 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **阈值告警（`--alert-cpu` / `--alert-mem`）**：`witr-rs --alert-cpu 90 --alert-mem 2048`——进程连续 5 个采样（约 15 秒）超过阈值时：弹桌面通知、Events 页记一条 alert、进程表红色行高亮。每次越界只报一次，占用回落后重新武装，不会刷屏。
 
-**配置文件**：`~/.config/witr-rs/config.toml`（macOS 在 `~/Library/Application Support/witr-rs/`，Windows 在 `%APPDATA%\witr-rs\`）——`refresh_secs`（采样间隔）/ `sort`（默认排序）/ `notify` / `paused` 四个键，相当于 CLI 参数的默认值：文件先行，命令行始终覆盖。坏行跳过并给出警告，没有文件一切照旧。
+**配置文件**：`~/.config/witr-rs/config.toml`（macOS 在 `~/Library/Application Support/witr-rs/`，Windows 在 `%APPDATA%\witr-rs\`）——`refresh_secs`（采样间隔）/ `sort`（默认排序）/ `notify` / `paused` / `watch`（关注列表）五个键，相当于 CLI 参数的默认值：文件先行，命令行始终覆盖。坏行跳过并给出警告，没有文件一切照旧。
+
+**关注列表（`w`）**：Processes 页选中行按 `w` 加 ★ 并置顶（保持所选排序），按 `w` 取消。关注项按 身份（名字 + exe 基名 + 用户）持久化到配置文件的 `watch` 键，不含 pid——进程重启换 pid 后 ★ 跟着程序走。树形视图下不置顶（避免拆散父子），搜索过滤照常生效。
 
 **系统资源页（`y`）**：整机仪表盘——CPU 占用历史图（固定 0–100 刻度，标注当前值与窗口峰值）、内存历史图（绝对刻度 + 峰值标注）、load average（1/5/15 分钟）、swap 用量、每核占用网格（≥90% 红色高亮）。Linux 直接读 `/proc`（微秒级，每周期采样，打开页面时历史已就绪）；macOS 走 Mach `host_processor_info` + `vm_stat`，Windows 走单次 PowerShell CIM 查询（这两个平台仅页面打开时采样）。回答"这台机器整体忙不忙、内存还剩多少"。
 
@@ -63,6 +65,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | `T` | Processes 页：树形视图 ↔ 平铺表格（子进程嵌在父进程下；搜索时显示平铺） |
 | `F` | Logs 页（容器来源）：切换实时 `logs -f` 日志流 |
 | `a` | Ports 页：切换 仅监听 ↔ 全部状态；Locks 页：切换 锁 ↔ 全部打开文件；Processes 页：打开操作栏（`k` kill / `t` term / `p` 暂停 / `r` 恢复 / `n` renice） |
+| `w` | Processes 页：关注选中进程（★ 置顶、写入配置文件跨会话保留，按身份匹配、重启换 pid 不丢）；再按取消 |
 | `o` | Ports 页：逐 socket 明细 ↔ 按 (端口, 属主) 聚合的总览（`Enter` 跳属主进程详情） |
 | `l` | 详情页 / Events 页：拉取该进程最近的日志（容器日志 / journalctl / macOS 统一日志），全屏 Logs 页滚动查看；Events 页已退出的进程优先显示退出瞬间自动捕获的最后日志 |
 | `S` | 打开会话摘要页（活动计数 / 重启链 / CPU 尖峰榜 / 内存爬升榜，窗口由 `--since` 预设），`r` 重算，`Esc` 返回 |
@@ -247,7 +250,7 @@ src/
 ├── tui.rs          交互界面（ratatui/crossterm）：五标签页 + 详情面板 + 鼠标 + 3s 自动刷新
 ├── render.rs       standard / tree / short / json / env / warnings / export 渲染
 ├── history.rs      采样历史：瞬时 CPU、sparkline、内存趋势 + 泄漏嫌疑、重启检测、Events 事件流、会话摘要
-├── config.rs       用户配置文件（flat toml 子集：refresh_secs/sort/notify/paused，CLI 覆盖）
+├── config.rs       用户配置文件（flat toml 子集：refresh_secs/sort/notify/paused/watch，CLI 覆盖）
 ├── snapshot.rs     --snap / --diff：全表快照与 new/gone/restarted/changed 对比
 ├── logs.rs         崩溃关联日志：容器日志 / journalctl / macOS 统一日志
 ├── risk.rs         0–10 风险评分（临时目录二进制、curl|sh、注入、公网对端、无效签名等）

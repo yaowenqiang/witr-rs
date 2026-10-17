@@ -426,6 +426,7 @@ fn main() {
             paused: cfg.paused.unwrap_or(false),
             alert_cpu: cli.alert_cpu,
             alert_mem: cli.alert_mem,
+            watch: cfg.watch.clone(),
             ..tui::Seed::from_targets(
                 &cli.names, &cli.pids, &cli.ports, &cli.files, &cli.containers,
             )
@@ -457,6 +458,7 @@ fn main() {
                 paused: cfg.paused.unwrap_or(false),
                 alert_cpu: cli.alert_cpu,
                 alert_mem: cli.alert_mem,
+                watch: cfg.watch.clone(),
                 ..tui::Seed::default()
             };
             if let Err(e) = tui::run(seed) {

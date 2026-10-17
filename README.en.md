@@ -38,7 +38,9 @@ A Rust implementation of [pranshuparmar/witr](https://github.com/pranshuparmar/w
 
 **Threshold alerts (`--alert-cpu` / `--alert-mem`)**: `witr-rs --alert-cpu 90 --alert-mem 2048` — when a process exceeds the threshold for 5 consecutive samples (~15 seconds): a desktop notification fires, the Events tab records an alert, and the row highlights red. One notification per excursion, re-armed once usage drops back under — no alert storms.
 
-**Config file**: `~/.config/witr-rs/config.toml` (macOS: `~/Library/Application Support/witr-rs/`, Windows: `%APPDATA%\witr-rs\`) — four keys, `refresh_secs` (sampling interval) / `sort` (default sort) / `notify` / `paused`, acting as defaults for the CLI flags: the file loads first, the command line always wins. Bad lines are skipped with a warning; no file changes nothing.
+**Config file**: `~/.config/witr-rs/config.toml` (macOS: `~/Library/Application Support/witr-rs/`, Windows: `%APPDATA%\witr-rs\`) — five keys, `refresh_secs` (sampling interval) / `sort` (default sort) / `notify` / `paused` / `watch` (watchlist), acting as defaults for the CLI flags: the file loads first, the command line always wins. Bad lines are skipped with a warning; no file changes nothing.
+
+**Watchlist (`w`)**: on the Processes tab, `w` stars the selected row and pins it to the top (your chosen sort still applies inside the pinned block); press again to unwatch. Entries persist by identity (name + exe basename + user) into the config file's `watch` key — no pid in the key, so the ★ follows the program across restarts. Tree mode skips pinning (it would tear children from parents); search filters still apply.
 
 **System resources page (`y`)**: a whole-machine dashboard — CPU history chart (fixed 0–100 scale, current value + window peak annotated), memory history chart (absolute scale + peak), load average (1/5/15 min), swap usage, and a per-core grid (cores ≥90% render red). Linux reads `/proc` directly (microsecond-cheap, sampled every cycle so history is already there when the page opens); macOS uses Mach `host_processor_info` + `vm_stat`, Windows a single PowerShell CIM query (those two sample only while the page is open). Answers "how busy is this machine overall, and how much memory is left".
 
@@ -63,6 +65,7 @@ Vim-style browsing (aligned with the Go witr):
 | `T` | Processes tab: tree view ↔ flat table (children nest under their parent; a live search shows flat) |
 | `F` | Logs page (container source): toggle the live `logs -f` stream |
 | `a` | Ports tab: listening-only ↔ all socket states; Locks tab: locks ↔ all open files; Processes tab: actions bar (`k` kill / `t` term / `p` pause / `r` resume / `n` renice) |
+| `w` | Processes tab: watch the selected process (★ pins it to the top, persists to the config file across sessions, matched by identity so restarts under a new pid keep it); press again to unwatch |
 | `o` | Ports tab: per-socket detail ↔ aggregate overview keyed by (port, owner) (`Enter` opens the owner's process detail) |
 | `l` | Detail page / Events tab: pull the process's recent logs (container logs / journalctl / macOS unified log) into a full-screen scrollable Logs page; on exited Events rows the auto-captured last words appear instantly |
 | `S` | Open the session summary page (activity counts / restart chains / CPU-spike board / memory climbers; window from `--since`), `r` recompute, `Esc` back |
@@ -247,7 +250,7 @@ src/
 ├── tui.rs          interactive UI (ratatui/crossterm): five tabs + detail panes + mouse + 3s auto-refresh
 ├── render.rs       standard / tree / short / json / env / warnings / export renderers
 ├── history.rs      sampling history: instantaneous cpu, sparklines, memory trend + leak suspicion, restart detection, event feed, session summary
-├── config.rs       user config file (flat toml subset: refresh_secs/sort/notify/paused; CLI overrides)
+├── config.rs       user config file (flat toml subset: refresh_secs/sort/notify/paused/watch; CLI overrides)
 ├── snapshot.rs     --snap / --diff: full-table snapshots + new/gone/restarted/changed comparison
 ├── logs.rs         crash log correlation: container logs / journalctl / macOS unified log
 ├── risk.rs         0–10 risk scoring (temp-dir binary, curl|sh, injections, public peers, bad signatures …)

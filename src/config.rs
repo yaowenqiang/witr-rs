@@ -12,6 +12,7 @@
 //! sort = "cpu"            # default Processes-tab sort: pid/name/user/cpu/mem/started
 //! notify = false          # desktop notifications on restarts (as --notify)
 //! paused = false          # start with sampling frozen (as 'P')
+//! watch = ["nginx|nginx|www"]  # TUI watchlist ('w'), one "name|exe|user" per entry
 //! ```
 
 use std::path::PathBuf;
@@ -24,6 +25,11 @@ pub struct Config {
     pub sort: Option<String>,
     pub notify: Option<bool>,
     pub paused: Option<bool>,
+    /// TUI watchlist entries, each "name|exe_basename|user" (util's
+    /// process-identity triple) — matches across restarts because the pid
+    /// is not part of the key. Written back by `save_watch` when 'w' is
+    /// pressed in the TUI.
+    pub watch: Vec<String>,
 }
 
 impl Config {
@@ -60,6 +66,60 @@ impl Config {
         }
     }
 
+    /// Persist the watchlist: reads the existing file (when present) and
+    /// rewrites only the `watch = [...]` line, appending it when missing —
+    /// comments, unknown keys and ordering elsewhere survive. Entries are
+    /// quoted and TOML-escaped. Never creates the file just to record an
+    /// empty list.
+    pub fn save_watch(entries: &[String]) -> std::io::Result<()> {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Ok(());
+        };
+        Self::save_watch_under(&std::path::PathBuf::from(home), entries)
+    }
+
+    /// save_watch under an explicit home dir (split out for tests).
+    pub fn save_watch_under(home: &std::path::Path, entries: &[String]) -> std::io::Result<()> {
+        let path = Self::path_under(home);
+        if entries.is_empty() && !path.exists() {
+            return Ok(());
+        }
+        let old = std::fs::read_to_string(&path).unwrap_or_default();
+        let items: Vec<String> = entries
+            .iter()
+            .map(|e| format!("\"{}\"", e.replace('\\', "\\\\").replace('"', "\\\"")))
+            .collect();
+        let line = format!("watch = [{}]", items.join(", "));
+        let mut out = String::with_capacity(old.len() + line.len() + 2);
+        let mut replaced = false;
+        for raw in old.lines() {
+            let is_watch_line = raw
+                .split_once('=')
+                .is_some_and(|(k, _)| k.trim() == "watch");
+            if is_watch_line {
+                if !replaced {
+                    out.push_str(&line);
+                    out.push('\n');
+                    replaced = true;
+                }
+            } else {
+                out.push_str(raw);
+                out.push('\n');
+            }
+        }
+        if !replaced {
+            if !old.is_empty() && !old.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, out)
+    }
+
     /// Parse the flat subset: `key = value` lines, `#` comments, `[section]`
     /// headers tolerated and ignored. Returns the config plus one warning
     /// string per skipped line (unknown key, bad value, no `=`).
@@ -88,6 +148,10 @@ impl Config {
                     Err(_) => warnings.push(format!("line {n}: refresh_secs {quoted:?} is not a number, skipped")),
                 },
                 "sort" => cfg.sort = Some(quoted.to_string()),
+                "watch" => match parse_string_array(value) {
+                    Some(list) => cfg.watch = list,
+                    None => warnings.push(format!("line {n}: watch is not a string array, skipped")),
+                },
                 "notify" | "paused" => match quoted.parse::<bool>() {
                     Ok(v) => {
                         if key == "notify" {
@@ -117,6 +181,27 @@ fn strip_comment(value: &str) -> &str {
     }
 }
 
+/// Parse a flat TOML string array: `["a", "b"]` — brackets, comma
+/// separation, optional trailing comma. Escapes are not interpreted (watch
+/// entries never contain quotes in practice). None when the value isn't
+/// bracketed or an item is unquoted.
+fn parse_string_array(value: &str) -> Option<Vec<String>> {
+    let inner = value.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let mut out = Vec::new();
+    for item in inner.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue; // trailing comma / empty array
+        }
+        let quoted = item
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(item);
+        out.push(quoted.to_string());
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +214,7 @@ refresh_secs = 5
 sort = \"cpu\"       # hottest first
 notify = true
 paused = false
+watch = [\"nginx|nginx|www\", \"tailspid|sleep|\"]
 
 [ignored-section]
 ";
@@ -140,9 +226,52 @@ paused = false
                 sort: Some("cpu".into()),
                 notify: Some(true),
                 paused: Some(false),
+                watch: vec!["nginx|nginx|www".into(), "tailspid|sleep|".into()],
             }
         );
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn parse_watch_array_edge_cases() {
+        // empty array, trailing comma, bare (unquoted) items
+        let (cfg, w) = Config::parse("watch = []\n");
+        assert!(cfg.watch.is_empty());
+        assert!(w.is_empty());
+        let (cfg, w) = Config::parse("watch = [\"a|b|c\",]\n");
+        assert_eq!(cfg.watch, vec!["a|b|c"]);
+        assert!(w.is_empty());
+        let (cfg, w) = Config::parse("watch = [a|b|c]\n");
+        assert_eq!(cfg.watch, vec!["a|b|c"]);
+        assert!(w.is_empty());
+        // not an array at all → warning, default kept
+        let (cfg, w) = Config::parse("watch = oops\n");
+        assert!(cfg.watch.is_empty());
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("not a string array"));
+    }
+
+    #[test]
+    fn save_watch_roundtrips_and_preserves_the_rest() {
+        let dir = std::env::temp_dir().join(format!("witr-cfg-test-{}", std::process::id()));
+        let path = Config::path_under(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "# my config\nrefresh_secs = 7\nwatch_old = \"keep me\"\nwatch = [\"old|exe|u\"]\nnotify = true\n",
+        )
+        .unwrap();
+        Config::save_watch_under(&dir, &["nginx|nginx|www".into()]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (cfg, _) = Config::parse(&text);
+        assert_eq!(cfg.watch, vec!["nginx|nginx|www"]);
+        assert_eq!(cfg.refresh_secs, Some(7), "untouched key survives");
+        assert_eq!(cfg.notify, Some(true));
+        assert!(text.starts_with("# my config"), "comment survives");
+        assert!(text.contains("keep me"), "similarly-named keys are untouched");
+        assert!(!text.contains("old|exe|u"), "stale entry replaced");
+        assert_eq!(text.matches("watch =").count(), 1, "exactly one watch line");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

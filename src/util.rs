@@ -311,6 +311,19 @@ pub fn identity(p: &crate::model::Process) -> u64 {
     h.finish()
 }
 
+/// The same triple as [identity], as a human-readable `"name|exe|user"`
+/// string — the persisted form of a watchlist entry (config `watch = [...]`).
+/// Same normalization, so a config entry written from one incarnation of a
+/// process still matches after a restart under a new pid.
+pub fn identity_key(p: &crate::model::Process) -> String {
+    format!(
+        "{}|{}|{}",
+        p.name,
+        p.exe.as_deref().map(basename).unwrap_or_default(),
+        p.user.as_deref().unwrap_or_default()
+    )
+}
+
 /// "1.2.3.4:80", "[::]:443", "*:22" → (addr, port)
 pub fn split_host_port(s: &str) -> Option<(String, u16)> {
     let (host, port) = if let Some(rest) = s.strip_prefix('[') {
@@ -363,6 +376,24 @@ mod tests {
     }
 
     #[test]
+    fn identity_key_ignores_pid_and_path_prefix() {
+        let mk = |pid, exe: &str, user: &str| crate::model::Process {
+            pid,
+            name: "sleep".into(),
+            exe: Some(exe.into()),
+            user: Some(user.into()),
+            ..Default::default()
+        };
+        // same program, new pid + different path form → same key
+        let a = mk(100, "/bin/sleep", "root");
+        let b = mk(200, "sleep", "root");
+        assert_eq!(identity_key(&a), identity_key(&b));
+        assert_eq!(identity_key(&a), "sleep|sleep|root");
+        // a different user is a different identity
+        assert_ne!(identity_key(&a), identity_key(&mk(100, "/bin/sleep", "www")));
+    }
+
+    #[test]
     fn age_format() {
         assert_eq!(fmt_age(42), "42s");
         assert_eq!(fmt_age(312), "5m 12s");
@@ -376,6 +407,8 @@ mod tests {
         assert_eq!(fmt_time_utc(0), "1970-01-01 00:00:00");
         assert_eq!(fmt_time_utc(1_000_000_000), "2001-09-09 01:46:40");
         // fmt_time must differ from UTC by exactly the machine's offset
-        assert_eq!(fmt_time_utc(now_unix() + local_utc_offset_secs()), fmt_time(now_unix()));
+        // (one now_unix() — calling it twice can straddle a second boundary)
+        let now = now_unix();
+        assert_eq!(fmt_time_utc(now + local_utc_offset_secs()), fmt_time(now));
     }
 }
