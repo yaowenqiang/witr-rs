@@ -875,6 +875,21 @@ impl Platform for MacOs {
         FileOverview { files, locks, fd_usage }
     }
 
+    fn fd_count(&self, pid: Pid) -> Option<u64> {
+        // field mode (-F f) prints one `f<fd>` line per descriptor — the
+        // leanest lsof shape for a count-only probe
+        let out = crate::util::run_ok(
+            "lsof",
+            &["-w", "-p", &pid.to_string(), "-F", "f"],
+            std::time::Duration::from_secs(5),
+        )?;
+        let n = out
+            .lines()
+            .filter(|l| l.starts_with('f') && l[1..].chars().all(|c| c.is_ascii_digit()))
+            .count() as u64;
+        (n > 0).then_some(n)
+    }
+
     fn list_locks(&self, pid: Option<Pid>) -> Vec<LockEntry> {
         let mut args = vec!["-l", "-n", "-P", "-w"];
         let pid_arg;

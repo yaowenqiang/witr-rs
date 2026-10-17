@@ -8,7 +8,9 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::model::{Pid, Process, Socket, Source};
-use crate::platform::{Capabilities, PlatError, PlatResult, Platform, SystemStats, Users};
+use crate::platform::{
+    Capabilities, MountUsage, PlatError, PlatResult, Platform, SystemStats, Users,
+};
 use crate::util::{basename, run, split_host_port};
 
 const PS_TIMEOUT: Duration = Duration::from_secs(20);
@@ -62,6 +64,33 @@ fn parse_windows_system_stats(text: &str) -> SystemStats {
     if total > 0 {
         out.mem_total_mb = Some(total / 1024);
         out.mem_used_mb = Some(total.saturating_sub(free) / 1024);
+    }
+    out
+}
+
+/// Parse the [`Windows::mount_usage`] script output: one
+/// `disk <DeviceID> <size_bytes> <used_bytes>` row per local fixed disk.
+fn parse_windows_mounts(text: &str) -> Vec<MountUsage> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        if it.next() != Some("disk") {
+            continue;
+        }
+        let (Some(target), Some(total), Some(used)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(total), Ok(used)) = (total.parse::<u64>(), used.parse::<u64>()) else {
+            continue;
+        };
+        if total == 0 {
+            continue;
+        }
+        out.push(MountUsage {
+            target: target.to_string(),
+            total_mb: total / 1024 / 1024,
+            used_mb: used / 1024 / 1024,
+        });
     }
     out
 }
@@ -597,6 +626,21 @@ impl Platform for Windows {
         Some(parse_windows_system_stats(&text))
     }
 
+    fn mount_usage(&self) -> Vec<MountUsage> {
+        let script = concat!(
+            "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ",
+            "ForEach-Object { \"disk {0} {1} {2}\" -f $_.DeviceID, ",
+            "$_.Size, ($_.Size - $_.FreeSpace) }\n",
+        );
+        let text = run(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", script],
+            PS_TIMEOUT,
+        )
+        .unwrap_or_default();
+        parse_windows_mounts(&text)
+    }
+
     fn detail(&self, brief: &Process, _want_env: bool) -> Process {
         let mut p = brief.clone();
         let details = cim_details(&[brief.pid]);
@@ -736,6 +780,16 @@ mod tests {
         // UTF-16LE of "hi" = 68 00 69 00
         assert_eq!(base64_utf16le("hi"), "aABpAA==");
         assert_eq!(base64_utf16le(""), "");
+    }
+
+    #[test]
+    fn windows_mounts_parse() {
+        let text = "disk C: 512110190592 256055095296\ndisk D: 0 0\ngarbage\n";
+        let m = parse_windows_mounts(text);
+        assert_eq!(m.len(), 1, "zero-size and malformed rows drop out");
+        assert_eq!(m[0].target, "C:");
+        assert_eq!(m[0].total_mb, 512110190592 / 1024 / 1024);
+        assert_eq!(m[0].used_mb, 256055095296 / 1024 / 1024);
     }
 
     #[test]

@@ -325,6 +325,41 @@ pub fn parse_scm_services(text: &str) -> Vec<Service> {
         .collect()
 }
 
+/// Parse POSIX `df -P -k` output into device-backed mounts: rows whose
+/// filesystem starts with `/dev/` (drops network mounts, `map auto_home`,
+/// tmpfs and friends), deduped by mount point, zero-size rows skipped.
+/// Shared by the unix platforms — both GNU and BSD df speak `-P -k`.
+pub(crate) fn parse_df(out: &str) -> Vec<MountUsage> {
+    let mut out_rows: Vec<MountUsage> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in out.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // "Filesystem 1024-blocks Used Available Capacity Mounted on..."
+        if fields.len() < 6 {
+            continue;
+        }
+        if !fields[0].starts_with("/dev/") {
+            continue;
+        }
+        let Ok(total_kb) = fields[1].parse::<u64>() else {
+            continue;
+        };
+        let Ok(used_kb) = fields[2].parse::<u64>() else {
+            continue;
+        };
+        let target = fields[5].to_string();
+        if total_kb == 0 || !seen.insert(target.clone()) {
+            continue;
+        }
+        out_rows.push(MountUsage {
+            target,
+            total_mb: total_kb / 1024,
+            used_mb: used_kb / 1024,
+        });
+    }
+    out_rows
+}
+
 /// One whole-machine resource snapshot for the system page ('y'). Every
 /// field is best-effort: platforms without a cheap source leave it `None`
 /// (or `cores` empty) and the page hides that section. CPU percents are
@@ -343,6 +378,16 @@ pub struct SystemStats {
     pub load1: Option<f64>,
     pub load5: Option<f64>,
     pub load15: Option<f64>,
+}
+
+/// One device-backed mounted filesystem for the system page's disk
+/// section. Pseudo filesystems (tmpfs, overlay, proc...) never appear.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MountUsage {
+    /// Mount point ("/", "/home", "C:\"...).
+    pub target: String,
+    pub total_mb: u64,
+    pub used_mb: u64,
 }
 
 /// The single seam between pipeline logic and OS specifics.
@@ -375,6 +420,24 @@ pub trait Platform {
         None
     }
 
+    /// Device-backed mounted filesystems for the system page's disk
+    /// section. One `df -P -k` sweep on unix (network/loopback mounts and
+    /// pseudo filesystems drop out because only `/dev/...` devices are
+    /// kept), a PowerShell CIM query on Windows. Callers run it only while
+    /// the page is open — it is a process spawn, not a file read.
+    fn mount_usage(&self) -> Vec<MountUsage> {
+        #[cfg(unix)]
+        {
+            let out = crate::util::run_ok("df", &["-P", "-k"], std::time::Duration::from_secs(5))
+                .unwrap_or_default();
+            parse_df(&out)
+        }
+        #[cfg(not(unix))]
+        {
+            Vec::new()
+        }
+    }
+
     /// All sockets whose local port equals `port` (any proto), with owning
     /// pid where resolvable.
     fn port_to_sockets(&self, port: u16) -> PlatResult<Vec<Socket>>;
@@ -400,6 +463,17 @@ pub trait Platform {
     fn open_files(&self, pid: Pid) -> Vec<String> {
         let _ = pid;
         Vec::new()
+    }
+
+    /// Open-descriptor count for one pid, or None when the platform has no
+    /// cheap probe (Windows) or the process is unreadable. Called once per
+    /// refresh while the detail page shows this pid — Linux counts
+    /// /proc/<pid>/fd (µs-cheap), macOS runs one `lsof -p`, so callers
+    /// gate it the same way as the system page ("only while the page is
+    /// open").
+    fn fd_count(&self, pid: Pid) -> Option<u64> {
+        let _ = pid;
+        None
     }
 
     /// Open files + file locks + fd usage in one pass. Platforms whose
@@ -538,5 +612,30 @@ sys-devices-loaded.device loaded active plugged stub\
         assert_eq!(ss[1].state, "Stopped");
         // garbage in → empty out
         assert!(parse_scm_services("not json").is_empty());
+    }
+
+    #[test]
+    fn df_parse_keeps_device_rows_only() {
+        let out = "\
+Filesystem 1024-blocks      Used Available Capacity  Mounted on
+/dev/disk1s1s1  482949120 38123456 444825664     8%    /
+/dev/disk1s5    482949120 38123456 444825664     8%    /System/Volumes/Data
+map auto_home           0        0          0     0%    /System/Volumes/Data/home
+//server/share   1000000   500000     500000    50%    /Volumes/share
+tmpfs             131072    65536     65536    50%    /run
+/dev/loop0             0        0          0     0%    /snap/empty
+";
+        let m = parse_df(out);
+        let targets: Vec<_> = m.iter().map(|x| x.target.as_str()).collect();
+        assert_eq!(targets, vec!["/", "/System/Volumes/Data"]);
+        let root = &m[0];
+        // 482949120 KB → MB (integer division)
+        assert_eq!(root.total_mb, 482949120 / 1024);
+        assert_eq!(root.used_mb, 38123456 / 1024);
+        // zero-size device rows drop out too
+        assert!(!targets.contains(&"/snap/empty"));
+        // header / malformed lines are silently skipped
+        assert!(parse_df("").is_empty());
+        assert!(parse_df("garbage line\nanother\n").is_empty());
     }
 }

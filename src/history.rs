@@ -18,6 +18,12 @@ const SPARK_LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇'
 const LEAK_SAMPLES: usize = 60; // ~5 min at the 3s TUI refresh
 const LEAK_MB: f64 = 20.0;
 const LEAK_FRACTION: f64 = 0.7;
+/// FD leak suspicion: same shape, on the open-descriptor count. Growth is
+/// in fds (a socket-per-request service that never closes them climbs
+/// steadily; a healthy one oscillates).
+const FD_LEAK_SAMPLES: usize = 60; // ~5 min at the 3s TUI refresh
+const FD_LEAK_GROWTH: f64 = 64.0;
+const FD_LEAK_FRACTION: f64 = 0.7;
 
 #[derive(Default, Clone)]
 struct RestartState {
@@ -230,6 +236,17 @@ pub struct History {
     /// pid → last BIG_SAMPLES RSS values in KiB (detail-page memory chart
     /// and leak suspicion)
     mem_big: HashMap<Pid, VecDeque<u64>>,
+    /// pid → last BIG_SAMPLES open-descriptor counts (detail-page fd chart
+    /// and fd leak suspicion). Only sampled for the selected process while
+    /// the detail page is open — cheap on Linux (/proc), one lsof per tick
+    /// on macOS, nothing on Windows.
+    fd_big: HashMap<Pid, VecDeque<u64>>,
+    /// pid → last SAMPLES fd counts as a sparkline (peak-normalized)
+    pub fd_sparks: HashMap<Pid, String>,
+    /// pid → last BIG_SAMPLES (read, write) rates in bytes/s (detail-page
+    /// I/O chart). Filled from the same cumulative deltas as `io_rate`,
+    /// so it covers exactly the platforms that report per-process I/O.
+    io_big: HashMap<Pid, VecDeque<(f64, f64)>>,
     /// pid → identity hash
     identity_of: HashMap<Pid, u64>,
     restarts: HashMap<u64, RestartState>,
@@ -303,10 +320,13 @@ impl History {
                     let wall = now.duration_since(*at).as_millis() as f64;
                     if wall >= 50.0 && rb >= *prb && wb >= *pwb {
                         let s = wall / 1000.0;
-                        self.io_rate.insert(
-                            p.pid,
-                            ((rb - prb) as f64 / s, (wb - pwb) as f64 / s),
-                        );
+                        let rate = ((rb - prb) as f64 / s, (wb - pwb) as f64 / s);
+                        self.io_rate.insert(p.pid, rate);
+                        let dq = self.io_big.entry(p.pid).or_default();
+                        dq.push_back(rate);
+                        while dq.len() > BIG_SAMPLES {
+                            dq.pop_front();
+                        }
                     }
                 }
                 self.io_prev.insert(p.pid, (rb, wb, now));
@@ -358,6 +378,9 @@ impl History {
         self.io_rate.retain(|pid, _| seen.contains(pid));
         self.io_prev.retain(|pid, _| seen.contains(pid));
         self.mem_big.retain(|pid, _| seen.contains(pid));
+        self.fd_big.retain(|pid, _| seen.contains(pid));
+        self.fd_sparks.retain(|pid, _| seen.contains(pid));
+        self.io_big.retain(|pid, _| seen.contains(pid));
         self.identity_of.retain(|pid, _| seen.contains(pid));
         self.restarts.retain(|_, rs| {
             rs.last_seen
@@ -648,6 +671,118 @@ impl History {
         ))
     }
 
+    /// Record one open-descriptor count for `pid` (selected detail page
+    /// only). Feeds the fd sparkline and the fd leak suspicion window.
+    pub fn record_fd(&mut self, pid: Pid, count: u64) {
+        let dq = self.fd_big.entry(pid).or_default();
+        dq.push_back(count);
+        while dq.len() > BIG_SAMPLES {
+            dq.pop_front();
+        }
+        let peak = dq.iter().copied().fold(0u64, u64::max).max(1) as f64;
+        let tail_len = dq.len().min(SAMPLES);
+        let start = dq.len() - tail_len;
+        let spark: String = dq
+            .iter()
+            .skip(start)
+            .map(|v| {
+                let idx = ((*v as f64 / peak).clamp(0.0, 0.999) * 8.0) as usize;
+                SPARK_LEVELS[idx]
+            })
+            .collect();
+        self.fd_sparks.insert(pid, spark);
+    }
+
+    /// FD sparkline + latest count for the detail page, None until two
+    /// samples exist.
+    pub fn fd_chart(&self, pid: Pid, width: usize) -> Option<(String, u64)> {
+        let dq = self.fd_big.get(&pid)?;
+        let vals: Vec<u64> = dq.iter().copied().collect();
+        if vals.len() < 2 {
+            return None;
+        }
+        let last = *vals.last().unwrap();
+        let thinned: Vec<u64> = if vals.len() > width {
+            let stride = vals.len() as f64 / width as f64;
+            (0..width)
+                .map(|i| vals[(i as f64 * stride) as usize])
+                .collect()
+        } else {
+            vals
+        };
+        let peak = thinned.iter().copied().fold(0u64, u64::max).max(1) as f64;
+        let bars: String = thinned
+            .iter()
+            .map(|v| {
+                let idx = ((*v as f64 / peak).clamp(0.0, 0.999) * 8.0) as usize;
+                SPARK_LEVELS[idx]
+            })
+            .collect();
+        Some((bars, last))
+    }
+
+    /// FD leak suspicion over the trailing [`FD_LEAK_SAMPLES`] samples:
+    /// the count grew by at least [`FD_LEAK_GROWTH`] descriptors while
+    /// rising at least [`FD_LEAK_FRACTION`] of the time — the signature of
+    /// a socket/fd-per-request path that never closes them.
+    pub fn fd_suspicion(&self, pid: Pid, sample_secs: f64) -> Option<String> {
+        let dq = self.fd_big.get(&pid)?;
+        let tail_len = dq.len().min(FD_LEAK_SAMPLES);
+        if tail_len < 8 {
+            return None;
+        }
+        let start = dq.len() - tail_len;
+        let tail: Vec<u64> = dq.iter().skip(start).copied().collect();
+        let grew = (*tail.last().unwrap() - tail[0]) as f64;
+        if grew < FD_LEAK_GROWTH {
+            return None;
+        }
+        let ups = tail.windows(2).filter(|w| w[1] > w[0]).count();
+        let pairs = tail_len - 1;
+        if (ups as f64 / pairs as f64) < FD_LEAK_FRACTION {
+            return None;
+        }
+        let mins = (pairs as f64 * sample_secs) / 60.0;
+        Some(format!(
+            "+{grew:.0} fds over the last {mins:.0} min, steadily increasing — possible fd leak"
+        ))
+    }
+
+    /// Detail-page disk I/O chart: (read line, write line), each a
+    /// peak-normalized sparkline with a human peak rate label. None until
+    /// two samples exist.
+    pub fn io_chart(&self, pid: Pid, width: usize) -> Option<(String, String)> {
+        let dq = self.io_big.get(&pid)?;
+        if dq.len() < 2 {
+            return None;
+        }
+        let bars_for = |pick: fn(&(f64, f64)) -> f64| -> (String, f64) {
+            let vals: Vec<f64> = if dq.len() > width {
+                let stride = dq.len() as f64 / width as f64;
+                (0..width)
+                    .map(|i| pick(&dq[(i as f64 * stride) as usize]))
+                    .collect()
+            } else {
+                dq.iter().map(|s| pick(s)).collect()
+            };
+            let peak = vals.iter().copied().fold(0.0f64, f64::max);
+            let bars: String = vals
+                .iter()
+                .map(|v| {
+                    let idx = ((v / peak.max(1.0)).clamp(0.0, 0.999) * 8.0) as usize;
+                    SPARK_LEVELS[idx]
+                })
+                .collect();
+            (bars, peak)
+        };
+        let (rb, rpeak) = bars_for(|s| s.0);
+        let (wb, wpeak) = bars_for(|s| s.1);
+        Some((
+            format!("r {rb}  peak {}", crate::util::fmt_rate(rpeak)),
+            format!("w {wb}  peak {}", crate::util::fmt_rate(wpeak)),
+        ))
+    }
+
     /// Record a threshold alert in the event ring (kind "alert", newest
     /// first, same cap) and return it so callers can persist it to
     /// `--events-log`. Alerts are TUI-generated — `update` never emits them.
@@ -828,6 +963,77 @@ mod tests {
         h3.update(&[]);
         assert!(h3.mem_chart(10, 80).is_none());
         assert!(h3.leak_suspicion(10, 3.0).is_none());
+    }
+
+    #[test]
+    fn fd_chart_and_leak_suspicion() {
+        let mut h = History::new();
+        h.record_fd(10, 100);
+        assert!(h.fd_chart(10, 80).is_none(), "needs 2+ samples");
+        // steady climb, +2 fds per sample: the trailing 60-sample window
+        // sees +120 — well past the 64-fd threshold
+        for i in 0..70u64 {
+            h.record_fd(10, 100 + i * 2);
+        }
+        let (bars, now) = h.fd_chart(10, 80).unwrap();
+        assert_eq!(now, 238);
+        assert_eq!(bars.chars().last().unwrap(), '█', "climb ends at the top bar");
+        let thin = h.fd_chart(10, 2).unwrap().0;
+        assert_eq!(thin.chars().count(), 2, "thinning caps the width");
+        let msg = h.fd_suspicion(10, 3.0).unwrap();
+        assert!(msg.contains("+118 fds"), "summary carries the growth: {msg}");
+        assert!(msg.contains("possible fd leak"));
+
+        // small growth stays quiet (32 fds < 64 threshold)
+        let mut h2 = History::new();
+        for i in 0..10u64 {
+            h2.record_fd(10, 100 + i * 3);
+        }
+        assert!(h2.fd_suspicion(10, 3.0).is_none(), "+27 fds is not a leak");
+
+        // big but sawtooth: every other step drops, so it is not "steadily
+        // increasing" (grew +90 overall, rose only 4 of 9 steps)
+        let mut h3 = History::new();
+        for i in 0..10u64 {
+            h3.record_fd(10, 100 + i * 10 + if i % 2 == 1 { 40 } else { 0 });
+        }
+        assert!(h3.fd_suspicion(10, 3.0).is_none(), "sawtooth is not flagged");
+
+        // sparkline bookkeeping follows the pid
+        assert!(h.fd_sparks.contains_key(&10));
+        h.update(&[]);
+        assert!(h.fd_chart(10, 80).is_none(), "vanished pid leaves no data");
+        assert!(!h.fd_sparks.contains_key(&10));
+    }
+
+    #[test]
+    fn io_chart_tracks_read_write_rates() {
+        let mut h = History::new();
+        // first sample seeds the baseline (no rate yet)
+        let mut p = proc(10, "/bin/io", None);
+        p.io_read_bytes = Some(1_000_000);
+        p.io_write_bytes = Some(500_000);
+        h.update(&[p.clone()]);
+        assert!(h.io_chart(10, 80).is_none(), "needs 2+ samples");
+        // each round accumulates 2 MB read / 1 MB write → 666K/s at 3s
+        // (real sleeps: the rate needs ≥50 ms between samples)
+        for i in 1..=4u64 {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            p.io_read_bytes = Some(1_000_000 + i * 2_000_000);
+            p.io_write_bytes = Some(500_000 + i * 1_000_000);
+            h.update(&[p.clone()]);
+        }
+        let (r, w) = h.io_chart(10, 80).unwrap();
+        assert!(r.starts_with("r "), "{r}");
+        assert!(w.starts_with("w "), "{w}");
+        // 2 MB over a real ~60 ms gap lands in the M/s range; the write
+        // line is half the read's magnitude
+        assert!(r.contains("M/s"), "read peak rate humanized: {r}");
+        assert!(w.contains("M/s"), "write peak rate humanized: {w}");
+        assert_eq!(r.chars().count(), w.chars().count(), "aligned sparklines");
+        // vanished pid leaves no data
+        h.update(&[]);
+        assert!(h.io_chart(10, 80).is_none());
     }
 
     #[test]

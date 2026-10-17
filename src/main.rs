@@ -300,6 +300,10 @@ fn main() {
         eprintln!("--on-exit watches a target; give a process name, --pid, --port or --file");
         std::process::exit(4);
     }
+    if cli.alert_exec.is_some() && cli.alert_cpu.is_none() && cli.alert_mem.is_none() {
+        eprintln!("--alert-exec runs with threshold alerts; give --alert-cpu and/or --alert-mem");
+        std::process::exit(4);
+    }
 
     // --replay: load a recorded --events-log JSONL — either to digest it
     // (`--since`, works piped) or to open the TUI on the Events tab (live
@@ -426,6 +430,7 @@ fn main() {
             paused: cfg.paused.unwrap_or(false),
             alert_cpu: cli.alert_cpu,
             alert_mem: cli.alert_mem,
+            alert_exec: cli.alert_exec.clone(),
             watch: cfg.watch.clone(),
             ..tui::Seed::from_targets(
                 &cli.names, &cli.pids, &cli.ports, &cli.files, &cli.containers,
@@ -458,6 +463,7 @@ fn main() {
                 paused: cfg.paused.unwrap_or(false),
                 alert_cpu: cli.alert_cpu,
                 alert_mem: cli.alert_mem,
+                alert_exec: cli.alert_exec.clone(),
                 watch: cfg.watch.clone(),
                 ..tui::Seed::default()
             };

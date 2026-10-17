@@ -460,6 +460,12 @@ impl Platform for Linux {
         }
     }
 
+    fn fd_count(&self, pid: Pid) -> Option<u64> {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .ok()
+            .map(|d| d.count() as u64)
+    }
+
     fn list_all_open_files(&self) -> Vec<LockEntry> {
         let mut out = Vec::new();
         let mut comms: HashMap<Pid, String> = HashMap::new();

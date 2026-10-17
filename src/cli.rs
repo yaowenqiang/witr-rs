@@ -152,6 +152,14 @@ pub struct Cli {
     #[arg(long = "alert-mem", value_name = "MB")]
     pub alert_mem: Option<u64>,
 
+    /// Run this shell command each time a threshold alert fires (needs
+    /// --alert-cpu and/or --alert-mem; one run per excursion). The alert
+    /// context is exported as WITR_ALERT_PID / WITR_ALERT_NAME /
+    /// WITR_ALERT_DETAIL — e.g. `--alert-exec 'curl -s $SLACK_HOOK -d
+    /// "$WITR_ALERT_NAME: $WITR_ALERT_DETAIL"'`. TUI only.
+    #[arg(long = "alert-exec", value_name = "CMD")]
+    pub alert_exec: Option<String>,
+
     /// Run this shell command once whenever a watched/followed target
     /// disappears (watch/follow mode only) — e.g. `--on-exit 'say gone'`.
     /// In --follow mode the loop still exits 2 when the program never

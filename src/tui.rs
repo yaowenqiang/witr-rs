@@ -145,6 +145,10 @@ struct TuiApp {
     detail_height: u16,
     detail_lines: Vec<Line<'static>>,
     detail_pid: Option<Pid>,
+    /// socket snapshot taken when the full detail page opened; the per-tick
+    /// page rebuild (render_detail_page) reuses it so the expensive probes
+    /// run once, at open
+    detail_socks: Vec<Socket>,
     /// full-page detail view (Enter from the table), mirroring the Go witr's
     /// stateDetail: left "Process Detail" pane + right "Environment Variables"
     page: Page,
@@ -306,6 +310,9 @@ struct TuiApp {
     /// Latest whole-machine snapshot ('y' system page "now" column:
     /// load / cores / swap live here, history rings only chart cpu+mem)
     sys_stats: Option<crate::platform::SystemStats>,
+    /// device-backed mounts for the system page's disk section — one df /
+    /// CIM sweep per refresh while the page is open
+    sys_mounts: Vec<crate::platform::MountUsage>,
     /// sampling interval (config refresh_secs, built-in default REFRESH)
     refresh: Duration,
     status: String,
@@ -314,6 +321,8 @@ struct TuiApp {
     alert_cpu: Option<f64>,
     /// --alert-mem in MB (mem_kb is KiB)
     alert_mem: Option<u64>,
+    /// --alert-exec: shell command per alert firing (context in env vars)
+    alert_exec: Option<String>,
     /// pid → per-metric streak/firing state (pruned to live pids)
     alert_state: HashMap<Pid, AlertTrack>,
 }
@@ -412,6 +421,9 @@ pub struct Seed {
     pub alert_cpu: Option<f64>,
     /// --alert-mem: RSS threshold in MB; sustained excess → alert
     pub alert_mem: Option<u64>,
+    /// --alert-exec: shell command run on every threshold-alert firing;
+    /// context exported as WITR_ALERT_PID/NAME/DETAIL
+    pub alert_exec: Option<String>,
 }
 
 impl Seed {
@@ -523,6 +535,7 @@ impl TuiApp {
             detail_height: 12,
             detail_lines: vec![Line::from("loading...".fg(MID))],
             detail_pid: None,
+            detail_socks: Vec::new(),
             page: Page::Browse,
             detail_pane: true,
             detail_report: None,
@@ -564,6 +577,7 @@ impl TuiApp {
             tab_rect: None,
             alert_cpu: seed.alert_cpu,
             alert_mem: seed.alert_mem,
+            alert_exec: seed.alert_exec.clone(),
             alert_state: HashMap::new(),
             table_rect: None,
             detail_rect: None,
@@ -609,6 +623,7 @@ impl TuiApp {
             summary: None,
             summary_window: seed.since.unwrap_or(u64::MAX),
             sys_stats: None,
+            sys_mounts: Vec::new(),
             refresh,
             status: String::new(),
             confirm_kill: None,
@@ -750,6 +765,9 @@ impl TuiApp {
                     }
                 }
                 send_desktop_notify("witr-rs", &format!("{name}: {detail}"));
+                if let Some(cmd) = &self.alert_exec {
+                    spawn_alert_exec(cmd, pid, &name, &detail);
+                }
                 self.status = format!("ALERT {name} — {detail}");
             }
         }
@@ -761,6 +779,22 @@ impl TuiApp {
             if let Some(s) = self.platform.system_stats() {
                 self.hist.update_system(s.clone());
                 self.sys_stats = Some(s);
+            }
+            if self.page == Page::System {
+                self.sys_mounts = self.platform.mount_usage();
+            }
+        }
+        // FD sampling for the fd chart + leak suspicion: only while the
+        // full detail page shows this pid (same gating as the system page;
+        // macOS pays one lsof per tick, Linux a /proc read, Windows none)
+        if self.page == Page::Detail {
+            if let Some(pid) = self.detail_pid {
+                if let Some(n) = self.platform.fd_count(pid) {
+                    self.hist.record_fd(pid, n);
+                }
+                // live charts: re-render the page from the open-time cache
+                // so cpu/mem/fd/io sections track samples taken since open
+                self.render_detail_page(pid);
             }
         }
         if self.tab == Tab::Ports {
@@ -999,6 +1033,32 @@ impl TuiApp {
                 lines.push(Line::from(spans));
             }
         }
+        // disk: one bar per device-backed mount; ≥90% full renders red
+        if !self.sys_mounts.is_empty() {
+            lines.push(Line::from(Span::styled("disk", Style::new().bold())));
+            for m in self.sys_mounts.iter().take(8) {
+                let pct = if m.total_mb > 0 {
+                    m.used_mb as f64 / m.total_mb as f64 * 100.0
+                } else {
+                    0.0
+                };
+                let n = ((pct / 100.0).clamp(0.0, 0.999) * 10.0) as usize;
+                let text = format!(
+                    "  {:<24}│{}{}│ {:>3.0}%  {} / {}",
+                    m.target,
+                    "█".repeat(n),
+                    "░".repeat(10 - n),
+                    pct,
+                    human_mb(m.used_mb),
+                    human_mb(m.total_mb)
+                );
+                lines.push(Line::from(if pct >= 90.0 {
+                    Span::styled(text, Style::new().fg(Color::Red))
+                } else {
+                    Span::raw(text)
+                }));
+            }
+        }
         lines
     }
 
@@ -1187,53 +1247,9 @@ impl TuiApp {
         }
         // the follow command per source (Windows has no streaming
         // equivalent for the event log)
-        let (prog, args, label) = match src {
-            crate::logs::LogSource::Container { runtime, ref_ } => {
-                let label = format!("{runtime} logs");
-                (
-                    runtime,
-                    vec![
-                        "logs".to_string(),
-                        "-f".to_string(),
-                        "--tail".to_string(),
-                        "100".to_string(),
-                        ref_,
-                    ],
-                    label,
-                )
-            }
-            crate::logs::LogSource::Journald { pid } => (
-                "journalctl".to_string(),
-                vec![
-                    "--no-pager".to_string(),
-                    "-f".to_string(),
-                    "-n".to_string(),
-                    "100".to_string(),
-                    format!("_PID={pid}"),
-                ],
-                format!("journal (_PID={pid})"),
-            ),
-            crate::logs::LogSource::UnifiedLog { name } => {
-                let pred = format!(
-                    "process == \"{}\"",
-                    crate::logs::sanitize_predicate(&name)
-                );
-                (
-                    "log".to_string(),
-                    vec![
-                        "stream".to_string(),
-                        "--style".to_string(),
-                        "compact".to_string(),
-                        "--predicate".to_string(),
-                        pred,
-                    ],
-                    format!("unified log (process {name})"),
-                )
-            }
-            crate::logs::LogSource::EventLog { .. } => {
-                self.status = "live follow has no Windows event-log equivalent".into();
-                return;
-            }
+        let Some((prog, args, label)) = follow_command_for(&src) else {
+            self.status = "live follow has no Windows event-log equivalent".into();
+            return;
         };
         match std::process::Command::new(&prog)
             .args(&args)
@@ -1282,7 +1298,6 @@ impl TuiApp {
         }
         self.follow_rx = None;
     }
-
     /// Drain new lines from the live stream into the view (capped), pinning
     /// the scroll to the bottom while the user is already near it.
     fn poll_follow_logs(&mut self) {
@@ -1790,70 +1805,9 @@ impl TuiApp {
                         crate::gpu::copy_fields(p, mp);
                     }
                 }
-                let full_socks = self.platform.list_all_sockets().unwrap_or_default();
-                let socks: Vec<Socket> =
-                    full_socks.iter().filter(|s| s.pid == Some(pid)).cloned().collect();
-                let locks = r.locks.clone();
-                let mut lines = detail_lines(&r, &socks, &locks);
-                push_history_lines(&mut lines, &self.hist, pid);
-                let names: HashMap<Pid, String> =
-                    self.procs.iter().map(|p| (p.pid, p.name.clone())).collect();
-                push_peer_lines(&mut lines, &full_socks, &names, pid);
-                if let Some(b) = &r.binary {
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled("Binary:", Style::new().bold())));
-                    match &b.sha256 {
-                        Some(h) => lines.push(Line::from(format!(
-                            "  sha256: {}…{}",
-                            &h[..16.min(h.len())],
-                            &h[h.len().saturating_sub(8)..]
-                        ))),
-                        None => lines.push(Line::from(Span::styled(
-                            "  sha256: unreadable (permissions?)",
-                            Style::new().fg(MID),
-                        ))),
-                    }
-                    let sig_line = b.signature.clone().unwrap_or_else(|| {
-                        "no signature infrastructure on this platform".into()
-                    });
-                    let sig_style = if sig_line.starts_with("NOT VALID") {
-                        Style::new().fg(Color::Red)
-                    } else if sig_line == "unsigned" {
-                        Style::new().fg(Color::Yellow)
-                    } else {
-                        Style::new().fg(GREEN)
-                    };
-                    lines.push(Line::from(Span::styled(
-                        format!("  signature: {sig_line}"),
-                        sig_style,
-                    )));
-                }
-                self.open_files = r.open_files.clone();
-                if let Some(files) = &self.open_files {
-                    lines.push(Line::from(""));
-                    if files.is_empty() {
-                        lines.push(Line::from(styled(
-                            Style::new().fg(MID),
-                            "open files: none readable (belongs to another user?)",
-                        )));
-                    } else {
-                        lines.push(Line::from(Span::styled(
-                            format!("Open Files ({}):", files.len()),
-                            Style::new().bold(),
-                        )));
-                        for f in files.iter().take(30) {
-                            lines.push(Line::from(format!("  {f}")));
-                        }
-                        if files.len() > 30 {
-                            lines.push(Line::from(format!("  … {} more", files.len() - 30)));
-                        }
-                    }
-                }
-                // provisional count (logical lines); refined to the wrapped
-                // count on the next render
-                self.detail_line_count = lines.len() as u16;
-                self.detail_lines = lines;
+                self.detail_socks = self.platform.list_all_sockets().unwrap_or_default();
                 self.detail_report = Some(r);
+                self.render_detail_page(pid);
                 self.detail_pid = Some(pid);
                 self.detail_scroll = 0;
                 self.env_scroll = 0;
@@ -1867,6 +1821,80 @@ impl TuiApp {
                 self.status = format!("pid {} is gone — details unavailable", pid);
             }
         }
+    }
+
+    /// Rebuild the full detail page content from the report + sockets cached
+    /// at open (open_detail_page_for ran the expensive probes once) plus the
+    /// live history charts. Called at open and every refresh tick while the
+    /// page shows, so the cpu/mem/fd/io sparklines track samples taken since
+    /// the page opened instead of freezing at open-time state.
+    fn render_detail_page(&mut self, pid: Pid) {
+        let Some(r) = self.detail_report.as_ref() else { return };
+        let full_socks = std::mem::take(&mut self.detail_socks);
+        let socks: Vec<Socket> =
+            full_socks.iter().filter(|s| s.pid == Some(pid)).cloned().collect();
+        let locks = r.locks.clone();
+        let mut lines = detail_lines(r, &socks, &locks);
+        push_history_lines(&mut lines, &self.hist, pid);
+        let names: HashMap<Pid, String> =
+            self.procs.iter().map(|p| (p.pid, p.name.clone())).collect();
+        push_peer_lines(&mut lines, &full_socks, &names, pid);
+        if let Some(b) = &r.binary {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("Binary:", Style::new().bold())));
+            match &b.sha256 {
+                Some(h) => lines.push(Line::from(format!(
+                    "  sha256: {}…{}",
+                    &h[..16.min(h.len())],
+                    &h[h.len().saturating_sub(8)..]
+                ))),
+                None => lines.push(Line::from(Span::styled(
+                    "  sha256: unreadable (permissions?)",
+                    Style::new().fg(MID),
+                ))),
+            }
+            let sig_line = b
+                .signature
+                .clone()
+                .unwrap_or_else(|| "no signature infrastructure on this platform".into());
+            let sig_style = if sig_line.starts_with("NOT VALID") {
+                Style::new().fg(Color::Red)
+            } else if sig_line == "unsigned" {
+                Style::new().fg(Color::Yellow)
+            } else {
+                Style::new().fg(GREEN)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  signature: {sig_line}"),
+                sig_style,
+            )));
+        }
+        self.open_files = r.open_files.clone();
+        if let Some(files) = &self.open_files {
+            lines.push(Line::from(""));
+            if files.is_empty() {
+                lines.push(Line::from(styled(
+                    Style::new().fg(MID),
+                    "open files: none readable (belongs to another user?)",
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("Open Files ({}):", files.len()),
+                    Style::new().bold(),
+                )));
+                for f in files.iter().take(30) {
+                    lines.push(Line::from(format!("  {f}")));
+                }
+                if files.len() > 30 {
+                    lines.push(Line::from(format!("  … {} more", files.len() - 30)));
+                }
+            }
+        }
+        // provisional count (logical lines); refined to the wrapped
+        // count on the next render
+        self.detail_line_count = lines.len() as u16;
+        self.detail_lines = lines;
+        self.detail_socks = full_socks;
     }
 
     /// Open the Ports-tab detail page: every socket touching the selected
@@ -2485,26 +2513,6 @@ fn fmt_mem(kb: Option<u64>) -> String {
 }
 
 /// Byte count with a K/M/G suffix ("45M", "1.2G"); plain bytes below 1K.
-fn fmt_bytes(b: u64) -> String {
-    if b >= 1024 * 1024 * 1024 {
-        format!("{:.1}G", b as f64 / 1024.0 / 1024.0 / 1024.0)
-    } else if b >= 1024 * 1024 {
-        format!("{:.1}M", b as f64 / 1024.0 / 1024.0)
-    } else if b >= 1024 {
-        format!("{:.0}K", b as f64 / 1024.0)
-    } else {
-        format!("{b}B")
-    }
-}
-
-/// Per-second rate ("12K/s") for the IO column (read+write combined).
-fn fmt_rate(bps: f64) -> String {
-    if bps < 0.5 {
-        return "0B/s".into();
-    }
-    format!("{}/s", fmt_bytes(bps as u64))
-}
-
 fn fmt_age_short(started: Option<i64>) -> String {
     match started {
         None => "-".into(),
@@ -2653,8 +2661,9 @@ fn death_log_source(platform_name: &str, pid: Pid, name: &str) -> crate::logs::L
 }
 
 /// The desktop-notification command for a given OS — macOS speaks
-/// osascript, Linux notify-send, everything else has no story yet.
-/// Split from the fire step so tests can assert the exact argv.
+/// osascript, Linux notify-send, Windows a native WinRT toast via
+/// PowerShell (no extra module needed). Split from the fire step so tests
+/// can assert the exact argv.
 fn notify_command_for(os: &str, title: &str, body: &str) -> Option<(String, Vec<String>)> {
     match os {
         "macos" => Some((
@@ -2672,7 +2681,84 @@ fn notify_command_for(os: &str, title: &str, body: &str) -> Option<(String, Vec<
             "notify-send".to_string(),
             vec![title.to_string(), body.to_string()],
         )),
+        "windows" => {
+            // single-quoted PowerShell strings: double the single quotes
+            let ps = |s: &str| s.replace('\'', "''");
+            Some((
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    format!(
+                        "[Windows.UI.Notifications.ToastNotificationManager, \
+                         Windows.UI.Notifications, ContentType = WindowsRuntime] > $null; \
+                         $x = [Windows.UI.Notifications.ToastNotificationManager]::\
+                         GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::\
+                         ToastText02); \
+                         $x.GetElementsByTagName('text').Item(0).AppendChild(\
+                         $x.CreateTextNode('{}')) > $null; \
+                         $x.GetElementsByTagName('text').Item(1).AppendChild(\
+                         $x.CreateTextNode('{}')) > $null; \
+                         [Windows.UI.Notifications.ToastNotificationManager]::\
+                         CreateToastNotifier('{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\
+                         \\WindowsPowerShell\\v1.0\\powershell.exe').Show(\
+                         [Windows.UI.Notifications.ToastNotification]::new($x))",
+                        ps(title),
+                        ps(body)
+                    ),
+                ],
+            ))
+        }
         _ => None,
+    }
+}
+
+/// The live-stream command behind the Logs page's 'F' for a source —
+/// container `logs -f`, `journalctl -f _PID=`, macOS `log stream
+/// --predicate`. None for the Windows event log (no streaming shape).
+/// Split from the spawn step so tests can assert the exact argv.
+fn follow_command_for(src: &crate::logs::LogSource) -> Option<(String, Vec<String>, String)> {
+    match src {
+        crate::logs::LogSource::Container { runtime, ref_ } => Some((
+            runtime.clone(),
+            vec![
+                "logs".to_string(),
+                "-f".to_string(),
+                "--tail".to_string(),
+                "100".to_string(),
+                ref_.clone(),
+            ],
+            format!("{runtime} logs"),
+        )),
+        crate::logs::LogSource::Journald { pid } => Some((
+            "journalctl".to_string(),
+            vec![
+                "--no-pager".to_string(),
+                "-f".to_string(),
+                "-n".to_string(),
+                "100".to_string(),
+                format!("_PID={pid}"),
+            ],
+            format!("journal (_PID={pid})"),
+        )),
+        crate::logs::LogSource::UnifiedLog { name } => {
+            let pred = format!(
+                "process == \"{}\"",
+                crate::logs::sanitize_predicate(name)
+            );
+            Some((
+                "log".to_string(),
+                vec![
+                    "stream".to_string(),
+                    "--style".to_string(),
+                    "compact".to_string(),
+                    "--predicate".to_string(),
+                    pred,
+                ],
+                format!("unified log (process {name})"),
+            ))
+        }
+        crate::logs::LogSource::EventLog { .. } => None,
     }
 }
 
@@ -2688,6 +2774,35 @@ fn send_desktop_notify(title: &str, body: &str) {
                 .status();
         });
     }
+}
+
+/// Run the `--alert-exec` command for one firing — sh -c / cmd /C, throwaway
+/// thread (a webhook POST must never stall a refresh tick). The alert
+/// context rides in the child's environment: WITR_ALERT_PID / NAME / DETAIL.
+fn spawn_alert_exec(cmd: &str, pid: Pid, name: &str, detail: &str) {
+    let cmd = cmd.to_string();
+    let name = name.to_string();
+    let detail = detail.to_string();
+    let _ = std::thread::spawn(move || {
+        #[cfg(windows)]
+        let mut c = {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", &cmd]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut c = {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", &cmd]);
+            c
+        };
+        c.env("WITR_ALERT_PID", pid.to_string())
+            .env("WITR_ALERT_NAME", &name)
+            .env("WITR_ALERT_DETAIL", &detail)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let _ = c.status();
+    });
 }
 
 fn push_history_lines(lines: &mut Vec<Line<'static>>, hist: &crate::history::History, pid: Pid) {
@@ -2731,6 +2846,33 @@ fn push_history_lines(lines: &mut Vec<Line<'static>>, hist: &crate::history::His
             format!("  ⚠ {w}"),
             Style::new().fg(Color::Yellow),
         )));
+    }
+    // Open-descriptor history on the same window; a steady climb surfaces
+    // as an fd leak suspicion line (same shape as the memory one)
+    if let Some((chart, now)) = hist.fd_chart(pid, 80) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("Open fds ({now}):"),
+            Style::new().bold(),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {chart}"),
+            Style::new().fg(GREEN),
+        )));
+    }
+    if let Some(w) = hist.fd_suspicion(pid, REFRESH.as_secs_f64()) {
+        lines.push(Line::from(Span::styled(
+            format!("  ⚠ {w}"),
+            Style::new().fg(Color::Yellow),
+        )));
+    }
+    // Disk I/O rates on the same window (read/write sparklines; only the
+    // platforms that report per-process I/O have data here)
+    if let Some((r, w)) = hist.io_chart(pid, 80) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Disk I/O:", Style::new().bold())));
+        lines.push(Line::from(Span::styled(format!("  {r}"), Style::new().fg(GREEN))));
+        lines.push(Line::from(Span::styled(format!("  {w}"), Style::new().fg(MID))));
     }
 }
 
@@ -3150,7 +3292,7 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
                 let cell = app
                     .hist
                     .io_rate_of(p.pid)
-                    .map(|(r, w)| fmt_rate(r + w))
+                    .map(|(r, w)| crate::util::fmt_rate(r + w))
                     .unwrap_or_else(|| "-".into());
                 cells.push(Cell::from(cell));
             }
@@ -3189,7 +3331,7 @@ fn groups_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_
                 }),
                 Cell::from(fmt_mem(Some(g.mem_kb))),
                 Cell::from(if g.io_bps > 0.0 {
-                    fmt_rate(g.io_bps)
+                    crate::util::fmt_rate(g.io_bps)
                 } else {
                     "-".into()
                 }),
@@ -5563,16 +5705,23 @@ mod tests {
             },
         );
         assert_eq!(app.alert_mem, Some(0), "seed propagates");
-        for _ in 0..6 {
+        // a listing pass that transiently misses a pid resets its streak
+        // (alert_state prunes to the seen set), so keep cycling until an
+        // alert lands instead of betting on an exact refresh count
+        let mut alerts: Vec<&crate::history::TuiEvent> = Vec::new();
+        for _ in 0..30 {
             app.refresh();
+            alerts = app
+                .hist
+                .events
+                .iter()
+                .filter(|e| e.kind == "alert")
+                .collect();
+            if !alerts.is_empty() {
+                break;
+            }
         }
-        let alerts: Vec<&crate::history::TuiEvent> = app
-            .hist
-            .events
-            .iter()
-            .filter(|e| e.kind == "alert")
-            .collect();
-        assert!(!alerts.is_empty(), "expected alerts after 6 refreshes");
+        assert!(!alerts.is_empty(), "expected alerts within 30 refreshes");
     }
 
     #[test]
@@ -6120,8 +6269,57 @@ mod tests {
         let (prog, args) = notify_command_for("linux", "witr-rs", "nginx restarted").unwrap();
         assert_eq!(prog, "notify-send");
         assert_eq!(args, vec!["witr-rs", "nginx restarted"]);
+        // Windows: one PowerShell -Command element with the toast script;
+        // single quotes are doubled, not stripped
+        let (prog, args) =
+            notify_command_for("windows", "witr-rs", "nginx exited; it's gone").unwrap();
+        assert_eq!(prog, "powershell");
+        assert_eq!(args[0], "-NoProfile");
+        assert_eq!(args[1], "-Command");
+        let script = &args[2];
+        assert!(script.contains("ToastNotificationManager"), "{script}");
+        assert!(script.contains("ToastText02"), "{script}");
+        assert!(script.contains("nginx exited; it''s gone"), "quotes doubled: {script}");
+        let evil = notify_command_for("windows", "witr-rs", "bad'); x").unwrap().1[2].clone();
+        assert!(evil.contains("bad''); x"), "hostile quotes doubled: {evil}");
         // elsewhere: nothing to call
-        assert!(notify_command_for("windows", "witr-rs", "x").is_none());
+        assert!(notify_command_for("plan9", "witr-rs", "x").is_none());
+    }
+
+    #[test]
+    fn follow_command_shapes_per_source() {
+        use crate::logs::LogSource;
+        // container: runtime CLI with -f and a tail seed
+        let (prog, args, label) = follow_command_for(&LogSource::Container {
+            runtime: "podman".into(),
+            ref_: "abc123".into(),
+        })
+        .unwrap();
+        assert_eq!(prog, "podman");
+        assert_eq!(args[..3], ["logs", "-f", "--tail"]);
+        assert_eq!(args[4], "abc123");
+        assert_eq!(label, "podman logs");
+        // journald: follow filtered by the pid
+        let (prog, args, _) = follow_command_for(&LogSource::Journald { pid: 42 }).unwrap();
+        assert_eq!(prog, "journalctl");
+        assert!(args.contains(&"-f".to_string()));
+        assert!(args.contains(&"_PID=42".to_string()));
+        // macOS unified log: log stream with the sanitized process predicate
+        let (prog, args, _) =
+            follow_command_for(&LogSource::UnifiedLog { name: "nginx-worker".into() }).unwrap();
+        assert_eq!(prog, "log");
+        assert_eq!(args[0], "stream");
+        assert!(args.contains(&"process == \"nginx-worker\"".to_string()));
+        // hostile names never reach the predicate raw
+        let (_, args, _) =
+            follow_command_for(&LogSource::UnifiedLog { name: "bad\"name;x".into() }).unwrap();
+        assert!(args.contains(&"process == \"badnamex\"".to_string()));
+        // Windows event log has no streaming shape
+        assert!(follow_command_for(&LogSource::EventLog {
+            pid: 1,
+            name: "x".into()
+        })
+        .is_none());
     }
 
     #[test]
@@ -6215,6 +6413,37 @@ mod tests {
         app.procs = vec![mk(3, None)];
         app.alert_picks();
         assert!(!app.alert_state.contains_key(&1));
+    }
+
+    #[test]
+    fn alert_exec_runs_with_alert_context_in_env() {
+        // real command, real env — the fastest hermetic check of the whole
+        // fire path (spawn_alert_exec is sync-equivalent from the test's
+        // view: the file appears within the wait loop or it didn't happen)
+        let dir = std::env::temp_dir().join(format!("witr-alert-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("fired.txt");
+        let _ = std::fs::remove_file(&out);
+        let cmd = format!(
+            "echo \"$WITR_ALERT_PID|$WITR_ALERT_NAME|$WITR_ALERT_DETAIL\" > {}",
+            out.display()
+        );
+        spawn_alert_exec(&cmd, 42, "nginx", "CPU 90% above 50% for 15s");
+        let mut content = String::new();
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&out) {
+                content = s;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::remove_dir_all(dir).ok();
+        let line = content.trim();
+        assert_eq!(
+            line,
+            "42|nginx|CPU 90% above 50% for 15s",
+            "env vars carry the alert context"
+        );
     }
 
     #[test]
@@ -7060,6 +7289,7 @@ mod tests {
                 replayed: Vec::new(),
                 notify: false,
                 watch: Vec::new(),
+                alert_exec: None,
                 since: None,
                 refresh_secs: None,
                 sort: None,

@@ -223,6 +223,27 @@ fn local_utc_offset_secs() -> i64 {
     0
 }
 
+/// Human-friendly byte size: "1.5G", "12.0M", "980K", "42B".
+pub fn fmt_bytes(b: u64) -> String {
+    if b >= 1024 * 1024 * 1024 {
+        format!("{:.1}G", b as f64 / 1024.0 / 1024.0 / 1024.0)
+    } else if b >= 1024 * 1024 {
+        format!("{:.1}M", b as f64 / 1024.0 / 1024.0)
+    } else if b >= 1024 {
+        format!("{:.0}K", b as f64 / 1024.0)
+    } else {
+        format!("{b}B")
+    }
+}
+
+/// Per-second rate ("12K/s") for IO columns and rate charts.
+pub fn fmt_rate(bps: f64) -> String {
+    if bps < 0.5 {
+        return "0B/s".into();
+    }
+    format!("{}/s", fmt_bytes(bps as u64))
+}
+
 /// Human-friendly duration: "3d 2h", "2h 13m", "5m 12s", "42s".
 pub fn fmt_age(seconds: i64) -> String {
     let s = seconds.max(0);
