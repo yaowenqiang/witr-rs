@@ -22,7 +22,23 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **详情页磁盘 I/O 历史图**：读/写速率两条块字符图（各标注窗口峰值速率），来自与 IO 列同一套跨平台累计字节差值（Linux `/proc/<pid>/io`；macOS/Windows 无每进程 I/O 时该节自动隐藏）。
 
-**快照 diff（`--snap` / `--diff`）**：`witr-rs --snap before.json` 把整张进程表落成 JSON；之后 `witr-rs --diff before.json` 报告变化——**new**（新出现）、**gone**（消失）、**restarted**（同一程序身份换了新 pid 回来，与 TUI 崩溃重启检测同一套身份判定；含"重启后恰好复用原 pid"——同 pid 同身份但启动时间变了也识别为 restarted）、**changed**（同 pid 同身份但命令行变了）。pid 被无关进程复用时不再误报为 changed：旧进程报 gone（标注 pid taken over）、新进程报 new（标注 pid reused）。有变化时退出码 1，无变化 0，适合脚本。
+**快照 diff（`--snap` / `--diff`）**：`witr-rs --snap before.json` 把整张进程表落成 JSON；之后 `witr-rs --diff before.json` 报告变化——**new**（新出现）、**gone**（消失）、**restarted**（同一程序身份换了新 pid 回来，与 TUI 崩溃重启检测同一套身份判定；含"重启后恰好复用原 pid"——同 pid 同身份但启动时间变了也识别为 restarted）、**changed**（同 pid 同身份但命令行变了）。pid 被无关进程复用时不再误报为 changed：旧进程报 gone（标注 pid taken over）、新进程报 new（标注 pid reused）。有变化时退出码 1，无变化 0，适合脚本。不带路径的 `witr-rs --snap` 走**自动轮转**：快照存到配置目录旁的 `snapshots/`，默认保留 10 份（`--keep N` 可调）；`--diff last` 直接对比最近一份自动快照，`--diff 30m` 对比"半小时前"那一份——"这半小时机器上多了什么、少了什么"一条命令。
+
+**排行榜（`--top`）**：`witr-rs --top cpu -n 30` 不进 TUI，直接打印按 CPU / 内存 / fd 数 / 磁盘 I/O 排名的前 N 个进程（`--top fd` 在 Linux 直读 `/proc/<pid>/fd`、macOS 用单次 `lsof -F pf` 扫全表，Windows 无数据源会明确退出；`--top io` 仅 Linux）。回答"现在最忙的是谁"不用开界面。
+
+**表格输出（`--csv` / `--markdown`）**：进程表的机器可读形式——`--csv` 按 RFC-4180 转义（命令行里的逗号、引号、换行都安全），`--markdown` 直接贴 issue / 文档；两列都含 NAME 与完整命令行，脚本与报表一等公民。
+
+**CSV 时间序列（`--watch` + `--record`）**：`witr-rs --watch 5 --record load.csv` 每 5 秒把整张进程表按进程追加进 CSV——timestamp / pid / user / name / cpu_pct / rss_mb / io 读写速率（平台没有的指标留空列）。收工后用 Excel / pandas / SQLite 回放负载走势，控制台输出不受影响。
+
+**HTML 报告（`--report-html`）**：`witr-rs --report-html status.html` 生成自包含的单文件报告（零 JS 零依赖）：每进程 CPU / 内存占用条、Top CPU / Top 内存榜单、全进程九列明细表，HTML 转义齐全——贴工单、存档、发同事都行。
+
+**树杀（`K`）**：操作栏新增 `K`——沿 ppid 做 BFS 收集选中进程的全部后代（含孙辈，父进程中途被收割也不漏），提示 `kill pid N + M descendant(s)? y 确认`，确认后对整棵树发 SIGTERM。杀 worker 池、清用户会话树不用再逐个查 pid。
+
+**进程备注（`N`）**：Processes 页选中行按 `N` 输入备注（Enter 保存、Esc 放弃、清空即删除），按身份持久化到配置文件 `notes` 键——进程重启换 pid 备注跟着程序走；表格行尾显示 ✎ 标记，详情页有 Note 一节。给"这个 python 到底是干嘛的"留下答案。
+
+**帮助页（`?`）**：任意页面按 `?` 弹出当前标签页的完整键速查（全局键 + 每页专属键分组），`j/k` 滚动；Esc / q / Backspace / 再按 `?` 返回**打开时的页面**（从详情页打开就回详情页，不会落回列表）。全部按键不用背。
+
+**JSON schema**：`--json` 输出升级为带版本信封 `{schema_version, generated_at, process_count, processes}`，下游解析可以校验版本再取数。
 
 **跨重启跟踪（`--follow`）**：`witr-rs --pid 1234 --follow` 在目标死后继续追——进程表里重找同名同程序身份（name+exe+user），切到新 pid 继续溯源（隐含 `--watch`；身份连续 3 个刷新周期找不到才放弃）。多个同名实例并存时取最新启动的那个。
 
@@ -40,9 +56,9 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **会话摘要（`--since` / `S`）**：`witr-rs --replay ev.jsonl --since 1h` 不进界面——直接打印这段录制时间"发生了什么"：出现 / 退出 / 重启计数，加上重启链（哪个程序重启了几次），管道里也能用。TUI 里按 `S` 打开同样的摘要页：活动计数、重启链，外加两张榜——**CPU 尖峰榜**（窗口内瞬时占用峰值最高的进程）与**内存爬升榜**（RSS 增长最快的进程）；`--since` 预设窗口（30、30s、5m、2h、1d，默认整个会话），`r` 重算。回答"刚这半小时机器上忙的是什么"。
 
-**阈值告警（`--alert-cpu` / `--alert-mem`）**：`witr-rs --alert-cpu 90 --alert-mem 2048`——进程连续 5 个采样（约 15 秒）超过阈值时：弹桌面通知、Events 页记一条 alert、进程表红色行高亮。每次越界只报一次，占用回落后重新武装，不会刷屏。配合 **`--alert-exec`** 可在每次告警触发时执行自定义命令（webhook 接告警即 `--alert-exec 'curl -s $SLACK_HOOK -d "$WITR_ALERT_NAME: $WITR_ALERT_DETAIL"'`），告警上下文经 `WITR_ALERT_PID` / `WITR_ALERT_NAME` / `WITR_ALERT_DETAIL` 环境变量传入。
+**阈值告警（`--alert-cpu` / `--alert-mem` / `--alert-fd` / `--alert-io`）**：`witr-rs --alert-cpu 90 --alert-mem 2048`——进程连续 5 个采样（约 15 秒）超过阈值时：弹桌面通知、Events 页记一条 alert、进程表红色行高亮。每次越界只报一次，占用回落后重新武装，不会刷屏。`--alert-fd 4096` 盯打开文件数（Linux 直读 `/proc`，macOS 每周期单次 `lsof` 扫全表——只在告警开启时才扫）；`--alert-io 100` 盯磁盘 I/O 速率（读+写 MB/s，Linux `/proc/<pid>/io` 差分）。配合 **`--alert-exec`** 可在每次告警触发时执行自定义命令（webhook 接告警即 `--alert-exec 'curl -s $SLACK_HOOK -d "$WITR_ALERT_NAME: $WITR_ALERT_DETAIL"'`），告警上下文经 `WITR_ALERT_PID` / `WITR_ALERT_NAME` / `WITR_ALERT_DETAIL` 环境变量传入。
 
-**配置文件**：`~/.config/witr-rs/config.toml`（macOS 在 `~/Library/Application Support/witr-rs/`，Windows 在 `%APPDATA%\witr-rs\`）——`refresh_secs`（采样间隔）/ `sort`（默认排序）/ `notify` / `paused` / `watch`（关注列表）五个键，相当于 CLI 参数的默认值：文件先行，命令行始终覆盖。坏行跳过并给出警告，没有文件一切照旧。
+**配置文件**：`~/.config/witr-rs/config.toml`（macOS 在 `~/Library/Application Support/witr-rs/`，Windows 在 `%APPDATA%\witr-rs\`）——`refresh_secs`（采样间隔）/ `sort`（默认排序）/ `notify` / `paused` / `watch`（关注列表）/ `notes`（进程备注）六个键，相当于 CLI 参数的默认值：文件先行，命令行始终覆盖。坏行跳过并给出警告，没有文件一切照旧。
 
 **关注列表（`w`）**：Processes 页选中行按 `w` 加 ★ 并置顶（保持所选排序），按 `w` 取消。关注项按 身份（名字 + exe 基名 + 用户）持久化到配置文件的 `watch` 键，不含 pid——进程重启换 pid 后 ★ 跟着程序走。树形视图下不置顶（避免拆散父子），搜索过滤照常生效。
 
@@ -68,8 +84,9 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | `t` `e` `p` `n` | Events 页按 时间 / 事件 / PID / 进程 排序（时间默认最新在前，重复按切换升降序） |
 | `T` | Processes 页：树形视图 ↔ 平铺表格（子进程嵌在父进程下；搜索时显示平铺） |
 | `F` | Logs 页：切换实时日志流（容器 `logs -f` / journald `journalctl -f` / macOS `log stream`，按来源自动选择命令） |
-| `a` | Ports 页：切换 仅监听 ↔ 全部状态；Locks 页：切换 锁 ↔ 全部打开文件；Processes 页：打开操作栏（`k` kill / `t` term / `p` 暂停 / `r` 恢复 / `n` renice） |
+| `a` | Ports 页：切换 仅监听 ↔ 全部状态；Locks 页：切换 锁 ↔ 全部打开文件；Processes 页：打开操作栏（`k` kill / `K` 树杀 / `t` term / `p` 暂停 / `r` 恢复 / `n` renice） |
 | `w` | Processes 页：关注选中进程（★ 置顶、写入配置文件跨会话保留，按身份匹配、重启换 pid 不丢）；再按取消 |
+| `N` | Processes 页：为选中进程写备注（Enter 保存 / Esc 放弃 / 清空删除；按身份持久化，行尾 ✎ 标记，重启换 pid 不丢） |
 | `o` | Ports 页：逐 socket 明细 ↔ 按 (端口, 属主) 聚合的总览（`Enter` 跳属主进程详情） |
 | `l` | 详情页 / Events 页：拉取该进程最近的日志（容器日志 / journalctl / macOS 统一日志），全屏 Logs 页滚动查看；Events 页已退出的进程优先显示退出瞬间自动捕获的最后日志 |
 | `S` | 打开会话摘要页（活动计数 / 重启链 / CPU 尖峰榜 / 内存爬升榜，窗口由 `--since` 预设），`r` 重算，`Esc` 返回 |
@@ -78,6 +95,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | `!` | 桌面通知开关（`--notify` 预开启，页脚有指示） |
 | `z` | 缩放：聚焦面板临时占满整行（tmux 风格） |
 | `x` | 杀掉选中进程（y/n 确认） |
+| `?` | 键速查 overlay：全局键 + 当前标签页专属键分组，`j/k` 滚动，Esc/q/Backspace 返回打开时的页面 |
 | `r` | 立即刷新 |
 | 详情页内 | `j/k` 滚动、`d/u` 半页、`g/G` 顶部/底部、`b/f` 翻页、`Tab` 切换面板、`a` 操作栏、`l` 最近日志、`/` 搜索环境变量、`z` 缩放、`c` 复制当前面板、`Esc/q` 返回 |
 | 鼠标 | 滚轮滚动列表 / 详情面板；点击标签页切换、点击行选中、点击面板聚焦；双击行打开详情 |
@@ -127,6 +145,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | nohup/disown 检测 | ✓（`/proc/<pid>/status` SigIgn SIGHUP 位，计入告警） | ✗ | ✗ |
 | 环境变量（`--env` / TUI 详情页） | ✓ `/proc/<pid>/environ`（同用户） | ✓ 同用户进程走 `ps -E`（其余受 SIP 限制，面板会提示） | ✗ |
 | 每进程磁盘 I/O（TUI IO 列 + 详情累计值） | ✓ `/proc/<pid>/io`（字节差分 → 速率） | ✓ `proc_pid_rusage` | ✓ PowerShell IO_COUNTERS |
+| 每进程 fd 数（`--top fd` / `--alert-fd`） | ✓ `/proc/<pid>/fd` 直读 | ✓ 单次 `lsof -F pf` 扫全表 | ✗ |
 | 启动时间 | btime + starttime | `ps etime` | CIM CreationDate |
 
 跨平台可选增强（三端一致，缺依赖时静默跳过）：`nvidia-smi`（GPU 列）、`kubectl`（K8s Pod 归因）、`docker`/`podman`/`nerdctl`（Containers 页）。
@@ -186,10 +205,16 @@ witr-rs --pid 1234 --logs 50  # 该进程最近 50 行日志（容器/journal/�
 witr-rs --events-log ev.jsonl # TUI 事件采样落盘（JSONL，追加写）
 witr-rs --replay ev.jsonl     # 回放事件记录，落在 Events 页
 witr-rs --replay ev.jsonl --since 1h # 录制内容"发生了什么"摘要：计数 + 重启链，直接打印退出
-witr-rs --alert-cpu 90 --alert-mem 2048 # 连续超阈值 → 桌面通知 + Events 记录 + 红色行高亮
+witr-rs --top cpu -n 30       # CPU 前排 30（--top mem|fd|io 同理；不进 TUI）
+witr-rs --csv                 # 全表 CSV（RFC-4180 转义；--markdown 贴文档用）
+witr-rs --watch 5 --record load.csv # 每 5s 把整张进程表追加进 CSV 时间序列
+witr-rs --report-html status.html   # 自包含单文件 HTML 报告（CPU/内存条 + Top 榜 + 全表）
+witr-rs --alert-fd 4096 --alert-io 100 # fd 数 / 磁盘 IO 速率阈值告警（同 CPU 告警机制）
 witr-rs --alert-cpu 90 --alert-exec 'curl -s $SLACK_HOOK -d "$WITR_ALERT_NAME: $WITR_ALERT_DETAIL"' # 每次告警触发时执行命令（webhook）
 witr-rs --snap before.json    # 进程表快照落盘（JSON）后退出
+witr-rs --snap                # 自动快照：存配置目录旁 snapshots/，轮转保留 10 份（--keep N 可调）
 witr-rs --diff before.json    # 对比快照：new / gone / restarted / changed（身份级判定，pid 复用不误报；有变化退出码 1）
+witr-rs --diff last           # 对比最近一份自动快照（--diff 30m 对比半小时前那份）
 witr-rs --pid 1234 --follow   # 跨重启跟踪目标（同程序换新 pid 继续追）
 witr-rs --pid 1234 --follow --on-exit 'say gone'  # watch/follow 下目标消失时执行一次命令（follow 彻底跟丢后 exit 2）
 witr-rs --notify              # TUI 桌面通知：重启必弹，crash loop 的退出也弹
@@ -253,10 +278,10 @@ src/
 ├── ancestry.rs     ppid 链回溯（防环、深度限制、父进程已退出的告警）
 ├── pipeline.rs     目标解析（name/pid/port/file/container → pid）、归因优先级、风险告警
 ├── tui.rs          交互界面（ratatui/crossterm）：五标签页 + 详情面板 + 鼠标 + 3s 自动刷新
-├── render.rs       standard / tree / short / json / env / warnings / export 渲染
+├── render.rs       standard / tree / short / json / env / warnings / export / csv / markdown / top / html 渲染
 ├── history.rs      采样历史：瞬时 CPU、sparkline、内存趋势 + 泄漏嫌疑、重启检测、Events 事件流、会话摘要
-├── config.rs       用户配置文件（flat toml 子集：refresh_secs/sort/notify/paused/watch，CLI 覆盖）
-├── snapshot.rs     --snap / --diff：全表快照与 new/gone/restarted/changed 对比
+├── config.rs       用户配置文件（flat toml 子集：refresh_secs/sort/notify/paused/watch/notes，CLI 覆盖）
+├── snapshot.rs     --snap / --diff：全表快照（含自动轮转）与 new/gone/restarted/changed 对比
 ├── logs.rs         崩溃关联日志：容器日志 / journalctl / macOS 统一日志
 ├── risk.rs         0–10 风险评分（临时目录二进制、curl|sh、注入、公网对端、无效签名等）
 ├── binary_id.rs    二进制 sha256 + 代码签名结论（codesign / Authenticode）
@@ -287,6 +312,7 @@ src/
 - macOS `launchctl list` 只覆盖当前用户域，系统域 daemon 需要 sudo 才能标注；文件锁来自 `lsof` 标志近似，内核未导出锁表
 - nohup/disown 检测仅 Linux（macOS/Windows 无 `/proc`，TUI/CLI 不显示该告警）
 - GPU 列只支持 NVIDIA（`nvidia-smi`）；Apple Silicon / AMD 显卡无每进程占用数据源
+- `--top fd` / `--alert-fd` 在 Windows 缺席（无每进程 fd 数据源）；`--top io` / `--alert-io` 与 `--record` 的 io 速率列仅 Linux（`/proc/<pid>/io`）
 
 ## 许可
 

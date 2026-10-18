@@ -154,6 +154,7 @@ fn analyze(
         warnings.retain(|w| seen.insert(w.clone()));
 
         reports.push(TargetReport {
+            schema_version: 1,
             target: spec.clone(),
             found: true,
             error: None,

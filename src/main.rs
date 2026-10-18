@@ -187,6 +187,99 @@ fn run_on_exit(cmd: &str) {
     let _ = std::process::Command::new("sh").args(["-c", cmd]).status();
 }
 
+/// The N highest-ranked processes by one metric, best first. Clones rather
+/// than borrows — the count is small and the callers mix owned outputs.
+fn top_procs(
+    procs: &[Process],
+    metric: cli::TopMetric,
+    count: usize,
+    fds: Option<&std::collections::HashMap<Pid, u64>>,
+) -> Vec<Process> {
+    let mut ranked: Vec<(f64, &Process)> = procs
+        .iter()
+        .filter_map(|p| {
+            let v = match metric {
+                cli::TopMetric::Cpu => p.cpu,
+                cli::TopMetric::Mem => p.mem_kb.map(|kb| kb as f64),
+                cli::TopMetric::Fd => fds.and_then(|m| m.get(&p.pid)).map(|&n| n as f64),
+                cli::TopMetric::Io => {
+                    let r = p.io_read_bytes.unwrap_or(0);
+                    let w = p.io_write_bytes.unwrap_or(0);
+                    (p.io_read_bytes.is_some() || p.io_write_bytes.is_some())
+                        .then_some((r + w) as f64)
+                }
+            }?;
+            Some((v, p))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(count.max(1));
+    ranked.into_iter().map(|(_, p)| p.clone()).collect()
+}
+
+/// Versioned JSON envelope for whole-table outputs (`--json` listing and
+/// `--top --json`): scripts can key off `schema_version` instead of
+/// guessing the shape. Bump [`SCHEMA_VERSION`] on breaking field changes.
+pub const SCHEMA_VERSION: u32 = 1;
+
+fn json_envelope(procs: &[Process]) -> String {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": util::now_unix(),
+        "process_count": procs.len(),
+        "processes": procs,
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
+}
+
+/// `--record` writer: appends one CSV row per process per --watch tick.
+/// The header is written once at creation; rows leave out metrics the
+/// platform doesn't report (empty cells), so the file stays loadable.
+struct RecordWriter {
+    file: std::fs::File,
+}
+
+impl RecordWriter {
+    fn create(path: &str) -> std::io::Result<Self> {
+        let mut f = std::fs::File::create(path)?;
+        use std::io::Write as _;
+        write!(
+            f,
+            "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps\n"
+        )?;
+        Ok(RecordWriter { file: f })
+    }
+
+    fn append(&mut self, procs: &[Process], hist: &history::History) {
+        use std::io::Write as _;
+        let ts = util::now_unix();
+        for p in procs {
+            let cpu = hist
+                .cpu_now
+                .get(&p.pid)
+                .map(|c| format!("{c:.1}"))
+                .unwrap_or_default();
+            let rss = p.mem_kb.map(|kb| (kb / 1024).to_string()).unwrap_or_default();
+            let io = hist
+                .io_rate_of(p.pid)
+                .map(|(r, w)| (format!("{r:.0}"), format!("{w:.0}")))
+                .unwrap_or_default();
+            let _ = writeln!(
+                self.file,
+                "{},{},{},{},{},{},{},{}",
+                ts,
+                p.pid,
+                render::csv_field(p.user.as_deref().unwrap_or("-")),
+                render::csv_field(&p.name),
+                cpu,
+                rss,
+                io.0,
+                io.1,
+            );
+        }
+    }
+}
+
 fn main() {
     let cli = match cli::Cli::try_parse() {
         Ok(c) => c,
@@ -300,8 +393,43 @@ fn main() {
         eprintln!("--on-exit watches a target; give a process name, --pid, --port or --file");
         std::process::exit(4);
     }
-    if cli.alert_exec.is_some() && cli.alert_cpu.is_none() && cli.alert_mem.is_none() {
-        eprintln!("--alert-exec runs with threshold alerts; give --alert-cpu and/or --alert-mem");
+    if cli.alert_exec.is_some()
+        && cli.alert_cpu.is_none()
+        && cli.alert_mem.is_none()
+        && cli.alert_fd.is_none()
+        && cli.alert_io.is_none()
+    {
+        eprintln!(
+            "--alert-exec runs with threshold alerts; give --alert-cpu, --alert-mem, --alert-fd or --alert-io"
+        );
+        std::process::exit(4);
+    }
+    if cli.record.is_some() && cli.watch.is_none() {
+        eprintln!("--record samples alongside --watch; add --watch SECONDS");
+        std::process::exit(4);
+    }
+    if cli.record.is_some() && !specs.is_empty() {
+        eprintln!("--record records the whole process table under --watch; drop the targets (filter later, e.g. with --recent or in the CSV itself)");
+        std::process::exit(4);
+    }
+    let listing_extras = cli.top.is_some() as u8
+        + cli.csv as u8
+        + cli.markdown as u8
+        + cli.report_html.is_some() as u8;
+    if listing_extras > 1 {
+        eprintln!("--top, --csv, --markdown and --report-html are separate output modes; use one at a time");
+        std::process::exit(4);
+    }
+    if listing_extras > 0 && !specs.is_empty() {
+        eprintln!("--top/--csv/--markdown/--report-html operate on the whole process table; drop the targets");
+        std::process::exit(4);
+    }
+    if (cli.csv || cli.markdown) && (cli.json || cli.tree || cli.short || cli.env || cli.warnings) {
+        eprintln!("--csv/--markdown are standalone listing formats; drop --json/--tree/--short/--env/--warnings");
+        std::process::exit(4);
+    }
+    if cli.count.is_some() && cli.top.is_none() {
+        eprintln!("--count sizes the --top listing; add --top METRIC");
         std::process::exit(4);
     }
 
@@ -367,15 +495,47 @@ fn main() {
         };
         gpu::enrich(&mut procs);
         if let Some(path) = &cli.snap {
-            if let Err(e) = snapshot::save(path, &procs) {
+            if path.is_empty() {
+                // no FILE: the auto-rotate directory under the config dir
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let Some(home) = home else {
+                    eprintln!("--snap needs $HOME for the auto-rotate directory, or give a FILE");
+                    std::process::exit(4);
+                };
+                let keep = cli.keep.unwrap_or(10).max(1);
+                match snapshot::save_auto(&home, &procs, keep) {
+                    Ok(written) => write_out(&format!(
+                        "snapshot: {} processes → {} (keeping {keep})",
+                        procs.len(),
+                        written.display()
+                    )),
+                    Err(e) => {
+                        eprintln!("--snap: {e}");
+                        std::process::exit(5);
+                    }
+                }
+            } else if let Err(e) = snapshot::save(path, &procs) {
                 eprintln!("--snap {path}: {e}");
                 std::process::exit(5);
+            } else {
+                write_out(&format!("snapshot: {} processes → {}", procs.len(), path));
             }
-            write_out(&format!("snapshot: {} processes → {}", procs.len(), path));
             std::process::exit(0);
         }
-        let path = cli.diff.as_deref().unwrap_or_default();
-        let old = match snapshot::load(path) {
+        let raw_ref = cli.diff.as_deref().unwrap_or_default();
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let resolved = match &home {
+            Some(h) => match snapshot::resolve_ref(h, raw_ref) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("--diff {raw_ref}: {e}");
+                    std::process::exit(4);
+                }
+            },
+            None => std::path::PathBuf::from(raw_ref),
+        };
+        let path = resolved.to_string_lossy().into_owned();
+        let old = match snapshot::load(&path) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("--diff {path}: {e}");
@@ -431,7 +591,10 @@ fn main() {
             alert_cpu: cli.alert_cpu,
             alert_mem: cli.alert_mem,
             alert_exec: cli.alert_exec.clone(),
+            alert_fd: cli.alert_fd,
+            alert_io: cli.alert_io,
             watch: cfg.watch.clone(),
+            notes: cfg.notes,
             ..tui::Seed::from_targets(
                 &cli.names, &cli.pids, &cli.ports, &cli.files, &cli.containers,
             )
@@ -439,6 +602,67 @@ fn main() {
         if let Err(e) = tui::run(seed) {
             eprintln!("tui error: {}", e);
             std::process::exit(5);
+        }
+        std::process::exit(0);
+    }
+
+    // --top / --csv / --markdown / --report-html: whole-table listings with
+    // a different renderer, valid piped or on a terminal (never the TUI).
+    if specs.is_empty() && listing_extras > 0 {
+        let platform = platform::get();
+        let mut procs = match platform.list_processes() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cannot list processes: {}", e);
+                std::process::exit(5);
+            }
+        };
+        let fds = if cli.top == Some(cli::TopMetric::Fd) {
+            match platform.fd_counts() {
+                Some(m) => Some(m),
+                None => {
+                    eprintln!("--top fd is not supported on {}", platform.name());
+                    std::process::exit(4);
+                }
+            }
+        } else {
+            None
+        };
+        if cli.top == Some(cli::TopMetric::Io) {
+            platform.enrich_listing(&mut procs);
+        }
+        gpu::enrich(&mut procs);
+        let procs = recent_only(procs);
+        if let Some(metric) = cli.top {
+            let count = cli.count.unwrap_or(15).max(1);
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            if cli.json {
+                let ranked = top_procs(&procs, metric, count, fds.as_ref());
+                write_out(&json_envelope(&ranked));
+            } else if cli.csv {
+                write_out(&render::render_csv(&top_procs(&procs, metric, count, fds.as_ref())));
+            } else if cli.markdown {
+                write_out(&render::render_markdown(&top_procs(
+                    &procs, metric, count, fds.as_ref(),
+                )));
+            } else {
+                write_out(&render::render_top(&procs, metric, count, fds.as_ref(), &painter));
+            }
+        } else if cli.report_html.is_some() {
+            let path = cli.report_html.as_deref().unwrap_or_default();
+            if let Err(e) = std::fs::write(path, render::render_html_report(&procs)) {
+                eprintln!("--report-html {path}: {e}");
+                std::process::exit(5);
+            }
+            write_out(&format!("report: {} processes → {}", procs.len(), path));
+        } else if cli.json {
+            // --csv/--markdown wins over plain table; --json alone keeps the
+            // versioned envelope shape
+            write_out(&json_envelope(&procs));
+        } else if cli.csv {
+            write_out(&render::render_csv(&procs));
+        } else {
+            write_out(&render::render_markdown(&procs));
         }
         std::process::exit(0);
     }
@@ -464,7 +688,10 @@ fn main() {
                 alert_cpu: cli.alert_cpu,
                 alert_mem: cli.alert_mem,
                 alert_exec: cli.alert_exec.clone(),
+                alert_fd: cli.alert_fd,
+                alert_io: cli.alert_io,
                 watch: cfg.watch.clone(),
+                notes: cfg.notes,
                 ..tui::Seed::default()
             };
             if let Err(e) = tui::run(seed) {
@@ -485,9 +712,24 @@ fn main() {
         let painter = render::Painter::new(color);
 
         // --watch on the listing: re-sample every N seconds until Ctrl-C.
+        // With --record each tick also appends one CSV row per process.
         if let Some(secs) = cli.watch {
             let interval = secs.max(1);
             let label = cli.recent.clone().unwrap_or_else(|| "all processes".into());
+            let mut recorder = match &cli.record {
+                Some(path) => match RecordWriter::create(path) {
+                    Ok(w) => {
+                        write_out(&format!("recording per-process samples → {path}"));
+                        Some(w)
+                    }
+                    Err(e) => {
+                        eprintln!("--record {path}: {e}");
+                        std::process::exit(5);
+                    }
+                },
+                None => None,
+            };
+            let mut hist = history::History::new();
             loop {
                 let mut listed = match platform.list_processes() {
                     Ok(p) => p,
@@ -496,8 +738,15 @@ fn main() {
                         std::process::exit(5);
                     }
                 };
+                // per-process io counters feed the recorded rates (a no-op
+                // where the platform has none)
+                platform.enrich_listing(&mut listed);
                 gpu::enrich(&mut listed);
                 let procs = recent_only(listed);
+                let _ = hist.update(&procs);
+                if let Some(w) = recorder.as_mut() {
+                    w.append(&procs, &hist);
+                }
                 write_out("\x1b[2J\x1b[1;1H");
                 let now = util::fmt_time(util::now_unix());
                 write_out(&format!(
@@ -694,5 +943,70 @@ mod tests {
         // comeback re-arms, next disappearance fires again
         assert!(!on_exit_edge(&mut had, true));
         assert!(on_exit_edge(&mut had, false));
+    }
+
+    fn proc(pid: i32, name: &str, cpu: Option<f64>, mem_kb: Option<u64>) -> Process {
+        Process {
+            pid,
+            name: name.into(),
+            cpu,
+            mem_kb,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn top_procs_ranks_and_truncates() {
+        let procs = vec![
+            proc(1, "a", Some(1.0), Some(1024)),
+            proc(2, "b", Some(9.0), Some(8192)),
+            proc(3, "c", Some(4.0), Some(4096)),
+        ];
+        let top = top_procs(&procs, cli::TopMetric::Cpu, 2, None);
+        let names: Vec<&str> = top.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["b", "c"]);
+        // mem ranking uses the same rows, different key
+        let top_mem = top_procs(&procs, cli::TopMetric::Mem, 1, None);
+        assert_eq!(top_mem[0].name, "b");
+        // fd with no map → nothing
+        assert!(top_procs(&procs, cli::TopMetric::Fd, 5, None).is_empty());
+    }
+
+    #[test]
+    fn json_envelope_carries_schema_version() {
+        let procs = vec![proc(7, "nginx", None, None)];
+        let v: serde_json::Value =
+            serde_json::from_str(&json_envelope(&procs)).unwrap();
+        assert_eq!(v["schema_version"], SCHEMA_VERSION);
+        assert_eq!(v["process_count"], 1);
+        assert_eq!(v["processes"][0]["pid"], 7);
+        assert!(v["generated_at"].is_number());
+    }
+
+    #[test]
+    fn record_writer_writes_header_and_rows() {
+        let path = std::env::temp_dir().join(format!("witr-record-{}.csv", std::process::id()));
+        let mut w = RecordWriter::create(path.to_str().unwrap()).unwrap();
+        let mut hist = history::History::new();
+        let procs = vec![proc(3, "worker", None, Some(2048))];
+        let _ = hist.update(&procs); // first sample: no cpu/io deltas yet
+        w.append(&procs, &hist);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps"
+        );
+        assert_eq!(lines.len(), 2, "one header + one row");
+        let row = lines[1];
+        // first sample: no cpu/io deltas yet → empty cells; rss 2048 KiB → 2
+        let fields: Vec<&str> = row.split(',').collect();
+        assert_eq!(fields.len(), 8, "{row}");
+        assert_eq!((fields[1], fields[2], fields[3]), ("3", "-", "worker"), "{row}");
+        assert_eq!(fields[4], "", "no cpu delta on the first sample: {row}");
+        assert_eq!(fields[5], "2", "2048 KiB → 2 MB rss: {row}");
+        assert_eq!((fields[6], fields[7]), ("", ""), "no io yet: {row}");
+        assert!(fields[0].parse::<u64>().is_ok(), "unix timestamp: {row}");
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -22,7 +22,23 @@ A Rust implementation of [pranshuparmar/witr](https://github.com/pranshuparmar/w
 
 **Detail-page disk I/O chart**: two block-char sparklines for read/write rates (each annotated with its window peak), fed by the same cross-platform cumulative-byte deltas as the IO column (Linux `/proc/<pid>/io`; the section hides itself on macOS/Windows where per-process I/O is unavailable).
 
-**Snapshot diff (`--snap` / `--diff`)**: `witr-rs --snap before.json` writes the whole process table as JSON; later `witr-rs --diff before.json` reports what changed — **new** processes, **gone** ones, **restarted** (same program identity back under a new pid, like the TUI's crash-loop detector — including a restart that happens to reuse the same pid: same pid, same identity, different start time counts as restarted) and **changed** (same pid, same identity, different command line). A pid taken over by an unrelated program no longer mis-reports as changed: the old process is **gone** (noted "pid taken over"), the new one **new** (noted "pid reused"). Exit code 1 when anything changed, 0 otherwise — script-friendly.
+**Snapshot diff (`--snap` / `--diff`)**: `witr-rs --snap before.json` writes the whole process table as JSON; later `witr-rs --diff before.json` reports what changed — **new** processes, **gone** ones, **restarted** (same program identity back under a new pid, like the TUI's crash-loop detector — including a restart that happens to reuse the same pid: same pid, same identity, different start time counts as restarted) and **changed** (same pid, same identity, different command line). A pid taken over by an unrelated program no longer mis-reports as changed: the old process is **gone** (noted "pid taken over"), the new one **new** (noted "pid reused"). Exit code 1 when anything changed, 0 otherwise — script-friendly. Pathless `witr-rs --snap` **auto-rotates**: snapshots land in `snapshots/` next to the config dir, keeping the newest 10 by default (`--keep N`); `--diff last` compares against the newest auto snapshot and `--diff 30m` against "30 minutes ago" — what appeared and disappeared in the last half hour, one command.
+
+**Ranking (`--top`)**: `witr-rs --top cpu -n 30` skips the TUI and prints the top N processes ranked by CPU / memory / fd count / disk I/O (`--top fd` reads `/proc/<pid>/fd` on Linux and sweeps one `lsof -F pf` pass on macOS; Windows exits with a clear message since it has no source; `--top io` is Linux-only). "What's busiest right now" without opening a UI.
+
+**Tabular output (`--csv` / `--markdown`)**: machine-readable forms of the process table — `--csv` escapes per RFC-4180 (commas, quotes and newlines inside command lines are safe), `--markdown` pastes straight into an issue or doc; both include NAME plus the full command line.
+
+**CSV time series (`--watch` + `--record`)**: `witr-rs --watch 5 --record load.csv` appends the whole process table to a CSV every 5 seconds — timestamp / pid / user / name / cpu_pct / rss_mb / io read+write rates (columns left empty where the platform doesn't report them). Replay the load curve afterwards with Excel / pandas / SQLite; console output is untouched.
+
+**HTML report (`--report-html`)**: `witr-rs --report-html status.html` writes a self-contained single-file report (no JS, no dependencies): per-process CPU / memory bars, Top-CPU / Top-memory boards, and a nine-column table of every process, fully HTML-escaped — attach it, archive it, send it.
+
+**Tree kill (`K`)**: the actions bar gains `K` — a BFS over ppid links collects every descendant of the selected process (grandchildren included, even if a parent is reaped mid-walk), prompts `kill pid N + M descendant(s)? y to confirm`, and SIGTERMs the whole tree on `y`. Killing a worker pool or a user session tree no longer means hunting pids one by one.
+
+**Process notes (`N`)**: on the Processes tab, `N` opens a note prompt for the selected process (Enter saves, Esc discards, empty text removes), persisted by identity into the config file's `notes` key — the note follows the program across restarts and new pids; the table row shows a ✎ marker and the detail page gains a Note section. Leave the answer to "what is this python actually doing".
+
+**Help overlay (`?`)**: from any page, `?` opens a full keymap for the current tab (global keys + per-tab sections), `j/k` scrolls; Esc / q / Backspace / `?` again returns to the page it was opened **from** (open it on a detail page, land back on that detail page). No key left unmemorized.
+
+**JSON schema**: `--json` output is now a versioned envelope `{schema_version, generated_at, process_count, processes}` so downstream parsers can check the version before trusting the shape.
 
 **Follow across restarts (`--follow`)**: `witr-rs --pid 1234 --follow` keeps tracing the target after it dies — when the pid exits, the process table is re-scanned for the same program identity (name+exe+user) and the trace continues under the new pid (implies `--watch`; gives up after the identity stays missing for 3 refreshes). Multi-instance ambiguity resolves to the most recently started match.
 
@@ -40,9 +56,9 @@ A Rust implementation of [pranshuparmar/witr](https://github.com/pranshuparmar/w
 
 **Session digest (`--since` / `S`)**: `witr-rs --replay ev.jsonl --since 1h` skips the UI — it prints a "what happened" digest of the recorded window and exits (pipe-friendly): started / exited / restarted counts plus restart chains (which program restarted how many times). In the TUI, `S` opens the same digest as a full page: activity counts, restart chains, and two boards — **CPU spikes** (highest instantaneous peak per process in the window) and **memory climbers** (fastest RSS growth); `--since` presets the window (30, 30s, 5m, 2h, 1d — default: whole session), `r` recomputes. Answers "what has this machine been busy with for the last half hour".
 
-**Threshold alerts (`--alert-cpu` / `--alert-mem`)**: `witr-rs --alert-cpu 90 --alert-mem 2048` — when a process exceeds the threshold for 5 consecutive samples (~15 seconds): a desktop notification fires, the Events tab records an alert, and the row highlights red. One notification per excursion, re-armed once usage drops back under — no alert storms. With **`--alert-exec`** a custom command runs on every firing (webhook: `--alert-exec 'curl -s $SLACK_HOOK -d "$WITR_ALERT_NAME: $WITR_ALERT_DETAIL"'`); the context rides in as `WITR_ALERT_PID` / `WITR_ALERT_NAME` / `WITR_ALERT_DETAIL` environment variables.
+**Threshold alerts (`--alert-cpu` / `--alert-mem` / `--alert-fd` / `--alert-io`)**: `witr-rs --alert-cpu 90 --alert-mem 2048` — when a process exceeds the threshold for 5 consecutive samples (~15 seconds): a desktop notification fires, the Events tab records an alert, and the row highlights red. One notification per excursion, re-armed once usage drops back under — no alert storms. `--alert-fd 4096` watches open-file counts (Linux reads `/proc` directly; macOS sweeps one `lsof` pass per cycle — only while the alert is armed); `--alert-io 100` watches disk I/O rate (read+write MB/s, from Linux `/proc/<pid>/io` deltas). With **`--alert-exec`** a custom command runs on every firing (webhook: `--alert-exec 'curl -s $SLACK_HOOK -d "$WITR_ALERT_NAME: $WITR_ALERT_DETAIL"'`); the context rides in as `WITR_ALERT_PID` / `WITR_ALERT_NAME` / `WITR_ALERT_DETAIL` environment variables.
 
-**Config file**: `~/.config/witr-rs/config.toml` (macOS: `~/Library/Application Support/witr-rs/`, Windows: `%APPDATA%\witr-rs\`) — five keys, `refresh_secs` (sampling interval) / `sort` (default sort) / `notify` / `paused` / `watch` (watchlist), acting as defaults for the CLI flags: the file loads first, the command line always wins. Bad lines are skipped with a warning; no file changes nothing.
+**Config file**: `~/.config/witr-rs/config.toml` (macOS: `~/Library/Application Support/witr-rs/`, Windows: `%APPDATA%\witr-rs\`) — six keys, `refresh_secs` (sampling interval) / `sort` (default sort) / `notify` / `paused` / `watch` (watchlist) / `notes` (process annotations), acting as defaults for the CLI flags: the file loads first, the command line always wins. Bad lines are skipped with a warning; no file changes nothing.
 
 **Watchlist (`w`)**: on the Processes tab, `w` stars the selected row and pins it to the top (your chosen sort still applies inside the pinned block); press again to unwatch. Entries persist by identity (name + exe basename + user) into the config file's `watch` key — no pid in the key, so the ★ follows the program across restarts. Tree mode skips pinning (it would tear children from parents); search filters still apply.
 
@@ -68,8 +84,9 @@ Vim-style browsing (aligned with the Go witr):
 | `t` `e` `p` `n` | Events tab: sort by time / event / PID / process (time defaults newest-first; press again to flip direction) |
 | `T` | Processes tab: tree view ↔ flat table (children nest under their parent; a live search shows flat) |
 | `F` | Logs page: toggle the live log stream (container `logs -f` / journald `journalctl -f` / macOS `log stream` — the command follows the source) |
-| `a` | Ports tab: listening-only ↔ all socket states; Locks tab: locks ↔ all open files; Processes tab: actions bar (`k` kill / `t` term / `p` pause / `r` resume / `n` renice) |
+| `a` | Ports tab: listening-only ↔ all socket states; Locks tab: locks ↔ all open files; Processes tab: actions bar (`k` kill / `K` tree-kill / `t` term / `p` pause / `r` resume / `n` renice) |
 | `w` | Processes tab: watch the selected process (★ pins it to the top, persists to the config file across sessions, matched by identity so restarts under a new pid keep it); press again to unwatch |
+| `N` | Processes tab: annotate the selected process (Enter saves / Esc discards / empty removes; identity-persisted, ✎ marker on the row, survives restarts) |
 | `o` | Ports tab: per-socket detail ↔ aggregate overview keyed by (port, owner) (`Enter` opens the owner's process detail) |
 | `l` | Detail page / Events tab: pull the process's recent logs (container logs / journalctl / macOS unified log) into a full-screen scrollable Logs page; on exited Events rows the auto-captured last words appear instantly |
 | `S` | Open the session summary page (activity counts / restart chains / CPU-spike board / memory climbers; window from `--since`), `r` recompute, `Esc` back |
@@ -78,6 +95,7 @@ Vim-style browsing (aligned with the Go witr):
 | `!` | Toggle desktop notifications (`--notify` pre-enables; footer shows the state) |
 | `z` | Zoom: the focused pane temporarily fills the row (tmux-style) |
 | `x` | Kill the selected process (y/n confirm) |
+| `?` | Keymap overlay: global keys + sections for the current tab, `j/k` scrolls, Esc/q/Backspace returns to the page it was opened from |
 | `r` | Refresh now |
 | In detail pages | `j/k` scroll, `d/u` half page, `g/G` top/bottom, `b/f` page, `Tab` switch panes, `a` actions bar, `l` recent logs, `/` search env vars, `z` zoom, `c` copy pane text, `Esc/q` back |
 | Mouse | Wheel scrolls the list / detail panes; click switches tabs, selects rows, focuses panes; double-click opens the detail |
@@ -127,6 +145,7 @@ Details of the selected process refresh 500ms after the cursor stops moving (deb
 | nohup/disown detection | ✓ (SIGHUP bit of `/proc/<pid>/status` SigIgn, surfaced as a warning) | ✗ | ✗ |
 | Environment variables (`--env` / TUI detail page) | ✓ `/proc/<pid>/environ` (same user) | ✓ same-user processes via `ps -E` (the rest are SIP-limited; the pane says so) | ✗ |
 | Per-process disk I/O (TUI IO column + detail totals) | ✓ `/proc/<pid>/io` (byte deltas → rate) | ✓ `proc_pid_rusage` | ✓ PowerShell IO_COUNTERS |
+| Per-process fd count (`--top fd` / `--alert-fd`) | ✓ direct `/proc/<pid>/fd` reads | ✓ single `lsof -F pf` sweep | ✗ |
 | Start time | btime + starttime | `ps etime` | CIM CreationDate |
 
 Optional cross-platform extras (identical on all three; silently skipped when the dependency is missing): `nvidia-smi` (GPU column), `kubectl` (K8s pod attribution), `docker`/`podman`/`nerdctl` (Containers tab).
@@ -186,10 +205,16 @@ witr-rs --pid 1234 --logs 50  # the process's last 50 log lines (container/journ
 witr-rs --events-log ev.jsonl # record TUI events to disk (JSONL, append)
 witr-rs --replay ev.jsonl     # replay a recording, opening on the Events tab
 witr-rs --replay ev.jsonl --since 1h # "what happened" digest of the recording: counts + restart chains, printed and exit
-witr-rs --alert-cpu 90 --alert-mem 2048 # sustained threshold breach → notification + Events record + red row highlight
+witr-rs --top cpu -n 30       # top 30 by CPU (--top mem|fd|io likewise; no TUI)
+witr-rs --csv                 # whole table as CSV (RFC-4180 escaping; --markdown for docs)
+witr-rs --watch 5 --record load.csv # append the whole table to a CSV every 5s
+witr-rs --report-html status.html   # self-contained HTML report (bars + top boards + full table)
+witr-rs --alert-fd 4096 --alert-io 100 # fd-count / disk-IO-rate threshold alerts (same mechanism as CPU)
 witr-rs --alert-cpu 90 --alert-exec 'curl -s $SLACK_HOOK -d "$WITR_ALERT_NAME: $WITR_ALERT_DETAIL"' # run a command on every alert firing (webhook)
 witr-rs --snap before.json    # write the process table as JSON and exit
+witr-rs --snap                # auto snapshot: stored next to the config dir, rotating (keeps 10; --keep N)
 witr-rs --diff before.json    # new / gone / restarted / changed vs a snapshot (identity-based; pid reuse doesn't fool it; exit 1 on change)
+witr-rs --diff last           # diff against the newest auto snapshot (--diff 30m = the one from 30 minutes ago)
 witr-rs --pid 1234 --follow   # keep tracing across restarts (new pid, same program)
 witr-rs --pid 1234 --follow --on-exit 'say gone'  # run a command once when a watched target disappears (follow then exits 2 when truly gone)
 witr-rs --notify              # TUI desktop notifications: restarts always, crash-loop exits too
@@ -253,10 +278,10 @@ src/
 ├── ancestry.rs     ppid chain walk (cycle guard, depth limit, missing-parent warnings)
 ├── pipeline.rs     target resolution (name/pid/port/file/container → pid), attribution priority, warnings
 ├── tui.rs          interactive UI (ratatui/crossterm): five tabs + detail panes + mouse + 3s auto-refresh
-├── render.rs       standard / tree / short / json / env / warnings / export renderers
+├── render.rs       standard / tree / short / json / env / warnings / export / csv / markdown / top / html renderers
 ├── history.rs      sampling history: instantaneous cpu, sparklines, memory trend + leak suspicion, restart detection, event feed, session summary
-├── config.rs       user config file (flat toml subset: refresh_secs/sort/notify/paused/watch; CLI overrides)
-├── snapshot.rs     --snap / --diff: full-table snapshots + new/gone/restarted/changed comparison
+├── config.rs       user config file (flat toml subset: refresh_secs/sort/notify/paused/watch/notes; CLI overrides)
+├── snapshot.rs     --snap / --diff: full-table snapshots (with auto-rotation) + new/gone/restarted/changed comparison
 ├── logs.rs         crash log correlation: container logs / journalctl / macOS unified log
 ├── risk.rs         0–10 risk scoring (temp-dir binary, curl|sh, injections, public peers, bad signatures …)
 ├── binary_id.rs    binary sha256 + code-signature verdict (codesign / Authenticode)
@@ -288,6 +313,7 @@ Attribution priority: container > ssh session > interactive shell > service mana
 - macOS `launchctl list` only covers the current user domain; system daemons need sudo to be labeled. macOS file locks are approximated from `lsof` flags — the kernel exports no lock table there
 - nohup/disown detection is Linux-only (no `/proc` on macOS/Windows, so no such warning there)
 - The GPU column covers NVIDIA only (`nvidia-smi`); there is no per-process utilization source for Apple Silicon / AMD GPUs
+- `--top fd` / `--alert-fd` are absent on Windows (no per-process fd source); `--top io` / `--alert-io` and the `--record` io-rate columns are Linux-only (`/proc/<pid>/io`)
 
 ## License
 

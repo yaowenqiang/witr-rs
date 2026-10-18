@@ -166,6 +166,31 @@ fn sysctl_str(_name: &str) -> Option<String> {
     None
 }
 
+/// Per-pid descriptor counts from one `lsof -F pf` scan: `p<pid>` opens a
+/// process section, each `f<fd>` line inside counts one descriptor. Pure —
+/// compiled everywhere so the trait impl does.
+#[cfg(any(target_os = "macos", test))]
+fn parse_lsof_fd_counts(text: &str) -> std::collections::HashMap<Pid, u64> {
+    let mut out: std::collections::HashMap<Pid, u64> = std::collections::HashMap::new();
+    let mut cur: Option<Pid> = None;
+    for l in text.lines() {
+        if let Some(rest) = l.strip_prefix('p') {
+            cur = rest.parse().ok();
+        } else if l.starts_with('f') {
+            if let Some(pid) = cur {
+                *out.entry(pid).or_insert(0) += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Non-macOS stub — see [`parse_lsof_fd_counts`].
+#[cfg(not(target_os = "macos"))]
+fn parse_lsof_fd_counts(_text: &str) -> std::collections::HashMap<Pid, u64> {
+    std::collections::HashMap::new()
+}
+
 /// (1, 5, 15-minute load) via getloadavg — empty on platforms without it.
 #[cfg(target_os = "macos")]
 fn loadavg() -> (Option<f64>, Option<f64>, Option<f64>) {
@@ -908,6 +933,17 @@ impl Platform for MacOs {
         (n > 0).then_some(n)
     }
 
+    fn fd_counts(&self) -> Option<std::collections::HashMap<Pid, u64>> {
+        // one system-wide field-mode scan: `p<pid>` opens each process's
+        // section, every `f<fd>` line inside counts one descriptor
+        let out = crate::util::run_ok(
+            "lsof",
+            &["-w", "-n", "-P", "-F", "pf"],
+            std::time::Duration::from_secs(10),
+        )?;
+        Some(parse_lsof_fd_counts(&out))
+    }
+
     fn list_locks(&self, pid: Option<Pid>) -> Vec<LockEntry> {
         let mut args = vec!["-l", "-n", "-P", "-w"];
         let pid_arg;
@@ -1323,6 +1359,28 @@ fn parse_cpu_time_to_ms(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lsof_fd_counts_sections_and_garbage() {
+        let text = "\
+p42
+f0
+f1
+f2
+f256
+p7
+f3
+pnotapid
+f9
+f10
+";
+        let m = parse_lsof_fd_counts(text);
+        assert_eq!(m.get(&42), Some(&4));
+        assert_eq!(m.get(&7), Some(&1));
+        // an unparseable `p` line closes the section — the orphan fds that
+        // follow count into no pid instead of leaking into the previous one
+        assert_eq!(m.len(), 2, "{m:?}");
+    }
 
     #[test]
     #[cfg(target_os = "macos")]

@@ -466,6 +466,23 @@ impl Platform for Linux {
             .map(|d| d.count() as u64)
     }
 
+    fn fd_counts(&self) -> Option<std::collections::HashMap<Pid, u64>> {
+        let mut out = std::collections::HashMap::new();
+        let dirs = std::fs::read_dir("/proc").ok()?;
+        for d in dirs.flatten() {
+            let Ok(pid) = d.file_name().to_string_lossy().parse::<Pid>() else {
+                continue;
+            };
+            if pid <= 0 {
+                continue;
+            }
+            if let Some(n) = self.fd_count(pid) {
+                out.insert(pid, n);
+            }
+        }
+        Some(out)
+    }
+
     fn list_all_open_files(&self) -> Vec<LockEntry> {
         let mut out = Vec::new();
         let mut comms: HashMap<Pid, String> = HashMap::new();

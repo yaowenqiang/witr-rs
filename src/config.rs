@@ -13,6 +13,7 @@
 //! notify = false          # desktop notifications on restarts (as --notify)
 //! paused = false          # start with sampling frozen (as 'P')
 //! watch = ["nginx|nginx|www"]  # TUI watchlist ('w'), one "name|exe|user" per entry
+//! notes = ["nginx|nginx|www|reverse proxy for the lab"]  # 'N' annotations
 //! ```
 
 use std::path::PathBuf;
@@ -30,6 +31,11 @@ pub struct Config {
     /// is not part of the key. Written back by `save_watch` when 'w' is
     /// pressed in the TUI.
     pub watch: Vec<String>,
+    /// Process annotations, each "name|exe_basename|user|note text" — the
+    /// identity triple extended with the note as a 4th field (splitn(4),
+    /// so note text may itself contain `|`). Written back by `save_notes`
+    /// when 'N' commits in the TUI.
+    pub notes: Vec<String>,
 }
 
 impl Config {
@@ -120,6 +126,57 @@ impl Config {
         std::fs::write(&path, out)
     }
 
+    /// Persist the notes list — same surgical line rewrite as
+    /// [`Config::save_watch`], for the `notes = [...]` key.
+    pub fn save_notes(entries: &[String]) -> std::io::Result<()> {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Ok(());
+        };
+        Self::save_notes_under(&std::path::PathBuf::from(home), entries)
+    }
+
+    /// save_notes under an explicit home dir (split out for tests).
+    pub fn save_notes_under(home: &std::path::Path, entries: &[String]) -> std::io::Result<()> {
+        let path = Self::path_under(home);
+        if entries.is_empty() && !path.exists() {
+            return Ok(());
+        }
+        let old = std::fs::read_to_string(&path).unwrap_or_default();
+        let items: Vec<String> = entries
+            .iter()
+            .map(|e| format!("\"{}\"", e.replace('\\', "\\\\").replace('"', "\\\"")))
+            .collect();
+        let line = format!("notes = [{}]", items.join(", "));
+        let mut out = String::with_capacity(old.len() + line.len() + 2);
+        let mut replaced = false;
+        for raw in old.lines() {
+            let is_notes_line = raw
+                .split_once('=')
+                .is_some_and(|(k, _)| k.trim() == "notes");
+            if is_notes_line {
+                if !replaced {
+                    out.push_str(&line);
+                    out.push('\n');
+                    replaced = true;
+                }
+            } else {
+                out.push_str(raw);
+                out.push('\n');
+            }
+        }
+        if !replaced {
+            if !old.is_empty() && !old.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, out)
+    }
+
     /// Parse the flat subset: `key = value` lines, `#` comments, `[section]`
     /// headers tolerated and ignored. Returns the config plus one warning
     /// string per skipped line (unknown key, bad value, no `=`).
@@ -151,6 +208,10 @@ impl Config {
                 "watch" => match parse_string_array(value) {
                     Some(list) => cfg.watch = list,
                     None => warnings.push(format!("line {n}: watch is not a string array, skipped")),
+                },
+                "notes" => match parse_string_array(value) {
+                    Some(list) => cfg.notes = list,
+                    None => warnings.push(format!("line {n}: notes is not a string array, skipped")),
                 },
                 "notify" | "paused" => match quoted.parse::<bool>() {
                     Ok(v) => {
@@ -227,9 +288,36 @@ watch = [\"nginx|nginx|www\", \"tailspid|sleep|\"]
                 notify: Some(true),
                 paused: Some(false),
                 watch: vec!["nginx|nginx|www".into(), "tailspid|sleep|".into()],
+                notes: Vec::new(),
             }
         );
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn parse_notes_and_save_roundtrips() {
+        let (cfg, w) = Config::parse("notes = [\"nginx|nginx|www|reverse proxy\"]\n");
+        assert_eq!(cfg.notes, vec!["nginx|nginx|www|reverse proxy"]);
+        assert!(w.is_empty());
+        // a note whose text contains `|` survives — splitn(4) keeps it whole
+        let (cfg, _) = Config::parse("notes = [\"a|b|c|first | second\"]\n");
+        assert_eq!(cfg.notes, vec!["a|b|c|first | second"]);
+        let (cfg, w) = Config::parse("notes = oops\n");
+        assert!(cfg.notes.is_empty());
+        assert_eq!(w.len(), 1);
+
+        // save preserves the rest of the file, like save_watch
+        let dir = std::env::temp_dir().join(format!("witr-notes-test-{}", std::process::id()));
+        let path = Config::path_under(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "refresh_secs = 3\nnotes = [\"old|x|y|stale\"]\n").unwrap();
+        Config::save_notes_under(&dir, &["nginx|nginx|www|hello world".to_string()]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (cfg, _) = Config::parse(&text);
+        assert_eq!(cfg.notes, vec!["nginx|nginx|www|hello world"]);
+        assert_eq!(cfg.refresh_secs, Some(3), "untouched key survives");
+        assert_eq!(text.matches("notes =").count(), 1, "exactly one notes line");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

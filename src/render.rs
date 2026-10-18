@@ -171,6 +171,291 @@ pub enum Format {
     Json,
 }
 
+/// Escape one RFC-4180 CSV field: quotes double, anything containing a
+/// comma, quote or newline gets wrapped in quotes.
+pub fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Escape for HTML text content and double-quoted attributes.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The normalized row behind the csv / markdown / html listing outputs —
+/// one flat view of a process so the three formats can't drift apart.
+pub struct ListingRow {
+    pub pid: i32,
+    pub ppid: Option<i32>,
+    pub user: String,
+    pub cpu: Option<f64>,
+    pub rss_mb: Option<u64>,
+    pub state: String,
+    pub age: String,
+    pub name: String,
+    pub command: String,
+}
+
+fn listing_row(p: &Process, now: i64) -> ListingRow {
+    ListingRow {
+        pid: p.pid,
+        ppid: p.ppid,
+        user: p.user.clone().unwrap_or_else(|| "-".into()),
+        cpu: p.cpu,
+        rss_mb: p.mem_kb.map(|kb| kb / 1024),
+        state: p.state.clone().unwrap_or_default(),
+        age: p.started.map(|t| fmt_age(now - t)).unwrap_or_default(),
+        name: p.name.clone(),
+        command: p.command_line(),
+    }
+}
+
+/// `--csv` on the listing / --top: one header row, one row per process.
+pub fn render_csv(procs: &[Process]) -> String {
+    let now = crate::util::now_unix();
+    let mut out = String::from(
+        "pid,ppid,user,cpu_pct,rss_mb,state,age,name,command\n",
+    );
+    for p in procs {
+        let r = listing_row(p, now);
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            r.pid,
+            r.ppid.map(|x| x.to_string()).unwrap_or_default(),
+            csv_field(&r.user),
+            r.cpu.map(|c| format!("{c:.1}")).unwrap_or_default(),
+            r.rss_mb.map(|m| m.to_string()).unwrap_or_default(),
+            csv_field(&r.state),
+            csv_field(&r.age),
+            csv_field(&r.name),
+            csv_field(&r.command),
+        ));
+    }
+    out
+}
+
+/// `--markdown` on the listing / --top: a GitHub-flavored table. Pipe
+/// characters in commands are escaped so the row structure survives
+/// pasting into an issue.
+pub fn render_markdown(procs: &[Process]) -> String {
+    let now = crate::util::now_unix();
+    let mut out = String::from("| PID | PPID | USER | CPU% | RSS MB | STATE | AGE | NAME | COMMAND |\n");
+    out.push_str("|---:|---:|---|---:|---:|---|---|---|---|\n");
+    for p in procs {
+        let r = listing_row(p, now);
+        let dash = "-".to_string();
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            r.pid,
+            r.ppid.map(|x| x.to_string()).unwrap_or_else(|| dash.clone()),
+            r.user,
+            r.cpu.map(|c| format!("{c:.1}")).unwrap_or_else(|| dash.clone()),
+            r.rss_mb.map(|m| m.to_string()).unwrap_or_else(|| dash.clone()),
+            if r.state.is_empty() { dash.clone() } else { r.state.clone() },
+            if r.age.is_empty() { dash.clone() } else { r.age },
+            r.name,
+            r.command.replace('|', "\\|"),
+        ));
+    }
+    out
+}
+
+/// `--top METRIC`: the highest-ranked processes by one metric, value first.
+/// Processes the metric can't measure (foreign-user fd counts, no io
+/// counters off Linux) drop out rather than rank as zero.
+pub fn render_top(
+    procs: &[Process],
+    metric: crate::cli::TopMetric,
+    count: usize,
+    fds: Option<&std::collections::HashMap<crate::model::Pid, u64>>,
+    p: &Painter,
+) -> String {
+    let now = crate::util::now_unix();
+    let mut ranked: Vec<(f64, &Process)> = procs
+        .iter()
+        .filter_map(|pr| {
+            let v = match metric {
+                crate::cli::TopMetric::Cpu => pr.cpu,
+                crate::cli::TopMetric::Mem => pr.mem_kb.map(|kb| kb as f64),
+                crate::cli::TopMetric::Fd => fds.and_then(|m| m.get(&pr.pid)).map(|&n| n as f64),
+                crate::cli::TopMetric::Io => {
+                    let r = pr.io_read_bytes.unwrap_or(0);
+                    let w = pr.io_write_bytes.unwrap_or(0);
+                    (pr.io_read_bytes.is_some() || pr.io_write_bytes.is_some())
+                        .then_some((r + w) as f64)
+                }
+            }?;
+            Some((v, pr))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(count);
+
+    let mut rows: Vec<[String; 5]> = vec![[
+        "PID".into(),
+        "USER".into(),
+        metric.header().into(),
+        "AGE".into(),
+        "COMMAND".into(),
+    ]];
+    for (v, pr) in &ranked {
+        let val = match metric {
+            crate::cli::TopMetric::Cpu => format!("{v:.1}"),
+            crate::cli::TopMetric::Mem => crate::util::fmt_bytes(*v as u64),
+            crate::cli::TopMetric::Fd => format!("{}", *v as u64),
+            crate::cli::TopMetric::Io => crate::util::fmt_bytes(*v as u64),
+        };
+        rows.push([
+            pr.pid.to_string(),
+            pr.user.clone().unwrap_or_else(|| "-".into()),
+            val,
+            pr.started.map(|t| fmt_age(now - t)).unwrap_or_else(|| "-".into()),
+            pr.command_line(),
+        ]);
+    }
+    let w = [
+        rows.iter().map(|r| r[0].chars().count()).max().unwrap_or(3),
+        rows.iter().map(|r| r[1].chars().count()).max().unwrap_or(4),
+        rows.iter().map(|r| r[2].chars().count()).max().unwrap_or(3),
+        rows.iter().map(|r| r[3].chars().count()).max().unwrap_or(3),
+    ];
+    let mut out = String::new();
+    let head = p.bold(&rows[0][0]);
+    let _ = writeln!(
+        out,
+        "{:>w0$}  {:<w1$}  {:>w2$}  {:>w3$}  {}",
+        head,
+        p.bold(&rows[0][1]),
+        p.bold(&rows[0][2]),
+        p.bold(&rows[0][3]),
+        p.bold(&rows[0][4]),
+        w0 = w[0],
+        w1 = w[1],
+        w2 = w[2],
+        w3 = w[3]
+    );
+    for r in rows.iter().skip(1) {
+        let _ = writeln!(
+            out,
+            "{:>w0$}  {:<w1$}  {:>w2$}  {:>w3$}  {}",
+            r[0], r[1], r[2], r[3], r[4],
+            w0 = w[0],
+            w1 = w[1],
+            w2 = w[2],
+            w3 = w[3]
+        );
+    }
+    if ranked.is_empty() {
+        let why = match metric {
+            crate::cli::TopMetric::Fd => "no fd counts available on this platform".to_string(),
+            crate::cli::TopMetric::Io => {
+                "no per-process I/O counters (a Linux /proc feature)".to_string()
+            }
+            _ => "no processes report this metric".to_string(),
+        };
+        let _ = writeln!(out, "({why})");
+    }
+    out
+}
+
+/// `--report-html FILE`: a self-contained report — no JS, no external
+/// assets. Summary + top-5 lists + the full table, with css bars for the
+/// cpu/mem columns so outliers read at a glance.
+pub fn render_html_report(procs: &[Process]) -> String {
+    let now = crate::util::now_unix();
+    let rows: Vec<ListingRow> = procs.iter().map(|p| listing_row(p, now)).collect();
+    let max_cpu = rows.iter().filter_map(|r| r.cpu).fold(0.0f64, f64::max);
+    let max_rss = rows.iter().filter_map(|r| r.rss_mb).max().unwrap_or(0);
+
+    let mut top_cpu: Vec<&ListingRow> = rows.iter().filter(|r| r.cpu.is_some()).collect();
+    top_cpu.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+    top_cpu.truncate(5);
+    let mut top_mem: Vec<&ListingRow> = rows.iter().filter(|r| r.rss_mb.is_some_and(|m| m > 0)).collect();
+    top_mem.sort_by_key(|r| std::cmp::Reverse(r.rss_mb));
+    top_mem.truncate(5);
+
+    let top_list = |items: &[&ListingRow], val: &dyn Fn(&ListingRow) -> String| -> String {
+        let mut s = String::from("<ol>");
+        for r in items {
+            s.push_str(&format!(
+                "<li><span class=\"who\">{}</span> <span class=\"val\">{}</span></li>",
+                html_escape(&r.name),
+                val(r),
+            ));
+        }
+        s.push_str("</ol>");
+        s
+    };
+
+    let mut table = String::new();
+    for r in &rows {
+        let cpu_bar = r.cpu.map(|c| {
+            let w = if max_cpu > 0.0 { (c / max_cpu * 100.0).round() as u32 } else { 0 };
+            format!("<div class=\"bar\"><div class=\"fill cpu\" style=\"width:{w}%\"></div></div> {:.1}", c)
+        }).unwrap_or_else(|| "-".into());
+        let rss_bar = r.rss_mb.map(|m| {
+            let w = if max_rss > 0 { (m * 100 / max_rss) as u32 } else { 0 };
+            format!("<div class=\"bar\"><div class=\"fill rss\" style=\"width:{w}%\"></div></div> {m} MB")
+        }).unwrap_or_else(|| "-".into());
+        table.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td></tr>\n",
+            r.pid,
+            r.ppid.map(|x| x.to_string()).unwrap_or_else(|| "-".into()),
+            html_escape(&r.user),
+            cpu_bar,
+            rss_bar,
+            html_escape(&r.state),
+            html_escape(&r.age),
+            html_escape(&r.name),
+            html_escape(&r.command),
+        ));
+    }
+
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n\
+         <title>witr-rs report · {when}</title>\n\
+         <style>\n\
+         body {{ font-family: -apple-system, 'Segoe UI', sans-serif; margin: 2rem; color: #1a1a2e; }}\n\
+         h1 {{ font-size: 1.4rem; }} .muted {{ color: #777; }}\n\
+         .cols {{ display: flex; gap: 3rem; flex-wrap: wrap; }}\n\
+         ol {{ padding-left: 1.2rem; }} .who {{ font-weight: 600; }} .val {{ color: #555; }}\n\
+         table {{ border-collapse: collapse; width: 100%; margin-top: 2rem; font-size: 0.85rem; }}\n\
+         th, td {{ text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid #e5e5ef; }}\n\
+         td.num {{ white-space: nowrap; }}\n\
+         .bar {{ display: inline-block; width: 8rem; height: 0.5rem; background: #eef; border-radius: 3px; vertical-align: middle; margin-right: 0.4rem; }}\n\
+         .fill {{ height: 100%; border-radius: 3px; }} .fill.cpu {{ background: #e5534b; }} .fill.rss {{ background: #3f6ad8; }}\n\
+         code {{ font-size: 0.8rem; color: #444; }}\n\
+         </style></head><body>\n\
+         <h1>witr-rs report</h1>\n\
+         <p class=\"muted\">{when} · {n} processes</p>\n\
+         <div class=\"cols\">\n\
+         <div><h2>Top CPU</h2>{top_cpu_html}</div>\n\
+         <div><h2>Top memory</h2>{top_mem_html}</div>\n\
+         </div>\n\
+         <table>\n\
+         <tr><th>PID</th><th>PPID</th><th>USER</th><th>CPU%</th><th>RSS</th><th>STATE</th><th>AGE</th><th>NAME</th><th>COMMAND</th></tr>\n\
+         {table}</table>\n\
+         </body></html>\n",
+        when = crate::util::fmt_time(now),
+        n = rows.len(),
+        top_cpu_html = top_list(&top_cpu, &|r| {
+            format!("{:.1}%", r.cpu.unwrap_or(0.0))
+        }),
+        top_mem_html = top_list(&top_mem, &|r| {
+            format!("{} MB", r.rss_mb.unwrap_or(0))
+        }),
+        table = table,
+    )
+}
+
+
 /// Minimal ANSI painter; every method degrades to plain text when disabled.
 pub struct Painter {
     enabled: bool,
@@ -774,4 +1059,106 @@ fn render_env_only(r: &TargetReport, p: &Painter) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proc(pid: i32, name: &str, cpu: Option<f64>, mem_kb: Option<u64>) -> Process {
+        Process {
+            pid,
+            name: name.into(),
+            cmdline: vec![name.into(), "--flag".into()],
+            cpu,
+            mem_kb,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn csv_fields_escape_commas_quotes_and_newlines() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("two\nlines"), "\"two\nlines\"");
+    }
+
+    #[test]
+    fn csv_and_markdown_render_header_plus_rows() {
+        let procs = vec![proc(7, "nginx", Some(1.5), Some(2048))];
+        let csv = render_csv(&procs);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "pid,ppid,user,cpu_pct,rss_mb,state,age,name,command");
+        assert!(lines[1].starts_with("7,,"));
+        assert!(lines[1].contains("1.5"));
+        assert!(lines[1].contains("2"), "2048 KiB → 2 MB");
+        assert!(lines[1].contains("nginx --flag"));
+        let md = render_markdown(&procs);
+        assert!(md.starts_with("| PID | PPID | USER | CPU% | RSS MB | STATE | AGE | NAME | COMMAND |"));
+        assert!(md.contains("| 7 |"));
+        assert!(md.contains("| 1.5 |"));
+    }
+
+    #[test]
+    fn markdown_escapes_pipes_in_commands() {
+        let mut p = proc(1, "sh", None, None);
+        p.cmdline = vec!["sh".into(), "-c".into(), "a | b".into()];
+        let md = render_markdown(std::slice::from_ref(&p));
+        assert!(md.contains("a \\| b"), "{md}");
+    }
+
+    #[test]
+    fn top_ranks_by_metric_and_drops_unmeasured() {
+        use crate::cli::TopMetric;
+        let painter = Painter::new(false);
+        let procs = vec![
+            proc(1, "low", Some(0.5), Some(1024)),
+            proc(2, "high", Some(9.0), Some(8192)),
+            proc(3, "unknown", None, None),
+        ];
+        let out = render_top(&procs, TopMetric::Cpu, 10, None, &painter);
+        let high = out.find("high").unwrap();
+        let low = out.find("low").unwrap();
+        assert!(high < low, "9.0 ranks above 0.5:\n{out}");
+        assert!(!out.contains("unknown"), "unmeasured processes drop out");
+        // count caps the rows
+        let out2 = render_top(&procs, TopMetric::Cpu, 1, None, &painter);
+        assert!(out2.contains("high"));
+        assert!(!out2.contains("low"), "count=1 keeps only the best");
+        // fd without a counts map → nothing to rank, note explains
+        let out3 = render_top(&procs, TopMetric::Fd, 10, None, &painter);
+        assert!(out3.contains("no fd counts"));
+        // io never measured → platform note
+        let out4 = render_top(&procs, TopMetric::Io, 10, None, &painter);
+        assert!(out4.contains("no per-process I/O counters"));
+    }
+
+    #[test]
+    fn top_fd_uses_the_counts_map() {
+        use crate::cli::TopMetric;
+        use std::collections::HashMap;
+        let painter = Painter::new(false);
+        let procs = vec![proc(1, "a", None, None), proc(2, "b", None, None)];
+        let mut fds = HashMap::new();
+        fds.insert(1, 4u64);
+        fds.insert(2, 900u64);
+        let out = render_top(&procs, TopMetric::Fd, 10, Some(&fds), &painter);
+        let b = out.find("b").unwrap();
+        let a = out.find("a").unwrap();
+        assert!(b < a, "900 fds ranks above 4:\n{out}");
+    }
+
+    #[test]
+    fn html_report_escapes_and_bars() {
+        let mut p = proc(1, "<script>", Some(50.0), Some(4096));
+        p.cmdline = vec!["x".into(), "&y".into()];
+        let html = render_html_report(std::slice::from_ref(&p));
+        assert!(!html.contains("<script>"), "name is escaped");
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("&amp;y"));
+        assert!(html.contains("width:100%"), "max-cpu row gets a full bar");
+        assert!(html.contains("Top CPU"));
+        assert!(html.contains("1 processes"));
+    }
 }

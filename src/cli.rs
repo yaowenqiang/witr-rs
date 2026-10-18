@@ -9,6 +9,31 @@ pub enum Shell {
     PowerShell,
 }
 
+/// Metric for `--top`.
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq)]
+pub enum TopMetric {
+    /// Lifetime average CPU percent
+    Cpu,
+    /// Resident set size
+    Mem,
+    /// Open descriptor count (Linux cheap; one lsof scan on macOS;
+    /// unsupported on Windows)
+    Fd,
+    /// Cumulative disk I/O bytes (read + write; Linux /proc)
+    Io,
+}
+
+impl TopMetric {
+    pub fn header(&self) -> &'static str {
+        match self {
+            TopMetric::Cpu => "CPU%",
+            TopMetric::Mem => "RSS",
+            TopMetric::Fd => "FDS",
+            TopMetric::Io => "IO",
+        }
+    }
+}
+
 /// Why is this running? — trace processes, ports and files back to what
 /// started them. A Rust rewrite inspired by pranshuparmar/witr.
 #[derive(Parser, Debug)]
@@ -26,7 +51,13 @@ pub enum Shell {
   witr-rs nginx --warnings show only the warnings
   witr-rs nginx --env      print the process environment
   witr-rs nginx --tree     full ancestry tree
-  witr-rs -i --port 8080   TUI opened on this port"
+  witr-rs -i --port 8080   TUI opened on this port
+  witr-rs --top cpu        hottest 15 processes, no TUI
+  witr-rs --top mem -n 30 --csv   top-30 memory as CSV
+  witr-rs --watch 5 --record load.csv   record a csv sample every 5s
+  witr-rs --snap           auto snapshot (rotates, keeps 10)
+  witr-rs --diff last      what changed since the last auto snapshot
+  witr-rs --report-html status.html   self-contained html report"
 )]
 pub struct Cli {
     /// Process name(s) to trace (substring match; combine with --exact).
@@ -97,6 +128,35 @@ pub struct Cli {
     #[arg(long = "recent", value_name = "DURATION")]
     pub recent: Option<String>,
 
+    /// Print the top N processes by this metric instead of a full listing
+    /// (default N = 15, override with --count). A no-target operation:
+    /// cannot be combined with targets.
+    #[arg(long = "top", value_name = "METRIC")]
+    pub top: Option<TopMetric>,
+
+    /// Row count for --top (default 15)
+    #[arg(short = 'n', long = "count", value_name = "N")]
+    pub count: Option<usize>,
+
+    /// Emit the listing / --top rows as CSV (one header row + one row per
+    /// process). A no-target format: cannot be combined with targets —
+    /// use --json there.
+    #[arg(long)]
+    pub csv: bool,
+
+    /// Emit the listing / --top rows as a Markdown table (pastes into
+    /// issues and PRs). Same rules as --csv.
+    #[arg(long)]
+    pub markdown: bool,
+
+    /// With --watch (no targets — it records the whole table): append one
+    /// CSV row per visible process per refresh tick to this file
+    /// (timestamp, pid, user, name, cpu%%, rss_mb, io read/write
+    /// bytes-per-second where the platform reports them). Leaves the
+    /// console output untouched.
+    #[arg(long = "record", value_name = "FILE")]
+    pub record: Option<String>,
+
     /// Re-run the current query every N seconds (default 2) until Ctrl-C.
     /// Works with targets, the plain listing and --recent.
     #[arg(
@@ -152,6 +212,21 @@ pub struct Cli {
     #[arg(long = "alert-mem", value_name = "MB")]
     pub alert_mem: Option<u64>,
 
+    /// Alert when a process exceeds this open-descriptor count for 5
+    /// consecutive samples (~15s) — the threshold-alert twin of
+    /// --alert-cpu/--alert-mem, for fd leaks. Costs one fd sweep per
+    /// refresh (cheap on Linux, one lsof scan on macOS, unsupported on
+    /// Windows). TUI only.
+    #[arg(long = "alert-fd", value_name = "N")]
+    pub alert_fd: Option<u64>,
+
+    /// Alert when a process exceeds this disk-I/O rate in MB/s (read +
+    /// write combined) for 5 consecutive samples (~15s). Per-process I/O
+    /// counters are a Linux /proc feature — other platforms cannot check.
+    /// TUI only.
+    #[arg(long = "alert-io", value_name = "MB/S")]
+    pub alert_io: Option<f64>,
+
     /// Run this shell command each time a threshold alert fires (needs
     /// --alert-cpu and/or --alert-mem; one run per excursion). The alert
     /// context is exported as WITR_ALERT_PID / WITR_ALERT_NAME /
@@ -160,6 +235,12 @@ pub struct Cli {
     #[arg(long = "alert-exec", value_name = "CMD")]
     pub alert_exec: Option<String>,
 
+    /// Self-contained HTML report of the current process table (summary
+    /// + full table with cpu/mem bars) written to this file and exit.
+    /// A no-target operation: cannot be combined with targets.
+    #[arg(long = "report-html", value_name = "FILE")]
+    pub report_html: Option<String>,
+
     /// Run this shell command once whenever a watched/followed target
     /// disappears (watch/follow mode only) — e.g. `--on-exit 'say gone'`.
     /// In --follow mode the loop still exits 2 when the program never
@@ -167,15 +248,30 @@ pub struct Cli {
     #[arg(long = "on-exit", value_name = "CMD")]
     pub on_exit: Option<String>,
 
-    /// Write every visible process as JSON to this file and exit — a
-    /// snapshot to --diff against later.
-    #[arg(long = "snap", value_name = "FILE")]
+    /// Write every visible process as JSON and exit — a snapshot to --diff
+    /// against later. Without a FILE the snapshot lands in the auto-rotate
+    /// directory under the config dir (the 10 most recent are kept) and the
+    /// chosen path is printed, so `--snap` / `--diff last` work without
+    /// managing files by hand.
+    #[arg(
+        long = "snap",
+        value_name = "FILE",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
     pub snap: Option<String>,
 
     /// Compare the current process table against a --snap file: new /
     /// gone / restarted (same program, new pid) / changed (cmdline).
-    #[arg(long = "diff", value_name = "FILE")]
+    /// FILE can also be `last` (the newest auto snapshot) or a duration
+    /// (`1h` — the newest snapshot at least that old).
+    #[arg(long = "diff", value_name = "FILE|last|DURATION")]
     pub diff: Option<String>,
+
+    /// How many auto snapshots --snap (without a FILE) keeps before
+    /// pruning the oldest (default 10)
+    #[arg(long = "keep", value_name = "N")]
+    pub keep: Option<usize>,
 
     /// With one --pid target: when the traced pid exits, keep going —
     /// re-acquire the same program (name+exe+user) under its new pid.

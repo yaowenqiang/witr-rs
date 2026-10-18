@@ -311,6 +311,9 @@ pub struct FileOverview {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TargetReport {
+    /// Bump when a serialized field changes meaning, so `--json` consumers
+    /// can branch safely (current: 1).
+    pub schema_version: u32,
     pub target: TargetSpec,
     /// false = nothing matched (report carries the reason in `error`)
     pub found: bool,
@@ -358,6 +361,7 @@ impl TargetReport {
     #[allow(clippy::too_many_arguments)]
     pub fn not_found(target: TargetSpec, error: String) -> Self {
         TargetReport {
+            schema_version: 1,
             target,
             found: false,
             error: Some(error),

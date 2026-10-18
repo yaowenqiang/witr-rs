@@ -478,6 +478,16 @@ pub trait Platform {
         None
     }
 
+    /// Open-descriptor counts for every process in one sweep — the
+    /// `--top fd` ranking and `--alert-fd` sampling read this. Linux walks
+    /// /proc/<pid>/fd (cheap); macOS parses one system-wide `lsof -F pf`
+    /// scan (~1s, acceptable because callers run it once per refresh only
+    /// when fd data is actually wanted); Windows has no equivalent probe
+    /// (None = the feature reports itself unavailable).
+    fn fd_counts(&self) -> Option<std::collections::HashMap<Pid, u64>> {
+        None
+    }
+
     /// Open files + file locks + fd usage in one pass. Platforms whose
     /// probes are expensive (macOS: every lookup is an lsof scan) override
     /// this so the detail page costs one scan instead of two. Default: the

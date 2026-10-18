@@ -25,6 +25,117 @@ pub fn load(path: &str) -> Result<Vec<Process>, String> {
     serde_json::from_str(&raw).map_err(|e| format!("{path}: invalid snapshot JSON: {e}"))
 }
 
+/// Directory the auto snapshots live in: `<config dir>/snapshots`
+/// (split out with an explicit home for tests).
+pub fn auto_dir_under(home: &std::path::Path) -> std::path::PathBuf {
+    crate::config::Config::path_under(home)
+        .parent()
+        .map(|p| p.join("snapshots"))
+        .unwrap_or_else(|| home.join("witr-rs-snapshots"))
+}
+
+/// `--snap` without a FILE: write to `snap-<unixts>.json` in the auto dir
+/// and prune everything but the newest `keep` files. Returns the path
+/// written so the caller can print it.
+pub fn save_auto(
+    home: &std::path::Path,
+    procs: &[Process],
+    keep: usize,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = auto_dir_under(home);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("snap-{}.json", crate::util::now_unix()));
+    save(path.to_str().unwrap_or_default(), procs)?;
+    prune(&dir, keep);
+    Ok(path)
+}
+
+/// Keep only the newest `keep` `snap-*.json` files (by name — the
+/// timestamp sorts lexicographically); failures to unlink are ignored
+/// (a file another process grabbed is not worth failing the snapshot).
+fn prune(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("snap-") && n.ends_with(".json"))
+        })
+        .collect();
+    files.sort();
+    while files.len() > keep {
+        let _ = std::fs::remove_file(files.remove(0));
+    }
+}
+
+/// Newest `snap-*.json` in the auto dir (lexicographic = chronological).
+pub fn newest_auto(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = auto_dir_under(home);
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("snap-") && n.ends_with(".json"))
+        })
+        .collect();
+    files.sort();
+    files.pop()
+}
+
+/// Resolve a `--diff` reference: `last` = newest auto snapshot, a duration
+/// (`1h`) = the newest snapshot at least that old (so you diff against the
+/// state as of roughly an hour ago), anything else = a literal path.
+pub fn resolve_ref(home: &std::path::Path, re: &str) -> Result<std::path::PathBuf, String> {
+    if re == "last" {
+        return newest_auto(home)
+            .ok_or_else(|| "no auto snapshots yet — run `witr-rs --snap` first".to_string());
+    }
+    if let Some(secs) = parse_age_ref(re) {
+        let cutoff = crate::util::now_unix() - secs;
+        let dir = auto_dir_under(home);
+        let mut best: Option<(i64, std::path::PathBuf)> = None;
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Err("no auto snapshots yet — run `witr-rs --snap` first".into());
+        };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(ts) = name
+                .strip_prefix("snap-")
+                .and_then(|s| s.strip_suffix(".json"))
+                .and_then(|s| s.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if ts <= cutoff && best.as_ref().is_none_or(|(bt, _)| ts > *bt) {
+                best = Some((ts, e.path()));
+            }
+        }
+        return best.map(|(_, p)| p).ok_or_else(|| {
+            format!("no snapshot older than {re} — the oldest auto snapshot is too recent")
+        });
+    }
+    Ok(std::path::PathBuf::from(re))
+}
+
+/// `1h` / `5m` / `30s` — a duration used as a point-in-time reference.
+/// Bare numbers are rejected (parse_duration would accept "30"; a plain
+/// number is far more likely a pid or path fragment than a duration).
+fn parse_age_ref(s: &str) -> Option<i64> {
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    crate::util::parse_duration(s)
+}
+
+
 fn command_of(p: &Process) -> String {
     if p.cmdline.is_empty() {
         p.name.clone()
@@ -271,6 +382,66 @@ mod tests {
     fn no_changes() {
         let ps = vec![proc(1, "init", None, None, "")];
         assert_eq!(render(&diff(&ps, &ps)), "no changes");
+    }
+
+    #[test]
+    fn auto_snap_rotates_and_resolves_refs() {
+        let dir = std::env::temp_dir().join(format!("witr-snapauto-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let home = dir.clone();
+        // write 12 snapshots (distinct names — one per second is too slow,
+        // so backdate the timestamps by renaming)
+        let mut paths = Vec::new();
+        for i in 0..12 {
+            let p = save_auto(&home, &[proc(i, "p", None, None, "")], 10).unwrap();
+            let backdated = p.with_file_name(format!(
+                "snap-{}.json",
+                crate::util::now_unix() - 3600 + i as i64 * 10
+            ));
+            std::fs::rename(&p, &backdated).unwrap();
+            paths.push(backdated);
+        }
+        let snapshots = auto_dir_under(&home);
+        let kept: Vec<_> = std::fs::read_dir(&snapshots)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(kept.len(), 10, "rotation prunes to --keep");
+        assert!(!kept.contains(&paths[0]), "oldest pruned");
+        assert!(kept.contains(paths.last().unwrap()), "newest kept");
+
+        // `last` resolves to the newest
+        let last = resolve_ref(&home, "last").unwrap();
+        assert_eq!(last, *paths.last().unwrap());
+
+        // a duration resolves to the newest snapshot at least that old
+        let hour_ago = resolve_ref(&home, "59m").unwrap();
+        assert!(
+            paths.iter().take(11).any(|p| *p == hour_ago),
+            "59m ref picks an old snapshot, got {}",
+            hour_ago.display()
+        );
+
+        // a plain path passes through untouched (even when it doesn't exist)
+        assert_eq!(
+            resolve_ref(&home, "/tmp/whatever.json").unwrap(),
+            std::path::PathBuf::from("/tmp/whatever.json")
+        );
+        // bare numbers are paths, not durations
+        assert_eq!(resolve_ref(&home, "42").unwrap(), std::path::PathBuf::from("42"));
+        // an impossible window fails with guidance
+        assert!(resolve_ref(&home, "1d").is_err(), "nothing is 1d old yet");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn resolve_ref_without_auto_dir_fails_with_guidance() {
+        let dir = std::env::temp_dir().join(format!("witr-snapnone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let err = resolve_ref(&dir, "last").unwrap_err();
+        assert!(err.contains("--snap"), "{err}");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
