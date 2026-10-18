@@ -328,7 +328,9 @@ pub fn parse_scm_services(text: &str) -> Vec<Service> {
 /// Parse POSIX `df -P -k` output into device-backed mounts: rows whose
 /// filesystem starts with `/dev/` (drops network mounts, `map auto_home`,
 /// tmpfs and friends), deduped by mount point, zero-size rows skipped.
-/// Shared by the unix platforms — both GNU and BSD df speak `-P -k`.
+/// Shared by the unix platforms — both GNU and BSD df speak `-P -k`
+/// (kept for non-unix test builds, which exercise it directly).
+#[cfg(any(unix, test))]
 pub(crate) fn parse_df(out: &str) -> Vec<MountUsage> {
     let mut out_rows: Vec<MountUsage> = Vec::new();
     let mut seen = std::collections::HashSet::new();

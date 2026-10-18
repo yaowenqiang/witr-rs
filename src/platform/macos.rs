@@ -99,9 +99,15 @@ fn host_cpu_ticks() -> Option<Vec<[u64; 4]>> {
     }
 }
 
+/// Non-macOS targets never call [`MacOs::system_stats`] — but the trait impl
+/// must still compile there, so mirror the [`disk_io_of`] stub pattern.
+#[cfg(not(target_os = "macos"))]
+fn host_cpu_ticks() -> Option<Vec<[u64; 4]>> {
+    None
+}
+
 /// (total busy %, per-core busy %) between two tick snapshots. Pure so the
-/// math is pinned by tests.
-#[cfg(any(target_os = "macos", test))]
+/// math is pinned by tests; compiled everywhere for the same reason.
 fn cpu_busy_between(prev: &[[u64; 4]], cur: &[[u64; 4]]) -> (Option<f64>, Vec<f64>) {
     let one = |p: [u64; 4], c: [u64; 4]| -> Option<f64> {
         let busy = c[0].saturating_sub(p[0])
@@ -154,6 +160,12 @@ fn sysctl_str(name: &str) -> Option<String> {
     }
 }
 
+/// Non-macOS stub — see [`host_cpu_ticks`].
+#[cfg(not(target_os = "macos"))]
+fn sysctl_str(_name: &str) -> Option<String> {
+    None
+}
+
 /// (1, 5, 15-minute load) via getloadavg — empty on platforms without it.
 #[cfg(target_os = "macos")]
 fn loadavg() -> (Option<f64>, Option<f64>, Option<f64>) {
@@ -170,9 +182,15 @@ fn loadavg() -> (Option<f64>, Option<f64>, Option<f64>) {
     }
 }
 
+/// Non-macOS stub — see [`host_cpu_ticks`].
+#[cfg(not(target_os = "macos"))]
+fn loadavg() -> (Option<f64>, Option<f64>, Option<f64>) {
+    (None, None, None)
+}
+
 /// Memory-in-use MB from `vm_stat` output: active + wired + compressor
 /// pages (the "Memory Used" Activity Monitor shows), scaled by `page_size`.
-#[cfg(any(target_os = "macos", test))]
+/// Pure — compiled everywhere so the trait impl does.
 fn parse_vm_stat(text: &str, page_size: u64) -> Option<u64> {
     let get = |label: &str| -> u64 {
         text.lines()
@@ -194,7 +212,7 @@ fn parse_vm_stat(text: &str, page_size: u64) -> Option<u64> {
 }
 
 /// `total = 3072.00M used = 12.53M free = ... (encrypted)` → (used, total) MB.
-#[cfg(any(target_os = "macos", test))]
+/// Pure — compiled everywhere so the trait impl does.
 fn parse_swapusage(text: &str) -> (Option<u64>, Option<u64>) {
     let get = |key: &str| -> Option<u64> {
         let idx = text.find(key)? + key.len();
@@ -1381,7 +1399,14 @@ mod tests {
         assert_eq!(p.ppid, Some(1));
         assert_eq!(p.uid, Some(501));
         assert_eq!(p.state.as_deref(), Some("S"));
-        assert_eq!(p.started, Some(now_unix() - 184_231));
+        // started = parse-time now − elapsed; the test's own now may tick a
+        // second later, so compare with a ±1s tolerance
+        let expect = now_unix() - 184_231;
+        assert!(
+            (p.started.unwrap() - expect).abs() <= 1,
+            "started {:?} vs expected {expect}",
+            p.started
+        );
         assert_eq!(p.cpu_time_ms, Some(5_000));
         assert_eq!(p.cpu, Some(1.2));
         assert_eq!(p.mem_kb, Some(45600));

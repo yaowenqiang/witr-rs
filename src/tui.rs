@@ -1233,8 +1233,7 @@ impl TuiApp {
     /// stops the stream and kills the child CLI.
     fn toggle_logs_follow(&mut self) {
         if self.follow_child.is_some() {
-            self.stop_logs_follow();
-            self.status = "follow stopped".into();
+            self.stop_logs_follow(); // reports "follow stopped" itself
             return;
         }
         let Some(src) = self.logs_src.clone() else {
@@ -1291,10 +1290,13 @@ impl TuiApp {
     }
 
     /// Kill the streaming child (page exit, toggle off, TUI shutdown).
+    /// Reports "follow stopped" only when a stream was actually running —
+    /// a no-op stop stays quiet.
     fn stop_logs_follow(&mut self) {
         if let Some(mut child) = self.follow_child.take() {
             let _ = child.kill();
             let _ = child.wait();
+            self.status = "follow stopped".into();
         }
         self.follow_rx = None;
     }
@@ -2166,34 +2168,43 @@ impl TuiApp {
 
 /// Send a POSIX signal via the kill utility (TERM/KILL/STOP/CONT...).
 /// Windows only supports graceful (/PID) and forced (/F) taskkill.
+/// Failures always carry a non-empty message: spawn errors get the tool
+/// name for context, and tools that fail silently (empty stderr) get a
+/// plain "failed" note — the status line would otherwise go blank.
 fn send_signal(pid: Pid, sig: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let out = std::process::Command::new("kill")
             .args(["-s", sig, &pid.to_string()])
-            .output()?;
+            .output()
+            .map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("kill: {e}"))
+            })?;
         if !out.status.success() {
             let msg = String::from_utf8_lossy(&out.stderr);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                msg.trim().to_string(),
-            ));
+            let msg = msg.trim();
+            let msg = if msg.is_empty() { "kill failed" } else { msg };
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, msg.to_string()));
         }
         Ok(())
     }
     #[cfg(windows)]
     {
+        let tool = |args: &[&str]| {
+            std::process::Command::new("taskkill")
+                .args(args)
+                .output()
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, format!("taskkill: {e}"))
+                })
+        };
         match sig {
             "TERM" => {
-                std::process::Command::new("taskkill")
-                    .args(["/PID", &pid.to_string()])
-                    .output()?;
+                tool(&["/PID", &pid.to_string()])?;
                 Ok(())
             }
             "KILL" => {
-                std::process::Command::new("taskkill")
-                    .args(["/F", "/PID", &pid.to_string()])
-                    .output()?;
+                tool(&["/F", "/PID", &pid.to_string()])?;
                 Ok(())
             }
             _ => Err(std::io::Error::new(
@@ -7052,11 +7063,14 @@ mod tests {
         assert_eq!(app.page, Page::Detail);
 
         // an action key on a dead pid reports the failure and closes the bar
+        // (the report quotes the tool's own stderr, which differs by platform
+        // — `kill: (4000000) - No such process`, a bare NotFound when kill
+        // isn't installed, taskkill text on Windows — so assert non-empty)
         app.detail_pid = Some(4_000_000); // nothing there
         on_key(&mut app, KeyCode::Char('a'));
         on_key(&mut app, KeyCode::Char('t'));
         assert!(!app.actions_open);
-        assert!(app.status.contains("4000000"), "status: {}", app.status);
+        assert!(!app.status.is_empty(), "no failure report for dead pid");
 
         // other keys inside the bar just close it without acting
         on_key(&mut app, KeyCode::Char('a'));
