@@ -210,7 +210,7 @@ fn base64_utf16le(s: &str) -> String {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
@@ -405,7 +405,7 @@ fn netstat_snapshot(listen_only: bool) -> PlatResult<Vec<Socket>> {
             }
         }
     }
-    out.sort_by(|a, b| (a.proto.clone(), a.local_port).cmp(&(b.proto.clone(), b.local_port)));
+    out.sort_by_key(|a| (a.proto.clone(), a.local_port));
     Ok(out)
 }
 
@@ -663,7 +663,7 @@ impl Platform for Windows {
     }
 
     fn list_sockets(&self) -> PlatResult<Vec<Socket>> {
-        Ok(netstat_snapshot(true)?)
+        netstat_snapshot(true)
     }
 
     fn list_all_sockets(&self) -> PlatResult<Vec<Socket>> {

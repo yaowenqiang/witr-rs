@@ -114,6 +114,7 @@ pub fn render_process_forest(procs: &[Process], p: &Painter) -> String {
             None => format!("pid {}", pid),
         }
     };
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         pid: i32,
         prefix: &str,
@@ -291,6 +292,8 @@ pub fn render_top(
                     (pr.io_read_bytes.is_some() || pr.io_write_bytes.is_some())
                         .then_some((r + w) as f64)
                 }
+                // age in seconds — desc order puts the oldest first
+                crate::cli::TopMetric::Age => pr.started.map(|t| (now.saturating_sub(t)) as f64),
             }?;
             Some((v, pr))
         })
@@ -298,11 +301,14 @@ pub fn render_top(
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(count);
 
+    // age ranking already shows the age — swap the trailing AGE column for
+    // the process state so the table doesn't repeat itself
+    let age_col = if metric == crate::cli::TopMetric::Age { "STATE" } else { "AGE" };
     let mut rows: Vec<[String; 5]> = vec![[
         "PID".into(),
         "USER".into(),
         metric.header().into(),
-        "AGE".into(),
+        age_col.into(),
         "COMMAND".into(),
     ]];
     for (v, pr) in &ranked {
@@ -311,12 +317,18 @@ pub fn render_top(
             crate::cli::TopMetric::Mem => crate::util::fmt_bytes(*v as u64),
             crate::cli::TopMetric::Fd => format!("{}", *v as u64),
             crate::cli::TopMetric::Io => crate::util::fmt_bytes(*v as u64),
+            crate::cli::TopMetric::Age => fmt_age(*v as i64),
+        };
+        let extra = if metric == crate::cli::TopMetric::Age {
+            pr.state.clone().unwrap_or_else(|| "-".into())
+        } else {
+            pr.started.map(|t| fmt_age(now - t)).unwrap_or_else(|| "-".into())
         };
         rows.push([
             pr.pid.to_string(),
             pr.user.clone().unwrap_or_else(|| "-".into()),
             val,
-            pr.started.map(|t| fmt_age(now - t)).unwrap_or_else(|| "-".into()),
+            extra,
             pr.command_line(),
         ]);
     }
@@ -358,6 +370,7 @@ pub fn render_top(
             crate::cli::TopMetric::Io => {
                 "no per-process I/O counters (a Linux /proc feature)".to_string()
             }
+            crate::cli::TopMetric::Age => "no processes carry a start time".to_string(),
             _ => "no processes report this metric".to_string(),
         };
         let _ = writeln!(out, "({why})");
@@ -401,7 +414,7 @@ pub fn render_html_report(procs: &[Process]) -> String {
             format!("<div class=\"bar\"><div class=\"fill cpu\" style=\"width:{w}%\"></div></div> {:.1}", c)
         }).unwrap_or_else(|| "-".into());
         let rss_bar = r.rss_mb.map(|m| {
-            let w = if max_rss > 0 { (m * 100 / max_rss) as u32 } else { 0 };
+            let w = (m * 100).checked_div(max_rss).unwrap_or(0) as u32;
             format!("<div class=\"bar\"><div class=\"fill rss\" style=\"width:{w}%\"></div></div> {m} MB")
         }).unwrap_or_else(|| "-".into());
         table.push_str(&format!(

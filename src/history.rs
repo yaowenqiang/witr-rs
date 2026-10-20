@@ -1,11 +1,53 @@
 //! Sampling history across TUI refreshes: instantaneous CPU percent
 //! (delta of cumulative CPU time), sparklines, and crash-loop detection
 //! (same process identity reappearing under a new pid).
+//!
+//! Also home of the threshold-alert primitives ([`alert_cycle`] /
+//! [`AlertTrack`]) shared by the TUI and the headless `--watch` loop.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::model::{Pid, Process};
+
+/// Consecutive over-threshold samples before an alert fires (~15s at the
+/// default 3s refresh) — one transient spike shouldn't page anyone.
+pub const ALERT_CYCLES: u32 = 5;
+
+/// One pid's threshold-alert bookkeeping: how many consecutive samples
+/// each metric has been over its limit, and whether an alert for that
+/// excursion already fired (one per excursion — re-arms when it drops
+/// back under).
+#[derive(Default)]
+pub struct AlertTrack {
+    pub cpu_streak: u32,
+    pub cpu_firing: bool,
+    pub mem_streak: u32,
+    pub mem_firing: bool,
+    pub fd_streak: u32,
+    pub fd_firing: bool,
+    pub io_streak: u32,
+    pub io_firing: bool,
+    pub conn_streak: u32,
+    pub conn_firing: bool,
+}
+
+/// Advance one metric's alert cycle by one sample. Returns true exactly
+/// when the streak first reaches [`ALERT_CYCLES`] on a not-yet-firing
+/// excursion; a sample under the threshold resets both counters.
+pub fn alert_cycle(streak: &mut u32, firing: &mut bool, over: bool) -> bool {
+    if over {
+        *streak += 1;
+        if *streak >= ALERT_CYCLES && !*firing {
+            *firing = true;
+            return true;
+        }
+    } else {
+        *streak = 0;
+        *firing = false;
+    }
+    false
+}
 
 const SAMPLES: usize = 8;
 /// Detail-page CPU chart window (~10 min at the 3s TUI refresh).
@@ -763,7 +805,7 @@ impl History {
                     .map(|i| pick(&dq[(i as f64 * stride) as usize]))
                     .collect()
             } else {
-                dq.iter().map(|s| pick(s)).collect()
+                dq.iter().map(pick).collect()
             };
             let peak = vals.iter().copied().fold(0.0f64, f64::max);
             let bars: String = vals
@@ -849,7 +891,7 @@ mod tests {
     fn cpu_delta_sampling() {
         let mut h = History::new();
         h.update(&[proc(10, "/bin/w", Some(1_000))]);
-        assert!(h.cpu_now.get(&10).is_none(), "first sample has no delta");
+        assert!(!h.cpu_now.contains_key(&10), "first sample has no delta");
         std::thread::sleep(Duration::from_millis(120));
         h.update(&[proc(10, "/bin/w", Some(1_120))]);
         // 120ms cpu in ~120ms wall → ~100%

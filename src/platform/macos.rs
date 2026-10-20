@@ -668,7 +668,7 @@ fn socket_snapshot(listen_only: bool) -> PlatResult<Vec<Socket>> {
             Err(e) => return Err(PlatError::Failed(format!("lsof: {}", e))),
         }
     }
-    out.sort_by(|a, b| (a.proto.clone(), a.local_port).cmp(&(b.proto.clone(), b.local_port)));
+    out.sort_by_key(|a| (a.proto.clone(), a.local_port));
     Ok(out)
 }
 

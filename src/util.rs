@@ -83,10 +83,11 @@ pub fn run(cmd: &str, args: &[&str], timeout: Duration) -> std::io::Result<Strin
             if trace {
                 eprintln!("[witr-trace] {} exited {} after {:?}", cmd, st.code().unwrap_or(-1), t0.elapsed());
             }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("{} exited with {}", cmd, st.code().unwrap_or(-1)),
-            ))
+            Err(std::io::Error::other(format!(
+                "{} exited with {}",
+                cmd,
+                st.code().unwrap_or(-1)
+            )))
         }
         None => {
             if trace {

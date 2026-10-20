@@ -87,42 +87,14 @@ enum Focus {
     Details,
 }
 
-/// Consecutive over-threshold samples before an alert fires (~15s at the
-/// default 3s refresh) — one transient spike shouldn't page anyone.
-const ALERT_CYCLES: u32 = 5;
+/// Consecutive over-threshold samples before an alert fires — re-exported
+/// from history (shared with the headless --watch loop).
+use crate::history::alert_cycle;
+use crate::history::AlertTrack;
+use crate::history::ALERT_CYCLES;
 
-/// One pid's threshold-alert bookkeeping: how many consecutive samples
-/// each metric has been over its limit, and whether an alert for that
-/// excursion already fired (one per excursion — re-arms when it drops
-/// back under).
-#[derive(Default)]
-struct AlertTrack {
-    cpu_streak: u32,
-    cpu_firing: bool,
-    mem_streak: u32,
-    mem_firing: bool,
-    fd_streak: u32,
-    fd_firing: bool,
-    io_streak: u32,
-    io_firing: bool,
-}
-
-/// Advance one metric's alert cycle by one sample. Returns true exactly
-/// when the streak first reaches [`ALERT_CYCLES`] on a not-yet-firing
-/// excursion; a sample under the threshold resets both counters.
-fn alert_cycle(streak: &mut u32, firing: &mut bool, over: bool) -> bool {
-    if over {
-        *streak += 1;
-        if *streak >= ALERT_CYCLES && !*firing {
-            *firing = true;
-            return true;
-        }
-    } else {
-        *streak = 0;
-        *firing = false;
-    }
-    false
-}
+/// the parked result of an in-flight death-logs fetch (see `TuiApp::death_rx`)
+type DeathLogsRx = std::sync::mpsc::Receiver<(Pid, std::result::Result<Vec<String>, String>)>;
 
 struct TuiApp {
     platform: Box<dyn Platform>,
@@ -277,7 +249,7 @@ struct TuiApp {
     /// minutes later often misses the window (macOS `log show --last 10m`)
     death_logs: std::collections::VecDeque<(Pid, Vec<String>)>,
     /// the one in-flight death-logs fetch
-    death_rx: Option<std::sync::mpsc::Receiver<(Pid, std::result::Result<Vec<String>, String>)>>,
+    death_rx: Option<DeathLogsRx>,
     /// --events-log sink: every event the sampler generates is appended as
     /// one JSON line (single writer — the event loop thread)
     events_log: Option<std::fs::File>,
@@ -335,6 +307,11 @@ struct TuiApp {
     fd_counts: HashMap<Pid, u64>,
     /// --alert-io disk rate threshold in MB/s, read+write (None = unchecked)
     alert_io: Option<f64>,
+    /// --alert-conn ESTABLISHED-connection threshold (None = unchecked)
+    alert_conn: Option<u64>,
+    /// established-connection counts from the last refresh (only sampled
+    /// when alert_conn is set — one socket sweep per tick)
+    conn_counts: HashMap<Pid, u64>,
     /// --alert-exec: shell command per alert firing (context in env vars)
     alert_exec: Option<String>,
     /// pid → per-metric streak/firing state (pruned to live pids)
@@ -344,6 +321,13 @@ struct TuiApp {
     notes: Vec<String>,
     /// 'N' on the Processes table: free-form note input for the selection
     note_input: Option<String>,
+    /// 'D' page: snapshot-diff entries (newest auto snapshot vs the live
+    /// table), computed at open time — 'r' on the page recomputes
+    diff_entries: Vec<crate::snapshot::DiffEntry>,
+    /// 'D' page: which snapshot was compared (shown under the header)
+    diff_source: String,
+    /// 'D' page: selected entry
+    diff_sel: usize,
     /// where '?' was pressed — the Help overlay returns here
     help_prev: Page,
 }
@@ -357,6 +341,8 @@ enum Page {
     Logs,
     Summary,
     System,
+    /// 'D': newest auto snapshot vs the live table, one row per DiffEntry
+    Diff,
     /// '?' overlay: the keymap for the current tab; returns to
     /// `help_prev` on close
     Help,
@@ -449,6 +435,9 @@ pub struct Seed {
     pub alert_fd: Option<u64>,
     /// --alert-io: disk-I/O rate threshold in MB/s (read+write); Linux only
     pub alert_io: Option<f64>,
+    /// --alert-conn: ESTABLISHED-connection-count threshold; sustained
+    /// excess → alert (connection-leak detection)
+    pub alert_conn: Option<u64>,
     /// --alert-exec: shell command run on every threshold-alert firing;
     /// context exported as WITR_ALERT_PID/NAME/DETAIL
     pub alert_exec: Option<String>,
@@ -611,10 +600,15 @@ impl TuiApp {
             alert_fd: seed.alert_fd,
             fd_counts: HashMap::new(),
             alert_io: seed.alert_io,
+            alert_conn: seed.alert_conn,
+            conn_counts: HashMap::new(),
             alert_exec: seed.alert_exec.clone(),
             alert_state: HashMap::new(),
             notes: seed.notes,
             note_input: None,
+            diff_entries: Vec::new(),
+            diff_source: String::new(),
+            diff_sel: 0,
             help_prev: Page::Browse,
             confirm_tree_kill: None,
             table_rect: None,
@@ -798,6 +792,12 @@ impl TuiApp {
                 if let Some(counts) = self.platform.fd_counts() {
                     self.fd_counts = counts;
                 }
+            }
+            // --alert-conn: established connections per pid, from the same
+            // socket sweep the Ports tab uses (only sampled when armed)
+            if self.alert_conn.is_some() {
+                let socks = self.platform.list_all_sockets().unwrap_or_default();
+                self.conn_counts = established_per_pid(&socks);
             }
             // threshold alerts (--alert-cpu / --alert-mem): a metric over
             // its limit for ALERT_CYCLES samples fires once per excursion —
@@ -986,6 +986,103 @@ impl TuiApp {
         }
         self.logs_scroll = 0;
         self.page = Page::System;
+    }
+
+    /// Open the snapshot-diff page ('D'): diff the newest auto snapshot
+    /// (`--snap` with no FILE writes it) against the live table. Computed
+    /// at open time — 'r' on the page re-diffs. The CLI's `--diff` is the
+    /// scripted twin of this page.
+    fn open_diff_page(&mut self) {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            self.status = "snapshot diff needs $HOME (no auto snapshots to compare)".into();
+            return;
+        };
+        let Some(path) = crate::snapshot::newest_auto(&home) else {
+            self.status = "no auto snapshots yet — run `witr --snap` once to seed one".into();
+            return;
+        };
+        match crate::snapshot::load(&path.to_string_lossy()) {
+            Ok((old, old_listeners)) => {
+                let mut entries = crate::snapshot::diff(&old, &self.procs);
+                if !old_listeners.is_empty() {
+                    let now = crate::snapshot::to_listeners(
+                        &self.platform.list_sockets().unwrap_or_default(),
+                        &self.procs,
+                    );
+                    entries.extend(crate::snapshot::diff_listeners(&old_listeners, &now));
+                }
+                self.diff_entries = entries;
+                self.diff_source = path.display().to_string();
+                self.diff_sel = 0;
+                self.logs_scroll = 0;
+                self.page = Page::Diff;
+            }
+            Err(e) => {
+                self.status = format!("snapshot {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// Lines for the snapshot-diff page ('D') — shared by the renderer and
+    /// the 'c' copy. One row per entry; kind carries the color.
+    fn diff_page_lines(&self) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if self.diff_source.is_empty() {
+            lines.push(Line::from(styled(
+                Style::new().fg(MID),
+                "no snapshot compared yet",
+            )));
+            return lines;
+        }
+        lines.push(Line::from(vec![
+            Span::styled("vs        ", Style::new().bold()),
+            Span::raw(self.diff_source.clone()),
+        ]));
+        let counts = |k: &str| self.diff_entries.iter().filter(|e| e.kind == k).count();
+        lines.push(Line::from(vec![
+            Span::styled("summary   ", Style::new().bold()),
+            Span::raw(format!(
+                "{} new · {} gone · {} restarted · {} changed · {} listen+ · {} listen-",
+                counts("new"),
+                counts("gone"),
+                counts("restarted"),
+                counts("changed"),
+                counts("listen-new"),
+                counts("listen-gone")
+            )),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("{:>9}  {:>7}  {:<22} {}", "KIND", "PID", "NAME", "DETAIL"),
+            Style::new().fg(ACCENT).bold(),
+        )));
+        for (i, e) in self.diff_entries.iter().enumerate() {
+            let color = match e.kind {
+                "new" => Color::Green,
+                "gone" => Color::Red,
+                "restarted" => Color::Yellow,
+                "listen-new" => Color::Cyan,
+                "listen-gone" => Color::Magenta,
+                _ => Color::Blue,
+            };
+            let marker = if i == self.diff_sel { "▸" } else { " " };
+            let text = format!(
+                "{marker}{:>9}  {:>7}  {:<22} {}",
+                e.kind, e.pid, e.name, e.detail
+            );
+            let span = if i == self.diff_sel {
+                Span::styled(text, Style::new().fg(color).bold())
+            } else {
+                Span::styled(text, Style::new().fg(color))
+            };
+            lines.push(Line::from(span));
+        }
+        if self.diff_entries.is_empty() {
+            lines.push(Line::from(styled(
+                Style::new().fg(MID),
+                "no differences — the machine looks like the snapshot",
+            )));
+        }
+        lines
     }
 
     /// Lines for the system resources page ('y') — shared by the renderer
@@ -1214,6 +1311,7 @@ impl TuiApp {
             && self.alert_mem.is_none()
             && self.alert_fd.is_none()
             && self.alert_io.is_none()
+            && self.alert_conn.is_none()
         {
             return Vec::new();
         }
@@ -1267,6 +1365,20 @@ impl TuiApp {
                         format!(
                             "I/O {:.1} MB/s above {limit_mbps} MB/s for {secs}s",
                             bps.unwrap_or(0.0) / 1024.0 / 1024.0
+                        ),
+                    ));
+                }
+            }
+            if let Some(limit) = self.alert_conn {
+                let n = self.conn_counts.get(&p.pid).copied();
+                let over = n.is_some_and(|c| c > limit);
+                if alert_cycle(&mut track.conn_streak, &mut track.conn_firing, over) {
+                    out.push((
+                        p.pid,
+                        p.name.clone(),
+                        format!(
+                            "{} established connection(s) above {limit} for {secs}s",
+                            n.unwrap_or(0)
                         ),
                     ));
                 }
@@ -2230,6 +2342,7 @@ impl TuiApp {
                 .map(|s| s.to_text().lines().map(|l| Line::from(l.to_string())).collect())
                 .unwrap_or_default(),
             Page::System => self.system_page_lines(),
+            Page::Diff => self.diff_page_lines(),
             Page::Help => help_lines(self.tab),
             Page::Browse => Vec::new(),
         };
@@ -2329,14 +2442,12 @@ fn send_signal(pid: Pid, sig: &str) -> std::io::Result<()> {
         let out = std::process::Command::new("kill")
             .args(["-s", sig, &pid.to_string()])
             .output()
-            .map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("kill: {e}"))
-            })?;
+            .map_err(|e| std::io::Error::other(format!("kill: {e}")))?;
         if !out.status.success() {
             let msg = String::from_utf8_lossy(&out.stderr);
             let msg = msg.trim();
             let msg = if msg.is_empty() { "kill failed" } else { msg };
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, msg.to_string()));
+            return Err(std::io::Error::other(msg.to_string()));
         }
         Ok(())
     }
@@ -2346,9 +2457,7 @@ fn send_signal(pid: Pid, sig: &str) -> std::io::Result<()> {
             std::process::Command::new("taskkill")
                 .args(args)
                 .output()
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, format!("taskkill: {e}"))
-                })
+                .map_err(|e| std::io::Error::other(format!("taskkill: {e}")))
         };
         match sig {
             "TERM" => {
@@ -2382,10 +2491,7 @@ fn renice_pid(pid: Pid, value: i32) -> std::io::Result<String> {
         if out.status.success() {
             Ok(text.trim().to_string())
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                text.trim().to_string(),
-            ))
+            Err(std::io::Error::other(text.trim().to_string()))
         }
     }
     #[cfg(windows)]
@@ -2416,10 +2522,10 @@ fn filter_sockets(
                 || s.pid.map(|p| p.to_string()).unwrap_or_default().contains(needle)
                 || name_of(s.pid.unwrap_or(-1))
                     .unwrap_or_default()
-                    .contains(&needle)
-                || s.local_addr.to_lowercase().contains(&needle)
-                || s.proto.to_lowercase().contains(&needle)
-                || s.state.to_lowercase().contains(&needle)
+                    .contains(needle)
+                || s.local_addr.to_lowercase().contains(needle)
+                || s.proto.to_lowercase().contains(needle)
+                || s.state.to_lowercase().contains(needle)
         })
         .map(|(i, _)| i)
         .collect()
@@ -2546,14 +2652,14 @@ fn group_rows(
             e.top_pid = p.pid;
         }
     }
-    order.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    order.sort_by_key(|a| a.to_lowercase());
     let mut rows: Vec<GroupRow> = order
         .into_iter()
         .filter_map(|k| acc.remove(&k))
         .collect();
     match sort_key {
         SortKey::Cpu => rows.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal)),
-        SortKey::Mem => rows.sort_by(|a, b| b.mem_kb.cmp(&a.mem_kb)),
+        SortKey::Mem => rows.sort_by_key(|b| std::cmp::Reverse(b.mem_kb)),
         _ => {}
     }
     rows
@@ -2942,7 +3048,8 @@ fn send_desktop_notify(title: &str, body: &str) {
 /// Run the `--alert-exec` command for one firing — sh -c / cmd /C, throwaway
 /// thread (a webhook POST must never stall a refresh tick). The alert
 /// context rides in the child's environment: WITR_ALERT_PID / NAME / DETAIL.
-fn spawn_alert_exec(cmd: &str, pid: Pid, name: &str, detail: &str) {
+/// Shared with the headless `--watch` alert loop.
+pub fn spawn_alert_exec(cmd: &str, pid: Pid, name: &str, detail: &str) {
     let cmd = cmd.to_string();
     let name = name.to_string();
     let detail = detail.to_string();
@@ -3470,7 +3577,11 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
                 .alert_state
                 .get(&p.pid)
                 .is_some_and(|t| {
-                    t.cpu_firing || t.mem_firing || t.fd_firing || t.io_firing
+                    t.cpu_firing
+                        || t.mem_firing
+                        || t.fd_firing
+                        || t.io_firing
+                        || t.conn_firing
                 })
             {
                 Cell::from(name).style(Style::new().fg(Color::Red).bold())
@@ -4542,6 +4653,70 @@ fn ui_summary_page(app: &mut TuiApp, f: &mut Frame<'_>) {
     );
 }
 
+/// Full-page snapshot diff ('D'): the newest auto snapshot vs the live
+/// table. Computed when the page opens; 'r' re-diffs. j/k move the
+/// selection, Enter opens the entry's process detail page.
+fn ui_diff_page(app: &mut TuiApp, f: &mut Frame<'_>) {
+    let outer = Block::bordered().border_style(Style::new().fg(GRAY));
+    f.render_widget(&outer, f.area());
+    let inner = outer.inner(f.area());
+    let v = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Length(1),
+        Constraint::Min(6),    // entries
+        Constraint::Length(1), // footer
+    ])
+    .split(inner);
+
+    let header = Line::from(vec![
+        styled(Style::new().bg(PURPLE).fg(Color::White).bold(), " witr-rs "),
+        Span::raw("  "),
+        styled(Style::new().fg(ACCENT).bold(), "Snapshot Diff"),
+    ]);
+    f.render_widget(Paragraph::new(header), v[0]);
+
+    app.tab_rect = None;
+    app.table_rect = Some(v[2]);
+    app.detail_rect = Some(v[2]);
+
+    let lines = app.diff_page_lines();
+    // entries start at line 3 (vs / summary / column header) — keep the
+    // selected row in view
+    let count = lines.len() as u16;
+    let height = v[2].height.saturating_sub(2);
+    let sel = app.diff_sel as u16 + 3;
+    let mut scroll = app.logs_scroll.min(count.saturating_sub(1));
+    if sel < scroll {
+        scroll = sel;
+    } else if height > 0 && sel >= scroll + height {
+        scroll = sel + 1 - height;
+    }
+    app.logs_scroll = scroll;
+
+    let block = Block::bordered()
+        .title(Line::from(styled(
+            Style::new().fg(ACCENT).bold(),
+            format!("Diff{}", TuiApp::scroll_indicator(app.logs_scroll, count, v[2].height)),
+        )))
+        .border_style(Style::new().fg(GRAY));
+    let area = block.inner(v[2]);
+    f.render_widget(block, v[2]);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+        area,
+    );
+
+    let mut footer =
+        "j/k: Select | Enter: Inspect | r: Re-diff | Esc/q: Back | c: Copy".to_string();
+    if !app.status.is_empty() {
+        footer.push_str(&format!("  ·  {}", app.status));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(styled(Style::new().fg(MID), footer))),
+        v[3],
+    );
+}
+
 fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
     match app.page {
         Page::Detail => ui_detail_page(app, f),
@@ -4550,6 +4725,7 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
         Page::Logs => ui_logs_page(app, f),
         Page::Summary => ui_summary_page(app, f),
         Page::System => ui_system_page(app, f),
+        Page::Diff => ui_diff_page(app, f),
         Page::Help => ui_help_page(app, f),
         Page::Browse => {}
     }
@@ -4612,7 +4788,6 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
                     vertical_right: "│",
                     horizontal_top: " ",
                     horizontal_bottom: " ",
-                    ..border::PLAIN
                 });
                 f.render_widget(divider, cols[1]);
 
@@ -4941,6 +5116,7 @@ fn focused_scroll_mut(app: &mut TuiApp) -> Option<&mut u16> {
         (Page::Logs, _, _, _) => Some(&mut app.logs_scroll),
         (Page::Summary, _, _, _) => Some(&mut app.logs_scroll),
         (Page::System, _, _, _) => Some(&mut app.logs_scroll),
+        (Page::Diff, _, _, _) => Some(&mut app.logs_scroll),
         (Page::Help, _, _, _) => Some(&mut app.logs_scroll),
         (Page::Browse, _, _, _) => None,
     }
@@ -4995,6 +5171,7 @@ fn help_lines(tab: Tab) -> Vec<Line<'static>> {
                 ("p/n/u/c/m/t", "sort: pid/name/user/cpu/mem/time"),
                 ("S", "session summary"),
                 ("y", "system resources"),
+                ("D", "snapshot diff vs the newest auto snapshot"),
             ],
         ),
         Tab::Ports => section(
@@ -5344,6 +5521,21 @@ fn descendants_of(root: Pid, procs: &[Process]) -> Vec<Pid> {
     out
 }
 
+/// Established-connection count per owning pid — the sample behind
+/// `--alert-conn` (sockets without an owner simply don't count). Shared
+/// with the headless `--watch` alert loop.
+pub fn established_per_pid(sockets: &[Socket]) -> HashMap<Pid, u64> {
+    let mut out: HashMap<Pid, u64> = HashMap::new();
+    for s in sockets {
+        if s.state == "ESTABLISHED" {
+            if let Some(pid) = s.pid {
+                *out.entry(pid).or_insert(0) += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Returns false when the app should quit.
 fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
     if app.confirm_kill.is_some() {
@@ -5542,6 +5734,46 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         if key == KeyCode::Char('r') && app.page == Page::System {
             app.refresh();
             return true;
+        }
+        // 'r' on the diff page: re-diff against the newest auto snapshot
+        if key == KeyCode::Char('r') && app.page == Page::Diff {
+            app.open_diff_page();
+            return true;
+        }
+        // D page: j/k/g/G move the selection, Enter inspects the entry's
+        // process (d/u/f/b keep their generic scroll meaning below)
+        if app.page == Page::Diff {
+            let count = app.diff_entries.len();
+            match key {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.diff_sel = (app.diff_sel + 1).min(count.saturating_sub(1));
+                    return true;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.diff_sel = app.diff_sel.saturating_sub(1);
+                    return true;
+                }
+                KeyCode::Char('g') => {
+                    app.diff_sel = 0;
+                    return true;
+                }
+                KeyCode::Char('G') => {
+                    app.diff_sel = count.saturating_sub(1);
+                    return true;
+                }
+                KeyCode::Enter => {
+                    if let Some(e) = app.diff_entries.get(app.diff_sel).map(|e| e.pid) {
+                        if app.procs.iter().any(|p| p.pid == e) {
+                            app.open_detail_page_for(e);
+                        } else {
+                            app.status =
+                                format!("pid {e} is gone — it only exists in the snapshot");
+                        }
+                    }
+                    return true;
+                }
+                _ => {}
+            }
         }
         if key == KeyCode::Char('c') {
             let text = app.focused_pane_text();
@@ -5765,6 +5997,10 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         // 'y': system resources — machine-wide cpu/memory/load meters
         KeyCode::Char('y') => {
             app.open_system();
+        }
+        // 'D': snapshot diff — newest auto snapshot vs the live table
+        KeyCode::Char('D') => {
+            app.open_diff_page();
         }
 
         // ---- cursor movement ----
@@ -6510,7 +6746,7 @@ mod tests {
         assert_eq!(depth, vec![0, 1, 2, 1, 0]);
         // cycle guard: ppid pointing back at a visited pid doesn't loop
         let cyc = vec![mk(5, Some(6)), mk(6, Some(5))];
-        let (o2, _) = tree_order(&cyc, &vec![0, 1]);
+        let (o2, _) = tree_order(&cyc, &[0, 1]);
         assert_eq!(o2.len(), 2, "cycle terminates with every row present");
     }
 
@@ -7329,7 +7565,7 @@ mod tests {
 
         // connections pane: header row + one line per socket
         let lines = app.port_connection_lines();
-        assert!(lines.len() >= 1);
+        assert!(!lines.is_empty());
 
         // Tab toggles focus between connections and owner
         assert!(app.port_pane_conn);
@@ -7453,7 +7689,7 @@ mod tests {
         assert_eq!(r.matches[0].pid, pid);
         assert!(app.detail_line_count > 1);
         // env pane has either variables or a platform note — never empty
-        assert!(app.env_lines().len() >= 1);
+        assert!(!app.env_lines().is_empty());
 
         // scroll the detail pane, switch to env, scroll it independently
         on_key(&mut app, KeyCode::Char('j'));
@@ -7735,6 +7971,7 @@ mod tests {
                 alert_mem: None,
                 alert_fd: None,
                 alert_io: None,
+                alert_conn: None,
                 notes: Vec::new(),
             },
         );
@@ -7999,5 +8236,124 @@ mod tests {
         // the shared funnel — the caller routes to events) — just check the
         // streak re-arms: a subsequent cycle stays quiet
         assert!(app.alert_picks().is_empty(), "firing latches until re-arm");
+    }
+
+    #[test]
+    fn diff_page_selects_jumps_and_reports_gone() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        let Some(live) = app.procs.first().cloned() else {
+            return; // empty machine table — nothing to jump to
+        };
+        app.diff_entries = vec![
+            crate::snapshot::DiffEntry {
+                kind: "new",
+                pid: live.pid,
+                name: live.name.clone(),
+                detail: "started".into(),
+            },
+            crate::snapshot::DiffEntry {
+                kind: "gone",
+                pid: -1,
+                name: "ghost".into(),
+                detail: "exited".into(),
+            },
+        ];
+        app.diff_source = "/tmp/snap.json".into();
+        app.page = Page::Diff;
+        app.diff_sel = 0;
+
+        // selection movement, clamped at both ends
+        on_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.diff_sel, 1);
+        on_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.diff_sel, 1, "clamped at the last entry");
+        on_key(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.diff_sel, 1);
+        on_key(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.diff_sel, 0);
+
+        // the page text carries the counts and the compared snapshot
+        let text = app
+            .diff_page_lines()
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("1 new"), "{text}");
+        assert!(text.contains("1 gone"), "{text}");
+        assert!(text.contains("/tmp/snap.json"), "{text}");
+
+        // Enter on a live pid opens its detail page
+        on_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.page, Page::Detail);
+        assert_eq!(app.detail_pid, Some(live.pid));
+
+        // back out, then Enter on the snapshot-only pid reports and stays
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Browse);
+        app.page = Page::Diff;
+        app.diff_sel = 1;
+        on_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.page, Page::Diff);
+        assert!(
+            app.status.contains("only exists in the snapshot"),
+            "{}",
+            app.status
+        );
+
+        // Esc leaves the diff page
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Browse);
+    }
+
+    #[test]
+    fn conn_alerts_count_established_sockets_per_pid() {
+        let sock = |pid: Option<i32>, state: &str| crate::model::Socket {
+            proto: "tcp".into(),
+            local_addr: "127.0.0.1".into(),
+            local_port: 0,
+            peer_addr: None,
+            peer_port: None,
+            state: state.into(),
+            pid,
+        };
+        let sockets = vec![
+            sock(Some(9), "ESTABLISHED"),
+            sock(Some(9), "ESTABLISHED"),
+            sock(Some(9), "ESTABLISHED"),
+            sock(Some(9), "LISTEN"), // not established
+            sock(None, "ESTABLISHED"), // no owner → uncounted
+            sock(Some(8), "ESTABLISHED"),
+        ];
+        let counts = established_per_pid(&sockets);
+        assert_eq!(counts.get(&9), Some(&3));
+        assert_eq!(counts.get(&8), Some(&1));
+        assert!(!counts.contains_key(&7));
+
+        let mut app = TuiApp::new(
+            crate::platform::get(),
+            Seed {
+                alert_conn: Some(2),
+                ..Seed::default()
+            },
+        );
+        app.procs.push(crate::model::Process {
+            pid: 9,
+            name: "chatty".into(),
+            ..Default::default()
+        });
+        app.conn_counts = counts;
+        for _ in 0..ALERT_CYCLES - 1 {
+            assert!(app.alert_picks().is_empty(), "no fire before the streak");
+        }
+        let fired = app.alert_picks();
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert_eq!(fired[0].0, 9);
+        assert!(
+            fired[0].2.contains("3 established connection(s) above 2"),
+            "{}",
+            fired[0].2
+        );
+        assert!(app.alert_picks().is_empty(), "latches until re-arm");
     }
 }

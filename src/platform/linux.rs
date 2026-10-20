@@ -119,7 +119,7 @@ fn parse_meminfo(
     let get_kb = |key: &str| -> Option<u64> {
         text.lines()
             .find_map(|l| l.strip_prefix(key))
-            .and_then(|rest| rest.trim_start().split_whitespace().next()?.parse().ok())
+            .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
     };
     let mem_total = get_kb("MemTotal:");
     let avail = get_kb("MemAvailable:").or_else(|| get_kb("MemFree:"));
@@ -1008,7 +1008,7 @@ impl Platform for Linux {
             // Loaded: loaded (/lib/systemd/system/nginx.service; enabled; preset: enabled)
             if let Some(rest) = t.strip_prefix("Loaded:") {
                 loaded_from = rest
-                    .split(|c| c == '(' || c == ';')
+                    .split(['(', ';'])
                     .map(|t| t.trim())
                     .find(|t| {
                         t.ends_with(".service")
@@ -1083,7 +1083,7 @@ fn socket_snapshot_impl(all_states: bool) -> PlatResult<Vec<Socket>> {
             out.push(build_socket(proto, addr, p, rem, state, inode, &owners));
         }
     }
-    out.sort_by(|a, b| (a.proto.clone(), a.local_port).cmp(&(b.proto.clone(), b.local_port)));
+    out.sort_by_key(|a| (a.proto.clone(), a.local_port));
     Ok(out)
 }
 

@@ -6,7 +6,7 @@ pub enum Shell {
     Bash,
     Zsh,
     Fish,
-    PowerShell,
+    Powershell,
 }
 
 /// Metric for `--top`.
@@ -21,6 +21,8 @@ pub enum TopMetric {
     Fd,
     /// Cumulative disk I/O bytes (read + write; Linux /proc)
     Io,
+    /// Time since start — oldest first ("what has been running since boot")
+    Age,
 }
 
 impl TopMetric {
@@ -30,6 +32,7 @@ impl TopMetric {
             TopMetric::Mem => "RSS",
             TopMetric::Fd => "FDS",
             TopMetric::Io => "IO",
+            TopMetric::Age => "AGE",
         }
     }
 }
@@ -53,11 +56,20 @@ impl TopMetric {
   witr-rs nginx --tree     full ancestry tree
   witr-rs -i --port 8080   TUI opened on this port
   witr-rs --top cpu        hottest 15 processes, no TUI
+  witr-rs --top age        what has been running the longest
+  witr-rs --top cpu --watch 5   refresh the top ranking every 5s
   witr-rs --top mem -n 30 --csv   top-30 memory as CSV
   witr-rs --watch 5 --record load.csv   record a csv sample every 5s
+  witr-rs --watch 5 --record samples.jsonl   ...as one json envelope per tick
+  witr-rs --watch 5 --alert-cpu 90 --alert-exec 'curl -s $HOOK -d \"$WITR_ALERT_NAME\"'   headless watchdog
+  witr-rs --watch 5 --times 12   bounded watch: sample a minute, print the digest, exit
   witr-rs --snap           auto snapshot (rotates, keeps 10)
+  witr-rs --snap=now.json --sockets   also record LISTEN ports for a later --diff
   witr-rs --diff last      what changed since the last auto snapshot
-  witr-rs --report-html status.html   self-contained html report"
+  witr-rs --diff last --json   ...as JSON
+  witr-rs --report-html status.html   self-contained html report
+  witr-rs --serve :9100    expose Prometheus metrics on :9100
+  witr-rs --man witr-rs.1  write the man page"
 )]
 pub struct Cli {
     /// Process name(s) to trace (substring match; combine with --exact).
@@ -167,6 +179,19 @@ pub struct Cli {
     )]
     pub watch: Option<u64>,
 
+    /// Stop --watch after this many refresh ticks and exit (a duration
+    /// bound for CI and cron: `--watch 5 --times 12` samples for a minute,
+    /// then prints the summary and exits). Needs --watch.
+    #[arg(long = "times", value_name = "N")]
+    pub times: Option<u64>,
+
+    /// Quiet --watch: skip the per-tick table redraw entirely — only
+    /// alerts, follow notes and hook output are printed, so a headless
+    /// watchdog can run for days without filling the scrollback or a
+    /// pipeline. Needs --watch.
+    #[arg(long = "quiet")]
+    pub quiet: bool,
+
     /// Print the last N log lines (default 100) of the matched process:
     /// container logs when attributed to one, else journald (Linux) or the
     /// unified log (macOS).
@@ -178,8 +203,10 @@ pub struct Cli {
     )]
     pub logs: Option<u64>,
 
-    /// Append every TUI event (started/exited/restarted) as JSON lines to
-    /// this file — a durable record you can --replay later. TUI only.
+    /// Append every event (started/exited/restarted) as JSON lines to
+    /// this file — a durable record you can --replay later. Without
+    /// targets this works headless under `--watch` too (threshold alerts
+    /// land in the same stream); with the TUI it records the sampler.
     #[arg(long = "events-log", value_name = "FILE")]
     pub events_log: Option<String>,
 
@@ -203,12 +230,12 @@ pub struct Cli {
     /// Alert when a process exceeds this CPU%% for 5 consecutive samples
     /// (~15s): desktop notification + Events-tab record + red row highlight.
     /// One alert per excursion — re-arms when usage drops back under.
-    /// TUI only.
+    /// Works in the TUI and under --watch.
     #[arg(long = "alert-cpu", value_name = "PCT")]
     pub alert_cpu: Option<f64>,
 
     /// Alert when a process exceeds this RSS in MB for 5 consecutive
-    /// samples (~15s) — same behavior as --alert-cpu. TUI only.
+    /// samples (~15s) — same behavior as --alert-cpu. TUI and --watch.
     #[arg(long = "alert-mem", value_name = "MB")]
     pub alert_mem: Option<u64>,
 
@@ -216,28 +243,35 @@ pub struct Cli {
     /// consecutive samples (~15s) — the threshold-alert twin of
     /// --alert-cpu/--alert-mem, for fd leaks. Costs one fd sweep per
     /// refresh (cheap on Linux, one lsof scan on macOS, unsupported on
-    /// Windows). TUI only.
+    /// Windows). TUI and --watch.
     #[arg(long = "alert-fd", value_name = "N")]
     pub alert_fd: Option<u64>,
 
     /// Alert when a process exceeds this disk-I/O rate in MB/s (read +
     /// write combined) for 5 consecutive samples (~15s). Per-process I/O
     /// counters are a Linux /proc feature — other platforms cannot check.
-    /// TUI only.
+    /// TUI and --watch.
     #[arg(long = "alert-io", value_name = "MB/S")]
     pub alert_io: Option<f64>,
 
-    /// Run this shell command each time a threshold alert fires (needs
-    /// --alert-cpu and/or --alert-mem; one run per excursion). The alert
-    /// context is exported as WITR_ALERT_PID / WITR_ALERT_NAME /
-    /// WITR_ALERT_DETAIL — e.g. `--alert-exec 'curl -s $SLACK_HOOK -d
-    /// "$WITR_ALERT_NAME: $WITR_ALERT_DETAIL"'`. TUI only.
+    /// Alert when a process holds more than this many ESTABLISHED
+    /// connections for 5 consecutive samples (~15s) — the network twin of
+    /// --alert-fd, for connection leaks. TUI and --watch.
+    #[arg(long = "alert-conn", value_name = "N")]
+    pub alert_conn: Option<u64>,
+
+    /// Run this shell command each time a threshold alert fires (needs one
+    /// of --alert-cpu/--alert-mem/--alert-fd/--alert-io/--alert-conn; one
+    /// run per excursion). The alert context is exported as
+    /// WITR_ALERT_PID / WITR_ALERT_NAME / WITR_ALERT_DETAIL — e.g.
+    /// `--alert-exec 'curl -s $SLACK_HOOK -d "$WITR_ALERT_NAME:
+    /// $WITR_ALERT_DETAIL"'`. TUI and --watch.
     #[arg(long = "alert-exec", value_name = "CMD")]
     pub alert_exec: Option<String>,
 
-    /// Self-contained HTML report of the current process table (summary
-    /// + full table with cpu/mem bars) written to this file and exit.
-    /// A no-target operation: cannot be combined with targets.
+    /// Self-contained HTML report of the current process table (a summary
+    /// plus the full table with cpu/mem bars) written to this file, then
+    /// exit. A no-target operation: cannot be combined with targets.
     #[arg(long = "report-html", value_name = "FILE")]
     pub report_html: Option<String>,
 
@@ -247,6 +281,13 @@ pub struct Cli {
     /// comes back under a new pid.
     #[arg(long = "on-exit", value_name = "CMD")]
     pub on_exit: Option<String>,
+
+    /// Run this shell command once whenever a watched target appears —
+    /// including on the very first tick if it is already up. The mirror of
+    /// --on-exit, for wait-for-deploy scripts: `--watch 2 --on-start 'say
+    /// up'`. Needs a target and --watch (or --follow).
+    #[arg(long = "on-start", value_name = "CMD")]
+    pub on_start: Option<String>,
 
     /// Write every visible process as JSON and exit — a snapshot to --diff
     /// against later. Without a FILE the snapshot lands in the auto-rotate
@@ -273,6 +314,13 @@ pub struct Cli {
     #[arg(long = "keep", value_name = "N")]
     pub keep: Option<usize>,
 
+    /// With --snap: also record the current LISTEN ports, so a later
+    /// --diff can report listeners that appeared or disappeared ("a new
+    /// process started serving on :8080") — a first-pass canary for
+    /// unexpected services.
+    #[arg(long = "sockets")]
+    pub sockets: bool,
+
     /// With one --pid target: when the traced pid exits, keep going —
     /// re-acquire the same program (name+exe+user) under its new pid.
     /// Implies --watch; stops once the identity stays gone for 3
@@ -285,4 +333,22 @@ pub struct Cli {
     /// `witr-rs --completions zsh >> ~/.zshrc`
     #[arg(long = "completions", value_name = "SHELL")]
     pub completions: Option<Shell>,
+
+    /// Print a roff man page (for `man witr-rs`) and exit — write it to
+    /// FILE instead when given, e.g.
+    /// `witr-rs --man ~/.local/share/man/man1/witr-rs.1`
+    #[arg(
+        long = "man",
+        value_name = "FILE",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
+    pub man: Option<String>,
+
+    /// Serve Prometheus metrics on this address ([HOST]:PORT or bare PORT,
+    /// default host 127.0.0.1) until Ctrl-C: per-process cpu/rss/fd gauges
+    /// (Prometheus text format) sampled fresh on every /metrics scrape.
+    /// A no-target operation.
+    #[arg(long = "serve", value_name = "[HOST]:PORT")]
+    pub serve: Option<String>,
 }

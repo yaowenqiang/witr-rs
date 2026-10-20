@@ -15,14 +15,79 @@ pub fn identity(p: &Process) -> u64 {
     crate::util::identity(p)
 }
 
-pub fn save(path: &str, procs: &[Process]) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(procs).unwrap_or_else(|_| "[]".into());
+/// Bumped when the snapshot envelope changes shape. v1 was a bare JSON
+/// array of processes; v2 is an envelope that can carry LISTEN ports.
+pub const SNAPSHOT_VERSION: u32 = 2;
+
+/// One LISTEN binding at snap time — (proto, port) plus who owned it, so a
+/// later --diff can report "something started serving on :8080".
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Listener {
+    pub proto: String,
+    pub port: u16,
+    /// Owners as "name (pid N)" — one per process bound to the port.
+    pub who: Vec<String>,
+}
+
+/// LISTEN sockets + the process table → listener records. Sockets without
+/// a visible owner are skipped (nothing to attribute, nothing to compare).
+pub fn to_listeners(sockets: &[crate::model::Socket], procs: &[Process]) -> Vec<Listener> {
+    let names: HashMap<Pid, &str> = procs.iter().map(|p| (p.pid, p.name.as_str())).collect();
+    let mut map: std::collections::BTreeMap<(String, u16), Vec<(Pid, String)>> = Default::default();
+    for s in sockets {
+        if s.state != "LISTEN" {
+            continue;
+        }
+        let Some(pid) = s.pid else { continue };
+        let label = match names.get(&pid) {
+            Some(n) => format!("{n} (pid {pid})"),
+            None => format!("pid {pid}"),
+        };
+        map.entry((s.proto.clone(), s.local_port)).or_default().push((pid, label));
+    }
+    map.into_iter()
+        .map(|((proto, port), mut who)| {
+            who.sort();
+            who.dedup();
+            Listener {
+                proto,
+                port,
+                who: who.into_iter().map(|(_, l)| l).collect(),
+            }
+        })
+        .collect()
+}
+
+pub fn save(path: &str, procs: &[Process], listeners: &[Listener]) -> std::io::Result<()> {
+    let doc = serde_json::json!({
+        "snapshot_version": SNAPSHOT_VERSION,
+        "saved_at": crate::util::now_unix(),
+        "processes": procs,
+        "listeners": listeners,
+    });
+    let json = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
     std::fs::write(path, json)
 }
 
-pub fn load(path: &str) -> Result<Vec<Process>, String> {
+/// Loads both shapes: the v1 bare array (no listeners recorded) and the v2
+/// envelope. Returns the process table plus the listener list (empty for
+/// v1 or for snapshots taken without `--snap --sockets`).
+pub fn load(path: &str) -> Result<(Vec<Process>, Vec<Listener>), String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    serde_json::from_str(&raw).map_err(|e| format!("{path}: invalid snapshot JSON: {e}"))
+    if raw.trim_start().starts_with('[') {
+        let procs: Vec<Process> = serde_json::from_str(&raw)
+            .map_err(|e| format!("{path}: invalid snapshot JSON: {e}"))?;
+        return Ok((procs, Vec::new()));
+    }
+    #[derive(serde::Deserialize)]
+    struct Snap {
+        processes: Vec<Process>,
+        #[serde(default)]
+        listeners: Vec<Listener>,
+    }
+    let snap: Snap =
+        serde_json::from_str(&raw).map_err(|e| format!("{path}: invalid snapshot JSON: {e}"))?;
+    Ok((snap.processes, snap.listeners))
 }
 
 /// Directory the auto snapshots live in: `<config dir>/snapshots`
@@ -40,12 +105,13 @@ pub fn auto_dir_under(home: &std::path::Path) -> std::path::PathBuf {
 pub fn save_auto(
     home: &std::path::Path,
     procs: &[Process],
+    listeners: &[Listener],
     keep: usize,
 ) -> std::io::Result<std::path::PathBuf> {
     let dir = auto_dir_under(home);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("snap-{}.json", crate::util::now_unix()));
-    save(path.to_str().unwrap_or_default(), procs)?;
+    save(path.to_str().unwrap_or_default(), procs, listeners)?;
     prune(&dir, keep);
     Ok(path)
 }
@@ -293,6 +359,39 @@ pub fn diff(old: &[Process], now: &[Process]) -> Vec<DiffEntry> {
     out
 }
 
+/// Compare two listener sets: bindings that appeared ("a process started
+/// serving on :8080") and ones that vanished. Keyed by (proto, port);
+/// owner changes on an existing binding are not reported (the pid set
+/// usually churns without anything interesting happening).
+pub fn diff_listeners(old: &[Listener], new: &[Listener]) -> Vec<DiffEntry> {
+    let key = |l: &Listener| (l.proto.clone(), l.port);
+    let old_map: HashMap<(String, u16), &Listener> = old.iter().map(|l| (key(l), l)).collect();
+    let new_map: HashMap<(String, u16), &Listener> = new.iter().map(|l| (key(l), l)).collect();
+    let mut out = Vec::new();
+    for l in new_map.values() {
+        if !old_map.contains_key(&key(l)) {
+            out.push(DiffEntry {
+                kind: "listen-new",
+                pid: 0,
+                name: format!(":{}/{}", l.port, l.proto),
+                detail: format!("port {} now served by {}", l.port, l.who.join(", ")),
+            });
+        }
+    }
+    for l in old_map.values() {
+        if !new_map.contains_key(&key(l)) {
+            out.push(DiffEntry {
+                kind: "listen-gone",
+                pid: 0,
+                name: format!(":{}/{}", l.port, l.proto),
+                detail: format!("port {} no longer served (was {})", l.port, l.who.join(", ")),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 /// Render the diff as plain text; empty when nothing changed.
 pub fn render(entries: &[DiffEntry]) -> String {
     if entries.is_empty() {
@@ -301,7 +400,7 @@ pub fn render(entries: &[DiffEntry]) -> String {
     let mut s = String::new();
     for e in entries {
         s.push_str(&format!(
-            "{:<9} pid {:<7} {}\n    {}\n",
+            "{:<11} pid {:<7} {}\n    {}\n",
             e.kind, e.pid, e.name, e.detail
         ));
     }
@@ -370,12 +469,91 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("snap.json");
         let procs = vec![proc(7, "a", None, None, "")];
-        save(path.to_str().unwrap(), &procs).unwrap();
-        let loaded = load(path.to_str().unwrap()).unwrap();
+        save(path.to_str().unwrap(), &procs, &[]).unwrap();
+        let (loaded, listeners) = load(path.to_str().unwrap()).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].pid, 7);
         assert_eq!(loaded[0].name, "a");
+        assert!(listeners.is_empty(), "no --sockets → no listeners");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn round_trip_with_listeners() {
+        let dir = std::env::temp_dir().join(format!("witr-snaplis-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.json");
+        let procs = vec![proc(7, "nginx", None, None, "")];
+        let listeners = vec![Listener {
+            proto: "tcp".into(),
+            port: 80,
+            who: vec!["nginx (pid 7)".into()],
+        }];
+        save(path.to_str().unwrap(), &procs, &listeners).unwrap();
+        let (loaded, lis) = load(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded[0].name, "nginx");
+        assert_eq!(lis, listeners, "listeners round-trip verbatim");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v1_bare_array_snapshots_still_load() {
+        let dir = std::env::temp_dir().join(format!("witr-snapv1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v1.json");
+        std::fs::write(&path, r#"[{"pid":3,"ppid":null,"name":"old","exe":null,"exe_deleted":false,"cmdline":[],"cwd":null,"user":null,"uid":null,"started":null,"env":null,"kernel_thread":false,"cpu":null,"mem_kb":null}]"#).unwrap();
+        let (procs, listeners) = load(path.to_str().unwrap()).unwrap();
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].pid, 3);
+        assert!(listeners.is_empty(), "v1 snapshots have no listener data");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn to_listeners_keeps_only_listen_rows_and_sorts() {
+        let sock = |port: u16, state: &str, pid: Option<i32>| crate::model::Socket {
+            proto: "tcp".into(),
+            local_addr: "0.0.0.0".into(),
+            local_port: port,
+            peer_addr: None,
+            peer_port: None,
+            state: state.into(),
+            pid,
+        };
+        let procs = vec![proc(7, "nginx", None, None, ""), proc(9, "redis", None, None, "")];
+        let sockets = vec![
+            sock(6379, "LISTEN", Some(9)),
+            sock(80, "LISTEN", Some(7)),
+            sock(80, "LISTEN", Some(7)),   // duplicate owner → deduped
+            sock(5222, "ESTABLISHED", Some(7)), // not a listener
+            sock(9999, "LISTEN", None),    // ownerless
+        ];
+        let l = to_listeners(&sockets, &procs);
+        assert_eq!(l.len(), 2, "{l:?}");
+        assert_eq!(l[0].port, 80);
+        assert_eq!(l[0].who, vec!["nginx (pid 7)".to_string()]);
+        assert_eq!(l[1].port, 6379);
+        assert_eq!(l[1].who, vec!["redis (pid 9)".to_string()]);
+    }
+
+    #[test]
+    fn diff_listeners_reports_new_and_gone_ports() {
+        let mk = |port: u16, who: &str| Listener {
+            proto: "tcp".into(),
+            port,
+            who: vec![who.into()],
+        };
+        let old = vec![mk(80, "nginx (pid 7)"), mk(443, "nginx (pid 7)")];
+        let now = vec![mk(80, "nginx (pid 9)"), mk(8080, "webpack (pid 20)")];
+        let d = diff_listeners(&old, &now);
+        let new_e = d.iter().find(|e| e.kind == "listen-new").expect("listen-new");
+        assert_eq!(new_e.pid, 0);
+        assert_eq!(new_e.name, ":8080/tcp");
+        assert!(new_e.detail.contains("8080") && new_e.detail.contains("webpack"));
+        let gone_e = d.iter().find(|e| e.kind == "listen-gone").expect("listen-gone");
+        assert_eq!(gone_e.name, ":443/tcp");
+        // owner churn on an existing binding is NOT reported
+        assert!(!d.iter().any(|e| e.name == ":80/tcp"), "{}", render(&d));
     }
 
     #[test]
@@ -393,7 +571,7 @@ mod tests {
         // so backdate the timestamps by renaming)
         let mut paths = Vec::new();
         for i in 0..12 {
-            let p = save_auto(&home, &[proc(i, "p", None, None, "")], 10).unwrap();
+            let p = save_auto(&home, &[proc(i, "p", None, None, "")], &[], 10).unwrap();
             let backdated = p.with_file_name(format!(
                 "snap-{}.json",
                 crate::util::now_unix() - 3600 + i as i64 * 10

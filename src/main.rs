@@ -11,15 +11,18 @@ mod pipeline;
 mod platform;
 mod render;
 mod risk;
+mod serve;
 mod snapshot;
 mod tui;
 mod util;
 
 use clap::Parser as _;
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
 use model::{Pid, Process, TargetReport, TargetSpec};
+use platform::Platform;
 
 /// Print and ignore write errors — a closed pipe (`| head`) must not panic.
 fn write_out(s: &str) {
@@ -179,6 +182,82 @@ fn on_exit_edge(had: &mut bool, present: bool) -> bool {
     fire
 }
 
+/// True only on the absent→present edge (the very first tick counts when
+/// the target is already up): the `--on-start` twin of `on_exit_edge`.
+fn on_start_edge(seen: &mut bool, present: bool) -> bool {
+    let fire = present && !*seen;
+    *seen = present;
+    fire
+}
+
+/// Classic edit distance over chars (name suggestions are short — the
+/// quadratic table is irrelevant).
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Up to `top` distinct process names closest to a missed name target —
+/// the did-you-mean for typos, from the same table the pipeline searched.
+fn suggest_names(table: &[Process], query: &str, top: usize) -> Vec<String> {
+    let q = query.to_lowercase();
+    let mut scored: Vec<(usize, &str)> = table
+        .iter()
+        .map(|p| (levenshtein(&q, &p.name.to_lowercase()), p.name.as_str()))
+        .collect();
+    scored.sort_by_key(|(d, _)| *d);
+    scored.dedup_by(|a, b| a.1 == b.1);
+    scored.into_iter().take(top).map(|(_, n)| n.to_string()).collect()
+}
+
+/// Ctrl-C during a headless `--watch`: the default disposition kills the
+/// process mid-tick; instead the handler raises a flag the watch loops
+/// poll between ticks, so the loop can unwind and print its exit summary.
+/// Unix only — Windows console events have no std-level hook (there the
+/// summary still comes via `--times`).
+static SAW_SIGINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn sigint_flagged(_sig: i32) {
+    SAW_SIGINT.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn install_sigint_flag() {
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGINT: i32 = 2;
+    unsafe {
+        signal(SIGINT, sigint_flagged as extern "C" fn(i32) as usize);
+    }
+}
+#[cfg(not(unix))]
+fn install_sigint_flag() {}
+
+/// Sleep one watch interval in 100ms slices, aborting early on Ctrl-C.
+/// Returns false when SIGINT arrived (the caller should unwind).
+fn sleep_interruptible(interval: u64) -> bool {
+    let slices = interval.max(1) * 10;
+    for _ in 0..slices {
+        if SAW_SIGINT.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !SAW_SIGINT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Best-effort `--on-exit` runner: sh -c on Unix, cmd /C on Windows.
 fn run_on_exit(cmd: &str) {
     #[cfg(windows)]
@@ -208,6 +287,10 @@ fn top_procs(
                     (p.io_read_bytes.is_some() || p.io_write_bytes.is_some())
                         .then_some((r + w) as f64)
                 }
+                // age in seconds — desc order puts the oldest first
+                cli::TopMetric::Age => {
+                    p.started.map(|t| (util::now_unix().saturating_sub(t)) as f64)
+                }
             }?;
             Some((v, p))
         })
@@ -232,26 +315,217 @@ fn json_envelope(procs: &[Process]) -> String {
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
 }
 
+/// `--tree --json`: a process nested under its parent (children
+/// pid-ascending; orphans and ppid cycles become roots — same rules as the
+/// text forest).
+#[derive(serde::Serialize)]
+struct JsonProcNode<'a> {
+    #[serde(flatten)]
+    proc: &'a Process,
+    children: Vec<JsonProcNode<'a>>,
+}
+
+/// The no-target listing as JSON: under `--tree` a nested children forest,
+/// otherwise the flat versioned envelope.
+fn json_listing_output(procs: &[Process], tree: bool) -> String {
+    if !tree {
+        return json_envelope(procs);
+    }
+    let by_pid: std::collections::HashMap<Pid, &Process> =
+        procs.iter().map(|p| (p.pid, p)).collect();
+    let mut children: std::collections::HashMap<Pid, Vec<&Process>> =
+        std::collections::HashMap::new();
+    let mut roots: Vec<&Process> = Vec::new();
+    for p in procs {
+        match p.ppid {
+            Some(ppid) if by_pid.contains_key(&ppid) && ppid != p.pid => {
+                children.entry(ppid).or_default().push(p);
+            }
+            _ => roots.push(p),
+        }
+    }
+    fn attach<'a>(
+        p: &'a Process,
+        children: &std::collections::HashMap<Pid, Vec<&'a Process>>,
+    ) -> JsonProcNode<'a> {
+        let mut kids: Vec<JsonProcNode> = children
+            .get(&p.pid)
+            .map(|v| v.iter().map(|c| attach(c, children)).collect())
+            .unwrap_or_default();
+        kids.sort_by_key(|n| n.proc.pid);
+        JsonProcNode { proc: p, children: kids }
+    }
+    roots.sort_by_key(|p| p.pid);
+    let forest: Vec<JsonProcNode> = roots.iter().map(|p| attach(p, &children)).collect();
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": util::now_unix(),
+        "process_count": procs.len(),
+        "roots": forest,
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
+}
+
+/// One `--watch` tick of the threshold-alert machinery — the headless twin
+/// of the TUI's alert_picks: sweeps fd/socket counters when armed, advances
+/// each pid's per-metric cycle, returns the firings (one per excursion,
+/// re-armed when the metric drops back under).
+#[allow(clippy::too_many_arguments)]
+fn watch_alert_picks(
+    platform: &dyn Platform,
+    cli: &cli::Cli,
+    procs: &[Process],
+    hist: &history::History,
+    interval: u64,
+    state: &mut HashMap<Pid, history::AlertTrack>,
+    fd_counts: &mut HashMap<Pid, u64>,
+    conn_counts: &mut HashMap<Pid, u64>,
+) -> Vec<(Pid, String, String)> {
+    let armed = cli.alert_cpu.is_some()
+        || cli.alert_mem.is_some()
+        || cli.alert_fd.is_some()
+        || cli.alert_io.is_some()
+        || cli.alert_conn.is_some();
+    if !armed {
+        return Vec::new();
+    }
+    if cli.alert_fd.is_some() {
+        if let Some(c) = platform.fd_counts() {
+            *fd_counts = c;
+        }
+    }
+    if cli.alert_conn.is_some() {
+        let socks = platform.list_all_sockets().unwrap_or_default();
+        *conn_counts = tui::established_per_pid(&socks);
+    }
+    let secs = history::ALERT_CYCLES as u64 * interval.max(1);
+    let mut out = Vec::new();
+    for p in procs {
+        let track = state.entry(p.pid).or_default();
+        if let Some(limit) = cli.alert_cpu {
+            let now = hist.cpu_now.get(&p.pid).copied();
+            let over = now.is_some_and(|c| c > limit);
+            if history::alert_cycle(&mut track.cpu_streak, &mut track.cpu_firing, over) {
+                out.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!("CPU {:.0}% above {limit:.0}% for {secs}s", now.unwrap_or(0.0)),
+                ));
+            }
+        }
+        if let Some(limit_mb) = cli.alert_mem {
+            let mb = p.mem_kb.map(|kb| kb / 1024);
+            let over = mb.is_some_and(|m| m > limit_mb);
+            if history::alert_cycle(&mut track.mem_streak, &mut track.mem_firing, over) {
+                out.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!("RSS {} MB above {limit_mb} MB for {secs}s", mb.unwrap_or(0)),
+                ));
+            }
+        }
+        if let Some(limit) = cli.alert_fd {
+            let n = fd_counts.get(&p.pid).copied();
+            let over = n.is_some_and(|c| c > limit);
+            if history::alert_cycle(&mut track.fd_streak, &mut track.fd_firing, over) {
+                out.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!("{} open fds above {limit} for {secs}s", n.unwrap_or(0)),
+                ));
+            }
+        }
+        if let Some(limit_mbps) = cli.alert_io {
+            let bps = hist.io_rate_of(p.pid).map(|(r, w)| r + w);
+            let over = bps.is_some_and(|b| b > limit_mbps * 1024.0 * 1024.0);
+            if history::alert_cycle(&mut track.io_streak, &mut track.io_firing, over) {
+                out.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!(
+                        "I/O {:.1} MB/s above {limit_mbps} MB/s for {secs}s",
+                        bps.unwrap_or(0.0) / 1024.0 / 1024.0
+                    ),
+                ));
+            }
+        }
+        if let Some(limit) = cli.alert_conn {
+            let n = conn_counts.get(&p.pid).copied();
+            let over = n.is_some_and(|c| c > limit);
+            if history::alert_cycle(&mut track.conn_streak, &mut track.conn_firing, over) {
+                out.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!(
+                        "{} established connection(s) above {limit} for {secs}s",
+                        n.unwrap_or(0)
+                    ),
+                ));
+            }
+        }
+    }
+    let seen: std::collections::HashSet<Pid> = procs.iter().map(|p| p.pid).collect();
+    state.retain(|pid, _| seen.contains(pid));
+    out
+}
+
 /// `--record` writer: appends one CSV row per process per --watch tick.
 /// The header is written once at creation; rows leave out metrics the
 /// platform doesn't report (empty cells), so the file stays loadable.
+/// A `.jsonl` path switches formats: one versioned JSON envelope per tick
+/// (richer — ppid, state, age ride along — and jq-friendly).
 struct RecordWriter {
     file: std::fs::File,
+    jsonl: bool,
 }
 
 impl RecordWriter {
     fn create(path: &str) -> std::io::Result<Self> {
+        let jsonl = path.ends_with(".jsonl");
         let mut f = std::fs::File::create(path)?;
         use std::io::Write as _;
-        write!(
-            f,
-            "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps\n"
-        )?;
-        Ok(RecordWriter { file: f })
+        if !jsonl {
+            writeln!(f, "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps")?;
+        }
+        Ok(RecordWriter { file: f, jsonl })
     }
 
     fn append(&mut self, procs: &[Process], hist: &history::History) {
         use std::io::Write as _;
+        if self.jsonl {
+            let rows: Vec<serde_json::Value> = procs
+                .iter()
+                .map(|p| {
+                    let (io_r, io_w) = hist
+                        .io_rate_of(p.pid)
+                        .unwrap_or((0.0, 0.0));
+                    serde_json::json!({
+                        "pid": p.pid,
+                        "ppid": p.ppid,
+                        "user": p.user,
+                        "name": p.name,
+                        "cpu_pct": hist.cpu_now.get(&p.pid),
+                        "rss_mb": p.mem_kb.map(|kb| kb / 1024),
+                        "state": p.state,
+                        "age_secs": p.started.map(|t| util::now_unix().saturating_sub(t)),
+                        "io_read_bps": (p.io_read_bytes.is_some()
+                            || p.io_write_bytes.is_some())
+                        .then_some(io_r),
+                        "io_write_bps": (p.io_read_bytes.is_some()
+                            || p.io_write_bytes.is_some())
+                        .then_some(io_w),
+                    })
+                })
+                .collect();
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "process_count": rows.len(),
+                "processes": rows,
+            });
+            let _ = writeln!(self.file, "{}", serde_json::to_string(&doc).unwrap_or_default());
+            return;
+        }
         let ts = util::now_unix();
         for p in procs {
             let cpu = hist
@@ -303,7 +577,7 @@ fn main() {
             cli::Shell::Bash => CompShell::Bash,
             cli::Shell::Zsh => CompShell::Zsh,
             cli::Shell::Fish => CompShell::Fish,
-            cli::Shell::PowerShell => CompShell::PowerShell,
+            cli::Shell::Powershell => CompShell::PowerShell,
         };
         clap_complete::generate(
             comp,
@@ -311,6 +585,37 @@ fn main() {
             "witr-rs",
             &mut std::io::stdout(),
         );
+        std::process::exit(0);
+    }
+
+    // --man: render the roff man page to stdout (or FILE) and exit — like
+    // --completions it needs nothing but the CLI definition
+    if let Some(dest) = &cli.man {
+        use clap::CommandFactory as _;
+        let mut page = Vec::new();
+        if let Err(e) = clap_mangen::Man::new(cli::Cli::command()).render(&mut page) {
+            eprintln!("--man: {e}");
+            std::process::exit(5);
+        }
+        let page = String::from_utf8_lossy(&page).into_owned();
+        if dest.is_empty() {
+            write_out(&page);
+        } else {
+            let path = std::path::Path::new(dest);
+            if let Some(dir) = path.parent() {
+                if !dir.as_os_str().is_empty() {
+                    if let Err(e) = std::fs::create_dir_all(dir) {
+                        eprintln!("--man {dest}: {e}");
+                        std::process::exit(5);
+                    }
+                }
+            }
+            if let Err(e) = std::fs::write(path, page) {
+                eprintln!("--man {dest}: {e}");
+                std::process::exit(5);
+            }
+            write_out(&format!("man page → {dest}"));
+        }
         std::process::exit(0);
     }
 
@@ -366,15 +671,40 @@ fn main() {
         std::process::exit(4);
     }
 
-    // --events-log records the TUI sampler; anywhere else it's a no-op
+    // --events-log records the TUI sampler — or, headless, the plain
+    // --watch table loop (no targets); anywhere else it's a no-op
     let no_target_tui = specs.is_empty()
         && std::io::stdout().is_terminal()
         && std::io::stdin().is_terminal()
         && !cli.list
         && cli.watch.is_none()
         && recent_secs.is_none();
-    if cli.events_log.is_some() && !cli.interactive && !no_target_tui {
-        eprintln!("--events-log records the TUI event sampler; run without targets (or with -i) on a terminal");
+    if cli.events_log.is_some()
+        && !cli.interactive
+        && !no_target_tui
+        && !(cli.watch.is_some() && specs.is_empty())
+    {
+        eprintln!("--events-log records the TUI sampler or a target-less --watch; run without targets (or with -i) on a terminal");
+        std::process::exit(4);
+    }
+    if cli.times.is_some() && cli.watch.is_none() {
+        eprintln!("--times bounds a --watch run; add --watch SECONDS");
+        std::process::exit(4);
+    }
+    if cli.quiet && cli.watch.is_none() {
+        eprintln!("--quiet suppresses the --watch redraw; add --watch SECONDS");
+        std::process::exit(4);
+    }
+    if cli.on_start.is_some() && cli.watch.is_none() && !cli.follow {
+        eprintln!("--on-start fires in watch/follow mode; add --watch or --follow");
+        std::process::exit(4);
+    }
+    if cli.on_start.is_some() && specs.is_empty() {
+        eprintln!("--on-start watches a target; give a process name, --pid, --port or --file");
+        std::process::exit(4);
+    }
+    if cli.sockets && cli.snap.is_none() {
+        eprintln!("--sockets extends --snap; add --snap [FILE]");
         std::process::exit(4);
     }
     if cli.replay.is_some() && !cli.interactive && !specs.is_empty() {
@@ -398,11 +728,36 @@ fn main() {
         && cli.alert_mem.is_none()
         && cli.alert_fd.is_none()
         && cli.alert_io.is_none()
+        && cli.alert_conn.is_none()
     {
         eprintln!(
-            "--alert-exec runs with threshold alerts; give --alert-cpu, --alert-mem, --alert-fd or --alert-io"
+            "--alert-exec runs with threshold alerts; give --alert-cpu, --alert-mem, --alert-fd, --alert-io or --alert-conn"
         );
         std::process::exit(4);
+    }
+    if cli.serve.is_some() {
+        if !specs.is_empty() || cli.interactive {
+            eprintln!("--serve exposes the whole process table; drop the targets or -i");
+            std::process::exit(4);
+        }
+        if cli.watch.is_some() {
+            eprintln!("--serve samples on every scrape; drop --watch (the metrics endpoint does the refreshing)");
+            std::process::exit(4);
+        }
+        let serve_clash = cli.top.is_some()
+            || cli.csv
+            || cli.markdown
+            || cli.report_html.is_some()
+            || cli.snap.is_some()
+            || cli.diff.is_some()
+            || cli.record.is_some()
+            || cli.events_log.is_some()
+            || cli.replay.is_some()
+            || cli.since.is_some();
+        if serve_clash {
+            eprintln!("--serve is a standalone mode; drop the other output/operation flags");
+            std::process::exit(4);
+        }
     }
     if cli.record.is_some() && cli.watch.is_none() {
         eprintln!("--record samples alongside --watch; add --watch SECONDS");
@@ -430,6 +785,13 @@ fn main() {
     }
     if cli.count.is_some() && cli.top.is_none() {
         eprintln!("--count sizes the --top listing; add --top METRIC");
+        std::process::exit(4);
+    }
+    if cli.watch.is_some() && cli.csv
+        || cli.watch.is_some() && cli.markdown
+        || cli.watch.is_some() && cli.report_html.is_some()
+    {
+        eprintln!("--watch refreshes --top rankings; it does not re-emit --csv/--markdown/--report-html");
         std::process::exit(4);
     }
 
@@ -485,6 +847,14 @@ fn main() {
             eprintln!("--snap/--diff snapshot the whole process table; drop the targets or -i");
             std::process::exit(4);
         }
+        if cli.snap.is_some() && cli.watch.is_some() {
+            eprintln!("--snap writes one snapshot and exits; drop --watch");
+            std::process::exit(4);
+        }
+        if cli.diff.is_some() && cli.sockets {
+            eprintln!("--sockets extends --snap (it records the listeners); --diff picks them up from the file");
+            std::process::exit(4);
+        }
         let platform = platform::get();
         let mut procs = match platform.list_processes() {
             Ok(p) => p,
@@ -494,6 +864,15 @@ fn main() {
             }
         };
         gpu::enrich(&mut procs);
+        // --sockets: record LISTEN ports alongside the processes, so a later
+        // --diff can report services that appeared or disappeared
+        let (listeners, listeners_note) = if cli.sockets {
+            let socks = platform.list_sockets().unwrap_or_default();
+            let l = snapshot::to_listeners(&socks, &procs);
+            (l.clone(), format!(" + {} listeners", l.len()))
+        } else {
+            (Vec::new(), String::new())
+        };
         if let Some(path) = &cli.snap {
             if path.is_empty() {
                 // no FILE: the auto-rotate directory under the config dir
@@ -503,10 +882,11 @@ fn main() {
                     std::process::exit(4);
                 };
                 let keep = cli.keep.unwrap_or(10).max(1);
-                match snapshot::save_auto(&home, &procs, keep) {
+                match snapshot::save_auto(&home, &procs, &listeners, keep) {
                     Ok(written) => write_out(&format!(
-                        "snapshot: {} processes → {} (keeping {keep})",
+                        "snapshot: {} processes{} → {} (keeping {keep})",
                         procs.len(),
+                        listeners_note,
                         written.display()
                     )),
                     Err(e) => {
@@ -514,11 +894,16 @@ fn main() {
                         std::process::exit(5);
                     }
                 }
-            } else if let Err(e) = snapshot::save(path, &procs) {
+            } else if let Err(e) = snapshot::save(path, &procs, &listeners) {
                 eprintln!("--snap {path}: {e}");
                 std::process::exit(5);
             } else {
-                write_out(&format!("snapshot: {} processes → {}", procs.len(), path));
+                write_out(&format!(
+                    "snapshot: {} processes{} → {}",
+                    procs.len(),
+                    listeners_note,
+                    path
+                ));
             }
             std::process::exit(0);
         }
@@ -535,29 +920,68 @@ fn main() {
             None => std::path::PathBuf::from(raw_ref),
         };
         let path = resolved.to_string_lossy().into_owned();
-        let old = match snapshot::load(&path) {
-            Ok(p) => p,
+        let (old, old_listeners) = match snapshot::load(&path) {
+            Ok(pair) => pair,
             Err(e) => {
                 eprintln!("--diff {path}: {e}");
                 std::process::exit(4);
             }
         };
-        let entries = snapshot::diff(&old, &procs);
+        let mut entries = snapshot::diff(&old, &procs);
+        // listener changes only make sense when the snapshot recorded them
+        if !old_listeners.is_empty() {
+            let now = snapshot::to_listeners(&platform.list_sockets().unwrap_or_default(), &procs);
+            entries.extend(snapshot::diff_listeners(&old_listeners, &now));
+        }
         if cli.json {
-            write_out(&serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".into()));
+            let count = |k: &str| entries.iter().filter(|e| e.kind == k).count();
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "compared_to": path,
+                "summary": {
+                    "new": count("new"),
+                    "gone": count("gone"),
+                    "restarted": count("restarted"),
+                    "changed": count("changed"),
+                    "listen_new": count("listen-new"),
+                    "listen_gone": count("listen-gone"),
+                    "total": entries.len(),
+                },
+                "entries": entries,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
         } else {
             write_out(&format!(
-                "diff vs {} · {} new / {} gone / {} restarted / {} changed",
+                "diff vs {} · {} new / {} gone / {} restarted / {} changed / {} listen+ / {} listen-",
                 path,
                 entries.iter().filter(|e| e.kind == "new").count(),
                 entries.iter().filter(|e| e.kind == "gone").count(),
                 entries.iter().filter(|e| e.kind == "restarted").count(),
                 entries.iter().filter(|e| e.kind == "changed").count(),
+                entries.iter().filter(|e| e.kind == "listen-new").count(),
+                entries.iter().filter(|e| e.kind == "listen-gone").count(),
             ));
             write_out(&snapshot::render(&entries));
         }
         // script-friendly: 0 = no changes, 1 = something changed
         std::process::exit(i32::from(!entries.is_empty()));
+    }
+
+    // --serve: Prometheus endpoint — samples the table on every scrape, so
+    // it needs no interval of its own; a standalone mode like --snap/--diff
+    // (compat rules validated above).
+    if let Some(spec) = &cli.serve {
+        let addr = serve::parse_addr(spec).unwrap_or_else(|| {
+            eprintln!("--serve {spec}: expected [HOST]:PORT or a bare PORT");
+            std::process::exit(4);
+        });
+        let fds_enabled = platform::get().fd_counts().is_some();
+        if let Err(e) = serve::run(&addr, fds_enabled) {
+            eprintln!("--serve: {e}");
+            std::process::exit(5);
+        }
+        std::process::exit(0);
     }
 
     // Keep the recent processes only (listing mode + --watch).
@@ -610,6 +1034,53 @@ fn main() {
     // a different renderer, valid piped or on a terminal (never the TUI).
     if specs.is_empty() && listing_extras > 0 {
         let platform = platform::get();
+        // --top --watch: re-rank in place every N seconds (a poor man's top)
+        if let (Some(metric), Some(secs)) = (cli.top, cli.watch) {
+            let interval = secs.max(1);
+            let count = cli.count.unwrap_or(15).max(1);
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            if metric == cli::TopMetric::Fd && platform.fd_counts().is_none() {
+                eprintln!("--top fd is not supported on {}", platform.name());
+                std::process::exit(4);
+            }
+            install_sigint_flag();
+            let mut ticks: u64 = 0;
+            loop {
+                let mut listed = match platform.list_processes() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("cannot list processes: {}", e);
+                        std::process::exit(5);
+                    }
+                };
+                if metric == cli::TopMetric::Io {
+                    platform.enrich_listing(&mut listed);
+                }
+                gpu::enrich(&mut listed);
+                let procs = recent_only(listed);
+                let fds = if metric == cli::TopMetric::Fd {
+                    platform.fd_counts()
+                } else {
+                    None
+                };
+                write_out("\x1b[2J\x1b[1;1H");
+                let now = util::fmt_time(util::now_unix());
+                write_out(&format!(
+                    "witr-rs top {} · every {}s · {} · Ctrl-C to stop",
+                    format!("{metric:?}").to_lowercase(),
+                    interval,
+                    now
+                ));
+                write_out(&render::render_top(&procs, metric, count, fds.as_ref(), &painter));
+                ticks += 1;
+                if cli.times.is_some_and(|n| ticks >= n.max(1)) {
+                    std::process::exit(0);
+                }
+                if !sleep_interruptible(interval) {
+                    std::process::exit(130);
+                }
+            }
+        }
         let mut procs = match platform.list_processes() {
             Ok(p) => p,
             Err(e) => {
@@ -712,10 +1183,16 @@ fn main() {
         let painter = render::Painter::new(color);
 
         // --watch on the listing: re-sample every N seconds until Ctrl-C.
-        // With --record each tick also appends one CSV row per process.
+        // With --record each tick also appends one CSV/JSONL row per
+        // process; --events-log records the sampler's events headless;
+        // --alert-* turns the loop into a watchdog; --quiet drops the
+        // redraw so only alerts/hooks reach the terminal.
         if let Some(secs) = cli.watch {
             let interval = secs.max(1);
             let label = cli.recent.clone().unwrap_or_else(|| "all processes".into());
+            let json_stream = cli.json; // one envelope per tick, no redraw
+            let redraw = !cli.quiet && !json_stream;
+            install_sigint_flag();
             let mut recorder = match &cli.record {
                 Some(path) => match RecordWriter::create(path) {
                     Ok(w) => {
@@ -729,7 +1206,32 @@ fn main() {
                 },
                 None => None,
             };
+            let mut events_file = match &cli.events_log {
+                Some(path) => match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    Ok(f) => {
+                        write_out(&format!("recording events → {path}"));
+                        Some(f)
+                    }
+                    Err(e) => {
+                        eprintln!("--events-log {path}: {e}");
+                        std::process::exit(5);
+                    }
+                },
+                None => None,
+            };
             let mut hist = history::History::new();
+            let mut alert_state: HashMap<Pid, history::AlertTrack> = HashMap::new();
+            let mut fd_counts: HashMap<Pid, u64> = HashMap::new();
+            let mut conn_counts: HashMap<Pid, u64> = HashMap::new();
+            // the most recent firings, repeated under the header so a redraw
+            // doesn't erase them from view
+            let mut recent_alerts: Vec<String> = Vec::new();
+            let mut ticks: u64 = 0;
+            let interrupted;
             loop {
                 let mut listed = match platform.list_processes() {
                     Ok(p) => p,
@@ -738,30 +1240,105 @@ fn main() {
                         std::process::exit(5);
                     }
                 };
-                // per-process io counters feed the recorded rates (a no-op
-                // where the platform has none)
+                // per-process io counters feed the recorded rates and the
+                // --alert-io check (a no-op where the platform has none)
                 platform.enrich_listing(&mut listed);
                 gpu::enrich(&mut listed);
                 let procs = recent_only(listed);
-                let _ = hist.update(&procs);
+                let fresh = hist.update(&procs);
+                if let Some(f) = events_file.as_mut() {
+                    use std::io::Write as _;
+                    for e in &fresh {
+                        if let Ok(json) = serde_json::to_string(e) {
+                            let _ = writeln!(f, "{json}");
+                        }
+                    }
+                    let _ = f.flush();
+                }
                 if let Some(w) = recorder.as_mut() {
                     w.append(&procs, &hist);
                 }
-                write_out("\x1b[2J\x1b[1;1H");
-                let now = util::fmt_time(util::now_unix());
-                write_out(&format!(
-                    "witr-rs watch · {} · every {}s · {} · Ctrl-C to stop",
-                    label, interval, now
-                ));
-                let body = match format {
-                    render::Format::Json => {
-                        serde_json::to_string_pretty(&procs).unwrap_or_else(|_| "[]".into())
+                for (pid, name, detail) in watch_alert_picks(
+                    platform.as_ref(),
+                    &cli,
+                    &procs,
+                    &hist,
+                    interval,
+                    &mut alert_state,
+                    &mut fd_counts,
+                    &mut conn_counts,
+                ) {
+                    // in JSON-stream mode the stdout pipe carries data only —
+                    // alerts go to stderr so jq output stays parseable
+                    let alert_line = format!("⚠ alert: {name} (pid {pid}) — {detail}");
+                    if json_stream {
+                        eprintln!("{alert_line}");
+                    } else {
+                        write_out(&alert_line);
                     }
-                    _ => render::render_process_table(&procs, &painter),
-                };
-                write_out(&body);
-                std::thread::sleep(Duration::from_secs(interval));
+                    // same durable stream as the TUI: alerts land in
+                    // --events-log too, so --replay shows them later
+                    if let Some(f) = events_file.as_mut() {
+                        use std::io::Write as _;
+                        let e = hist.push_alert(pid, &name, &detail);
+                        if let Ok(json) = serde_json::to_string(&e) {
+                            let _ = writeln!(f, "{json}");
+                            let _ = f.flush();
+                        }
+                    }
+                    if let Some(cmd) = &cli.alert_exec {
+                        tui::spawn_alert_exec(cmd, pid, &name, &detail);
+                    }
+                    recent_alerts.push(format!("{name} (pid {pid}) — {detail}"));
+                    let excess = recent_alerts.len().saturating_sub(5);
+                    recent_alerts.drain(..excess);
+                }
+                if redraw {
+                    write_out("\x1b[2J\x1b[1;1H");
+                    let now = util::fmt_time(util::now_unix());
+                    write_out(&format!(
+                        "witr-rs watch · {} · every {}s · {} · Ctrl-C to stop",
+                        label, interval, now
+                    ));
+                    for a in &recent_alerts {
+                        write_out(&format!("⚠ {a}"));
+                    }
+                    write_out(&render::render_process_table(&procs, &painter));
+                } else if json_stream {
+                    write_out(&json_listing_output(&procs, cli.tree));
+                }
+                ticks += 1;
+                if cli.times.is_some_and(|n| ticks >= n.max(1)) {
+                    interrupted = false;
+                    break;
+                }
+                if !sleep_interruptible(interval) {
+                    interrupted = true;
+                    break;
+                }
             }
+            // leaving the loop (Ctrl-C or --times): print the run's digest —
+            // what appeared, exited, restarted and spiked while watched
+            let summary = hist.summary(u64::MAX);
+            if json_stream {
+                let doc = serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "generated_at": util::now_unix(),
+                    "ticks": ticks,
+                    "interrupted": interrupted,
+                    "summary": summary,
+                });
+                write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+            } else {
+                write_out("");
+                write_out(&format!(
+                    "== watch summary · {ticks} tick{}{} ==",
+                    if ticks == 1 { "" } else { "s" },
+                    if interrupted { " · interrupted" } else { "" },
+                ));
+                write_out(&summary.to_text());
+            }
+            std::process::exit(i32::from(interrupted) * 130);
         }
 
         let procs = match platform.list_processes() {
@@ -786,7 +1363,7 @@ fn main() {
             std::process::exit(2);
         }
         let body = match format {
-            render::Format::Json => serde_json::to_string_pretty(&procs).unwrap_or_else(|_| "[]".into()),
+            render::Format::Json => json_listing_output(&procs, cli.tree),
             render::Format::Tree => render::render_process_forest(&procs, &painter),
             _ => render::render_process_table(&procs, &painter),
         };
@@ -815,6 +1392,10 @@ fn main() {
         // --on-exit: armed once the target has been seen, fires on the
         // present→absent edge, re-arms if it comes back
         let mut had_target = false;
+        // --on-start: the mirror — fires on absent→present, including the
+        // first tick when the target is already up
+        let mut seen_target = false;
+        let mut ticks: u64 = 0;
         loop {
             let reports = pipeline::run(platform.as_ref(), live_specs.clone(), &opts);
             write_out("\x1b[2J\x1b[1;1H");
@@ -853,7 +1434,18 @@ fn main() {
                 write_out(&format!("on-exit: running `{cmd}`"));
                 run_on_exit(cmd);
             }
-            std::thread::sleep(Duration::from_secs(interval));
+            if on_start_edge(&mut seen_target, present) && cli.on_start.is_some() {
+                let cmd = cli.on_start.as_deref().unwrap_or_default();
+                write_out(&format!("on-start: running `{cmd}`"));
+                run_on_exit(cmd);
+            }
+            ticks += 1;
+            if cli.times.is_some_and(|n| ticks >= n.max(1)) {
+                std::process::exit(0);
+            }
+            if !sleep_interruptible(interval) {
+                std::process::exit(130);
+            }
         }
     }
 
@@ -881,6 +1473,47 @@ fn main() {
     let color = !no_color && std::io::stdout().is_terminal() && format != render::Format::Json;
 
     write_out(&render::render(&reports, format, color));
+
+    // not-found nudges (text formats only — machine outputs stay clean):
+    // a dead pid is one --follow away; a misspelled name gets its closest
+    // real matches from the table
+    if reports.iter().any(|r| r.matches.is_empty())
+        && matches!(format, render::Format::Standard | render::Format::Tree)
+    {
+        for pid in &cli.pids {
+            let missed = reports.iter().any(|r| {
+                r.matches.is_empty()
+                    && matches!(&r.target, TargetSpec::Pid { pid: p } if p == pid)
+            });
+            if missed {
+                eprintln!(
+                    "hint: pid {pid} not found — did it just exit? `--pid {pid} --follow` keeps tracing the program under its new pid"
+                );
+            }
+        }
+        let name_misses: Vec<&String> = cli
+            .names
+            .iter()
+            .filter(|name| {
+                reports.iter().any(|r| {
+                    r.matches.is_empty()
+                        && matches!(&r.target, TargetSpec::Name { pattern, .. } if pattern == *name)
+                })
+            })
+            .collect();
+        if !name_misses.is_empty() {
+            let table = platform.list_processes().unwrap_or_default();
+            for name in name_misses {
+                let suggestions = suggest_names(&table, name, 3);
+                if !suggestions.is_empty() {
+                    eprintln!(
+                        "hint: no process matches `{name}` — closest: {}",
+                        suggestions.join(", ")
+                    );
+                }
+            }
+        }
+    }
 
     // --logs: tail the first match's logs; when the container's process
     // isn't visible on this host (VM-backed runtime), fall back to the
@@ -1008,5 +1641,135 @@ mod tests {
         assert_eq!((fields[6], fields[7]), ("", ""), "no io yet: {row}");
         assert!(fields[0].parse::<u64>().is_ok(), "unix timestamp: {row}");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn record_writer_jsonl_appends_versioned_envelopes() {
+        let path = std::env::temp_dir().join(format!("witr-record-{}.jsonl", std::process::id()));
+        let mut w = RecordWriter::create(path.to_str().unwrap()).unwrap();
+        assert!(w.jsonl, "the extension selects the format");
+        let mut hist = history::History::new();
+        let procs = vec![proc(9, "daemon", None, Some(8192))];
+        let _ = hist.update(&procs);
+        w.append(&procs, &hist);
+        w.append(&procs, &hist);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one envelope per tick, no header");
+        for line in lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["schema_version"], SCHEMA_VERSION, "{line}");
+            assert_eq!(v["process_count"], 1);
+            assert_eq!(v["processes"][0]["pid"], 9);
+            assert_eq!(v["processes"][0]["rss_mb"], 8);
+            assert_eq!(v["processes"][0]["ppid"], serde_json::Value::Null);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn json_listing_tree_nests_children_under_roots() {
+        let mut parent = proc(1, "launchd", None, None);
+        parent.ppid = Some(1); // self-cycle: still a root
+        let mut child = proc(2, "worker", None, None);
+        child.ppid = Some(1);
+        let mut orphan = proc(3, "stray", None, None);
+        orphan.ppid = Some(99); // parent not in the set → root
+        let v: serde_json::Value = serde_json::from_str(&json_listing_output(
+            &[child.clone(), orphan.clone(), parent.clone()],
+            true,
+        ))
+        .unwrap();
+        assert_eq!(v["process_count"], 3);
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(
+            roots.iter().map(|r| r["pid"].as_i64()).collect::<Vec<_>>(),
+            vec![Some(1), Some(3)],
+            "pid-ascending roots, parent stays a root despite the self-cycle"
+        );
+        assert_eq!(
+            roots[0]["children"][0]["pid"].as_i64(),
+            Some(2),
+            "worker nests under launchd"
+        );
+        assert!(roots[0]["children"][0]["name"] == "worker");
+        // flat mode is the plain envelope, no nesting
+        let flat: serde_json::Value =
+            serde_json::from_str(&json_listing_output(&procs_of(parent), false)).unwrap();
+        assert!(flat["processes"].is_array());
+        assert!(flat.get("roots").is_none());
+    }
+
+    fn procs_of(p: Process) -> Vec<Process> {
+        vec![p]
+    }
+
+    struct NoPlatform;
+
+    impl Platform for NoPlatform {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        fn capabilities(&self) -> platform::Capabilities {
+            platform::Capabilities { file_lookup: false, env: false }
+        }
+        fn list_processes(&self) -> platform::PlatResult<Vec<Process>> {
+            Ok(Vec::new())
+        }
+        fn detail(&self, brief: &Process, _want_env: bool) -> Process {
+            brief.clone()
+        }
+        fn port_to_sockets(&self, _port: u16) -> platform::PlatResult<Vec<model::Socket>> {
+            Ok(Vec::new())
+        }
+        fn list_sockets(&self) -> platform::PlatResult<Vec<model::Socket>> {
+            Ok(Vec::new())
+        }
+        fn file_to_pids(&self, _path: &str) -> platform::PlatResult<Vec<i32>> {
+            Ok(Vec::new())
+        }
+        fn container_of(&self, _pid: i32) -> Option<model::Source> {
+            None
+        }
+        fn service_source(&self, _procs: &[Process]) -> Option<model::Source> {
+            None
+        }
+    }
+
+    #[test]
+    fn watch_alerts_fire_once_per_excursion() {
+        let cli = cli::Cli::parse_from(["witr", "--alert-mem", "10"]);
+        let platform = NoPlatform;
+        let hist = history::History::new();
+        let mut state = HashMap::new();
+        let mut fds = HashMap::new();
+        let mut conns = HashMap::new();
+        let hog = vec![proc(5, "hog", None, Some(20 * 1024))]; // 20 MB
+        for _ in 0..history::ALERT_CYCLES - 1 {
+            assert!(
+                watch_alert_picks(&platform, &cli, &hog, &hist, 1, &mut state, &mut fds, &mut conns)
+                    .is_empty(),
+                "no fire before the streak completes"
+            );
+        }
+        let fired =
+            watch_alert_picks(&platform, &cli, &hog, &hist, 1, &mut state, &mut fds, &mut conns);
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert_eq!(fired[0].0, 5);
+        assert!(fired[0].2.contains("20 MB above 10"), "{}", fired[0].2);
+        // still over: no re-fire
+        assert!(watch_alert_picks(&platform, &cli, &hog, &hist, 1, &mut state, &mut fds, &mut conns)
+            .is_empty());
+        // one under-tick re-arms; a new streak fires once more
+        let quiet = vec![proc(5, "hog", None, Some(1024))];
+        watch_alert_picks(&platform, &cli, &quiet, &hist, 1, &mut state, &mut fds, &mut conns);
+        let mut again = Vec::new();
+        for _ in 0..history::ALERT_CYCLES {
+            again = watch_alert_picks(&platform, &cli, &hog, &hist, 1, &mut state, &mut fds, &mut conns);
+        }
+        assert_eq!(again.len(), 1, "{again:?}");
+        // unlisted pids are pruned from the state map
+        assert!(state.contains_key(&5));
+        assert_eq!(state.len(), 1);
     }
 }
