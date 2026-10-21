@@ -270,12 +270,14 @@ pub fn render_markdown(procs: &[Process]) -> String {
 
 /// `--top METRIC`: the highest-ranked processes by one metric, value first.
 /// Processes the metric can't measure (foreign-user fd counts, no io
-/// counters off Linux) drop out rather than rank as zero.
+/// counters off Linux) drop out rather than rank as zero. `rates` carries
+/// the sampler's per-pid I/O rates (bytes/s) for `--top io-rate`.
 pub fn render_top(
     procs: &[Process],
     metric: crate::cli::TopMetric,
     count: usize,
     fds: Option<&std::collections::HashMap<crate::model::Pid, u64>>,
+    rates: Option<&crate::history::History>,
     p: &Painter,
 ) -> String {
     let now = crate::util::now_unix();
@@ -292,6 +294,9 @@ pub fn render_top(
                     (pr.io_read_bytes.is_some() || pr.io_write_bytes.is_some())
                         .then_some((r + w) as f64)
                 }
+                crate::cli::TopMetric::IoRate => rates
+                    .and_then(|h| h.io_rate_of(pr.pid))
+                    .map(|(r, w)| r + w),
                 // age in seconds — desc order puts the oldest first
                 crate::cli::TopMetric::Age => pr.started.map(|t| (now.saturating_sub(t)) as f64),
             }?;
@@ -317,6 +322,9 @@ pub fn render_top(
             crate::cli::TopMetric::Mem => crate::util::fmt_bytes(*v as u64),
             crate::cli::TopMetric::Fd => format!("{}", *v as u64),
             crate::cli::TopMetric::Io => crate::util::fmt_bytes(*v as u64),
+            crate::cli::TopMetric::IoRate => {
+                format!("{}/s", crate::util::fmt_bytes(*v as u64))
+            }
             crate::cli::TopMetric::Age => fmt_age(*v as i64),
         };
         let extra = if metric == crate::cli::TopMetric::Age {
@@ -367,7 +375,7 @@ pub fn render_top(
     if ranked.is_empty() {
         let why = match metric {
             crate::cli::TopMetric::Fd => "no fd counts available on this platform".to_string(),
-            crate::cli::TopMetric::Io => {
+            crate::cli::TopMetric::Io | crate::cli::TopMetric::IoRate => {
                 "no per-process I/O counters (a Linux /proc feature)".to_string()
             }
             crate::cli::TopMetric::Age => "no processes carry a start time".to_string(),
@@ -1130,20 +1138,20 @@ mod tests {
             proc(2, "high", Some(9.0), Some(8192)),
             proc(3, "unknown", None, None),
         ];
-        let out = render_top(&procs, TopMetric::Cpu, 10, None, &painter);
+        let out = render_top(&procs, TopMetric::Cpu, 10, None, None, &painter);
         let high = out.find("high").unwrap();
         let low = out.find("low").unwrap();
         assert!(high < low, "9.0 ranks above 0.5:\n{out}");
         assert!(!out.contains("unknown"), "unmeasured processes drop out");
         // count caps the rows
-        let out2 = render_top(&procs, TopMetric::Cpu, 1, None, &painter);
+        let out2 = render_top(&procs, TopMetric::Cpu, 1, None, None, &painter);
         assert!(out2.contains("high"));
         assert!(!out2.contains("low"), "count=1 keeps only the best");
         // fd without a counts map → nothing to rank, note explains
-        let out3 = render_top(&procs, TopMetric::Fd, 10, None, &painter);
+        let out3 = render_top(&procs, TopMetric::Fd, 10, None, None, &painter);
         assert!(out3.contains("no fd counts"));
         // io never measured → platform note
-        let out4 = render_top(&procs, TopMetric::Io, 10, None, &painter);
+        let out4 = render_top(&procs, TopMetric::Io, 10, None, None, &painter);
         assert!(out4.contains("no per-process I/O counters"));
     }
 
@@ -1156,7 +1164,7 @@ mod tests {
         let mut fds = HashMap::new();
         fds.insert(1, 4u64);
         fds.insert(2, 900u64);
-        let out = render_top(&procs, TopMetric::Fd, 10, Some(&fds), &painter);
+        let out = render_top(&procs, TopMetric::Fd, 10, Some(&fds), None, &painter);
         let b = out.find("b").unwrap();
         let a = out.find("a").unwrap();
         assert!(b < a, "900 fds ranks above 4:\n{out}");

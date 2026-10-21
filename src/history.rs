@@ -15,21 +15,27 @@ use crate::model::{Pid, Process};
 pub const ALERT_CYCLES: u32 = 5;
 
 /// One pid's threshold-alert bookkeeping: how many consecutive samples
-/// each metric has been over its limit, and whether an alert for that
+/// each metric has been over its limit, whether an alert for that
 /// excursion already fired (one per excursion — re-arms when it drops
-/// back under).
+/// back under), and how long each firing excursion has been burning
+/// (for `--alert-repeat` re-sends; seconds accumulate per sample).
 #[derive(Default)]
 pub struct AlertTrack {
     pub cpu_streak: u32,
     pub cpu_firing: bool,
+    pub cpu_fired_secs: u32,
     pub mem_streak: u32,
     pub mem_firing: bool,
+    pub mem_fired_secs: u32,
     pub fd_streak: u32,
     pub fd_firing: bool,
+    pub fd_fired_secs: u32,
     pub io_streak: u32,
     pub io_firing: bool,
+    pub io_fired_secs: u32,
     pub conn_streak: u32,
     pub conn_firing: bool,
+    pub conn_fired_secs: u32,
 }
 
 /// Advance one metric's alert cycle by one sample. Returns true exactly
@@ -45,6 +51,42 @@ pub fn alert_cycle(streak: &mut u32, firing: &mut bool, over: bool) -> bool {
     } else {
         *streak = 0;
         *firing = false;
+    }
+    false
+}
+
+/// [`alert_cycle`] plus `--alert-repeat`: on an excursion that is already
+/// firing and still over the threshold, keep returning true about every
+/// `repeat_secs` seconds (samples arrive every `interval_secs`). `None`
+/// repeat keeps the classic once-per-excursion behavior. A first fire or a
+/// drop back under resets the repeat clock.
+pub fn alert_cycle_repeat(
+    streak: &mut u32,
+    firing: &mut bool,
+    over: bool,
+    fired_secs: &mut u32,
+    repeat_secs: Option<u64>,
+    interval_secs: u64,
+) -> bool {
+    let first = alert_cycle(streak, firing, over);
+    if !over {
+        *fired_secs = 0;
+        return first;
+    }
+    if first {
+        *fired_secs = 0;
+        return true;
+    }
+    if let Some(rp) = repeat_secs {
+        // only an excursion that is actually firing re-fires — the arming
+        // samples (streak below ALERT_CYCLES) don't tick the repeat clock
+        if *firing {
+            *fired_secs += interval_secs.max(1) as u32;
+            if *fired_secs >= rp.max(1) as u32 {
+                *fired_secs = 0;
+                return true;
+            }
+        }
     }
     false
 }
@@ -869,6 +911,44 @@ mod tests {
             cpu_time_ms: cpu_ms,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn alert_repeat_refires_on_interval_and_resets_under() {
+        // feed `n` over-threshold samples, return the per-sample firings
+        let run_over = |repeat: Option<u64>, n: usize, interval: u64,
+                        streak: &mut u32, firing: &mut bool, fired: &mut u32| -> Vec<bool> {
+            (0..n)
+                .map(|_| alert_cycle_repeat(streak, firing, true, fired, repeat, interval))
+                .collect()
+        };
+        let count = |hits: &[bool]| hits.iter().filter(|h| **h).count();
+
+        // no repeat configured: exactly one fire per excursion, however long
+        // it stays over (arming takes ALERT_CYCLES samples)
+        let n = ALERT_CYCLES as usize;
+        let mut streak = 0u32;
+        let mut firing = false;
+        let mut fired = 0u32;
+        let hits = run_over(None, n * 2, 5, &mut streak, &mut firing, &mut fired);
+        assert_eq!(count(&hits), 1);
+        assert!(hits[n - 1], "fires exactly when the streak completes");
+
+        // repeat every 10s at a 5s sample interval: the first fire, then a
+        // re-fire every second sample (samples 7 and 9)
+        let mut streak = 0u32;
+        let mut firing = false;
+        let mut fired = 0u32;
+        let hits = run_over(Some(10), n + 4, 5, &mut streak, &mut firing, &mut fired);
+        assert_eq!(count(&hits), 3);
+        assert!(hits[n - 1] && hits[6] && hits[8]);
+
+        // dropping back under resets the repeat clock — the next excursion
+        // fires on its own ALERT_CYCLES cadence, then repeats again
+        assert!(!alert_cycle_repeat(&mut streak, &mut firing, false, &mut fired, Some(10), 5));
+        assert_eq!(fired, 0);
+        let hits = run_over(Some(10), n + 2, 5, &mut streak, &mut firing, &mut fired);
+        assert_eq!(count(&hits), 2);
     }
 
     #[test]

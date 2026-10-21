@@ -1,11 +1,13 @@
-//! `--serve [HOST]:PORT`: a Prometheus text-format endpoint. Every
-//! /metrics scrape samples the process table fresh — no background
+//! `--serve [HOST]:PORT`: a Prometheus text-format endpoint (/metrics) and
+//! a JSON process table (/api/ps, the same versioned envelope as `--json`).
+//! Every scrape samples the process table fresh — no background
 //! sampler, no interval to tune; scrape frequency IS the sample rate.
 //!
 //! Hand-rolled on std::net (one thread per connection, sequential reads)
 //! so the binary keeps zero extra dependencies. Cardinality stays bounded:
 //! per-process gauges cover the union of the top-20 CPU and top-20 RSS
-//! processes, plus the machine totals.
+//! processes, plus the machine totals; port gauges are one series per
+//! listening (proto, port).
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -120,6 +122,20 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
             ));
         }
     }
+    // listening sockets: one series per (proto, port), owner a comma-joined
+    // "name (pid N)" list — port sprawl and unexpected listeners at a glance
+    let socks = platform.list_sockets().unwrap_or_default();
+    let listeners = crate::snapshot::to_listeners(&socks, &procs);
+    out.push_str("# HELP witr_port_listeners Listening sockets by proto and port\n");
+    out.push_str("# TYPE witr_port_listeners gauge\n");
+    for l in &listeners {
+        out.push_str(&format!(
+            "witr_port_listeners{{proto=\"{}\",port=\"{}\",owner=\"{}\"}} 1\n",
+            label_escape(&l.proto),
+            l.port,
+            label_escape(&l.who.join(", ")),
+        ));
+    }
     // self-monitoring: total scrapes served and how long the last one took
     out.push_str("# HELP witr_scrapes_total Scrapes served since startup\n");
     out.push_str("# TYPE witr_scrapes_total counter\n");
@@ -174,13 +190,28 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
             let Ok(n) = stream.read(&mut buf) else { return };
             let req = String::from_utf8_lossy(&buf[..n]);
             let path = req.split_whitespace().nth(1).unwrap_or("");
+            // /api/ps: the full process table as the same versioned JSON
+            // envelope `--json` prints — a machine-readable sibling to the
+            // Prometheus gauges
+            if path == "/api/ps" || path.starts_with("/api/ps?") {
+                let platform = crate::platform::get();
+                let mut procs = platform.list_processes().unwrap_or_default();
+                platform.enrich_listing(&mut procs);
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    &crate::json_envelope(&procs),
+                );
+                return;
+            }
             if !path.starts_with("/metrics") {
                 match path {
                     "/" => respond(
                         &mut stream,
                         "200 OK",
                         "text/plain; charset=utf-8",
-                        "witr-rs metrics at /metrics\n",
+                        "witr-rs: /metrics (Prometheus) · /api/ps (JSON process table)\n",
                     ),
                     _ => respond(&mut stream, "404 Not Found", "text/plain", "not found\n"),
                 }

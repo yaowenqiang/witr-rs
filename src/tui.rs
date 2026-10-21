@@ -89,6 +89,7 @@ enum Focus {
 
 /// Consecutive over-threshold samples before an alert fires — re-exported
 /// from history (shared with the headless --watch loop).
+#[cfg(test)]
 use crate::history::alert_cycle;
 use crate::history::AlertTrack;
 use crate::history::ALERT_CYCLES;
@@ -312,6 +313,18 @@ struct TuiApp {
     /// established-connection counts from the last refresh (only sampled
     /// when alert_conn is set — one socket sweep per tick)
     conn_counts: HashMap<Pid, u64>,
+    /// --alert-port canaries: (port, negate) — negate=true means the
+    /// listener must stay up; alerts fire on the appear/gone edges
+    alert_port: Vec<(u16, bool)>,
+    /// per-port LISTEN presence from the last refresh (edge detection;
+    /// the first observation only arms)
+    port_seen: HashMap<u16, bool>,
+    /// last-known "name (pid N)" label per watched port (the "gone"
+    /// message says what vanished)
+    port_owner: HashMap<u16, String>,
+    /// --alert-repeat: re-send a firing alert about every N seconds while
+    /// its excursion keeps burning (None = once per excursion)
+    alert_repeat: Option<u64>,
     /// --alert-exec: shell command per alert firing (context in env vars)
     alert_exec: Option<String>,
     /// pid → per-metric streak/firing state (pruned to live pids)
@@ -438,6 +451,11 @@ pub struct Seed {
     /// --alert-conn: ESTABLISHED-connection-count threshold; sustained
     /// excess → alert (connection-leak detection)
     pub alert_conn: Option<u64>,
+    /// --alert-port canaries: (port, negate) — alert on the LISTEN
+    /// appear edge, or (negated) on the listener-gone edge
+    pub alert_port: Vec<(u16, bool)>,
+    /// --alert-repeat: re-send firing alerts about every N seconds
+    pub alert_repeat: Option<u64>,
     /// --alert-exec: shell command run on every threshold-alert firing;
     /// context exported as WITR_ALERT_PID/NAME/DETAIL
     pub alert_exec: Option<String>,
@@ -602,6 +620,10 @@ impl TuiApp {
             alert_io: seed.alert_io,
             alert_conn: seed.alert_conn,
             conn_counts: HashMap::new(),
+            alert_port: seed.alert_port.clone(),
+            port_seen: HashMap::new(),
+            port_owner: HashMap::new(),
+            alert_repeat: seed.alert_repeat,
             alert_exec: seed.alert_exec.clone(),
             alert_state: HashMap::new(),
             notes: seed.notes,
@@ -803,7 +825,21 @@ impl TuiApp {
             // its limit for ALERT_CYCLES samples fires once per excursion —
             // ring record, --events-log line, desktop ping. Always notifies:
             // the flag IS the opt-in.
-            for (pid, name, detail) in self.alert_picks() {
+            let mut picks = self.alert_picks();
+            if !self.alert_port.is_empty() {
+                // --alert-port: listener appear/gone edges from the same
+                // socket sweep the Ports tab uses; first sighting only arms,
+                // so listeners already up at startup don't fire
+                let socks = self.platform.list_all_sockets().unwrap_or_default();
+                picks.extend(crate::port_alert_picks(
+                    &self.alert_port,
+                    &socks,
+                    &self.procs,
+                    &mut self.port_seen,
+                    &mut self.port_owner,
+                ));
+            }
+            for (pid, name, detail) in picks {
                 let e = self.hist.push_alert(pid, &name, &detail);
                 if let Some(f) = self.events_log.as_mut() {
                     use std::io::Write as _;
@@ -1315,14 +1351,22 @@ impl TuiApp {
         {
             return Vec::new();
         }
-        let secs = ALERT_CYCLES as u64 * self.refresh.max(Duration::from_secs(1)).as_secs();
+        let interval = self.refresh.max(Duration::from_secs(1)).as_secs();
+        let secs = ALERT_CYCLES as u64 * interval;
         let mut out = Vec::new();
         for p in &self.procs {
             let track = self.alert_state.entry(p.pid).or_default();
             if let Some(limit) = self.alert_cpu {
                 let now = self.hist.cpu_now.get(&p.pid).copied();
                 let over = now.is_some_and(|c| c > limit);
-                if alert_cycle(&mut track.cpu_streak, &mut track.cpu_firing, over) {
+                if crate::history::alert_cycle_repeat(
+                    &mut track.cpu_streak,
+                    &mut track.cpu_firing,
+                    over,
+                    &mut track.cpu_fired_secs,
+                    self.alert_repeat,
+                    interval,
+                ) {
                     out.push((
                         p.pid,
                         p.name.clone(),
@@ -1333,7 +1377,14 @@ impl TuiApp {
             if let Some(limit_mb) = self.alert_mem {
                 let mb = p.mem_kb.map(|kb| kb / 1024);
                 let over = mb.is_some_and(|m| m > limit_mb);
-                if alert_cycle(&mut track.mem_streak, &mut track.mem_firing, over) {
+                if crate::history::alert_cycle_repeat(
+                    &mut track.mem_streak,
+                    &mut track.mem_firing,
+                    over,
+                    &mut track.mem_fired_secs,
+                    self.alert_repeat,
+                    interval,
+                ) {
                     out.push((
                         p.pid,
                         p.name.clone(),
@@ -1344,7 +1395,14 @@ impl TuiApp {
             if let Some(limit) = self.alert_fd {
                 let n = self.fd_counts.get(&p.pid).copied();
                 let over = n.is_some_and(|c| c > limit);
-                if alert_cycle(&mut track.fd_streak, &mut track.fd_firing, over) {
+                if crate::history::alert_cycle_repeat(
+                    &mut track.fd_streak,
+                    &mut track.fd_firing,
+                    over,
+                    &mut track.fd_fired_secs,
+                    self.alert_repeat,
+                    interval,
+                ) {
                     out.push((
                         p.pid,
                         p.name.clone(),
@@ -1358,7 +1416,14 @@ impl TuiApp {
             if let Some(limit_mbps) = self.alert_io {
                 let bps = self.hist.io_rate_of(p.pid).map(|(r, w)| r + w);
                 let over = bps.is_some_and(|b| b > limit_mbps * 1024.0 * 1024.0);
-                if alert_cycle(&mut track.io_streak, &mut track.io_firing, over) {
+                if crate::history::alert_cycle_repeat(
+                    &mut track.io_streak,
+                    &mut track.io_firing,
+                    over,
+                    &mut track.io_fired_secs,
+                    self.alert_repeat,
+                    interval,
+                ) {
                     out.push((
                         p.pid,
                         p.name.clone(),
@@ -1372,7 +1437,14 @@ impl TuiApp {
             if let Some(limit) = self.alert_conn {
                 let n = self.conn_counts.get(&p.pid).copied();
                 let over = n.is_some_and(|c| c > limit);
-                if alert_cycle(&mut track.conn_streak, &mut track.conn_firing, over) {
+                if crate::history::alert_cycle_repeat(
+                    &mut track.conn_streak,
+                    &mut track.conn_firing,
+                    over,
+                    &mut track.conn_fired_secs,
+                    self.alert_repeat,
+                    interval,
+                ) {
                     out.push((
                         p.pid,
                         p.name.clone(),
@@ -2436,7 +2508,7 @@ impl TuiApp {
 /// Failures always carry a non-empty message: spawn errors get the tool
 /// name for context, and tools that fail silently (empty stderr) get a
 /// plain "failed" note — the status line would otherwise go blank.
-fn send_signal(pid: Pid, sig: &str) -> std::io::Result<()> {
+pub(crate) fn send_signal(pid: Pid, sig: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let out = std::process::Command::new("kill")
@@ -5504,7 +5576,7 @@ fn on_click(app: &mut TuiApp, x: u16, y: u16) {
 
 /// Every pid in `procs` that descends from `root` via ppid links (BFS, so
 /// grandchildren are covered even when the direct parent is reaped mid-walk).
-fn descendants_of(root: Pid, procs: &[Process]) -> Vec<Pid> {
+pub(crate) fn descendants_of(root: Pid, procs: &[Process]) -> Vec<Pid> {
     let mut out = Vec::new();
     let mut frontier = vec![root];
     let mut seen: std::collections::HashSet<Pid> = std::collections::HashSet::new();
@@ -7972,6 +8044,8 @@ mod tests {
                 alert_fd: None,
                 alert_io: None,
                 alert_conn: None,
+                alert_port: Vec::new(),
+                alert_repeat: None,
                 notes: Vec::new(),
             },
         );

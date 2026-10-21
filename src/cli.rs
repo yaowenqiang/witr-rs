@@ -21,6 +21,9 @@ pub enum TopMetric {
     Fd,
     /// Cumulative disk I/O bytes (read + write; Linux /proc)
     Io,
+    /// Disk I/O rate in bytes/s (read + write; needs two samples one
+    /// second apart — or a running --watch — to take the delta)
+    IoRate,
     /// Time since start — oldest first ("what has been running since boot")
     Age,
 }
@@ -32,6 +35,7 @@ impl TopMetric {
             TopMetric::Mem => "RSS",
             TopMetric::Fd => "FDS",
             TopMetric::Io => "IO",
+            TopMetric::IoRate => "IO/S",
             TopMetric::Age => "AGE",
         }
     }
@@ -68,7 +72,14 @@ impl TopMetric {
   witr-rs --diff last      what changed since the last auto snapshot
   witr-rs --diff last --json   ...as JSON
   witr-rs --report-html status.html   self-contained html report
-  witr-rs --serve :9100    expose Prometheus metrics on :9100
+  witr-rs --audit 'make build'   run a command, report its subtree resource footprint
+  witr-rs node --kill            kill every matching process
+  witr-rs node --kill-tree --signal KILL   ...and every descendant
+  witr-rs --watch 2 --alert-port 9090        alert when something starts listening on :9090
+  witr-rs --watch 2 --alert-port '!8080' --alert-repeat 60   ...and keep nagging while :8080 is down
+  witr-rs --top io-rate          hottest processes by disk-I/O rate
+  witr-rs nginx --logs --grep error   last 100 log lines, filtered
+  witr-rs --serve :9100    expose Prometheus metrics on :9100 (curl :9100/api/ps for JSON)
   witr-rs --man witr-rs.1  write the man page"
 )]
 pub struct Cli {
@@ -194,7 +205,7 @@ pub struct Cli {
 
     /// Print the last N log lines (default 100) of the matched process:
     /// container logs when attributed to one, else journald (Linux) or the
-    /// unified log (macOS).
+    /// unified log (macOS). Add --grep PATTERN to keep only matching lines.
     #[arg(
         long = "logs",
         value_name = "N",
@@ -202,6 +213,10 @@ pub struct Cli {
         default_missing_value = "100"
     )]
     pub logs: Option<u64>,
+
+    /// With --logs: keep only log lines containing this substring.
+    #[arg(long = "grep", value_name = "PATTERN")]
+    pub grep: Option<String>,
 
     /// Append every event (started/exited/restarted) as JSON lines to
     /// this file — a durable record you can --replay later. Without
@@ -260,14 +275,52 @@ pub struct Cli {
     #[arg(long = "alert-conn", value_name = "N")]
     pub alert_conn: Option<u64>,
 
+    /// Listener canary, repeatable: alert when something starts LISTENing
+    /// on this port (an edge — a port already bound at startup is the
+    /// status quo, not an event). Prefix with ! to invert: `--alert-port
+    /// '!8080'` alerts when a listener that was up disappears. TUI and
+    /// --watch.
+    #[arg(long = "alert-port", value_name = "PORT|!PORT")]
+    pub alert_port: Vec<String>,
+
+    /// While a threshold alert keeps firing, re-send it about every N
+    /// seconds instead of once per excursion — a watchdog that nags until
+    /// someone looks. Needs one of the --alert-* thresholds.
+    #[arg(long = "alert-repeat", value_name = "SECONDS")]
+    pub alert_repeat: Option<u64>,
+
     /// Run this shell command each time a threshold alert fires (needs one
-    /// of --alert-cpu/--alert-mem/--alert-fd/--alert-io/--alert-conn; one
-    /// run per excursion). The alert context is exported as
-    /// WITR_ALERT_PID / WITR_ALERT_NAME / WITR_ALERT_DETAIL — e.g.
+    /// of --alert-cpu/--alert-mem/--alert-fd/--alert-io/--alert-conn/
+    /// --alert-port; one run per excursion). The alert context is exported
+    /// as WITR_ALERT_PID / WITR_ALERT_NAME / WITR_ALERT_DETAIL — e.g.
     /// `--alert-exec 'curl -s $SLACK_HOOK -d "$WITR_ALERT_NAME:
     /// $WITR_ALERT_DETAIL"'`. TUI and --watch.
     #[arg(long = "alert-exec", value_name = "CMD")]
     pub alert_exec: Option<String>,
+
+    /// Run CMD under a shell, watch only its process subtree, and on exit
+    /// print the audit report: wall duration, exit code, how many processes
+    /// it spawned, peak subtree CPU/RSS, disk I/O and the process tree.
+    /// A standalone mode: cannot be combined with targets.
+    #[arg(long = "audit", value_name = "CMD")]
+    pub audit: Option<String>,
+
+    /// Kill every process matching the targets (name, --pid, --port,
+    /// --file, --container) instead of reporting on them. Sends SIGTERM
+    /// unless --signal says otherwise. Needs targets.
+    #[arg(long = "kill")]
+    pub kill: bool,
+
+    /// Like --kill, but also kills every descendant of each match
+    /// (children first, then the match). Needs targets.
+    #[arg(long = "kill-tree")]
+    pub kill_tree: bool,
+
+    /// Signal name for --kill/--kill-tree (default TERM; e.g. KILL, INT,
+    /// HUP — passed to `kill -s` on Unix, mapped to taskkill /F for KILL
+    /// on Windows).
+    #[arg(long = "signal", value_name = "SIG")]
+    pub signal: Option<String>,
 
     /// Self-contained HTML report of the current process table (a summary
     /// plus the full table with cpu/mem bars) written to this file, then

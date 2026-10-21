@@ -1,4 +1,5 @@
 mod ancestry;
+mod audit;
 mod binary_id;
 mod cli;
 mod config;
@@ -268,11 +269,13 @@ fn run_on_exit(cmd: &str) {
 
 /// The N highest-ranked processes by one metric, best first. Clones rather
 /// than borrows — the count is small and the callers mix owned outputs.
+/// `rates` carries the sampler's per-pid I/O rates (bytes/s) for IoRate.
 fn top_procs(
     procs: &[Process],
     metric: cli::TopMetric,
     count: usize,
     fds: Option<&std::collections::HashMap<Pid, u64>>,
+    rates: Option<&history::History>,
 ) -> Vec<Process> {
     let mut ranked: Vec<(f64, &Process)> = procs
         .iter()
@@ -287,6 +290,9 @@ fn top_procs(
                     (p.io_read_bytes.is_some() || p.io_write_bytes.is_some())
                         .then_some((r + w) as f64)
                 }
+                cli::TopMetric::IoRate => rates
+                    .and_then(|h| h.io_rate_of(p.pid))
+                    .map(|(r, w)| r + w),
                 // age in seconds — desc order puts the oldest first
                 cli::TopMetric::Age => {
                     p.started.map(|t| (util::now_unix().saturating_sub(t)) as f64)
@@ -305,7 +311,7 @@ fn top_procs(
 /// guessing the shape. Bump [`SCHEMA_VERSION`] on breaking field changes.
 pub const SCHEMA_VERSION: u32 = 1;
 
-fn json_envelope(procs: &[Process]) -> String {
+pub(crate) fn json_envelope(procs: &[Process]) -> String {
     let doc = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "generated_at": util::now_unix(),
@@ -369,7 +375,8 @@ fn json_listing_output(procs: &[Process], tree: bool) -> String {
 /// One `--watch` tick of the threshold-alert machinery — the headless twin
 /// of the TUI's alert_picks: sweeps fd/socket counters when armed, advances
 /// each pid's per-metric cycle, returns the firings (one per excursion,
-/// re-armed when the metric drops back under).
+/// re-armed when the metric drops back under; with --alert-repeat, re-sent
+/// about every N seconds while the excursion keeps burning).
 #[allow(clippy::too_many_arguments)]
 fn watch_alert_picks(
     platform: &dyn Platform,
@@ -399,13 +406,21 @@ fn watch_alert_picks(
         *conn_counts = tui::established_per_pid(&socks);
     }
     let secs = history::ALERT_CYCLES as u64 * interval.max(1);
+    let repeat = cli.alert_repeat;
     let mut out = Vec::new();
     for p in procs {
         let track = state.entry(p.pid).or_default();
         if let Some(limit) = cli.alert_cpu {
             let now = hist.cpu_now.get(&p.pid).copied();
             let over = now.is_some_and(|c| c > limit);
-            if history::alert_cycle(&mut track.cpu_streak, &mut track.cpu_firing, over) {
+            if history::alert_cycle_repeat(
+                &mut track.cpu_streak,
+                &mut track.cpu_firing,
+                over,
+                &mut track.cpu_fired_secs,
+                repeat,
+                interval,
+            ) {
                 out.push((
                     p.pid,
                     p.name.clone(),
@@ -416,7 +431,14 @@ fn watch_alert_picks(
         if let Some(limit_mb) = cli.alert_mem {
             let mb = p.mem_kb.map(|kb| kb / 1024);
             let over = mb.is_some_and(|m| m > limit_mb);
-            if history::alert_cycle(&mut track.mem_streak, &mut track.mem_firing, over) {
+            if history::alert_cycle_repeat(
+                &mut track.mem_streak,
+                &mut track.mem_firing,
+                over,
+                &mut track.mem_fired_secs,
+                repeat,
+                interval,
+            ) {
                 out.push((
                     p.pid,
                     p.name.clone(),
@@ -427,7 +449,14 @@ fn watch_alert_picks(
         if let Some(limit) = cli.alert_fd {
             let n = fd_counts.get(&p.pid).copied();
             let over = n.is_some_and(|c| c > limit);
-            if history::alert_cycle(&mut track.fd_streak, &mut track.fd_firing, over) {
+            if history::alert_cycle_repeat(
+                &mut track.fd_streak,
+                &mut track.fd_firing,
+                over,
+                &mut track.fd_fired_secs,
+                repeat,
+                interval,
+            ) {
                 out.push((
                     p.pid,
                     p.name.clone(),
@@ -438,7 +467,14 @@ fn watch_alert_picks(
         if let Some(limit_mbps) = cli.alert_io {
             let bps = hist.io_rate_of(p.pid).map(|(r, w)| r + w);
             let over = bps.is_some_and(|b| b > limit_mbps * 1024.0 * 1024.0);
-            if history::alert_cycle(&mut track.io_streak, &mut track.io_firing, over) {
+            if history::alert_cycle_repeat(
+                &mut track.io_streak,
+                &mut track.io_firing,
+                over,
+                &mut track.io_fired_secs,
+                repeat,
+                interval,
+            ) {
                 out.push((
                     p.pid,
                     p.name.clone(),
@@ -452,7 +488,14 @@ fn watch_alert_picks(
         if let Some(limit) = cli.alert_conn {
             let n = conn_counts.get(&p.pid).copied();
             let over = n.is_some_and(|c| c > limit);
-            if history::alert_cycle(&mut track.conn_streak, &mut track.conn_firing, over) {
+            if history::alert_cycle_repeat(
+                &mut track.conn_streak,
+                &mut track.conn_firing,
+                over,
+                &mut track.conn_fired_secs,
+                repeat,
+                interval,
+            ) {
                 out.push((
                     p.pid,
                     p.name.clone(),
@@ -466,6 +509,83 @@ fn watch_alert_picks(
     }
     let seen: std::collections::HashSet<Pid> = procs.iter().map(|p| p.pid).collect();
     state.retain(|pid, _| seen.contains(pid));
+    out
+}
+
+/// Parse one `--alert-port` value: `8080` (alert when a listener appears)
+/// or `!8080` (alert when a listener that was up disappears).
+fn parse_alert_port(raw: &str) -> Option<(u16, bool)> {
+    let (negate, rest) = match raw.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    rest.parse::<u16>().ok().map(|port| (port, negate))
+}
+
+/// One `--watch` tick of the `--alert-port` canary: compares each armed
+/// port's LISTEN presence against the previous tick. The first observation
+/// only arms — a port already in whatever state at startup is the status
+/// quo, not an event (mirrors `--on-exit`/`--on-start` edge semantics).
+/// Returns (owner_pid_or_0, name, detail) firings; `owner` remembers the
+/// last-known listener label so the "gone" message can say what vanished.
+pub(crate) fn port_alert_picks(
+    armed: &[(u16, bool)],
+    socks: &[model::Socket],
+    procs: &[Process],
+    seen: &mut HashMap<u16, bool>,
+    owner: &mut HashMap<u16, String>,
+) -> Vec<(Pid, String, String)> {
+    if armed.is_empty() {
+        return Vec::new();
+    }
+    let listeners = snapshot::to_listeners(socks, procs);
+    let mut out = Vec::new();
+    for &(port, negate) in armed {
+        let hit = listeners.iter().find(|l| l.port == port);
+        let now_present = hit.is_some();
+        let who = hit.map(|l| l.who.join(", ")).unwrap_or_default();
+        // "name (pid N)" → the pid, for the event record
+        let pid = hit
+            .and_then(|l| l.who.first())
+            .and_then(|w| w.split("(pid ").nth(1))
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|num| num.parse::<Pid>().ok())
+            .unwrap_or(0);
+        match seen.get(&port) {
+            None => {
+                seen.insert(port, now_present);
+                if now_present {
+                    owner.insert(port, who);
+                }
+            }
+            Some(&prev) => {
+                seen.insert(port, now_present);
+                match (now_present, prev) {
+                    (true, false) => {
+                        // remember the owner even on a negated arm — the
+                        // "gone" report should name what was listening
+                        owner.insert(port, who.clone());
+                        if !negate {
+                            out.push((
+                                pid,
+                                format!(":{port}"),
+                                format!("listener appeared on :{port} ({who})"),
+                            ));
+                        }
+                    }
+                    (false, true) if negate => {
+                        let was = owner.get(&port).map(String::as_str).unwrap_or("?");
+                        out.push((
+                            0,
+                            format!(":{port}"),
+                            format!("listener gone from :{port} (was {was})"),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     out
 }
 
@@ -707,6 +827,55 @@ fn main() {
         eprintln!("--sockets extends --snap; add --snap [FILE]");
         std::process::exit(4);
     }
+    // --alert-port values parse up front (bad ports exit 4 here, not a
+    // silent no-alert later)
+    let alert_ports: Vec<(u16, bool)> = match cli
+        .alert_port
+        .iter()
+        .map(|raw| parse_alert_port(raw).ok_or_else(|| raw.clone()))
+        .collect::<Result<Vec<_>, String>>()
+    {
+        Ok(v) => v,
+        Err(bad) => {
+            eprintln!("--alert-port {bad}: expected PORT or !PORT (e.g. 9090 or '!8080')");
+            std::process::exit(4);
+        }
+    };
+    let any_alert_armed = cli.alert_cpu.is_some()
+        || cli.alert_mem.is_some()
+        || cli.alert_fd.is_some()
+        || cli.alert_io.is_some()
+        || cli.alert_conn.is_some()
+        || !alert_ports.is_empty();
+    if cli.alert_repeat.is_some() && !any_alert_armed {
+        eprintln!(
+            "--alert-repeat re-sends threshold alerts; give --alert-cpu, --alert-mem, --alert-fd, --alert-io, --alert-conn or --alert-port"
+        );
+        std::process::exit(4);
+    }
+    if cli.grep.is_some() && cli.logs.is_none() {
+        eprintln!("--grep filters --logs output; add --logs [N]");
+        std::process::exit(4);
+    }
+    if (cli.kill || cli.kill_tree) && specs.is_empty() {
+        eprintln!(
+            "--kill/--kill-tree kill the processes matching a target; give a name, --pid, --port, --file or --container"
+        );
+        std::process::exit(4);
+    }
+    if cli.signal.is_some() && !cli.kill && !cli.kill_tree {
+        eprintln!("--signal chooses the signal --kill/--kill-tree sends; add --kill or --kill-tree");
+        std::process::exit(4);
+    }
+    if let Some(sig) = &cli.signal {
+        // names only (TERM/KILL/USR1, optional SIG prefix); a typo'd number
+        // silently meaning SIGKILL is worse than an error
+        let bare = sig.strip_prefix("SIG").unwrap_or(sig);
+        if bare.is_empty() || !bare.chars().all(|c| c.is_ascii_alphabetic()) {
+            eprintln!("--signal {sig}: use a signal name like TERM, KILL, INT, HUP");
+            std::process::exit(4);
+        }
+    }
     if cli.replay.is_some() && !cli.interactive && !specs.is_empty() {
         eprintln!("--replay opens the TUI; drop the targets or use -i");
         std::process::exit(4);
@@ -729,9 +898,10 @@ fn main() {
         && cli.alert_fd.is_none()
         && cli.alert_io.is_none()
         && cli.alert_conn.is_none()
+        && cli.alert_port.is_empty()
     {
         eprintln!(
-            "--alert-exec runs with threshold alerts; give --alert-cpu, --alert-mem, --alert-fd, --alert-io or --alert-conn"
+            "--alert-exec runs with threshold alerts; give --alert-cpu, --alert-mem, --alert-fd, --alert-io, --alert-conn or --alert-port"
         );
         std::process::exit(4);
     }
@@ -794,6 +964,27 @@ fn main() {
         eprintln!("--watch refreshes --top rankings; it does not re-emit --csv/--markdown/--report-html");
         std::process::exit(4);
     }
+    // --audit runs a command of its own — it is the whole point, so nothing
+    // else may drive the session
+    if cli.audit.is_some()
+        && (!specs.is_empty()
+            || cli.interactive
+            || cli.watch.is_some()
+            || cli.follow
+            || listing_extras > 0
+            || cli.snap.is_some()
+            || cli.diff.is_some()
+            || cli.serve.is_some()
+            || cli.kill
+            || cli.kill_tree)
+    {
+        eprintln!("--audit runs and observes its own command; drop the other modes and targets");
+        std::process::exit(4);
+    }
+    if (cli.kill || cli.kill_tree) && (cli.interactive || cli.watch.is_some() || cli.follow) {
+        eprintln!("--kill/--kill-tree are one-shot; drop -i/--watch/--follow");
+        std::process::exit(4);
+    }
 
     // --replay: load a recorded --events-log JSONL — either to digest it
     // (`--since`, works piped) or to open the TUI on the Events tab (live
@@ -834,6 +1025,79 @@ fn main() {
             eprintln!("--since needs --replay FILE for a CLI digest, or the TUI (-i) for the live summary page");
             std::process::exit(4);
         }
+    }
+
+    // --audit: run a command under observation — its own standalone mode,
+    // exit code mirrors the audited command's
+    if let Some(cmd) = &cli.audit {
+        if cmd.trim().is_empty() {
+            eprintln!("--audit: empty command");
+            std::process::exit(4);
+        }
+        let code = audit::run(cmd, !no_color);
+        std::process::exit(code);
+    }
+
+    // --kill / --kill-tree: trace the targets like a report run would, then
+    // signal the matches instead of printing them. Exit 0 when everything
+    // was delivered, 2 when nothing matched, 1 on partial failure.
+    if cli.kill || cli.kill_tree {
+        let platform = platform::get();
+        let opts = pipeline::Options {
+            want_env: false,
+            deep_files: false,
+            deep_binaries: false,
+            ..Default::default()
+        };
+        let reports = pipeline::run(platform.as_ref(), specs, &opts);
+        let mut matches: Vec<Process> = reports
+            .iter()
+            .flat_map(|r| r.matches.iter().cloned())
+            .collect();
+        matches.sort_by_key(|p| p.pid);
+        matches.dedup_by(|a, b| a.pid == b.pid);
+        if matches.is_empty() {
+            eprintln!("--kill: no process matched the target(s)");
+            std::process::exit(2);
+        }
+        let sig = cli
+            .signal
+            .as_deref()
+            .unwrap_or("TERM")
+            .trim_start_matches("SIG")
+            .to_ascii_uppercase();
+        // tree mode: descendants first (reversed BFS puts leaves before
+        // roots), then the matches themselves
+        let mut order: Vec<Process> = Vec::new();
+        if cli.kill_tree {
+            let table = platform.list_processes().unwrap_or_default();
+            let mut extra: Vec<Process> = Vec::new();
+            for m in &matches {
+                for pid in tui::descendants_of(m.pid, &table).into_iter().rev() {
+                    if pid == m.pid || matches.iter().any(|x| x.pid == pid) {
+                        continue;
+                    }
+                    if let Some(p) = table.iter().find(|p| p.pid == pid) {
+                        extra.push(p.clone());
+                    }
+                }
+            }
+            extra.sort_by_key(|p| p.pid);
+            extra.dedup_by(|a, b| a.pid == b.pid);
+            order.extend(extra);
+        }
+        order.extend(matches);
+        let mut failed = 0usize;
+        for p in &order {
+            match tui::send_signal(p.pid, &sig) {
+                Ok(()) => write_out(&format!("killed {} (pid {}) [SIG{}]", p.name, p.pid, sig)),
+                Err(e) => {
+                    eprintln!("⚠ kill {} (pid {}): {e}", p.name, p.pid);
+                    failed += 1;
+                }
+            }
+        }
+        std::process::exit(i32::from(failed > 0));
     }
 
     // --snap / --diff: whole-process-table snapshots, listing operations —
@@ -1017,6 +1281,9 @@ fn main() {
             alert_exec: cli.alert_exec.clone(),
             alert_fd: cli.alert_fd,
             alert_io: cli.alert_io,
+            alert_conn: cli.alert_conn,
+            alert_port: alert_ports.clone(),
+            alert_repeat: cli.alert_repeat,
             watch: cfg.watch.clone(),
             notes: cfg.notes,
             ..tui::Seed::from_targets(
@@ -1044,6 +1311,9 @@ fn main() {
                 std::process::exit(4);
             }
             install_sigint_flag();
+            // io-rate ranking samples the counters every tick; the history
+            // turns the deltas into bytes/s
+            let mut hist = history::History::new();
             let mut ticks: u64 = 0;
             loop {
                 let mut listed = match platform.list_processes() {
@@ -1053,11 +1323,12 @@ fn main() {
                         std::process::exit(5);
                     }
                 };
-                if metric == cli::TopMetric::Io {
+                if matches!(metric, cli::TopMetric::Io | cli::TopMetric::IoRate) {
                     platform.enrich_listing(&mut listed);
                 }
                 gpu::enrich(&mut listed);
                 let procs = recent_only(listed);
+                hist.update(&procs);
                 let fds = if metric == cli::TopMetric::Fd {
                     platform.fd_counts()
                 } else {
@@ -1071,7 +1342,14 @@ fn main() {
                     interval,
                     now
                 ));
-                write_out(&render::render_top(&procs, metric, count, fds.as_ref(), &painter));
+                write_out(&render::render_top(
+                    &procs,
+                    metric,
+                    count,
+                    fds.as_ref(),
+                    Some(&hist),
+                    &painter,
+                ));
                 ticks += 1;
                 if cli.times.is_some_and(|n| ticks >= n.max(1)) {
                     std::process::exit(0);
@@ -1099,7 +1377,10 @@ fn main() {
         } else {
             None
         };
-        if cli.top == Some(cli::TopMetric::Io) {
+        if matches!(
+            cli.top,
+            Some(cli::TopMetric::Io) | Some(cli::TopMetric::IoRate)
+        ) {
             platform.enrich_listing(&mut procs);
         }
         gpu::enrich(&mut procs);
@@ -1107,17 +1388,54 @@ fn main() {
         if let Some(metric) = cli.top {
             let count = cli.count.unwrap_or(15).max(1);
             let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            // io-rate is a delta metric: two samples one second apart turn
+            // the cumulative counters into bytes/s (a running --watch keeps
+            // its own persistent history instead)
+            let rates = if metric == cli::TopMetric::IoRate {
+                let mut hist = history::History::new();
+                let _ = hist.update(&procs);
+                std::thread::sleep(Duration::from_secs(1));
+                let mut again = match platform.list_processes() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("cannot list processes: {}", e);
+                        std::process::exit(5);
+                    }
+                };
+                platform.enrich_listing(&mut again);
+                let _ = hist.update(&again);
+                Some(hist)
+            } else {
+                None
+            };
             if cli.json {
-                let ranked = top_procs(&procs, metric, count, fds.as_ref());
+                let ranked = top_procs(&procs, metric, count, fds.as_ref(), rates.as_ref());
                 write_out(&json_envelope(&ranked));
             } else if cli.csv {
-                write_out(&render::render_csv(&top_procs(&procs, metric, count, fds.as_ref())));
+                write_out(&render::render_csv(&top_procs(
+                    &procs,
+                    metric,
+                    count,
+                    fds.as_ref(),
+                    rates.as_ref(),
+                )));
             } else if cli.markdown {
                 write_out(&render::render_markdown(&top_procs(
-                    &procs, metric, count, fds.as_ref(),
+                    &procs,
+                    metric,
+                    count,
+                    fds.as_ref(),
+                    rates.as_ref(),
                 )));
             } else {
-                write_out(&render::render_top(&procs, metric, count, fds.as_ref(), &painter));
+                write_out(&render::render_top(
+                    &procs,
+                    metric,
+                    count,
+                    fds.as_ref(),
+                    rates.as_ref(),
+                    &painter,
+                ));
             }
         } else if cli.report_html.is_some() {
             let path = cli.report_html.as_deref().unwrap_or_default();
@@ -1161,6 +1479,9 @@ fn main() {
                 alert_exec: cli.alert_exec.clone(),
                 alert_fd: cli.alert_fd,
                 alert_io: cli.alert_io,
+                alert_conn: cli.alert_conn,
+                alert_port: alert_ports.clone(),
+                alert_repeat: cli.alert_repeat,
                 watch: cfg.watch.clone(),
                 notes: cfg.notes,
                 ..tui::Seed::default()
@@ -1227,6 +1548,9 @@ fn main() {
             let mut alert_state: HashMap<Pid, history::AlertTrack> = HashMap::new();
             let mut fd_counts: HashMap<Pid, u64> = HashMap::new();
             let mut conn_counts: HashMap<Pid, u64> = HashMap::new();
+            // --alert-port bookkeeping: presence + last-known owner per port
+            let mut port_seen: HashMap<u16, bool> = HashMap::new();
+            let mut port_owner: HashMap<u16, String> = HashMap::new();
             // the most recent firings, repeated under the header so a redraw
             // doesn't erase them from view
             let mut recent_alerts: Vec<String> = Vec::new();
@@ -1258,7 +1582,7 @@ fn main() {
                 if let Some(w) = recorder.as_mut() {
                     w.append(&procs, &hist);
                 }
-                for (pid, name, detail) in watch_alert_picks(
+                let mut picks = watch_alert_picks(
                     platform.as_ref(),
                     &cli,
                     &procs,
@@ -1267,10 +1591,26 @@ fn main() {
                     &mut alert_state,
                     &mut fd_counts,
                     &mut conn_counts,
-                ) {
+                );
+                if !alert_ports.is_empty() {
+                    let socks = platform.list_sockets().unwrap_or_default();
+                    picks.extend(port_alert_picks(
+                        &alert_ports,
+                        &socks,
+                        &procs,
+                        &mut port_seen,
+                        &mut port_owner,
+                    ));
+                }
+                for (pid, name, detail) in picks {
                     // in JSON-stream mode the stdout pipe carries data only —
                     // alerts go to stderr so jq output stays parseable
-                    let alert_line = format!("⚠ alert: {name} (pid {pid}) — {detail}");
+                    let who = if pid > 0 {
+                        format!("{name} (pid {pid})")
+                    } else {
+                        name.clone()
+                    };
+                    let alert_line = format!("⚠ alert: {who} — {detail}");
                     if json_stream {
                         eprintln!("{alert_line}");
                     } else {
@@ -1289,7 +1629,7 @@ fn main() {
                     if let Some(cmd) = &cli.alert_exec {
                         tui::spawn_alert_exec(cmd, pid, &name, &detail);
                     }
-                    recent_alerts.push(format!("{name} (pid {pid}) — {detail}"));
+                    recent_alerts.push(format!("{who} — {detail}"));
                     let excess = recent_alerts.len().saturating_sub(5);
                     recent_alerts.drain(..excess);
                 }
@@ -1531,16 +1871,36 @@ fn main() {
         match resolved {
             Some((src, what)) => {
                 write_out("");
-                write_out(&format!("== recent logs · {} ({what}) ==", src.describe()));
+                let grep_note = cli
+                    .grep
+                    .as_deref()
+                    .map(|g| format!(" · grep '{g}'"))
+                    .unwrap_or_default();
+                write_out(&format!(
+                    "== recent logs · {} ({what}){grep_note} ==",
+                    src.describe()
+                ));
                 match logs::fetch(&src, n.max(1) as usize) {
                     Ok(lines) if lines.is_empty() => {
                         write_out("(no log entries found for this process)");
                     }
-                    Ok(lines) => {
-                        for l in lines {
-                            write_out(&l);
+                    Ok(lines) => match cli.grep.as_deref() {
+                        Some(pattern) => {
+                            let hits: Vec<&String> =
+                                lines.iter().filter(|l| l.contains(pattern)).collect();
+                            if hits.is_empty() {
+                                write_out(&format!("(no log lines matching '{pattern}')"));
+                            }
+                            for l in hits {
+                                write_out(l);
+                            }
                         }
-                    }
+                        None => {
+                            for l in lines {
+                                write_out(&l);
+                            }
+                        }
+                    },
                     Err(e) => write_out(&format!("⚠ {e}")),
                 }
             }
@@ -1578,6 +1938,59 @@ mod tests {
         assert!(on_exit_edge(&mut had, false));
     }
 
+    #[test]
+    fn parse_alert_port_accepts_port_and_negation() {
+        assert_eq!(parse_alert_port("8080"), Some((8080, false)));
+        assert_eq!(parse_alert_port("!8080"), Some((8080, true)));
+        assert_eq!(parse_alert_port(""), None);
+        assert_eq!(parse_alert_port("!"), None);
+        assert_eq!(parse_alert_port("nope"), None);
+        assert_eq!(parse_alert_port("99999"), None);
+    }
+
+    #[test]
+    fn port_alert_picks_arms_then_fires_edges() {
+        let sock = |port: u16, pid: Option<Pid>| crate::model::Socket {
+            proto: "tcp".into(),
+            local_addr: "0.0.0.0".into(),
+            local_port: port,
+            peer_addr: None,
+            peer_port: None,
+            state: "LISTEN".into(),
+            pid,
+        };
+        let procs = vec![proc(5, "nginx", None, None)];
+        let armed = vec![(8080u16, false), (9090u16, true)];
+        let up = vec![sock(8080, Some(5))];
+        let mut seen = HashMap::new();
+        let mut owner = HashMap::new();
+
+        // first sighting only arms — whatever is up at startup is the
+        // status quo, not an event
+        assert!(port_alert_picks(&armed, &up, &procs, &mut seen, &mut owner).is_empty());
+
+        // 8080 vanishes → quiet (a plain arm reports appears only);
+        // 9090 still absent → quiet
+        let empty: Vec<crate::model::Socket> = Vec::new();
+        assert!(port_alert_picks(&armed, &empty, &procs, &mut seen, &mut owner).is_empty());
+
+        // 8080 returns → appear fires, carrying the owning pid
+        let hits = port_alert_picks(&armed, &up, &procs, &mut seen, &mut owner);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 5);
+        assert_eq!(hits[0].1, ":8080");
+        assert!(hits[0].2.contains("listener appeared on :8080"));
+
+        // 9090 comes up (arms silently), then goes away → the negated arm
+        // fires gone with the remembered owner
+        let both = vec![sock(8080, Some(5)), sock(9090, Some(5))];
+        assert!(port_alert_picks(&armed, &both, &procs, &mut seen, &mut owner).is_empty());
+        let hits = port_alert_picks(&armed, &up, &procs, &mut seen, &mut owner);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 0);
+        assert!(hits[0].2.contains("listener gone from :9090 (was nginx (pid 5))"));
+    }
+
     fn proc(pid: i32, name: &str, cpu: Option<f64>, mem_kb: Option<u64>) -> Process {
         Process {
             pid,
@@ -1595,14 +2008,14 @@ mod tests {
             proc(2, "b", Some(9.0), Some(8192)),
             proc(3, "c", Some(4.0), Some(4096)),
         ];
-        let top = top_procs(&procs, cli::TopMetric::Cpu, 2, None);
+        let top = top_procs(&procs, cli::TopMetric::Cpu, 2, None, None);
         let names: Vec<&str> = top.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["b", "c"]);
         // mem ranking uses the same rows, different key
-        let top_mem = top_procs(&procs, cli::TopMetric::Mem, 1, None);
+        let top_mem = top_procs(&procs, cli::TopMetric::Mem, 1, None, None);
         assert_eq!(top_mem[0].name, "b");
         // fd with no map → nothing
-        assert!(top_procs(&procs, cli::TopMetric::Fd, 5, None).is_empty());
+        assert!(top_procs(&procs, cli::TopMetric::Fd, 5, None, None).is_empty());
     }
 
     #[test]
