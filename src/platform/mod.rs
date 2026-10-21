@@ -481,9 +481,9 @@ pub trait Platform {
     /// Open-descriptor counts for every process in one sweep — the
     /// `--top fd` ranking and `--alert-fd` sampling read this. Linux walks
     /// /proc/<pid>/fd (cheap); macOS parses one system-wide `lsof -F pf`
-    /// scan (~1s, acceptable because callers run it once per refresh only
-    /// when fd data is actually wanted); Windows has no equivalent probe
-    /// (None = the feature reports itself unavailable).
+    /// scan; Windows sweeps `Get-Process` HandleCount (kernel handles —
+    /// the same counter Sysinternals surfaces). None = the feature
+    /// reports itself unavailable.
     fn fd_counts(&self) -> Option<std::collections::HashMap<Pid, u64>> {
         None
     }

@@ -1,6 +1,7 @@
 //! `--serve [HOST]:PORT`: a Prometheus text-format endpoint (/metrics) and
-//! a JSON process table (/api/ps, the same versioned envelope as `--json`).
-//! Every scrape samples the process table fresh — no background
+//! a small JSON API — /api/ps (process table), /api/ports (listeners),
+//! /api/tree (nested forest), all in the same versioned envelopes the CLI
+//! prints. Every scrape samples the process table fresh — no background
 //! sampler, no interval to tune; scrape frequency IS the sample rate.
 //!
 //! Hand-rolled on std::net (one thread per connection, sequential reads)
@@ -205,13 +206,48 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
                 );
                 return;
             }
+            // /api/ports: the LISTEN table (proto, port, owners) — the
+            // `--ports` listing as JSON
+            if path == "/api/ports" || path.starts_with("/api/ports?") {
+                let platform = crate::platform::get();
+                let procs = platform.list_processes().unwrap_or_default();
+                let socks = platform.list_sockets().unwrap_or_default();
+                let mut listeners = crate::snapshot::to_listeners(&socks, &procs);
+                listeners.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.proto.cmp(&b.proto)));
+                let doc = serde_json::json!({
+                    "schema_version": crate::SCHEMA_VERSION,
+                    "generated_at": crate::util::now_unix(),
+                    "listener_count": listeners.len(),
+                    "listeners": listeners,
+                });
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    &serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()),
+                );
+                return;
+            }
+            // /api/tree: the nested children forest — `--tree --json` over
+            // HTTP
+            if path == "/api/tree" || path.starts_with("/api/tree?") {
+                let platform = crate::platform::get();
+                let procs = platform.list_processes().unwrap_or_default();
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    &crate::json_tree_forest(&procs),
+                );
+                return;
+            }
             if !path.starts_with("/metrics") {
                 match path {
                     "/" => respond(
                         &mut stream,
                         "200 OK",
                         "text/plain; charset=utf-8",
-                        "witr-rs: /metrics (Prometheus) · /api/ps (JSON process table)\n",
+                        "witr-rs: /metrics (Prometheus) · /api/ps (process table) · /api/ports (listeners) · /api/tree (forest)\n",
                     ),
                     _ => respond(&mut stream, "404 Not Found", "text/plain", "not found\n"),
                 }

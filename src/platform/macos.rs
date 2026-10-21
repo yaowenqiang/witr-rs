@@ -166,6 +166,44 @@ fn sysctl_str(_name: &str) -> Option<String> {
     None
 }
 
+/// One integer sysctl as a number (`hw.memsize`, `hw.pagesize`) — these are
+/// raw little-endian words, not text, so `sysctl_str` can't read them.
+#[cfg(target_os = "macos")]
+fn sysctl_u64(name: &str) -> Option<u64> {
+    extern "C" {
+        fn sysctlbyname(
+            name: *const i8,
+            oldp: *mut u8,
+            oldlenp: *mut usize,
+            newp: *mut u8,
+            newlen: usize,
+        ) -> i32;
+    }
+    let cname = std::ffi::CString::new(name).ok()?;
+    unsafe {
+        let mut len: usize = 0;
+        if sysctlbyname(cname.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) != 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        if sysctlbyname(cname.as_ptr(), buf.as_mut_ptr(), &mut len, std::ptr::null_mut(), 0) != 0 {
+            return None;
+        }
+        buf.truncate(len);
+        match buf.len() {
+            8 => Some(u64::from_le_bytes(buf.try_into().ok()?)),
+            4 => Some(u32::from_le_bytes(buf.try_into().ok()?) as u64),
+            _ => None,
+        }
+    }
+}
+
+/// Non-macOS stub — see [`sysctl_u64`].
+#[cfg(not(target_os = "macos"))]
+fn sysctl_u64(_name: &str) -> Option<u64> {
+    None
+}
+
 /// Per-pid descriptor counts from one `lsof -F pf` scan: `p<pid>` opens a
 /// process section, each `f<fd>` line inside counts one descriptor. Pure —
 /// compiled everywhere so the trait impl does.
@@ -229,10 +267,18 @@ fn parse_vm_stat(text: &str, page_size: u64) -> Option<u64> {
             })
             .unwrap_or(0)
     };
-    let used_pages = get("Pages active: ")
-        + get("Pages wired down: ")
-        + get("Pages occupied by compressor: ")
-        + get("Pages stored in compressor: "); // older label; the two never coexist
+    let active = get("Pages active: ");
+    let wired = get("Pages wired down: ");
+    // both compressor labels exist on modern macOS: "occupied" is the
+    // physical pages holding compressed data, "stored" the logical page
+    // count of what's inside — counting both double-books memory. Prefer
+    // occupied; old macOS that only reported stored still works.
+    let compressor = {
+        let occupied = get("Pages occupied by compressor: ");
+        let stored = get("Pages stored in compressor: ");
+        if occupied > 0 { occupied } else { stored }
+    };
+    let used_pages = active + wired + compressor;
     (used_pages > 0).then(|| used_pages * page_size / (1024 * 1024))
 }
 
@@ -730,15 +776,11 @@ impl Platform for MacOs {
         *prev = Some(cur);
         drop(prev);
 
-        let page_size: u64 = sysctl_str("hw.pagesize")
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(16384);
+        let page_size: u64 = sysctl_u64("hw.pagesize").unwrap_or(16384);
         if let Ok(text) = crate::util::run("vm_stat", &[], CMD_TIMEOUT) {
             out.mem_used_mb = parse_vm_stat(&text, page_size);
         }
-        out.mem_total_mb = sysctl_str("hw.memsize")
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(|b| b / (1024 * 1024));
+        out.mem_total_mb = sysctl_u64("hw.memsize").map(|b| b / (1024 * 1024));
         if let Some(su) = sysctl_str("vm.swapusage") {
             let (used, total) = parse_swapusage(&su);
             out.swap_used_mb = used;
@@ -1360,6 +1402,20 @@ fn parse_cpu_time_to_ms(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// Integer sysctls must come back as numbers — `sysctl_str` reads raw
+    /// bytes and made `hw.memsize` unparseable, so memory-percent alerts
+    /// silently never measured (total stayed None).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn sysctl_u64_reads_integer_sysctls() {
+        let page = sysctl_u64("hw.pagesize").expect("hw.pagesize is an integer sysctl");
+        assert!(page == 4096 || page == 16384, "realistic page size, got {page}");
+        let mem = sysctl_u64("hw.memsize").expect("hw.memsize is an integer sysctl");
+        assert!(mem > 1024 * 1024 * 1024, "at least 1 GB of RAM, got {mem}");
+        // string sysctls keep working through the text reader
+        assert!(sysctl_str("vm.swapusage").is_some());
+    }
+
     #[test]
     fn lsof_fd_counts_sections_and_garbage() {
         let text = "\
@@ -1711,6 +1767,11 @@ Pages occupied by compressor:            75000.
         // the older compressor label still counts
         let old = text.replace("Pages occupied by compressor:", "Pages stored in compressor:");
         assert_eq!(parse_vm_stat(&old, 4096), Some(2832));
+        // modern macOS emits both labels — "stored" is the logical page
+        // count inside the compressor, "occupied" the physical one; adding
+        // both double-books ~half the RAM
+        let both = format!("{text}Pages stored in compressor:           300000.\n");
+        assert_eq!(parse_vm_stat(&both, 4096), Some(2832));
         // a broken read yields nothing rather than 0
         assert_eq!(parse_vm_stat("Pages free: 1.", 4096), None);
 

@@ -20,7 +20,7 @@ mod util;
 use clap::Parser as _;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use model::{Pid, Process, TargetReport, TargetSpec};
 use platform::Platform;
@@ -229,6 +229,7 @@ fn suggest_names(table: &[Process], query: &str, top: usize) -> Vec<String> {
 /// summary still comes via `--times`).
 static SAW_SIGINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(unix)]
 extern "C" fn sigint_flagged(_sig: i32) {
     SAW_SIGINT.store(true, std::sync::atomic::Ordering::SeqCst);
 }
@@ -337,6 +338,13 @@ fn json_listing_output(procs: &[Process], tree: bool) -> String {
     if !tree {
         return json_envelope(procs);
     }
+    json_tree_forest(procs)
+}
+
+/// The nested process forest as a versioned JSON envelope (children under
+/// parents, orphans and ppid cycles as roots) — shared by `--tree --json`
+/// and the `/api/tree` serve endpoint.
+pub(crate) fn json_tree_forest(procs: &[Process]) -> String {
     let by_pid: std::collections::HashMap<Pid, &Process> =
         procs.iter().map(|p| (p.pid, p)).collect();
     let mut children: std::collections::HashMap<Pid, Vec<&Process>> =
@@ -846,10 +854,12 @@ fn main() {
         || cli.alert_fd.is_some()
         || cli.alert_io.is_some()
         || cli.alert_conn.is_some()
+        || cli.alert_load.is_some()
+        || cli.alert_mem_pct.is_some()
         || !alert_ports.is_empty();
     if cli.alert_repeat.is_some() && !any_alert_armed {
         eprintln!(
-            "--alert-repeat re-sends threshold alerts; give --alert-cpu, --alert-mem, --alert-fd, --alert-io, --alert-conn or --alert-port"
+            "--alert-repeat re-sends threshold alerts; give one of the --alert-* thresholds"
         );
         std::process::exit(4);
     }
@@ -898,10 +908,12 @@ fn main() {
         && cli.alert_fd.is_none()
         && cli.alert_io.is_none()
         && cli.alert_conn.is_none()
+        && cli.alert_load.is_none()
+        && cli.alert_mem_pct.is_none()
         && cli.alert_port.is_empty()
     {
         eprintln!(
-            "--alert-exec runs with threshold alerts; give --alert-cpu, --alert-mem, --alert-fd, --alert-io, --alert-conn or --alert-port"
+            "--alert-exec runs with threshold alerts; give one of the --alert-* thresholds"
         );
         std::process::exit(4);
     }
@@ -929,6 +941,43 @@ fn main() {
             std::process::exit(4);
         }
     }
+    // --ports: a one-shot listener table — its own standalone mode like
+    // --serve (pairs with --csv/--json only)
+    if cli.ports_list {
+        let clash = !specs.is_empty()
+            || cli.interactive
+            || cli.watch.is_some()
+            || cli.top.is_some()
+            || cli.markdown
+            || cli.report_html.is_some()
+            || cli.tree
+            || cli.short
+            || cli.env
+            || cli.warnings
+            || cli.snap.is_some()
+            || cli.diff.is_some()
+            || cli.serve.is_some()
+            || cli.recent.is_some();
+        if clash {
+            eprintln!("--ports is a standalone listing; drop the targets and other modes (it pairs with --csv/--json)");
+            std::process::exit(4);
+        }
+    }
+    // --diff-auto rides the target-less --watch loop
+    if cli.diff_auto.is_some() {
+        if cli.watch.is_none() {
+            eprintln!("--diff-auto re-checks the table every --watch tick interval; add --watch SECONDS");
+            std::process::exit(4);
+        }
+        if !specs.is_empty() {
+            eprintln!("--diff-auto watches the whole table; drop the targets");
+            std::process::exit(4);
+        }
+        if cli.json {
+            eprintln!("--diff-auto prints human-readable drift lines; drop --json (or use --events-log for machine-readable events)");
+            std::process::exit(4);
+        }
+    }
     if cli.record.is_some() && cli.watch.is_none() {
         eprintln!("--record samples alongside --watch; add --watch SECONDS");
         std::process::exit(4);
@@ -937,12 +986,16 @@ fn main() {
         eprintln!("--record records the whole process table under --watch; drop the targets (filter later, e.g. with --recent or in the CSV itself)");
         std::process::exit(4);
     }
-    let listing_extras = cli.top.is_some() as u8
-        + cli.csv as u8
-        + cli.markdown as u8
-        + cli.report_html.is_some() as u8;
+    // --top pairs with the machine-readable formats (the ranked rows are
+    // the same shape as the full table's); --csv/--markdown/--report-html
+    // remain mutually exclusive among themselves
+    let listing_extras = cli.csv as u8 + cli.markdown as u8 + cli.report_html.is_some() as u8;
     if listing_extras > 1 {
-        eprintln!("--top, --csv, --markdown and --report-html are separate output modes; use one at a time");
+        eprintln!("--csv, --markdown and --report-html are separate output modes; use one at a time");
+        std::process::exit(4);
+    }
+    if cli.top.is_some() && cli.report_html.is_some() {
+        eprintln!("--top ranks rows; --report-html renders the whole table — use one at a time");
         std::process::exit(4);
     }
     if listing_extras > 0 && !specs.is_empty() {
@@ -1034,7 +1087,7 @@ fn main() {
             eprintln!("--audit: empty command");
             std::process::exit(4);
         }
-        let code = audit::run(cmd, !no_color);
+        let code = audit::run(cmd, !no_color, cli.json);
         std::process::exit(code);
     }
 
@@ -1230,6 +1283,37 @@ fn main() {
         }
         // script-friendly: 0 = no changes, 1 = something changed
         std::process::exit(i32::from(!entries.is_empty()));
+    }
+
+    // --ports: every LISTEN socket + owner as a one-shot table (the CLI
+    // twin of the TUI Ports overview), text / --csv / --json
+    if cli.ports_list {
+        let platform = platform::get();
+        let procs = match platform.list_processes() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cannot list processes: {}", e);
+                std::process::exit(5);
+            }
+        };
+        let socks = platform.list_sockets().unwrap_or_default();
+        let mut listeners = snapshot::to_listeners(&socks, &procs);
+        listeners.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.proto.cmp(&b.proto)));
+        if cli.json {
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "listener_count": listeners.len(),
+                "listeners": listeners,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if cli.csv {
+            write_out(&render::render_listeners_csv(&listeners));
+        } else {
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            write_out(&render::render_listeners(&listeners, &painter));
+        }
+        std::process::exit(0);
     }
 
     // --serve: Prometheus endpoint — samples the table on every scrape, so
@@ -1551,6 +1635,11 @@ fn main() {
             // --alert-port bookkeeping: presence + last-known owner per port
             let mut port_seen: HashMap<u16, bool> = HashMap::new();
             let mut port_owner: HashMap<u16, String> = HashMap::new();
+            // --alert-load / --alert-mem-pct: one machine-wide state
+            let mut sys_alert = history::SysAlertState::default();
+            // --diff-auto: the previous frame to diff against
+            let mut last_frame: Option<(Vec<Process>, Vec<snapshot::Listener>)> = None;
+            let mut last_diff = Instant::now();
             // the most recent firings, repeated under the header so a redraw
             // doesn't erase them from view
             let mut recent_alerts: Vec<String> = Vec::new();
@@ -1601,6 +1690,52 @@ fn main() {
                         &mut port_seen,
                         &mut port_owner,
                     ));
+                }
+                // machine-wide alerts (--alert-load / --alert-mem-pct):
+                // sample the whole system when armed — macOS's vm_stat spawn
+                // and Windows's PowerShell query are paid only when watched
+                if cli.alert_load.is_some() || cli.alert_mem_pct.is_some() {
+                    if let Some(stats) = platform.system_stats() {
+                        for (name, detail) in history::system_alert_picks(
+                            &stats,
+                            &mut sys_alert,
+                            cli.alert_load,
+                            cli.alert_mem_pct,
+                            cli.alert_repeat,
+                            interval,
+                        ) {
+                            picks.push((0, name, detail));
+                        }
+                    }
+                }
+                // --diff-auto: every N seconds, diff the live table against
+                // the previous check (in-memory — no snapshot files) and
+                // print the drift as plain report lines
+                if let Some(every) = cli.diff_auto {
+                    if last_diff.elapsed() >= Duration::from_secs(every.max(1)) {
+                        last_diff = Instant::now();
+                        let listeners = snapshot::to_listeners(
+                            &platform.list_sockets().unwrap_or_default(),
+                            &procs,
+                        );
+                        if let Some((old, old_listeners)) = last_frame.take() {
+                            let mut entries = snapshot::diff(&old, &procs);
+                            entries.extend(snapshot::diff_listeners(&old_listeners, &listeners));
+                            if !entries.is_empty() {
+                                write_out(&format!(
+                                    "== drift · {} new / {} gone / {} restarted / {} changed / {} listen+ / {} listen- ==",
+                                    entries.iter().filter(|e| e.kind == "new").count(),
+                                    entries.iter().filter(|e| e.kind == "gone").count(),
+                                    entries.iter().filter(|e| e.kind == "restarted").count(),
+                                    entries.iter().filter(|e| e.kind == "changed").count(),
+                                    entries.iter().filter(|e| e.kind == "listen-new").count(),
+                                    entries.iter().filter(|e| e.kind == "listen-gone").count(),
+                                ));
+                                write_out(&snapshot::render(&entries));
+                            }
+                        }
+                        last_frame = Some((procs.clone(), listeners));
+                    }
                 }
                 for (pid, name, detail) in picks {
                     // in JSON-stream mode the stdout pipe carries data only —

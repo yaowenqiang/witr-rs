@@ -182,6 +182,46 @@ pub fn csv_field(s: &str) -> String {
     }
 }
 
+/// `--ports`: the listener table — one row per (proto, port), owners
+/// comma-joined. Empty input prints the nothing-to-see note.
+pub fn render_listeners(
+    listeners: &[crate::snapshot::Listener],
+    p: &Painter,
+) -> String {
+    if listeners.is_empty() {
+        return "(no listening sockets with a visible owner)\n".to_string();
+    }
+    let port_w = listeners.iter().map(|l| l.port.to_string().len()).max().unwrap_or(4);
+    let proto_w = listeners.iter().map(|l| l.proto.len()).max().unwrap_or(5).max(5);
+    let mut out = String::new();
+    let _ = writeln!(out, "{:>port_w$}  {:proto_w$}  OWNER(S)", "PORT", "PROTO");
+    for l in listeners {
+        let _ = writeln!(
+            out,
+            "{:>port_w$}  {:proto_w$}  {}",
+            p.bold(&l.port.to_string()),
+            p.dim(&l.proto),
+            l.who.join(", "),
+        );
+    }
+    out
+}
+
+/// `--ports --csv`: the same rows as RFC-4180 (owners are "; "-joined so
+/// the comma stays a field separator).
+pub fn render_listeners_csv(listeners: &[crate::snapshot::Listener]) -> String {
+    let mut out = String::from("port,proto,owners\n");
+    for l in listeners {
+        out.push_str(&format!(
+            "{},{},{}\n",
+            l.port,
+            csv_field(&l.proto),
+            csv_field(&l.who.join("; ")),
+        ));
+    }
+    out
+}
+
 /// Escape for HTML text content and double-quoted attributes.
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -1103,6 +1143,35 @@ mod tests {
         assert_eq!(csv_field("a,b"), "\"a,b\"");
         assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(csv_field("two\nlines"), "\"two\nlines\"");
+    }
+
+    #[test]
+    fn listeners_table_and_csv_cover_empty_and_shared_ports() {
+        let p = Painter::new(false);
+        // empty: the nothing-to-see note, no panic on max() over nothing
+        assert!(render_listeners(&[], &p).contains("no listening sockets"));
+        assert_eq!(render_listeners_csv(&[]), "port,proto,owners\n");
+
+        let mk = |proto: &str, port: u16, who: &[&str]| crate::snapshot::Listener {
+            proto: proto.into(),
+            port,
+            who: who.iter().map(|s| s.to_string()).collect(),
+        };
+        let listeners = vec![
+            mk("tcp", 80, &["nginx (pid 7)"]),
+            mk("tcp", 8080, &["a (pid 1)", "b (pid 2)"]),
+        ];
+        let table = render_listeners(&listeners, &p);
+        assert!(table.contains("PORT") && table.contains("PROTO") && table.contains("OWNER(S)"));
+        let l80 = table.lines().find(|l| l.contains(" 80 ")).unwrap();
+        assert!(l80.contains("nginx (pid 7)"), "{table}");
+
+        let csv = render_listeners_csv(&listeners);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "port,proto,owners");
+        assert_eq!(lines[1], "80,tcp,nginx (pid 7)");
+        // two owners on one port: "; "-joined so the comma stays a separator
+        assert_eq!(lines[2], "8080,tcp,a (pid 1); b (pid 2)");
     }
 
     #[test]

@@ -324,6 +324,24 @@ fn cim_details(pids: &[Pid]) -> Vec<PsProc> {
 
 // ---------- netstat ----------
 
+/// Parse the `h <pid> <handles>` lines the fd_counts sweep emits.
+fn parse_handle_counts(text: &str) -> Option<std::collections::HashMap<Pid, u64>> {
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("h") {
+            continue;
+        }
+        if let (Some(pid), Some(handles)) = (
+            parts.next().and_then(|s| s.parse().ok()),
+            parts.next().and_then(|s| s.parse().ok()),
+        ) {
+            map.insert(pid, handles);
+        }
+    }
+    (!map.is_empty()).then_some(map)
+}
+
 fn parse_netstat(text: &str, proto_hint: &str) -> Vec<Socket> {
     let _ = proto_hint;
     let mut out = Vec::new();
@@ -604,6 +622,22 @@ impl Platform for Windows {
                 p.io_write_bytes = Some(*w);
             }
         }
+    }
+
+    /// One PowerShell sweep: `Get-Process` exposes `HandleCount` for every
+    /// process this user can see — the Windows analogue of an fd count
+    /// (kernel handles: sockets, files, section objects...; Sysinternals
+    /// surfaces the same counter as "Handles"). Paid once per call, same
+    /// shape as the macOS lsof sweep.
+    fn fd_counts(&self) -> Option<std::collections::HashMap<Pid, u64>> {
+        let script = "Get-Process | ForEach-Object { \"h {0} {1}\" -f $_.Id, $_.HandleCount }\n";
+        let text = run(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", script],
+            PS_TIMEOUT,
+        )
+        .ok()?;
+        parse_handle_counts(&text)
     }
 
     /// One PowerShell call: the OS class for memory, the formatted

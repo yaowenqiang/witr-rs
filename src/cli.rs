@@ -16,8 +16,8 @@ pub enum TopMetric {
     Cpu,
     /// Resident set size
     Mem,
-    /// Open descriptor count (Linux cheap; one lsof scan on macOS;
-    /// unsupported on Windows)
+    /// Open descriptor count (Linux cheap; one lsof scan on macOS; one
+    /// PowerShell handle sweep on Windows)
     Fd,
     /// Cumulative disk I/O bytes (read + write; Linux /proc)
     Io,
@@ -79,6 +79,9 @@ impl TopMetric {
   witr-rs --watch 2 --alert-port '!8080' --alert-repeat 60   ...and keep nagging while :8080 is down
   witr-rs --top io-rate          hottest processes by disk-I/O rate
   witr-rs nginx --logs --grep error   last 100 log lines, filtered
+  witr-rs --ports          every listening port and its owner, one table
+  witr-rs --watch 5 --alert-load 8 --alert-mem-pct 90   machine-wide watchdog
+  witr-rs --watch 30 --diff-auto 30   print process-table drift every 30s
   witr-rs --serve :9100    expose Prometheus metrics on :9100 (curl :9100/api/ps for JSON)
   witr-rs --man witr-rs.1  write the man page"
 )]
@@ -135,6 +138,13 @@ pub struct Cli {
     /// Force the static process listing even on a terminal (no args = TUI)
     #[arg(long = "list")]
     pub list: bool,
+
+    /// List every LISTEN socket with its owning processes — the Ports
+    /// overview as a one-shot table (port, proto, owners). Pairs with
+    /// --csv / --json. A no-target operation: cannot be combined with
+    /// targets.
+    #[arg(long = "ports")]
+    pub ports_list: bool,
 
     /// Open the interactive TUI even with targets, seeded from them
     /// (one target per type: name, pid, port, file, container)
@@ -257,8 +267,8 @@ pub struct Cli {
     /// Alert when a process exceeds this open-descriptor count for 5
     /// consecutive samples (~15s) — the threshold-alert twin of
     /// --alert-cpu/--alert-mem, for fd leaks. Costs one fd sweep per
-    /// refresh (cheap on Linux, one lsof scan on macOS, unsupported on
-    /// Windows). TUI and --watch.
+    /// refresh (cheap on Linux, one lsof scan on macOS, one PowerShell
+    /// sweep on Windows). TUI and --watch.
     #[arg(long = "alert-fd", value_name = "N")]
     pub alert_fd: Option<u64>,
 
@@ -274,6 +284,18 @@ pub struct Cli {
     /// --alert-fd, for connection leaks. TUI and --watch.
     #[arg(long = "alert-conn", value_name = "N")]
     pub alert_conn: Option<u64>,
+
+    /// Machine-wide alert: fire when the 1-minute load average exceeds
+    /// this value for 5 consecutive samples (~15s). Unlike the per-process
+    /// --alert-* thresholds this watches the whole machine — runaways,
+    /// thrashing, an overloaded box. TUI and --watch.
+    #[arg(long = "alert-load", value_name = "N")]
+    pub alert_load: Option<f64>,
+
+    /// Machine-wide alert: fire when used RAM exceeds this percent of
+    /// physical memory for 5 consecutive samples (~15s). TUI and --watch.
+    #[arg(long = "alert-mem-pct", value_name = "PCT")]
+    pub alert_mem_pct: Option<u64>,
 
     /// Listener canary, repeatable: alert when something starts LISTENing
     /// on this port (an edge — a port already bound at startup is the
@@ -291,17 +313,19 @@ pub struct Cli {
 
     /// Run this shell command each time a threshold alert fires (needs one
     /// of --alert-cpu/--alert-mem/--alert-fd/--alert-io/--alert-conn/
-    /// --alert-port; one run per excursion). The alert context is exported
-    /// as WITR_ALERT_PID / WITR_ALERT_NAME / WITR_ALERT_DETAIL — e.g.
-    /// `--alert-exec 'curl -s $SLACK_HOOK -d "$WITR_ALERT_NAME:
-    /// $WITR_ALERT_DETAIL"'`. TUI and --watch.
+    /// --alert-port/--alert-load/--alert-mem-pct; one run per excursion).
+    /// The alert context is exported as WITR_ALERT_PID / WITR_ALERT_NAME /
+    /// WITR_ALERT_DETAIL — e.g. `--alert-exec 'curl -s $SLACK_HOOK -d
+    /// "$WITR_ALERT_NAME: $WITR_ALERT_DETAIL"'`. TUI and --watch.
     #[arg(long = "alert-exec", value_name = "CMD")]
     pub alert_exec: Option<String>,
 
     /// Run CMD under a shell, watch only its process subtree, and on exit
     /// print the audit report: wall duration, exit code, how many processes
     /// it spawned, peak subtree CPU/RSS, disk I/O and the process tree.
-    /// A standalone mode: cannot be combined with targets.
+    /// Add --json for the machine-readable envelope (CI can assert on peak
+    /// RSS, spawned counts and the like). A standalone mode: cannot be
+    /// combined with targets.
     #[arg(long = "audit", value_name = "CMD")]
     pub audit: Option<String>,
 
@@ -373,6 +397,14 @@ pub struct Cli {
     /// unexpected services.
     #[arg(long = "sockets")]
     pub sockets: bool,
+
+    /// With a target-less --watch: every N seconds compare the live table
+    /// against the previous check and print what drifted — new / gone /
+    /// restarted / changed, plus listen edges (an in-memory snapshot+diff
+    /// each interval, no files written). The process-side twin of
+    /// --alert-port's canary.
+    #[arg(long = "diff-auto", value_name = "SECONDS")]
+    pub diff_auto: Option<u64>,
 
     /// With one --pid target: when the traced pid exits, keep going —
     /// re-acquire the same program (name+exe+user) under its new pid.

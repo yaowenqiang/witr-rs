@@ -91,6 +91,81 @@ pub fn alert_cycle_repeat(
     false
 }
 
+/// Streak/firing/repeat-clock state for the machine-wide alerts
+/// (--alert-load / --alert-mem-pct) — one instance per sampler, shared by
+/// the TUI and the headless --watch loop (the per-process counterpart
+/// lives in [`AlertTrack`], keyed by pid; the machine has no pid).
+#[derive(Debug, Default, Clone)]
+pub struct SysAlertState {
+    pub load_streak: u32,
+    pub load_firing: bool,
+    pub load_fired_secs: u32,
+    pub mem_streak: u32,
+    pub mem_firing: bool,
+    pub mem_fired_secs: u32,
+}
+
+/// One tick of the machine-wide alerts. `stats` comes from the platform's
+/// `system_stats()`; firings are `(name, detail)` pairs with no pid (the
+/// machine is not a process). Same 5-samples-and-latch cycle as the
+/// per-process alerts, including --alert-repeat.
+pub fn system_alert_picks(
+    stats: &crate::platform::SystemStats,
+    state: &mut SysAlertState,
+    load_limit: Option<f64>,
+    mem_pct_limit: Option<u64>,
+    repeat_secs: Option<u64>,
+    interval_secs: u64,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(limit) = load_limit {
+        let now = stats.load1;
+        let over = now.is_some_and(|l| l > limit);
+        if alert_cycle_repeat(
+            &mut state.load_streak,
+            &mut state.load_firing,
+            over,
+            &mut state.load_fired_secs,
+            repeat_secs,
+            interval_secs,
+        ) {
+            out.push((
+                "system".to_string(),
+                format!(
+                    "load average {:.2} above {limit} for {}s",
+                    now.unwrap_or(0.0),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+            ));
+        }
+    }
+    if let Some(limit) = mem_pct_limit {
+        let pct = match (stats.mem_used_mb, stats.mem_total_mb) {
+            (Some(u), Some(t)) if t > 0 => Some((u * 100) / t),
+            _ => None,
+        };
+        let over = pct.is_some_and(|p| p > limit);
+        if alert_cycle_repeat(
+            &mut state.mem_streak,
+            &mut state.mem_firing,
+            over,
+            &mut state.mem_fired_secs,
+            repeat_secs,
+            interval_secs,
+        ) {
+            out.push((
+                "system".to_string(),
+                format!(
+                    "RAM {}% above {limit}% for {}s",
+                    pct.unwrap_or(0),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+            ));
+        }
+    }
+    out
+}
+
 const SAMPLES: usize = 8;
 /// Detail-page CPU chart window (~10 min at the 3s TUI refresh).
 const BIG_SAMPLES: usize = 120;
@@ -949,6 +1024,46 @@ mod tests {
         assert_eq!(fired, 0);
         let hits = run_over(Some(10), n + 2, 5, &mut streak, &mut firing, &mut fired);
         assert_eq!(count(&hits), 2);
+    }
+
+    #[test]
+    fn system_alerts_fire_on_load_and_ram_percent() {
+        let stats = |load1: Option<f64>, used: Option<u64>, total: Option<u64>| {
+            crate::platform::SystemStats {
+                load1,
+                mem_used_mb: used,
+                mem_total_mb: total,
+                ..Default::default()
+            }
+        };
+        let mut state = SysAlertState::default();
+        // nothing armed → no output even over the line
+        let s = stats(Some(20.0), Some(9900), Some(10_000));
+        assert!(system_alert_picks(&s, &mut state, None, None, None, 3).is_empty());
+
+        // load over the line: quiet until ALERT_CYCLES completes, then one
+        // fire naming the value and the sustained window
+        let mut fires = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            fires = system_alert_picks(&s, &mut state, Some(8.0), None, None, 3);
+        }
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].0, "system");
+        assert!(fires[0].1.contains("load average 20.00 above 8"), "{}", fires[0].1);
+
+        // RAM percent: 9900/10000 = 99% over 90 → fires after the cycle
+        let mut state = SysAlertState::default();
+        let mut fired = false;
+        for _ in 0..ALERT_CYCLES {
+            fired |= !system_alert_picks(&s, &mut state, None, Some(90), None, 3).is_empty();
+        }
+        assert!(fired, "99% over 90 fires");
+        // total unknown → no measurement, no fire
+        let mut state = SysAlertState::default();
+        let s2 = stats(None, Some(9900), None);
+        for _ in 0..ALERT_CYCLES {
+            assert!(system_alert_picks(&s2, &mut state, None, Some(90), None, 3).is_empty());
+        }
     }
 
     #[test]

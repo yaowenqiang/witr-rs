@@ -26,9 +26,10 @@ use crate::model::{Pid, Process};
 const SAMPLE_EVERY: Duration = Duration::from_millis(500);
 
 /// One audit run: spawn `cmd` under the shell, sample until it exits,
-/// print the report. Returns the command's exit code (1 when it died to a
-/// signal or could not be spawned).
-pub fn run(cmd: &str, color: bool) -> i32 {
+/// print the report (or, with `json`, the machine-readable envelope).
+/// Returns the command's exit code (1 when it died to a signal or could
+/// not be spawned).
+pub fn run(cmd: &str, color: bool, json: bool) -> i32 {
     #[cfg(windows)]
     let mut child = match std::process::Command::new("cmd").args(["/C", cmd]).spawn() {
         Ok(c) => c,
@@ -118,9 +119,6 @@ pub fn run(cmd: &str, color: bool) -> i32 {
 
     let elapsed = started.elapsed();
 
-    // ---- the report --------------------------------------------------
-    let mut out = String::new();
-    let _ = writeln!(out, "== audit: {cmd} ==");
     let (code_txt, code) = match child.wait() {
         Ok(st) => match st.code() {
             Some(c) => (format!("exit code {c}"), c),
@@ -128,32 +126,55 @@ pub fn run(cmd: &str, color: bool) -> i32 {
         },
         Err(e) => (format!("wait failed: {e}"), 1),
     };
-    let _ = writeln!(
-        out,
-        "duration {} · {code_txt}",
-        crate::util::fmt_age(elapsed.as_secs() as i64),
-    );
     let io_read: u64 = io_total.values().map(|(r, _)| r).sum();
     let io_write: u64 = io_total.values().map(|(_, w)| w).sum();
-    let _ = writeln!(
-        out,
-        "processes spawned {} (peak alive {peak_alive}) · peak CPU (subtree) {peak_cpu:.0}% · peak RSS {}",
-        seen.len(),
-        crate::util::fmt_bytes(peak_rss_kb * 1024),
-    );
-    let _ = writeln!(
-        out,
-        "disk I/O: read {} · write {}",
-        crate::util::fmt_bytes(io_read),
-        crate::util::fmt_bytes(io_write),
-    );
     // the tree: last sighting of every member, rendered as a forest — the
     // audit root is a root here because witr-rs's own pid isn't in the set
     let mut members: Vec<Process> = seen.into_values().collect();
     members.sort_by_key(|p| p.pid);
-    let _ = writeln!(out, "\nprocess tree ({} processes, last sighting):", members.len());
-    let _ = write!(out, "{}", crate::render::render_process_forest(&members, &painter));
-    print!("{out}");
+
+    // ---- the report --------------------------------------------------
+    if json {
+        let doc = serde_json::json!({
+            "schema_version": crate::SCHEMA_VERSION,
+            "generated_at": crate::util::now_unix(),
+            "command": cmd,
+            "duration_secs": elapsed.as_secs_f64(),
+            "exit_code": code,
+            "killed_by_signal": code_txt == "killed by signal",
+            "spawned": members.len(),
+            "peak_alive": peak_alive,
+            "peak_cpu_pct": peak_cpu,
+            "peak_rss_bytes": peak_rss_kb * 1024,
+            "io_read_bytes": io_read,
+            "io_write_bytes": io_write,
+            "tree": members,
+        });
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+    } else {
+        let mut out = String::new();
+        let _ = writeln!(out, "== audit: {cmd} ==");
+        let _ = writeln!(
+            out,
+            "duration {} · {code_txt}",
+            crate::util::fmt_age(elapsed.as_secs() as i64),
+        );
+        let _ = writeln!(
+            out,
+            "processes spawned {} (peak alive {peak_alive}) · peak CPU (subtree) {peak_cpu:.0}% · peak RSS {}",
+            members.len(),
+            crate::util::fmt_bytes(peak_rss_kb * 1024),
+        );
+        let _ = writeln!(
+            out,
+            "disk I/O: read {} · write {}",
+            crate::util::fmt_bytes(io_read),
+            crate::util::fmt_bytes(io_write),
+        );
+        let _ = writeln!(out, "\nprocess tree ({} processes, last sighting):", members.len());
+        let _ = write!(out, "{}", crate::render::render_process_forest(&members, &painter));
+        print!("{out}");
+    }
     let _ = std::io::stdout().flush();
     code
 }
@@ -166,14 +187,14 @@ mod tests {
     #[test]
     fn audit_of_true_reports_zero_and_fast() {
         // the smallest real command: exits 0 almost immediately
-        let code = run("true", false);
+        let code = run("true", false, false);
         assert_eq!(code, 0);
     }
 
     #[cfg(unix)]
     #[test]
     fn audit_mirrors_child_exit_code() {
-        let code = run("sh -c 'exit 3'", false);
+        let code = run("sh -c 'exit 3'", false, false);
         assert_eq!(code, 3);
     }
 
@@ -181,7 +202,7 @@ mod tests {
     #[test]
     fn audit_counts_spawned_children() {
         // two levels of children: sh -c spawns sh -c spawns sleep
-        let code = run("sh -c 'sh -c \"sleep 0.2\" ; true'", false);
+        let code = run("sh -c 'sh -c \"sleep 0.2\" ; true'", false, false);
         assert_eq!(code, 0);
     }
 }

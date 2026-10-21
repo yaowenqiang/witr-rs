@@ -325,6 +325,12 @@ struct TuiApp {
     /// --alert-repeat: re-send a firing alert about every N seconds while
     /// its excursion keeps burning (None = once per excursion)
     alert_repeat: Option<u64>,
+    /// --alert-load: machine-wide 1-minute load-average threshold
+    alert_load: Option<f64>,
+    /// --alert-mem-pct: machine-wide used-RAM percent threshold
+    alert_mem_pct: Option<u64>,
+    /// streak/firing state for the machine-wide alerts
+    sys_alert: crate::history::SysAlertState,
     /// --alert-exec: shell command per alert firing (context in env vars)
     alert_exec: Option<String>,
     /// pid → per-metric streak/firing state (pruned to live pids)
@@ -456,6 +462,10 @@ pub struct Seed {
     pub alert_port: Vec<(u16, bool)>,
     /// --alert-repeat: re-send firing alerts about every N seconds
     pub alert_repeat: Option<u64>,
+    /// --alert-load: machine-wide 1-minute load-average threshold
+    pub alert_load: Option<f64>,
+    /// --alert-mem-pct: machine-wide used-RAM percent threshold
+    pub alert_mem_pct: Option<u64>,
     /// --alert-exec: shell command run on every threshold-alert firing;
     /// context exported as WITR_ALERT_PID/NAME/DETAIL
     pub alert_exec: Option<String>,
@@ -624,6 +634,9 @@ impl TuiApp {
             port_seen: HashMap::new(),
             port_owner: HashMap::new(),
             alert_repeat: seed.alert_repeat,
+            alert_load: seed.alert_load,
+            alert_mem_pct: seed.alert_mem_pct,
+            sys_alert: crate::history::SysAlertState::default(),
             alert_exec: seed.alert_exec.clone(),
             alert_state: HashMap::new(),
             notes: seed.notes,
@@ -838,6 +851,25 @@ impl TuiApp {
                     &mut self.port_seen,
                     &mut self.port_owner,
                 ));
+            }
+            if self.alert_load.is_some() || self.alert_mem_pct.is_some() {
+                // --alert-load / --alert-mem-pct: sample the whole machine
+                // when armed (macOS's vm_stat spawn is paid only when watched)
+                if let Some(stats) = self.platform.system_stats() {
+                    let interval = self.refresh.max(Duration::from_secs(1)).as_secs();
+                    picks.extend(
+                        crate::history::system_alert_picks(
+                            &stats,
+                            &mut self.sys_alert,
+                            self.alert_load,
+                            self.alert_mem_pct,
+                            self.alert_repeat,
+                            interval,
+                        )
+                        .into_iter()
+                        .map(|(name, detail)| (0, name, detail)),
+                    );
+                }
             }
             for (pid, name, detail) in picks {
                 let e = self.hist.push_alert(pid, &name, &detail);
@@ -8046,6 +8078,8 @@ mod tests {
                 alert_conn: None,
                 alert_port: Vec::new(),
                 alert_repeat: None,
+                alert_load: None,
+                alert_mem_pct: None,
                 notes: Vec::new(),
             },
         );
