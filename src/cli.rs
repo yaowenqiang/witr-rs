@@ -1,6 +1,34 @@
 use clap::{Parser, ValueEnum};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Shell for `--completions`.
+// --- UI language -----------------------------------------------------------------
+// Help text is bilingual: Chinese by default, English under `--en`. Every
+// string below is resolved while the clap Command is being built, and
+// `init_language()` runs at the very top of main() — before the parse — so
+// `--help`, the `--man` page and the `--completions` scripts all come out in
+// the chosen language. clap's own scaffolding ("Usage:", "Options:", parse
+// errors) stays English either way; clap has no i18n layer to hook.
+
+static ENGLISH: AtomicBool = AtomicBool::new(false);
+
+/// Pick between the Chinese (default) and English variant of a help string.
+pub fn t<'a>(zh: &'a str, en: &'a str) -> &'a str {
+    if ENGLISH.load(Ordering::Relaxed) {
+        en
+    } else {
+        zh
+    }
+}
+
+/// Pre-scan the raw argv for `--en` before the clap parse — the language has
+/// to be known while the Command (and every help string in it) is built.
+pub fn init_language() {
+    if std::env::args_os().any(|a| a == "--en") {
+        ENGLISH.store(true, Ordering::Relaxed);
+    }
+}
+
+// Shell for `--completions`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Shell {
     Bash,
@@ -9,22 +37,29 @@ pub enum Shell {
     Powershell,
 }
 
-/// Metric for `--top`.
+// Metric for `--top`.
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq)]
 pub enum TopMetric {
-    /// Lifetime average CPU percent
+    #[value(help = t("进程生命周期内的平均 CPU 占用率", "Lifetime average CPU percent"))]
     Cpu,
-    /// Resident set size
+    #[value(help = t("常驻内存大小（RSS）", "Resident set size"))]
     Mem,
-    /// Open descriptor count (Linux cheap; one lsof scan on macOS; one
-    /// PowerShell handle sweep on Windows)
+    #[value(help = t(
+        "打开的描述符数（Linux 开销小；macOS 一次 lsof 扫描；Windows 一次 PowerShell 句柄扫描）",
+        "Open descriptor count (Linux cheap; one lsof scan on macOS; one PowerShell handle sweep on Windows)"
+    ))]
     Fd,
-    /// Cumulative disk I/O bytes (read + write; Linux /proc)
+    #[value(help = t("累计磁盘 I/O 字节数（读 + 写；Linux /proc）", "Cumulative disk I/O bytes (read + write; Linux /proc)"))]
     Io,
-    /// Disk I/O rate in bytes/s (read + write; needs two samples one
-    /// second apart — or a running --watch — to take the delta)
+    #[value(help = t(
+        "磁盘 I/O 速率（字节/秒，读 + 写；需要相隔一秒的两次采样——或一次正在运行的 --watch——才能做差分）",
+        "Disk I/O rate in bytes/s (read + write; needs two samples one second apart — or a running --watch — to take the delta)"
+    ))]
     IoRate,
-    /// Time since start — oldest first ("what has been running since boot")
+    #[value(help = t(
+        "启动至今的时长——最旧的在前（“开机以来一直跑着的是什么”）",
+        "Time since start — oldest first (\"what has been running since boot\")"
+    ))]
     Age,
 }
 
@@ -41,13 +76,47 @@ impl TopMetric {
     }
 }
 
-/// Why is this running? — trace processes, ports and files back to what
-/// started them. A Rust rewrite inspired by pranshuparmar/witr.
-#[derive(Parser, Debug)]
-#[command(
-    name = "witr-rs",
-    version,
-    after_help = "Examples:
+// Worked examples at the bottom of --help — kept out of the attribute so the
+// bilingual block stays readable.
+const EXAMPLES_ZH: &str = "示例：
+  witr-rs                  列出所有进程
+  witr-rs --tree           完整进程树
+  witr-rs nginx            nginx 为什么在运行？
+  witr-rs --pid 1234       检查一个 pid
+  witr-rs --port 8080      谁占着这个端口？
+  witr-rs --file /var/log/x.log   谁打开着这个文件？
+  witr-rs -c web           容器 \"web\" 为什么在运行？
+  witr-rs nginx --warnings 只看告警
+  witr-rs nginx --env      打印进程命令行与环境变量
+  witr-rs nginx --tree     完整祖先树
+  witr-rs -i --port 8080   在 TUI 中打开该端口
+  witr-rs --top cpu        最忙的 15 个进程，不进 TUI
+  witr-rs --top age        什么进程跑得最久
+  witr-rs --top cpu --watch 5   每 5 秒刷新排行
+  witr-rs --top mem -n 30 --csv   内存前 30 名，CSV 格式
+  witr-rs --watch 5 --record load.csv   每 5 秒记录一行 csv 样本
+  witr-rs --watch 5 --record samples.jsonl   ……每帧一条 json 信封
+  witr-rs --watch 5 --alert-cpu 90 --alert-exec 'curl -s $HOOK -d \"$WITR_ALERT_NAME\"'   无头看门狗
+  witr-rs --watch 5 --times 12   有界 watch：采样一分钟，打印摘要后退出
+  witr-rs --snap           自动快照（自动轮换，保留 10 份）
+  witr-rs --snap=now.json --sockets   同时记录 LISTEN 端口，供之后 --diff
+  witr-rs --diff last      距上次自动快照有什么变化
+  witr-rs --diff last --json   ……JSON 格式
+  witr-rs --report-html status.html   自包含 HTML 报告
+  witr-rs --audit 'make build'   运行命令并报告其子树的资源足迹
+  witr-rs node --kill            杀掉所有匹配的进程
+  witr-rs node --kill-tree --signal KILL   ……连同所有后代
+  witr-rs --watch 2 --alert-port 9090        :9090 出现新监听时告警
+  witr-rs --watch 2 --alert-port '!8080' --alert-repeat 60   ……:8080 一直不在就反复催
+  witr-rs --top io-rate          按磁盘 I/O 速率排最忙
+  witr-rs nginx --logs --grep error   最近 100 行日志，过滤后
+  witr-rs --ports          所有监听端口及其归属进程，一张表
+  witr-rs --watch 5 --alert-load 8 --alert-mem-pct 90   整机看门狗
+  witr-rs --watch 30 --diff-auto 30   每 30 秒打印一次进程表漂移
+  witr-rs --serve :9100    在 :9100 暴露 Prometheus 指标（curl :9100/api/ps 取 JSON）
+  witr-rs --man witr-rs.1  写出 man 手册页";
+
+const EXAMPLES_EN: &str = "Examples:
   witr-rs                  list all processes
   witr-rs --tree           full process tree
   witr-rs nginx            why is nginx running?
@@ -83,357 +152,586 @@ impl TopMetric {
   witr-rs --watch 5 --alert-load 8 --alert-mem-pct 90   machine-wide watchdog
   witr-rs --watch 30 --diff-auto 30   print process-table drift every 30s
   witr-rs --serve :9100    expose Prometheus metrics on :9100 (curl :9100/api/ps for JSON)
-  witr-rs --man witr-rs.1  write the man page"
+  witr-rs --man witr-rs.1  write the man page";
+
+fn examples() -> &'static str {
+    if ENGLISH.load(Ordering::Relaxed) {
+        EXAMPLES_EN
+    } else {
+        EXAMPLES_ZH
+    }
+}
+
+// witr-rs 的命令行定义。帮助文本双语：默认中文，`--en` 切换英文——每个
+// 帮助串都经 t() 在 Command 构建时定稿，语言由 init_language() 预扫描决定。
+#[derive(Parser, Debug)]
+#[command(
+    name = "witr-rs",
+    version,
+    about = t(
+        "Why is this running? —— 给出进程名、PID、端口或文件，一路追溯它是被谁、以何种方式拉起来的。pranshuparmar/witr 的 Rust 重写版",
+        "Why is this running? — trace processes, ports and files back to what started them. A Rust rewrite inspired by pranshuparmar/witr"
+    ),
+    after_help = examples()
 )]
 pub struct Cli {
-    /// Process name(s) to trace (substring match; combine with --exact).
-    /// With no target at all, witr-rs lists every process.
+    #[arg(
+        value_name = "NAMES",
+        help = t(
+            "要溯源的进程名，可给多个（子串匹配；配合 --exact 精确匹配）。完全不带目标时，witr-rs 列出所有进程",
+            "Process name(s) to trace (substring match; combine with --exact). With no target at all, witr-rs lists every process"
+        )
+    )]
     pub names: Vec<String>,
 
-    /// Trace by pid (repeatable)
-    #[arg(short = 'p', long = "pid", value_name = "PID")]
+    #[arg(
+        short = 'p',
+        long = "pid",
+        value_name = "PID",
+        help = t("按 PID 溯源（可重复）", "Trace by pid (repeatable)")
+    )]
     pub pids: Vec<i32>,
 
-    /// Trace by local port (repeatable)
-    #[arg(long = "port", value_name = "PORT")]
+    #[arg(
+        long = "port",
+        value_name = "PORT",
+        help = t("按本地端口溯源（可重复）", "Trace by local port (repeatable)")
+    )]
     pub ports: Vec<u16>,
 
-    /// Trace by open file path (repeatable; globs like /var/log/*.log
-    /// match every existing file)
-    #[arg(short = 'f', long = "file", value_name = "PATH")]
+    #[arg(
+        short = 'f',
+        long = "file",
+        value_name = "PATH",
+        help = t(
+            "按打开的文件路径溯源（可重复；支持 /var/log/*.log 这类通配符，匹配所有已存在的文件）",
+            "Trace by open file path (repeatable; globs like /var/log/*.log match every existing file)"
+        )
+    )]
     pub files: Vec<String>,
 
-    /// Trace by container (name, image, id prefix; repeatable)
-    #[arg(short = 'c', long = "container", value_name = "QUERY")]
+    #[arg(
+        short = 'c',
+        long = "container",
+        value_name = "QUERY",
+        help = t(
+            "按容器溯源（名称、镜像、ID 前缀；可重复）",
+            "Trace by container (name, image, id prefix; repeatable)"
+        )
+    )]
     pub containers: Vec<String>,
 
-    /// Match names exactly instead of by substring
-    #[arg(short = 'x', long)]
+    #[arg(
+        short = 'x',
+        long,
+        help = t("进程名按精确匹配，而非子串匹配", "Match names exactly instead of by substring")
+    )]
     pub exact: bool,
 
-    /// Show the ancestry as a tree
-    #[arg(short = 't', long)]
+    #[arg(
+        short = 't',
+        long,
+        help = t("把祖先链显示为进程树", "Show the ancestry as a tree")
+    )]
     pub tree: bool,
 
-    /// Single-line output per match (for scripts)
-    #[arg(short = 's', long)]
+    #[arg(
+        short = 's',
+        long,
+        help = t("每个匹配结果只输出一行（便于脚本处理）", "Single-line output per match (for scripts)")
+    )]
     pub short: bool,
 
-    /// Machine-readable JSON
-    #[arg(short = 'j', long)]
+    #[arg(short = 'j', long, help = t("输出机器可读的 JSON", "Machine-readable JSON"))]
     pub json: bool,
 
-    /// Show only the collected warnings for the matched process(es)
-    #[arg(long = "warnings")]
+    #[arg(
+        long = "warnings",
+        help = t("只显示为匹配进程采集到的告警", "Show only the collected warnings for the matched process(es)")
+    )]
     pub warnings: bool,
 
-    /// Print the process command and environment variables, nothing else
-    #[arg(long = "env")]
+    #[arg(
+        long = "env",
+        help = t(
+            "只打印进程的命令行与环境变量，不输出其他内容",
+            "Print the process command and environment variables, nothing else"
+        )
+    )]
     pub env: bool,
 
-    /// Disable colored output (also honors the NO_COLOR environment variable)
-    #[arg(long = "no-color")]
+    #[arg(
+        long = "no-color",
+        help = t(
+            "关闭彩色输出（同时遵循 NO_COLOR 环境变量）",
+            "Disable colored output (also honors the NO_COLOR environment variable)"
+        )
+    )]
     pub no_color: bool,
 
-    /// Force the static process listing even on a terminal (no args = TUI)
-    #[arg(long = "list")]
+    #[arg(
+        long = "list",
+        help = t(
+            "即使在终端下也强制输出静态进程列表（无参数时默认进 TUI）",
+            "Force the static process listing even on a terminal (no args = TUI)"
+        )
+    )]
     pub list: bool,
 
-    /// List every LISTEN socket with its owning processes — the Ports
-    /// overview as a one-shot table (port, proto, owners). Pairs with
-    /// --csv / --json. A no-target operation: cannot be combined with
-    /// targets.
-    #[arg(long = "ports")]
+    #[arg(
+        long = "ports",
+        help = t(
+            "列出所有 LISTEN 套接字及其归属进程——一次性表格版的端口总览（端口、协议、归属进程）。可搭配 --csv / --json。属于无目标操作：不能与目标同时使用",
+            "List every LISTEN socket with its owning processes — the Ports overview as a one-shot table (port, proto, owners). Pairs with --csv / --json. A no-target operation: cannot be combined with targets"
+        )
+    )]
     pub ports_list: bool,
 
-    /// Open the interactive TUI even with targets, seeded from them
-    /// (one target per type: name, pid, port, file, container)
-    #[arg(short = 'i', long = "interactive")]
+    #[arg(
+        short = 'i',
+        long = "interactive",
+        help = t(
+            "即使带了目标也打开交互式 TUI，并直接定位到目标（每类目标限一个：进程名、PID、端口、文件、容器）",
+            "Open the interactive TUI even with targets, seeded from them (one target per type: name, pid, port, file, container)"
+        )
+    )]
     pub interactive: bool,
 
-    /// Plain-text diagnostic report (identity, source, chain, env values,
-    /// open files) — combine with any target
-    #[arg(long = "export")]
+    #[arg(
+        long = "export",
+        help = t(
+            "输出纯文本诊断报告（进程身份、来源、祖先链、环境变量取值、打开的文件）——可与任意目标搭配",
+            "Plain-text diagnostic report (identity, source, chain, env values, open files) — combine with any target"
+        )
+    )]
     pub export: bool,
 
-    /// Only list processes started within this window (30, 30s, 5m, 2h,
-    /// 1d, 1h30m). Filters the listing; cannot be combined with targets.
-    #[arg(long = "recent", value_name = "DURATION")]
+    #[arg(
+        long = "recent",
+        value_name = "DURATION",
+        help = t(
+            "只列出在该时间窗内启动的进程（30、30s、5m、2h、1d、1h30m）。过滤列表输出；不能与目标同时使用",
+            "Only list processes started within this window (30, 30s, 5m, 2h, 1d, 1h30m). Filters the listing; cannot be combined with targets"
+        )
+    )]
     pub recent: Option<String>,
 
-    /// Print the top N processes by this metric instead of a full listing
-    /// (default N = 15, override with --count). A no-target operation:
-    /// cannot be combined with targets.
-    #[arg(long = "top", value_name = "METRIC")]
+    #[arg(
+        long = "top",
+        value_name = "METRIC",
+        help = t(
+            "按该指标输出前 N 名进程，代替完整列表（默认 N = 15，可用 --count 覆盖）。属于无目标操作：不能与目标同时使用",
+            "Print the top N processes by this metric instead of a full listing (default N = 15, override with --count). A no-target operation: cannot be combined with targets"
+        )
+    )]
     pub top: Option<TopMetric>,
 
-    /// Row count for --top (default 15)
-    #[arg(short = 'n', long = "count", value_name = "N")]
+    #[arg(
+        short = 'n',
+        long = "count",
+        value_name = "N",
+        help = t("--top 的行数（默认 15）", "Row count for --top (default 15)")
+    )]
     pub count: Option<usize>,
 
-    /// Emit the listing / --top rows as CSV (one header row + one row per
-    /// process). A no-target format: cannot be combined with targets —
-    /// use --json there.
-    #[arg(long)]
+    #[arg(
+        long,
+        help = t(
+            "把列表 / --top 行输出为 CSV（一行表头 + 每个进程一行）。属于无目标格式：不能与目标同时使用——目标查询请用 --json",
+            "Emit the listing / --top rows as CSV (one header row + one row per process). A no-target format: cannot be combined with targets — use --json there"
+        )
+    )]
     pub csv: bool,
 
-    /// Emit the listing / --top rows as a Markdown table (pastes into
-    /// issues and PRs). Same rules as --csv.
-    #[arg(long)]
+    #[arg(
+        long,
+        help = t(
+            "把列表 / --top 行输出为 Markdown 表格（可直接粘贴到 issue 和 PR）。规则与 --csv 相同",
+            "Emit the listing / --top rows as a Markdown table (pastes into issues and PRs). Same rules as --csv"
+        )
+    )]
     pub markdown: bool,
 
-    /// With --watch (no targets — it records the whole table): append one
-    /// CSV row per visible process per refresh tick to this file
-    /// (timestamp, pid, user, name, cpu%%, rss_mb, io read/write
-    /// bytes-per-second where the platform reports them). Leaves the
-    /// console output untouched.
-    #[arg(long = "record", value_name = "FILE")]
+    #[arg(
+        long = "record",
+        value_name = "FILE",
+        help = t(
+            "配合 --watch（无目标——记录整个进程表）：每刷新一次，把每个可见进程追加一行 CSV 到该文件（timestamp、pid、user、name、cpu_pct、rss_mb，平台支持时还有每秒 io 读/写字节）。不影响控制台输出",
+            "With --watch (no targets — it records the whole table): append one CSV row per visible process per refresh tick to this file (timestamp, pid, user, name, cpu_pct, rss_mb, io read/write bytes-per-second where the platform reports them). Leaves the console output untouched"
+        )
+    )]
     pub record: Option<String>,
 
-    /// Re-run the current query every N seconds (default 2) until Ctrl-C.
-    /// Works with targets, the plain listing and --recent.
     #[arg(
         long = "watch",
         value_name = "SECONDS",
         num_args = 0..=1,
-        default_missing_value = "2"
+        default_missing_value = "2",
+        help = t(
+            "每 N 秒重新执行一次当前查询（默认 2），直到 Ctrl-C。可用于目标查询、普通列表和 --recent",
+            "Re-run the current query every N seconds (default 2) until Ctrl-C. Works with targets, the plain listing and --recent"
+        )
     )]
     pub watch: Option<u64>,
 
-    /// Stop --watch after this many refresh ticks and exit (a duration
-    /// bound for CI and cron: `--watch 5 --times 12` samples for a minute,
-    /// then prints the summary and exits). Needs --watch.
-    #[arg(long = "times", value_name = "N")]
+    #[arg(
+        long = "times",
+        value_name = "N",
+        help = t(
+            "--watch 达到该刷新次数后停止并退出（给 CI 和 cron 的时长上限：`--watch 5 --times 12` 采样一分钟，打印摘要后退出）。需要 --watch",
+            "Stop --watch after this many refresh ticks and exit (a duration bound for CI and cron: `--watch 5 --times 12` samples for a minute, then prints the summary and exits). Needs --watch"
+        )
+    )]
     pub times: Option<u64>,
 
-    /// Quiet --watch: skip the per-tick table redraw entirely — only
-    /// alerts, follow notes and hook output are printed, so a headless
-    /// watchdog can run for days without filling the scrollback or a
-    /// pipeline. Needs --watch.
-    #[arg(long = "quiet")]
+    #[arg(
+        long = "quiet",
+        help = t(
+            "静默版 --watch：完全跳过每次刷新的表格重绘——只打印告警、follow 提示和钩子输出，无头看门狗可以连跑几天而不撑爆回滚缓冲或管道。需要 --watch",
+            "Quiet --watch: skip the per-tick table redraw entirely — only alerts, follow notes and hook output are printed, so a headless watchdog can run for days without filling the scrollback or a pipeline. Needs --watch"
+        )
+    )]
     pub quiet: bool,
 
-    /// Print the last N log lines (default 100) of the matched process:
-    /// container logs when attributed to one, else journald (Linux) or the
-    /// unified log (macOS). Add --grep PATTERN to keep only matching lines.
     #[arg(
         long = "logs",
         value_name = "N",
         num_args = 0..=1,
-        default_missing_value = "100"
+        default_missing_value = "100",
+        help = t(
+            "打印匹配进程的最后 N 行日志（默认 100）：归属到容器时取容器日志，否则取 journald（Linux）或统一日志（macOS）。加 --grep PATTERN 只保留匹配行",
+            "Print the last N log lines (default 100) of the matched process: container logs when attributed to one, else journald (Linux) or the unified log (macOS). Add --grep PATTERN to keep only matching lines"
+        )
     )]
     pub logs: Option<u64>,
 
-    /// With --logs: keep only log lines containing this substring.
-    #[arg(long = "grep", value_name = "PATTERN")]
+    #[arg(
+        long = "grep",
+        value_name = "PATTERN",
+        help = t("配合 --logs：只保留包含该子串的日志行", "With --logs: keep only log lines containing this substring")
+    )]
     pub grep: Option<String>,
 
-    /// Append every event (started/exited/restarted) as JSON lines to
-    /// this file — a durable record you can --replay later. Without
-    /// targets this works headless under `--watch` too (threshold alerts
-    /// land in the same stream); with the TUI it records the sampler.
-    #[arg(long = "events-log", value_name = "FILE")]
+    #[arg(
+        long = "events-log",
+        value_name = "FILE",
+        help = t(
+            "把每个事件（出现/退出/重启）以 JSON lines 追加到该文件——持久记录，之后可用 --replay 回放。无目标时也能在 `--watch` 下无头运行（阈值告警写入同一数据流）；TUI 下则记录采样器",
+            "Append every event (started/exited/restarted) as JSON lines to this file — a durable record you can --replay later. Without targets this works headless under `--watch` too (threshold alerts land in the same stream); with the TUI it records the sampler"
+        )
+    )]
     pub events_log: Option<String>,
 
-    /// Open the TUI on the Events tab replaying a recorded --events-log
-    /// file; live sampling continues on top of the imported history.
-    #[arg(long = "replay", value_name = "FILE")]
+    #[arg(
+        long = "replay",
+        value_name = "FILE",
+        help = t(
+            "打开 TUI 的 Events 页，回放 --events-log 录制的文件；在导入的历史之上继续实时采样",
+            "Open the TUI on the Events tab replaying a recorded --events-log file; live sampling continues on top of the imported history"
+        )
+    )]
     pub replay: Option<String>,
 
-    /// Session digest window (30, 30s, 5m, 2h, 1d): with --replay FILE,
-    /// print a "what happened" digest of the recorded events and exit;
-    /// with the TUI it sets the 'S' summary-page window.
-    #[arg(long = "since", value_name = "DURATION")]
+    #[arg(
+        long = "since",
+        value_name = "DURATION",
+        help = t(
+            "会话摘要时间窗（30、30s、5m、2h、1d）：配合 --replay FILE，打印已录事件的“发生了什么”摘要后退出；TUI 下则设定 'S' 摘要页的时间窗",
+            "Session digest window (30, 30s, 5m, 2h, 1d): with --replay FILE, print a \"what happened\" digest of the recorded events and exit; with the TUI it sets the 'S' summary-page window"
+        )
+    )]
     pub since: Option<String>,
 
-    /// Desktop notifications when a process restarts, or exits repeatedly
-    /// (crash loop): macOS osascript / Linux notify-send. TUI only; the
-    /// '!' key toggles it live.
-    #[arg(long = "notify")]
+    #[arg(
+        long = "notify",
+        help = t(
+            "进程重启或反复退出（崩溃循环）时发桌面通知：macOS osascript / Linux notify-send。仅 TUI；'!' 键可实时开关",
+            "Desktop notifications when a process restarts, or exits repeatedly (crash loop): macOS osascript / Linux notify-send. TUI only; the '!' key toggles it live"
+        )
+    )]
     pub notify: bool,
 
-    /// Alert when a process exceeds this CPU%% for 5 consecutive samples
-    /// (~15s): desktop notification + Events-tab record + red row highlight.
-    /// One alert per excursion — re-arms when usage drops back under.
-    /// Works in the TUI and under --watch.
-    #[arg(long = "alert-cpu", value_name = "PCT")]
+    #[arg(
+        long = "alert-cpu",
+        value_name = "PCT",
+        help = t(
+            "进程 CPU 占用率连续 5 次采样（约 15s）超过该百分比时告警：桌面通知 + Events 页记录 + 红色行高亮。一次超标只告警一次——回落后重新武装。TUI 和 --watch 下均可用",
+            "Alert when a process exceeds this CPU% for 5 consecutive samples (~15s): desktop notification + Events-tab record + red row highlight. One alert per excursion — re-arms when usage drops back under. Works in the TUI and under --watch"
+        )
+    )]
     pub alert_cpu: Option<f64>,
 
-    /// Alert when a process exceeds this RSS in MB for 5 consecutive
-    /// samples (~15s) — same behavior as --alert-cpu. TUI and --watch.
-    #[arg(long = "alert-mem", value_name = "MB")]
+    #[arg(
+        long = "alert-mem",
+        value_name = "MB",
+        help = t(
+            "进程 RSS 连续 5 次采样（约 15s）超过该 MB 数时告警——行为与 --alert-cpu 相同。TUI 和 --watch",
+            "Alert when a process exceeds this RSS in MB for 5 consecutive samples (~15s) — same behavior as --alert-cpu. TUI and --watch"
+        )
+    )]
     pub alert_mem: Option<u64>,
 
-    /// Alert when a process exceeds this open-descriptor count for 5
-    /// consecutive samples (~15s) — the threshold-alert twin of
-    /// --alert-cpu/--alert-mem, for fd leaks. Costs one fd sweep per
-    /// refresh (cheap on Linux, one lsof scan on macOS, one PowerShell
-    /// sweep on Windows). TUI and --watch.
-    #[arg(long = "alert-fd", value_name = "N")]
+    #[arg(
+        long = "alert-fd",
+        value_name = "N",
+        help = t(
+            "进程打开的描述符数连续 5 次采样（约 15s）超过该值时告警——--alert-cpu/--alert-mem 的阈值告警姊妹版，用于 fd 泄漏。每次刷新多一次 fd 扫描（Linux 开销小，macOS 一次 lsof，Windows 一次 PowerShell 扫描）。TUI 和 --watch",
+            "Alert when a process exceeds this open-descriptor count for 5 consecutive samples (~15s) — the threshold-alert twin of --alert-cpu/--alert-mem, for fd leaks. Costs one fd sweep per refresh (cheap on Linux, one lsof scan on macOS, one PowerShell sweep on Windows). TUI and --watch"
+        )
+    )]
     pub alert_fd: Option<u64>,
 
-    /// Alert when a process exceeds this disk-I/O rate in MB/s (read +
-    /// write combined) for 5 consecutive samples (~15s). Per-process I/O
-    /// counters are a Linux /proc feature — other platforms cannot check.
-    /// TUI and --watch.
-    #[arg(long = "alert-io", value_name = "MB/S")]
+    #[arg(
+        long = "alert-io",
+        value_name = "MB/S",
+        help = t(
+            "进程磁盘 I/O 速率连续 5 次采样（约 15s）超过该 MB/s（读 + 写合计）时告警。进程级 I/O 计数是 Linux /proc 特性——其他平台无法检测。TUI 和 --watch",
+            "Alert when a process exceeds this disk-I/O rate in MB/s (read + write combined) for 5 consecutive samples (~15s). Per-process I/O counters are a Linux /proc feature — other platforms cannot check. TUI and --watch"
+        )
+    )]
     pub alert_io: Option<f64>,
 
-    /// Alert when a process holds more than this many ESTABLISHED
-    /// connections for 5 consecutive samples (~15s) — the network twin of
-    /// --alert-fd, for connection leaks. TUI and --watch.
-    #[arg(long = "alert-conn", value_name = "N")]
+    #[arg(
+        long = "alert-conn",
+        value_name = "N",
+        help = t(
+            "进程持有的 ESTABLISHED 连接数连续 5 次采样（约 15s）超过该值时告警——--alert-fd 的网络版，用于连接泄漏。TUI 和 --watch",
+            "Alert when a process holds more than this many ESTABLISHED connections for 5 consecutive samples (~15s) — the network twin of --alert-fd, for connection leaks. TUI and --watch"
+        )
+    )]
     pub alert_conn: Option<u64>,
 
-    /// Machine-wide alert: fire when the 1-minute load average exceeds
-    /// this value for 5 consecutive samples (~15s). Unlike the per-process
-    /// --alert-* thresholds this watches the whole machine — runaways,
-    /// thrashing, an overloaded box. TUI and --watch.
-    #[arg(long = "alert-load", value_name = "N")]
+    #[arg(
+        long = "alert-load",
+        value_name = "N",
+        help = t(
+            "整机告警：1 分钟负载均值连续 5 次采样（约 15s）超过该值时触发。与按进程的 --alert-* 阈值不同，它盯着整台机器——失控进程、内存颠簸、超载主机。TUI 和 --watch",
+            "Machine-wide alert: fire when the 1-minute load average exceeds this value for 5 consecutive samples (~15s). Unlike the per-process --alert-* thresholds this watches the whole machine — runaways, thrashing, an overloaded box. TUI and --watch"
+        )
+    )]
     pub alert_load: Option<f64>,
 
-    /// Machine-wide alert: fire when used RAM exceeds this percent of
-    /// physical memory for 5 consecutive samples (~15s). TUI and --watch.
-    #[arg(long = "alert-mem-pct", value_name = "PCT")]
+    #[arg(
+        long = "alert-mem-pct",
+        value_name = "PCT",
+        help = t(
+            "整机告警：已用内存占物理内存的百分比连续 5 次采样（约 15s）超过该值时触发。TUI 和 --watch",
+            "Machine-wide alert: fire when used RAM exceeds this percent of physical memory for 5 consecutive samples (~15s). TUI and --watch"
+        )
+    )]
     pub alert_mem_pct: Option<u64>,
 
-    /// Listener canary, repeatable: alert when something starts LISTENing
-    /// on this port (an edge — a port already bound at startup is the
-    /// status quo, not an event). Prefix with ! to invert: `--alert-port
-    /// '!8080'` alerts when a listener that was up disappears. TUI and
-    /// --watch.
-    #[arg(long = "alert-port", value_name = "PORT|!PORT")]
+    #[arg(
+        long = "alert-port",
+        value_name = "PORT|!PORT",
+        help = t(
+            "监听金丝雀，可重复：有进程开始 LISTEN 该端口时告警（只报边沿——启动时就已绑定的端口属于现状，不算事件）。加 ! 前缀反转：`--alert-port '!8080'` 在原本存在的监听消失时告警。TUI 和 --watch",
+            "Listener canary, repeatable: alert when something starts LISTENing on this port (an edge — a port already bound at startup is the status quo, not an event). Prefix with ! to invert: `--alert-port '!8080'` alerts when a listener that was up disappears. TUI and --watch"
+        )
+    )]
     pub alert_port: Vec<String>,
 
-    /// While a threshold alert keeps firing, re-send it about every N
-    /// seconds instead of once per excursion — a watchdog that nags until
-    /// someone looks. Needs one of the --alert-* thresholds.
-    #[arg(long = "alert-repeat", value_name = "SECONDS")]
+    #[arg(
+        long = "alert-repeat",
+        value_name = "SECONDS",
+        help = t(
+            "阈值告警持续命中时，改为约每 N 秒重发一次而不是每次超标只报一次——适合一直催到有人来看的看门狗。需要某个 --alert-* 阈值",
+            "While a threshold alert keeps firing, re-send it about every N seconds instead of once per excursion — a watchdog that nags until someone looks. Needs one of the --alert-* thresholds"
+        )
+    )]
     pub alert_repeat: Option<u64>,
 
-    /// Run this shell command each time a threshold alert fires (needs one
-    /// of --alert-cpu/--alert-mem/--alert-fd/--alert-io/--alert-conn/
-    /// --alert-port/--alert-load/--alert-mem-pct; one run per excursion).
-    /// The alert context is exported as WITR_ALERT_PID / WITR_ALERT_NAME /
-    /// WITR_ALERT_DETAIL — e.g. `--alert-exec 'curl -s $SLACK_HOOK -d
-    /// "$WITR_ALERT_NAME: $WITR_ALERT_DETAIL"'`. TUI and --watch.
-    #[arg(long = "alert-exec", value_name = "CMD")]
+    #[arg(
+        long = "alert-exec",
+        value_name = "CMD",
+        help = t(
+            "每次阈值告警触发时执行该 shell 命令（需要 --alert-cpu/--alert-mem/--alert-fd/--alert-io/--alert-conn/--alert-port/--alert-load/--alert-mem-pct 之一；每次超标执行一次）。告警上下文以 WITR_ALERT_PID / WITR_ALERT_NAME / WITR_ALERT_DETAIL 导出——例如 `--alert-exec 'curl -s $SLACK_HOOK -d \"$WITR_ALERT_NAME: $WITR_ALERT_DETAIL\"'`。TUI 和 --watch",
+            "Run this shell command each time a threshold alert fires (needs one of --alert-cpu/--alert-mem/--alert-fd/--alert-io/--alert-conn/--alert-port/--alert-load/--alert-mem-pct; one run per excursion). The alert context is exported as WITR_ALERT_PID / WITR_ALERT_NAME / WITR_ALERT_DETAIL — e.g. `--alert-exec 'curl -s $SLACK_HOOK -d \"$WITR_ALERT_NAME: $WITR_ALERT_DETAIL\"'`. TUI and --watch"
+        )
+    )]
     pub alert_exec: Option<String>,
 
-    /// Run CMD under a shell, watch only its process subtree, and on exit
-    /// print the audit report: wall duration, exit code, how many processes
-    /// it spawned, peak subtree CPU/RSS, disk I/O and the process tree.
-    /// Add --json for the machine-readable envelope (CI can assert on peak
-    /// RSS, spawned counts and the like). A standalone mode: cannot be
-    /// combined with targets.
-    #[arg(long = "audit", value_name = "CMD")]
+    #[arg(
+        long = "audit",
+        value_name = "CMD",
+        help = t(
+            "在 shell 下运行 CMD，只盯它的进程子树，退出时打印审计报告：实际耗时、退出码、派生了多少进程、子树峰值 CPU/RSS、磁盘 I/O 和进程树。加 --json 得到机器可读的信封（CI 可对峰值 RSS、派生进程数等做断言）。独立模式：不能与目标同时使用",
+            "Run CMD under a shell, watch only its process subtree, and on exit print the audit report: wall duration, exit code, how many processes it spawned, peak subtree CPU/RSS, disk I/O and the process tree. Add --json for the machine-readable envelope (CI can assert on peak RSS, spawned counts and the like). A standalone mode: cannot be combined with targets"
+        )
+    )]
     pub audit: Option<String>,
 
-    /// Kill every process matching the targets (name, --pid, --port,
-    /// --file, --container) instead of reporting on them. Sends SIGTERM
-    /// unless --signal says otherwise. Needs targets.
-    #[arg(long = "kill")]
+    #[arg(
+        long = "kill",
+        help = t(
+            "杀掉所有匹配目标的进程（进程名、--pid、--port、--file、--container），而不是只做报告。默认发 SIGTERM，除非 --signal 另有指定。需要目标",
+            "Kill every process matching the targets (name, --pid, --port, --file, --container) instead of reporting on them. Sends SIGTERM unless --signal says otherwise. Needs targets"
+        )
+    )]
     pub kill: bool,
 
-    /// Like --kill, but also kills every descendant of each match
-    /// (children first, then the match). Needs targets.
-    #[arg(long = "kill-tree")]
+    #[arg(
+        long = "kill-tree",
+        help = t(
+            "同 --kill，但还会杀掉每个匹配的所有后代（先杀子进程，再杀匹配本身）。需要目标",
+            "Like --kill, but also kills every descendant of each match (children first, then the match). Needs targets"
+        )
+    )]
     pub kill_tree: bool,
 
-    /// Signal name for --kill/--kill-tree (default TERM; e.g. KILL, INT,
-    /// HUP — passed to `kill -s` on Unix, mapped to taskkill /F for KILL
-    /// on Windows).
-    #[arg(long = "signal", value_name = "SIG")]
+    #[arg(
+        long = "signal",
+        value_name = "SIG",
+        help = t(
+            "--kill/--kill-tree 使用的信号名（默认 TERM；如 KILL、INT、HUP——Unix 下传给 `kill -s`，Windows 下 KILL 映射为 taskkill /F）",
+            "Signal name for --kill/--kill-tree (default TERM; e.g. KILL, INT, HUP — passed to `kill -s` on Unix, mapped to taskkill /F for KILL on Windows)"
+        )
+    )]
     pub signal: Option<String>,
 
-    /// Self-contained HTML report of the current process table (a summary
-    /// plus the full table with cpu/mem bars) written to this file, then
-    /// exit. A no-target operation: cannot be combined with targets.
-    #[arg(long = "report-html", value_name = "FILE")]
+    #[arg(
+        long = "report-html",
+        value_name = "FILE",
+        help = t(
+            "把当前进程表生成自包含的 HTML 报告（摘要 + 带 CPU/内存条的完整表格）写入该文件后退出。属于无目标操作：不能与目标同时使用",
+            "Self-contained HTML report of the current process table (a summary plus the full table with cpu/mem bars) written to this file, then exit. A no-target operation: cannot be combined with targets"
+        )
+    )]
     pub report_html: Option<String>,
 
-    /// Run this shell command once whenever a watched/followed target
-    /// disappears (watch/follow mode only) — e.g. `--on-exit 'say gone'`.
-    /// In --follow mode the loop still exits 2 when the program never
-    /// comes back under a new pid.
-    #[arg(long = "on-exit", value_name = "CMD")]
+    #[arg(
+        long = "on-exit",
+        value_name = "CMD",
+        help = t(
+            "被 watch/follow 的目标消失时执行一次该 shell 命令（仅 watch/follow 模式）——例如 `--on-exit 'say gone'`。--follow 模式下，若程序再也没以新 pid 回来，循环仍以退出码 2 结束",
+            "Run this shell command once whenever a watched/followed target disappears (watch/follow mode only) — e.g. `--on-exit 'say gone'`. In --follow mode the loop still exits 2 when the program never comes back under a new pid"
+        )
+    )]
     pub on_exit: Option<String>,
 
-    /// Run this shell command once whenever a watched target appears —
-    /// including on the very first tick if it is already up. The mirror of
-    /// --on-exit, for wait-for-deploy scripts: `--watch 2 --on-start 'say
-    /// up'`. Needs a target and --watch (or --follow).
-    #[arg(long = "on-start", value_name = "CMD")]
+    #[arg(
+        long = "on-start",
+        value_name = "CMD",
+        help = t(
+            "被 watch 的目标出现时执行一次该 shell 命令——若第一个采样点它已在运行也会触发。--on-exit 的镜像版，用于等待部署的脚本：`--watch 2 --on-start 'say up'`。需要目标且搭配 --watch（或 --follow）",
+            "Run this shell command once whenever a watched target appears — including on the very first tick if it is already up. The mirror of --on-exit, for wait-for-deploy scripts: `--watch 2 --on-start 'say up'`. Needs a target and --watch (or --follow)"
+        )
+    )]
     pub on_start: Option<String>,
 
-    /// Write every visible process as JSON and exit — a snapshot to --diff
-    /// against later. Without a FILE the snapshot lands in the auto-rotate
-    /// directory under the config dir (the 10 most recent are kept) and the
-    /// chosen path is printed, so `--snap` / `--diff last` work without
-    /// managing files by hand.
     #[arg(
         long = "snap",
         value_name = "FILE",
         num_args = 0..=1,
-        default_missing_value = ""
+        default_missing_value = "",
+        help = t(
+            "把所有可见进程写成 JSON 后退出——一份快照，供之后 --diff 对比。不给 FILE 时，快照落入配置目录下的自动轮换目录（保留最近 10 份）并打印所选路径，`--snap` / `--diff last` 无需手工管理文件",
+            "Write every visible process as JSON and exit — a snapshot to --diff against later. Without a FILE the snapshot lands in the auto-rotate directory under the config dir (the 10 most recent are kept) and the chosen path is printed, so `--snap` / `--diff last` work without managing files by hand"
+        )
     )]
     pub snap: Option<String>,
 
-    /// Compare the current process table against a --snap file: new /
-    /// gone / restarted (same program, new pid) / changed (cmdline).
-    /// FILE can also be `last` (the newest auto snapshot) or a duration
-    /// (`1h` — the newest snapshot at least that old).
-    #[arg(long = "diff", value_name = "FILE|last|DURATION")]
+    #[arg(
+        long = "diff",
+        value_name = "FILE|last|DURATION",
+        help = t(
+            "把当前进程表与 --snap 快照文件对比：新增 / 消失 / 重启（同程序换了新 pid）/ 变化（cmdline）。FILE 还可以是 `last`（最新的自动快照）或时长（`1h`——满足该年龄的最新快照）",
+            "Compare the current process table against a --snap file: new / gone / restarted (same program, new pid) / changed (cmdline). FILE can also be `last` (the newest auto snapshot) or a duration (`1h` — the newest snapshot at least that old)"
+        )
+    )]
     pub diff: Option<String>,
 
-    /// How many auto snapshots --snap (without a FILE) keeps before
-    /// pruning the oldest (default 10)
-    #[arg(long = "keep", value_name = "N")]
+    #[arg(
+        long = "keep",
+        value_name = "N",
+        help = t(
+            "--snap（不给 FILE）保留多少份自动快照后才删最旧的（默认 10）",
+            "How many auto snapshots --snap (without a FILE) keeps before pruning the oldest (default 10)"
+        )
+    )]
     pub keep: Option<usize>,
 
-    /// With --snap: also record the current LISTEN ports, so a later
-    /// --diff can report listeners that appeared or disappeared ("a new
-    /// process started serving on :8080") — a first-pass canary for
-    /// unexpected services.
-    #[arg(long = "sockets")]
+    #[arg(
+        long = "sockets",
+        help = t(
+            "配合 --snap：同时记录当前 LISTEN 端口，之后的 --diff 就能报告出现或消失的监听（“有新进程开始在 :8080 上服务”）——意外服务的初级金丝雀",
+            "With --snap: also record the current LISTEN ports, so a later --diff can report listeners that appeared or disappeared (\"a new process started serving on :8080\") — a first-pass canary for unexpected services"
+        )
+    )]
     pub sockets: bool,
 
-    /// With a target-less --watch: every N seconds compare the live table
-    /// against the previous check and print what drifted — new / gone /
-    /// restarted / changed, plus listen edges (an in-memory snapshot+diff
-    /// each interval, no files written). The process-side twin of
-    /// --alert-port's canary.
-    #[arg(long = "diff-auto", value_name = "SECONDS")]
+    #[arg(
+        long = "diff-auto",
+        value_name = "SECONDS",
+        help = t(
+            "配合无目标的 --watch：每 N 秒把实时进程表与上一次检查对比并打印漂移——新增 / 消失 / 重启 / 变化，外加监听边沿事件（每个周期在内存里做快照+对比，不写文件）。--alert-port 金丝雀的进程侧孪生版",
+            "With a target-less --watch: every N seconds compare the live table against the previous check and print what drifted — new / gone / restarted / changed, plus listen edges (an in-memory snapshot+diff each interval, no files written). The process-side twin of --alert-port's canary"
+        )
+    )]
     pub diff_auto: Option<u64>,
 
-    /// With one --pid target: when the traced pid exits, keep going —
-    /// re-acquire the same program (name+exe+user) under its new pid.
-    /// Implies --watch; stops once the identity stays gone for 3
-    /// consecutive refreshes.
-    #[arg(short = 'o', long = "follow")]
+    #[arg(
+        short = 'o',
+        long = "follow",
+        help = t(
+            "配合单个 --pid 目标：被追踪的 pid 退出后继续——以相同程序身份（名称+exe+user）在新 pid 上重新接续。隐含 --watch；身份连续 3 次刷新都不存在才停止",
+            "With one --pid target: when the traced pid exits, keep going — re-acquire the same program (name+exe+user) under its new pid. Implies --watch; stops once the identity stays gone for 3 consecutive refreshes"
+        )
+    )]
     pub follow: bool,
 
-    /// Print the shell completion script for the given shell and exit:
-    /// source it from your rc file, e.g.
-    /// `witr-rs --completions zsh >> ~/.zshrc`
-    #[arg(long = "completions", value_name = "SHELL")]
+    #[arg(
+        long = "completions",
+        value_name = "SHELL",
+        help = t(
+            "打印指定 shell 的补全脚本后退出：在你的 rc 文件里 source 它，例如 `witr-rs --completions zsh >> ~/.zshrc`",
+            "Print the shell completion script for the given shell and exit: source it from your rc file, e.g. `witr-rs --completions zsh >> ~/.zshrc`"
+        )
+    )]
     pub completions: Option<Shell>,
 
-    /// Print a roff man page (for `man witr-rs`) and exit — write it to
-    /// FILE instead when given, e.g.
-    /// `witr-rs --man ~/.local/share/man/man1/witr-rs.1`
     #[arg(
         long = "man",
         value_name = "FILE",
         num_args = 0..=1,
-        default_missing_value = ""
+        default_missing_value = "",
+        help = t(
+            "打印 roff man 手册页（供 `man witr-rs` 使用）后退出——给了 FILE 则写入文件，例如 `witr-rs --man ~/.local/share/man/man1/witr-rs.1`",
+            "Print a roff man page (for `man witr-rs`) and exit — write it to FILE instead when given, e.g. `witr-rs --man ~/.local/share/man/man1/witr-rs.1`"
+        )
     )]
     pub man: Option<String>,
 
-    /// Serve Prometheus metrics on this address ([HOST]:PORT or bare PORT,
-    /// default host 127.0.0.1) until Ctrl-C: per-process cpu/rss/fd gauges
-    /// (Prometheus text format) sampled fresh on every /metrics scrape.
-    /// A no-target operation.
-    #[arg(long = "serve", value_name = "[HOST]:PORT")]
+    #[arg(
+        long = "serve",
+        value_name = "[HOST]:PORT",
+        help = t(
+            "在该地址上提供 Prometheus 指标（[HOST]:PORT 或裸端口，默认主机 127.0.0.1），直到 Ctrl-C：每个进程的 cpu/rss/fd 指标（Prometheus 文本格式），每次 /metrics 抓取都实时重新采样。属于无目标操作",
+            "Serve Prometheus metrics on this address ([HOST]:PORT or bare PORT, default host 127.0.0.1) until Ctrl-C: per-process cpu/rss/fd gauges (Prometheus text format) sampled fresh on every /metrics scrape. A no-target operation"
+        )
+    )]
     pub serve: Option<String>,
+
+    #[arg(
+        long = "en",
+        help = t(
+            "以英文输出帮助说明（默认中文）",
+            "Print the help text in English (Chinese is the default)"
+        )
+    )]
+    pub en: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_language_defaults_to_chinese_and_flips_on_english() {
+        ENGLISH.store(false, Ordering::Relaxed);
+        assert_eq!(t("中文", "english"), "中文");
+        ENGLISH.store(true, Ordering::Relaxed);
+        assert_eq!(t("中文", "english"), "english");
+        ENGLISH.store(false, Ordering::Relaxed);
+    }
 }

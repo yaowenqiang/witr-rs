@@ -683,6 +683,10 @@ impl RecordWriter {
 }
 
 fn main() {
+    // pre-scan argv for `--en` before building the Command, so the help text
+    // (and the man page / completions generated from it) comes out in the
+    // chosen language — Chinese by default
+    cli::init_language();
     let cli = match cli::Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {

@@ -223,8 +223,9 @@ fn parse_lsof_fd_counts(text: &str) -> std::collections::HashMap<Pid, u64> {
     out
 }
 
-/// Non-macOS stub — see [`parse_lsof_fd_counts`].
-#[cfg(not(target_os = "macos"))]
+/// Non-macOS stub — see [`parse_lsof_fd_counts`]. Not under `test`: there
+/// the pure implementation above is compiled on every platform.
+#[cfg(all(not(target_os = "macos"), not(test)))]
 fn parse_lsof_fd_counts(_text: &str) -> std::collections::HashMap<Pid, u64> {
     std::collections::HashMap::new()
 }
