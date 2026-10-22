@@ -365,6 +365,24 @@ pub struct Cli {
     #[arg(
         long,
         help = t(
+            "列出全部僵尸进程（state Z）及其父进程——谁的锅一眼可见。发现僵尸退出码 1，干净则 0，脚本可直接判断。属于无目标操作；--json 出版本化信封",
+            "List every zombie process (state Z) with its parent — whose fault it is, at a glance. Exit 1 when any zombie exists, 0 when clean, so scripts can branch. A no-target operation; --json emits the versioned envelope"
+        )
+    )]
+    pub zombies: bool,
+
+    #[arg(
+        long,
+        help = t(
+            "列出全系统当前持有的文件锁（持锁进程 / 模式 / 文件路径）——“哪个进程锁着这个文件”一条命令。属于无目标操作；--json 出版本化信封",
+            "List every file lock currently held system-wide (holder / mode / file path) — \"which process locks this file\" in one command. A no-target operation; --json emits the versioned envelope"
+        )
+    )]
+    pub locks: bool,
+
+    #[arg(
+        long,
+        help = t(
             "把列表 / --top 行输出为 CSV（一行表头 + 每个进程一行）。属于无目标格式：不能与目标同时使用——目标查询请用 --json",
             "Emit the listing / --top rows as CSV (one header row + one row per process). A no-target format: cannot be combined with targets — use --json there"
         )
@@ -476,8 +494,8 @@ pub struct Cli {
         long = "replay",
         value_name = "FILE",
         help = t(
-            "打开 TUI 的 Events 页，回放 --events-log 录制的文件；在导入的历史之上继续实时采样",
-            "Open the TUI on the Events tab replaying a recorded --events-log file; live sampling continues on top of the imported history"
+            "打开 TUI 的 Events 页，回放 --events-log 录制的文件；在导入的历史之上继续实时采样。加 --follow 持续跟随文件末尾——录制侧追加的事件实时流入（把 TUI 变成另一台机器/另一个会话的直播窗口）",
+            "Open the TUI on the Events tab replaying a recorded --events-log file; live sampling continues on top of the imported history. Add --follow to keep tailing the file — events the recording side appends stream in live (turns the TUI into a live window onto another session or machine)"
         )
     )]
     pub replay: Option<String>,
@@ -535,8 +553,8 @@ pub struct Cli {
         long = "alert-io",
         value_name = "MB/S",
         help = t(
-            "进程磁盘 I/O 速率连续 5 次采样（约 15s）超过该 MB/s（读 + 写合计）时告警。进程级 I/O 计数是 Linux /proc 特性——其他平台无法检测。TUI 和 --watch",
-            "Alert when a process exceeds this disk-I/O rate in MB/s (read + write combined) for 5 consecutive samples (~15s). Per-process I/O counters are a Linux /proc feature — other platforms cannot check. TUI and --watch"
+            "进程磁盘 I/O 速率连续 5 次采样（约 15s）超过该 MB/s（读 + 写合计）时告警。TUI 和 --watch",
+            "Alert when a process exceeds this disk-I/O rate in MB/s (read + write combined) for 5 consecutive samples (~15s). TUI and --watch"
         )
     )]
     pub alert_io: Option<f64>,
@@ -570,6 +588,16 @@ pub struct Cli {
         )
     )]
     pub alert_mem_pct: Option<u64>,
+
+    #[arg(
+        long = "alert-count",
+        value_name = "N",
+        help = t(
+            "整机告警：可见进程数连续 5 次采样（约 15s）超过该值时触发——fork 炸弹、失控任务生成器把进程表撑爆的哨兵。TUI 和 --watch",
+            "Machine-wide alert: fire when the visible process count exceeds this value for 5 consecutive samples (~15s) — a sentinel for table explosions (fork bombs, runaway task spawners). TUI and --watch"
+        )
+    )]
+    pub alert_count: Option<u32>,
 
     #[arg(
         long = "alert-port",

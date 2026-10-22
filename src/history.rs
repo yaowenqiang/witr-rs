@@ -103,6 +103,21 @@ pub struct SysAlertState {
     pub mem_streak: u32,
     pub mem_firing: bool,
     pub mem_fired_secs: u32,
+    pub count_streak: u32,
+    pub count_firing: bool,
+    pub count_fired_secs: u32,
+}
+
+/// The armed machine-wide alert thresholds plus the inputs they compare
+/// against — one bundle so [`system_alert_picks`] stays readable. Fields
+/// left `None` are disarmed; `proc_count` is only read when `count` is
+/// armed.
+pub struct SysAlertLimits {
+    pub load: Option<f64>,
+    pub mem_pct: Option<u64>,
+    pub count: Option<u32>,
+    pub proc_count: usize,
+    pub repeat: Option<u64>,
 }
 
 /// One tick of the machine-wide alerts. `stats` comes from the platform's
@@ -112,11 +127,16 @@ pub struct SysAlertState {
 pub fn system_alert_picks(
     stats: &crate::platform::SystemStats,
     state: &mut SysAlertState,
-    load_limit: Option<f64>,
-    mem_pct_limit: Option<u64>,
-    repeat_secs: Option<u64>,
+    limits: &SysAlertLimits,
     interval_secs: u64,
 ) -> Vec<(String, String)> {
+    let SysAlertLimits {
+        load: load_limit,
+        mem_pct: mem_pct_limit,
+        count: count_limit,
+        proc_count,
+        repeat: repeat_secs,
+    } = *limits;
     let mut out = Vec::new();
     if let Some(limit) = load_limit {
         let now = stats.load1;
@@ -158,6 +178,25 @@ pub fn system_alert_picks(
                 format!(
                     "RAM {}% above {limit}% for {}s",
                     pct.unwrap_or(0),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+            ));
+        }
+    }
+    if let Some(limit) = count_limit {
+        let over = proc_count > limit as usize;
+        if alert_cycle_repeat(
+            &mut state.count_streak,
+            &mut state.count_firing,
+            over,
+            &mut state.count_fired_secs,
+            repeat_secs,
+            interval_secs,
+        ) {
+            out.push((
+                "system".to_string(),
+                format!(
+                    "{proc_count} visible processes above {limit} for {}s",
                     ALERT_CYCLES as u64 * interval_secs.max(1)
                 ),
             ));
@@ -957,6 +996,16 @@ impl History {
         self.events.truncate(EVENT_CAP);
         e
     }
+
+    /// Merge tail-replayed events (append-ordered, oldest first) into the
+    /// ring, newest first — the `--replay FILE --follow` feed.
+    pub fn ingest(&mut self, mut events: Vec<TuiEvent>) {
+        events.reverse();
+        for e in events {
+            self.events.insert(0, e);
+        }
+        self.events.truncate(EVENT_CAP);
+    }
 }
 
 /// Read a `--events-log` JSONL file back into a newest-first event ring
@@ -971,6 +1020,66 @@ pub fn load_events_log(path: &str) -> std::io::Result<Vec<TuiEvent>> {
         .collect();
     events.reverse();
     Ok(events)
+}
+
+/// Tail a growing `--events-log` JSONL file — the live half of
+/// `--replay FILE --follow`. `poll()` reads only the bytes appended since
+/// the last call (the initial `load_events_log` already replayed history,
+/// so the tail starts at the file's current end), parses complete lines,
+/// and returns them append-ordered. A torn final write waits for its
+/// newline; a shrunk file (truncation/rotation) restarts from the top.
+/// All errors are swallowed — a vanished or unreadable file just polls
+/// empty, the same tolerance the recorder side has.
+pub struct EventTail {
+    path: String,
+    offset: u64,
+    pending: String,
+}
+
+impl EventTail {
+    /// Start tailing at the file's current end.
+    pub fn at_end(path: &str) -> std::io::Result<Self> {
+        let offset = std::fs::metadata(path)?.len();
+        Ok(Self {
+            path: path.to_string(),
+            offset,
+            pending: String::new(),
+        })
+    }
+
+    /// Events appended since the last poll, oldest first (the ring's
+    /// insert-at-0 does the newest-first flip).
+    pub fn poll(&mut self) -> Vec<TuiEvent> {
+        let mut out = Vec::new();
+        if let Ok(meta) = std::fs::metadata(&self.path) {
+            if meta.len() < self.offset {
+                // truncated or rotated: start over from the top
+                self.offset = 0;
+                self.pending.clear();
+            }
+            if let Ok(mut f) = std::fs::File::open(&self.path) {
+                use std::io::{Read as _, Seek as _};
+                if self.offset > 0
+                    && f.seek(std::io::SeekFrom::Start(self.offset)).is_err()
+                {
+                    return out;
+                }
+                let mut bytes = Vec::new();
+                if f.read_to_end(&mut bytes).is_ok() {
+                    self.offset += bytes.len() as u64;
+                    self.pending.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(pos) = self.pending.find('\n') {
+                        let line: String = self.pending.drain(..=pos).collect();
+                        let line = line.trim_end();
+                        if let Ok(e) = serde_json::from_str::<TuiEvent>(line) {
+                            out.push(e);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -1039,13 +1148,22 @@ mod tests {
         let mut state = SysAlertState::default();
         // nothing armed → no output even over the line
         let s = stats(Some(20.0), Some(9900), Some(10_000));
-        assert!(system_alert_picks(&s, &mut state, None, None, None, 3).is_empty());
+        let limits = |load, mem_pct, count, proc_count| SysAlertLimits {
+            load,
+            mem_pct,
+            count,
+            proc_count,
+            repeat: None,
+        };
+        assert!(
+            system_alert_picks(&s, &mut state, &limits(None, None, None, 0), 3).is_empty()
+        );
 
         // load over the line: quiet until ALERT_CYCLES completes, then one
         // fire naming the value and the sustained window
         let mut fires = Vec::new();
         for _ in 0..ALERT_CYCLES {
-            fires = system_alert_picks(&s, &mut state, Some(8.0), None, None, 3);
+            fires = system_alert_picks(&s, &mut state, &limits(Some(8.0), None, None, 0), 3);
         }
         assert_eq!(fires.len(), 1);
         assert_eq!(fires[0].0, "system");
@@ -1055,15 +1173,100 @@ mod tests {
         let mut state = SysAlertState::default();
         let mut fired = false;
         for _ in 0..ALERT_CYCLES {
-            fired |= !system_alert_picks(&s, &mut state, None, Some(90), None, 3).is_empty();
+            fired |= !system_alert_picks(&s, &mut state, &limits(None, Some(90), None, 0), 3)
+                .is_empty();
         }
         assert!(fired, "99% over 90 fires");
         // total unknown → no measurement, no fire
         let mut state = SysAlertState::default();
         let s2 = stats(None, Some(9900), None);
         for _ in 0..ALERT_CYCLES {
-            assert!(system_alert_picks(&s2, &mut state, None, Some(90), None, 3).is_empty());
+            assert!(
+                system_alert_picks(&s2, &mut state, &limits(None, Some(90), None, 0), 3)
+                    .is_empty()
+            );
         }
+    }
+
+    #[test]
+    fn system_alert_fires_on_process_count() {
+        let s = crate::platform::SystemStats::default();
+        let mut state = SysAlertState::default();
+        let limits = |count, proc_count| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count,
+            proc_count,
+            repeat: None,
+        };
+        // 5 visible, limit 10 → under, never fires
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(system_alert_picks(&s, &mut state, &limits(Some(10), 5), 3).is_empty());
+        }
+        // climb to 12: quiet until the cycle completes, then one fire naming
+        // the count and the sustained window
+        let mut fires = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            fires = system_alert_picks(&s, &mut state, &limits(Some(10), 12), 3);
+        }
+        assert_eq!(fires.len(), 1);
+        assert!(fires[0].1.contains("12 visible processes above 10"), "{}", fires[0].1);
+        // latched: still over → no repeat without --alert-repeat
+        assert!(system_alert_picks(&s, &mut state, &limits(Some(10), 12), 3).is_empty());
+        // dropping back under re-arms
+        for _ in 0..ALERT_CYCLES {
+            system_alert_picks(&s, &mut state, &limits(Some(10), 5), 3);
+        }
+    }
+
+    #[test]
+    fn event_tail_streams_new_lines_only() {
+        let dir = std::env::temp_dir().join(format!("witr-tail-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        let ev = |pid: Pid, kind: &str| TuiEvent {
+            at_unix: 0,
+            kind: kind.into(),
+            pid,
+            name: "worker".into(),
+            detail: String::new(),
+        };
+        let line = |e: &TuiEvent| serde_json::to_string(e).unwrap();
+        // two events recorded before the tail attaches
+        std::fs::write(&path, format!("{}\n", line(&ev(1, "started")))).unwrap();
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, "{}", line(&ev(2, "started"))).unwrap();
+        }
+        let mut tail = EventTail::at_end(path.to_str().unwrap()).unwrap();
+        // nothing new → empty poll
+        assert!(tail.poll().is_empty());
+        // appends stream in, oldest first; a torn final line waits
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, "{}", line(&ev(1, "exited"))).unwrap();
+            write!(f, "{}", line(&ev(3, "started"))).unwrap(); // no newline yet
+        }
+        let got = tail.poll();
+        assert_eq!(got.len(), 1, "torn line held back: {got:?}");
+        assert_eq!((got[0].pid, got[0].kind.as_str()), (1, "exited"));
+        // newline arrives → the held event completes
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f).unwrap();
+        }
+        let got = tail.poll();
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].pid, got[0].kind.as_str()), (3, "started"));
+        // truncation (rotation) restarts from the top, history re-streams
+        std::fs::write(&path, format!("{}\n", line(&ev(9, "started")))).unwrap();
+        let got = tail.poll();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].pid, 9);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

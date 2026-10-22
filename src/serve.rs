@@ -8,7 +8,8 @@
 //! Hand-rolled on std::net (one thread per connection, sequential reads)
 //! so the binary keeps zero extra dependencies. Cardinality stays bounded:
 //! per-process gauges cover the union of the top-20 CPU and top-20 RSS
-//! processes, plus the machine totals; port gauges are one series per
+//! processes (including cumulative IO read/write counters — `rate()` them
+//! for throughput), plus the machine totals; port gauges are one series per
 //! listening (proto, port).
 
 use std::collections::{HashMap, HashSet};
@@ -64,7 +65,10 @@ fn export_set(procs: &[Process], n: usize) -> Vec<&Process> {
 /// One scrape: sample the platform and render the Prometheus exposition.
 fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
     let mut out = String::with_capacity(16 * 1024);
-    let procs = platform.list_processes().unwrap_or_default();
+    let mut procs = platform.list_processes().unwrap_or_default();
+    // IO counters need enrich_listing (proc_pid_rusage / /proc/<pid>/io per
+    // process) — same cost class as the fd sweep, paid once per scrape
+    platform.enrich_listing(&mut procs);
     let rss_total: u64 = procs.iter().filter_map(|p| p.mem_kb).sum::<u64>() / 1024;
     out.push_str("# HELP witr_process_count Visible processes\n");
     out.push_str("# TYPE witr_process_count gauge\n");
@@ -96,6 +100,30 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
                 label_escape(&p.name),
                 label_escape(p.user.as_deref().unwrap_or("-")),
                 kb * 1024,
+            ));
+        }
+    }
+    // cumulative disk I/O as counters — `rate()` in PromQL turns them into
+    // per-process read/write throughput (same top-N set, bounded cardinality)
+    out.push_str("# HELP witr_process_io_read_bytes_total Cumulative disk read bytes\n");
+    out.push_str("# TYPE witr_process_io_read_bytes_total counter\n");
+    for p in &set {
+        if let Some(v) = p.io_read_bytes {
+            out.push_str(&format!(
+                "witr_process_io_read_bytes_total{{pid=\"{}\",name=\"{}\"}} {v}\n",
+                p.pid,
+                label_escape(&p.name),
+            ));
+        }
+    }
+    out.push_str("# HELP witr_process_io_write_bytes_total Cumulative disk write bytes\n");
+    out.push_str("# TYPE witr_process_io_write_bytes_total counter\n");
+    for p in &set {
+        if let Some(v) = p.io_write_bytes {
+            out.push_str(&format!(
+                "witr_process_io_write_bytes_total{{pid=\"{}\",name=\"{}\"}} {v}\n",
+                p.pid,
+                label_escape(&p.name),
             ));
         }
     }

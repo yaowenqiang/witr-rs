@@ -254,6 +254,9 @@ struct TuiApp {
     /// --events-log sink: every event the sampler generates is appended as
     /// one JSON line (single writer — the event loop thread)
     events_log: Option<std::fs::File>,
+    /// --replay FILE --follow: tails the recorded file; appended events
+    /// stream into the ring on every refresh tick
+    event_tail: Option<crate::history::EventTail>,
     /// desktop notifications enabled (--notify, '!' toggles)
     notify: bool,
     /// watchlist: persisted "name|exe_basename|user" identity keys (config
@@ -329,6 +332,8 @@ struct TuiApp {
     alert_load: Option<f64>,
     /// --alert-mem-pct: machine-wide used-RAM percent threshold
     alert_mem_pct: Option<u64>,
+    /// --alert-count: machine-wide visible-process-count threshold
+    alert_count: Option<u32>,
     /// streak/firing state for the machine-wide alerts
     sys_alert: crate::history::SysAlertState,
     /// --alert-exec: shell command per alert firing (context in env vars)
@@ -433,6 +438,9 @@ pub struct Seed {
     /// --replay: pre-recorded events (newest first) loaded into the ring
     /// before the live sampler starts
     pub replayed: Vec<crate::history::TuiEvent>,
+    /// --replay FILE --follow: keep tailing the file — events appended by
+    /// the recording side stream into the ring live
+    pub replay_follow: Option<String>,
     /// --notify: desktop notifications on restarts / repeated exits
     /// ('!' toggles live inside the TUI)
     pub notify: bool,
@@ -466,6 +474,8 @@ pub struct Seed {
     pub alert_load: Option<f64>,
     /// --alert-mem-pct: machine-wide used-RAM percent threshold
     pub alert_mem_pct: Option<u64>,
+    /// --alert-count: machine-wide visible-process-count threshold
+    pub alert_count: Option<u32>,
     /// --alert-exec: shell command run on every threshold-alert firing;
     /// context exported as WITR_ALERT_PID/NAME/DETAIL
     pub alert_exec: Option<String>,
@@ -636,6 +646,7 @@ impl TuiApp {
             alert_repeat: seed.alert_repeat,
             alert_load: seed.alert_load,
             alert_mem_pct: seed.alert_mem_pct,
+            alert_count: seed.alert_count,
             sys_alert: crate::history::SysAlertState::default(),
             alert_exec: seed.alert_exec.clone(),
             alert_state: HashMap::new(),
@@ -668,6 +679,7 @@ impl TuiApp {
             death_logs: std::collections::VecDeque::new(),
             death_rx: None,
             events_log: None,
+            event_tail: None,
             notify: false,
             watch: seed.watch,
             restart_tally: HashMap::new(),
@@ -739,6 +751,14 @@ impl TuiApp {
             app.hist.events = seed.replayed;
             app.switch_tab(Tab::Events);
             app.rebuild_event_view();
+        }
+        // --replay FILE --follow: after the one-shot history load, tail the
+        // file from its current end so only new appends stream in
+        if let Some(path) = &seed.replay_follow {
+            match crate::history::EventTail::at_end(path) {
+                Ok(tail) => app.event_tail = Some(tail),
+                Err(e) => app.status = format!("--replay --follow {path}: {e}"),
+            }
         }
         app.notify = seed.notify;
         // config defaults: start frozen, and sort the process table
@@ -818,6 +838,14 @@ impl TuiApp {
                     send_desktop_notify("witr-rs", &body);
                 }
             }
+            // --replay FILE --follow: events appended by the recording side
+            // join the ring; the Events tab rebuild below picks them up
+            if let Some(tail) = self.event_tail.as_mut() {
+                let tailed = tail.poll();
+                if !tailed.is_empty() {
+                    self.hist.ingest(tailed);
+                }
+            }
             // --alert-fd needs descriptor counts for every pid: one sweep
             // per refresh, only when the alert is armed (one lsof scan per
             // tick on macOS; a cheap /proc walk on Linux). A failed sweep
@@ -852,18 +880,24 @@ impl TuiApp {
                     &mut self.port_owner,
                 ));
             }
-            if self.alert_load.is_some() || self.alert_mem_pct.is_some() {
-                // --alert-load / --alert-mem-pct: sample the whole machine
-                // when armed (macOS's vm_stat spawn is paid only when watched)
+            if self.alert_load.is_some() || self.alert_mem_pct.is_some() || self.alert_count.is_some() {
+                // --alert-load / --alert-mem-pct / --alert-count: sample the
+                // whole machine when armed (macOS's vm_stat spawn is paid
+                // only when watched)
                 if let Some(stats) = self.platform.system_stats() {
                     let interval = self.refresh.max(Duration::from_secs(1)).as_secs();
+                    let limits = crate::history::SysAlertLimits {
+                        load: self.alert_load,
+                        mem_pct: self.alert_mem_pct,
+                        count: self.alert_count,
+                        proc_count: self.procs.len(),
+                        repeat: self.alert_repeat,
+                    };
                     picks.extend(
                         crate::history::system_alert_picks(
                             &stats,
                             &mut self.sys_alert,
-                            self.alert_load,
-                            self.alert_mem_pct,
-                            self.alert_repeat,
+                            &limits,
                             interval,
                         )
                         .into_iter()
@@ -3317,6 +3351,31 @@ fn detail_lines(
             t.clone()
         };
         push_kv(&mut v, "Tty", label);
+    }
+    if m.pgid.is_some() || m.sid.is_some() {
+        let mut label = String::new();
+        if let Some(g) = m.pgid {
+            label.push_str(&format!("pgid {g}"));
+        }
+        if m.pgid.is_some() && m.sid.is_some() {
+            label.push_str(" · ");
+        }
+        if let Some(s) = m.sid {
+            label.push_str(&format!("sid {s}"));
+        }
+        push_kv(&mut v, "Group", label);
+    }
+    // cgroup v2 (Linux detail-time): path plus the group's own memory and
+    // CPU totals — the container/service view a bare RSS can't give
+    if let Some(cg) = &m.cgroup {
+        let mut label = cg.clone();
+        if let Some(bytes) = m.cgroup_mem_bytes {
+            label.push_str(&format!(" · mem {}", crate::util::fmt_bytes(bytes)));
+        }
+        if let Some(usec) = m.cgroup_cpu_usec {
+            label.push_str(&format!(" · cpu {:.1}s", usec as f64 / 1_000_000.0));
+        }
+        push_kv(&mut v, "Cgroup", label);
     }
     if let Some(e) = &m.exe {
         push_kv(&mut v, "Exe", e.clone());
@@ -8096,6 +8155,8 @@ mod tests {
                 alert_repeat: None,
                 alert_load: None,
                 alert_mem_pct: None,
+                alert_count: None,
+                replay_follow: None,
                 notes: Vec::new(),
             },
         );

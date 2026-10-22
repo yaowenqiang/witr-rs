@@ -77,6 +77,24 @@ pub struct Process {
     /// anything nohup'd), None when the platform doesn't report one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tty: Option<String>,
+    /// Process group id (stat field 5 / ps pgid=) — "these processes were
+    /// spawned as one job" groups shell pipelines and job control.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pgid: Option<Pid>,
+    /// Session id (stat field 6 / ps sess=) — the session leader's pid;
+    /// processes sharing a sid belong to one login / daemon session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sid: Option<Pid>,
+    /// cgroup v2 path relative to /sys/fs/cgroup (Linux only, detail-time),
+    /// with the cgroup's memory.current and cpu.stat usage_usec alongside.
+    /// "Is this memory the process's own or the whole container's" — the
+    /// cgroup view answers it. None off Linux / at the root cgroup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cgroup: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cgroup_mem_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cgroup_cpu_usec: Option<u64>,
 }
 
 impl Process {

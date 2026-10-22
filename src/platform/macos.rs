@@ -331,9 +331,9 @@ impl MacOs {
     }
 }
 
-/// `ps -axo pid=,ppid=,uid=,state=,etime=,time=,pcpu=,rss=,vsz=,comm=` — comm
-/// is the last column and may contain spaces, so the first nine whitespace
-/// tokens are fixed and the rest is the executable path.
+/// `ps -axo pid=,ppid=,uid=,state=,pgid=,sess=,etime=,time=,pcpu=,rss=,vsz=,tty=,comm=` —
+/// comm is the last column and may contain spaces, so the first twelve
+/// whitespace tokens are fixed and the rest is the executable path.
 fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
     let line = line.trim();
     if line.is_empty() {
@@ -341,8 +341,8 @@ fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
     }
     let bytes = line.as_bytes();
     let mut idx = 0usize;
-    // skip leading whitespace, then consume ten fixed fields
-    let mut fixed: [Option<&str>; 10] = [None; 10];
+    // skip leading whitespace, then consume twelve fixed fields
+    let mut fixed: [Option<&str>; 12] = [None; 12];
     for slot in fixed.iter_mut() {
         while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
             idx += 1;
@@ -362,14 +362,16 @@ fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
     let ppid: Pid = fixed[1]?.parse().ok()?;
     let uid: u32 = fixed[2]?.parse().ok()?;
     let state = fixed[3].and_then(|s| s.chars().next()).map(|c| c.to_string());
-    let started = parse_etime_to_secs(fixed[4]?).map(|age| now_unix() - age);
-    let cpu_time_ms = parse_cpu_time_to_ms(fixed[5]?);
-    let cpu = fixed[6]?.parse::<f64>().ok().filter(|c| *c > 0.05);
-    let mem_kb = fixed[7]?.parse::<u64>().ok().filter(|m| *m > 0);
-    let vm_kb = fixed[8]?.parse::<u64>().ok().filter(|m| *m > 0);
+    let pgid: Pid = fixed[4]?.parse().ok()?;
+    let sid: Pid = fixed[5]?.parse().ok()?;
+    let started = parse_etime_to_secs(fixed[6]?).map(|age| now_unix() - age);
+    let cpu_time_ms = parse_cpu_time_to_ms(fixed[7]?);
+    let cpu = fixed[8]?.parse::<f64>().ok().filter(|c| *c > 0.05);
+    let mem_kb = fixed[9]?.parse::<u64>().ok().filter(|m| *m > 0);
+    let vm_kb = fixed[10]?.parse::<u64>().ok().filter(|m| *m > 0);
     // ps prints "??" for no controlling terminal — normalize to "-" so the
     // detached marker renders the same on Linux and macOS
-    let tty = fixed[9].map(|t| {
+    let tty = fixed[11].map(|t| {
         if t == "??" || t == "-" {
             "-".to_string()
         } else {
@@ -385,6 +387,8 @@ fn parse_ps_list_line(line: &str, users: &Users) -> Option<Process> {
         uid: Some(uid),
         started,
         state,
+        pgid: Some(pgid),
+        sid: Some(sid),
         cpu,
         mem_kb,
         vm_kb,
@@ -747,7 +751,7 @@ impl Platform for MacOs {
             "ps",
             &[
                 "-axo",
-                "pid=,ppid=,uid=,state=,etime=,time=,pcpu=,rss=,vsz=,tty=,comm=",
+                "pid=,ppid=,uid=,state=,pgid=,sess=,etime=,time=,pcpu=,rss=,vsz=,tty=,comm=",
             ],
             CMD_TIMEOUT,
         )
@@ -1516,11 +1520,13 @@ f10
     #[test]
     fn ps_list_line() {
         let p = parse_ps_list_line(
-            "  350   1   501 S 2-03:10:31 0:05.00  1.2  45600 456780 ttys004 /opt/homebrew/bin/nginx",
+            "  350   1   501 S 350 1 2-03:10:31 0:05.00  1.2  45600 456780 ttys004 /opt/homebrew/bin/nginx",
             &Users::load(),
         )
         .unwrap();
         assert_eq!(p.tty.as_deref(), Some("ttys004"));
+        assert_eq!(p.pgid, Some(350));
+        assert_eq!(p.sid, Some(1));
         assert_eq!(p.pid, 350);
         assert_eq!(p.ppid, Some(1));
         assert_eq!(p.uid, Some(501));
@@ -1544,7 +1550,7 @@ f10
     #[test]
     fn ps_list_line_with_spaces_in_path() {
         let p = parse_ps_list_line(
-            "  999   1   0  S 42 1:02:03.4  0.0   1024   2048 ?? /Applications/My App/Helper --flag",
+            "  999   1   0  S 999 1 42 1:02:03.4  0.0   1024   2048 ?? /Applications/My App/Helper --flag",
             &Users::load(),
         )
         .unwrap();

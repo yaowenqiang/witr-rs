@@ -806,8 +806,11 @@ fn main() {
         eprintln!("--recent filters the process listing and cannot be combined with targets");
         std::process::exit(4);
     }
-    if cli.follow && !matches!(specs.as_slice(), [TargetSpec::Pid { .. }]) {
-        eprintln!("--follow tracks one pid across restarts: use exactly one --pid target");
+    if cli.follow
+        && !matches!(specs.as_slice(), [TargetSpec::Pid { .. }])
+        && cli.replay.is_none()
+    {
+        eprintln!("--follow tracks one pid across restarts: use exactly one --pid target (or tail --replay FILE)");
         std::process::exit(4);
     }
 
@@ -868,6 +871,7 @@ fn main() {
         || cli.alert_conn.is_some()
         || cli.alert_load.is_some()
         || cli.alert_mem_pct.is_some()
+        || cli.alert_count.is_some()
         || !alert_ports.is_empty();
     if cli.alert_repeat.is_some() && !any_alert_armed {
         eprintln!(
@@ -922,6 +926,7 @@ fn main() {
         && cli.alert_conn.is_none()
         && cli.alert_load.is_none()
         && cli.alert_mem_pct.is_none()
+        && cli.alert_count.is_none()
         && cli.alert_port.is_empty()
     {
         eprintln!(
@@ -1072,6 +1077,39 @@ fn main() {
         if clash {
             eprintln!("--by-name aggregates the whole table; drop the targets and other modes (it pairs with --csv/--markdown/--json/--watch)");
             std::process::exit(4);
+        }
+    }
+    // --zombies / --locks: whole-table no-target listings (text or --json)
+    for (flag, on) in [("--zombies", cli.zombies), ("--locks", cli.locks)] {
+        if on {
+            let clash = !specs.is_empty()
+                || cli.interactive
+                || cli.top.is_some()
+                || cli.ports_list
+                || cli.tree
+                || cli.short
+                || cli.env
+                || cli.warnings
+                || cli.report_html.is_some()
+                || cli.csv
+                || cli.markdown
+                || cli.snap.is_some()
+                || cli.diff.is_some()
+                || cli.serve.is_some()
+                || cli.replay.is_some()
+                || cli.since.is_some()
+                || cli.by_name
+                || cli.pids_only
+                || cli.wait.is_some()
+                || cli.watch.is_some()
+                || cli.follow
+                || cli.audit.is_some()
+                || cli.kill
+                || cli.kill_tree;
+            if clash {
+                eprintln!("{flag} is a whole-table listing; drop the targets and other modes (pairs with --json)");
+                std::process::exit(4);
+            }
         }
     }
     if cli.record.is_some() && cli.watch.is_none() {
@@ -1495,9 +1533,13 @@ fn main() {
             alert_io: cli.alert_io,
             alert_conn: cli.alert_conn,
             alert_port: alert_ports.clone(),
+            alert_load: cli.alert_load,
+            alert_mem_pct: cli.alert_mem_pct,
+            alert_count: cli.alert_count,
             alert_repeat: cli.alert_repeat,
             watch: cfg.watch.clone(),
             notes: cfg.notes,
+            replay_follow: cli.replay.clone().filter(|_| cli.follow),
             ..tui::Seed::from_targets(
                 &cli.names, &cli.pids, &cli.ports, &cli.files, &cli.containers,
             )
@@ -1574,9 +1616,56 @@ fn main() {
         std::process::exit(0);
     }
 
+    // --zombies: dead-but-unreaped processes + the parent that should have
+    // reaped them. Exit 1 when any exist so scripts can branch directly.
+    if cli.zombies {
+        let platform = platform::get();
+        let listed = match platform.list_processes() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cannot list processes: {}", e);
+                std::process::exit(5);
+            }
+        };
+        let rows = render::collect_zombies(&listed);
+        if cli.json {
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "zombie_count": rows.len(),
+                "zombies": rows,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else {
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            write_out(&render::render_zombies(&rows, &painter));
+        }
+        std::process::exit(if rows.is_empty() { 0 } else { 1 });
+    }
+
+    // --locks: every file lock currently held system-wide (the Locks tab's
+    // CLI twin; --json shares the LockEntry rows)
+    if cli.locks {
+        let platform = platform::get();
+        let locks = platform.list_locks(None);
+        if cli.json {
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "lock_count": locks.len(),
+                "locks": locks,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else {
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            write_out(&render::render_locks_table(&locks, &painter));
+        }
+        std::process::exit(0);
+    }
+
     // --top / --csv / --markdown / --report-html: whole-table listings with
     // a different renderer, valid piped or on a terminal (never the TUI).
-    if specs.is_empty() && listing_extras > 0 {
+    if specs.is_empty() && (listing_extras > 0 || cli.top.is_some()) {
         let platform = platform::get();
         // --top --watch: re-rank in place every N seconds (a poor man's top)
         if let (Some(metric), Some(secs)) = (cli.top, cli.watch) {
@@ -1758,9 +1847,13 @@ fn main() {
                 alert_io: cli.alert_io,
                 alert_conn: cli.alert_conn,
                 alert_port: alert_ports.clone(),
+                alert_load: cli.alert_load,
+                alert_mem_pct: cli.alert_mem_pct,
+                alert_count: cli.alert_count,
                 alert_repeat: cli.alert_repeat,
                 watch: cfg.watch.clone(),
                 notes: cfg.notes,
+                replay_follow: cli.replay.clone().filter(|_| cli.follow),
                 ..tui::Seed::default()
             };
             if let Err(e) = tui::run(seed) {
@@ -1884,17 +1977,23 @@ fn main() {
                         &mut port_owner,
                     ));
                 }
-                // machine-wide alerts (--alert-load / --alert-mem-pct):
-                // sample the whole system when armed — macOS's vm_stat spawn
-                // and Windows's PowerShell query are paid only when watched
-                if cli.alert_load.is_some() || cli.alert_mem_pct.is_some() {
+                // machine-wide alerts (--alert-load / --alert-mem-pct /
+                // --alert-count): sample the whole system when armed —
+                // macOS's vm_stat spawn and Windows's PowerShell query are
+                // paid only when watched
+                if cli.alert_load.is_some() || cli.alert_mem_pct.is_some() || cli.alert_count.is_some() {
                     if let Some(stats) = platform.system_stats() {
+                        let limits = history::SysAlertLimits {
+                            load: cli.alert_load,
+                            mem_pct: cli.alert_mem_pct,
+                            count: cli.alert_count,
+                            proc_count: procs.len(),
+                            repeat: cli.alert_repeat,
+                        };
                         for (name, detail) in history::system_alert_picks(
                             &stats,
                             &mut sys_alert,
-                            cli.alert_load,
-                            cli.alert_mem_pct,
-                            cli.alert_repeat,
+                            &limits,
                             interval,
                         ) {
                             picks.push((0, name, detail));

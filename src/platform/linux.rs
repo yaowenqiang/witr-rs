@@ -140,31 +140,57 @@ fn parse_loadavg(text: &str) -> (Option<f64>, Option<f64>, Option<f64>) {
     )
 }
 
-/// Parse /proc/<pid>/stat: comm may contain spaces and parentheses, so
-/// cut at the LAST ')'. Fields after it: state, ppid, ... (field 3+).
-fn parse_stat(raw: &str) -> Option<(String, Pid, char, u64, u64, u64, u64)> {
-    // (comm, ppid, state, starttime_ticks, cpu_ticks_total, rss_pages, tty_nr)
+/// The /proc/<pid>/stat fields witr uses. comm may contain spaces and
+/// parentheses, so the parse cuts at the LAST ')' — everything after it is
+/// field 3+ of stat(5), indexed here by the canonical field number.
+#[derive(Debug, Clone)]
+pub struct StatInfo {
+    pub comm: String,
+    /// field 4: parent pid
+    pub ppid: Pid,
+    /// field 3: state letter (R/S/D/Z/T)
+    pub state: char,
+    /// field 5: process group id
+    pub pgid: Pid,
+    /// field 6: session id (the session leader's pid)
+    pub sid: Pid,
+    /// field 7: controlling terminal as a dev_t (0 = none)
+    pub tty_nr: u64,
+    /// field 22: start time in clock ticks since boot
+    pub starttime: u64,
+    /// fields 14+15: utime + stime in clock ticks
+    pub cpu_ticks: u64,
+    /// field 24: resident set size in pages
+    pub rss_pages: u64,
+}
+
+fn parse_stat(raw: &str) -> Option<StatInfo> {
     let rparen = raw.rfind(')')?;
     let comm = raw[raw.find('(')? + 1..rparen].to_string();
     let rest = raw[rparen + 2..].split_whitespace().collect::<Vec<_>>();
-    // rest[0]=state(3) rest[1]=ppid(4) rest[4]=tty_nr(7) rest[11]=utime(14)
-    // rest[12]=stime(15) rest[19]=starttime(22) rest[21]=rss(24, pages)
+    // rest[i] = field i+3: rest[0]=state(3) rest[1]=ppid(4) rest[2]=pgid(5)
+    // rest[3]=sid(6) rest[4]=tty_nr(7) rest[11]=utime(14) rest[12]=stime(15)
+    // rest[19]=starttime(22) rest[21]=rss(24, pages)
     let state = rest.first()?.chars().next()?;
     let ppid: Pid = rest.get(1)?.parse().ok()?;
+    let pgid: Pid = rest.get(2)?.parse().unwrap_or(0);
+    let sid: Pid = rest.get(3)?.parse().unwrap_or(0);
     let tty_nr: u64 = rest.get(4)?.parse().unwrap_or(0);
     let starttime: u64 = rest.get(19)?.parse().ok()?;
     let utime: u64 = rest.get(11)?.parse().unwrap_or(0);
     let stime: u64 = rest.get(12)?.parse().unwrap_or(0);
     let rss: i64 = rest.get(21)?.parse().unwrap_or(0);
-    Some((
+    Some(StatInfo {
         comm,
         ppid,
         state,
-        starttime,
-        utime + stime,
-        rss.max(0) as u64,
+        pgid,
+        sid,
         tty_nr,
-    ))
+        starttime,
+        cpu_ticks: utime + stime,
+        rss_pages: rss.max(0) as u64,
+    })
 }
 
 /// Decode a /proc stat tty_nr (a dev_t) into the short terminal name ps
@@ -610,11 +636,17 @@ impl Platform for Linux {
             let Some(stat) = read_ok(&base.join("stat")) else {
                 continue;
             };
-            let Some((comm, ppid, state, starttime, cpu_ticks, rss_pages, tty_nr)) =
-                parse_stat(&stat)
-            else {
+            let Some(s) = parse_stat(&stat) else {
                 continue;
             };
+            let (ppid, state, starttime, cpu_ticks, rss_pages, tty_nr) = (
+                s.ppid,
+                s.state,
+                s.starttime,
+                s.cpu_ticks,
+                s.rss_pages,
+                s.tty_nr,
+            );
             let uid = read_ok(&base.join("status"))
                 .and_then(|s| parse_uid_from_status(&s));
             let kernel_thread = pid == 2 || ppid == 2;
@@ -637,7 +669,7 @@ impl Platform for Linux {
             procs.push(Process {
                 pid,
                 ppid: Some(ppid),
-                name: comm,
+                name: s.comm,
                 user: uid.and_then(|u| self.users.name_for(u)),
                 uid,
                 started,
@@ -647,6 +679,8 @@ impl Platform for Linux {
                 cpu_time_ms,
                 state: Some(state.to_string()),
                 tty: Some(tty_name(tty_nr)),
+                pgid: Some(s.pgid),
+                sid: Some(s.sid),
                 ..Default::default()
             });
         }
@@ -660,11 +694,11 @@ impl Platform for Linux {
         // cut table noise, but in the detail pane 0.0% is meaningful)
         if !p.kernel_thread {
             if let (Some(stat), Some(btime)) = (read_ok(&base.join("stat")), self.boot_time()) {
-                if let Some((_, _, _, starttime, ticks, _, _)) = parse_stat(&stat) {
-                    let started_at = btime + (starttime as f64 / CLK_TCK).round() as i64;
+                if let Some(s) = parse_stat(&stat) {
+                    let started_at = btime + (s.starttime as f64 / CLK_TCK).round() as i64;
                     let elapsed = now_unix() - started_at;
                     p.cpu = Some(if elapsed > 0 {
-                        (ticks as f64 / CLK_TCK) / elapsed as f64 * 100.0
+                        (s.cpu_ticks as f64 / CLK_TCK) / elapsed as f64 * 100.0
                     } else {
                         0.0
                     });
@@ -731,6 +765,31 @@ impl Platform for Linux {
         }
         // disk I/O (same-user only; kernel threads and other users -> None)
         fill_io_from_proc(&base.join("io"), &mut p);
+        // cgroup v2 panel: the control-group path from /proc/<pid>/cgroup's
+        // "0::" line (a v1-only system has no such line — skip), plus the
+        // group's memory.current and cpu.stat usage_usec read back from
+        // /sys/fs/cgroup<path>. The root group is the whole machine, not
+        // per-process information, so "/" stays empty.
+        if let Some(cg) = read_ok(&base.join("cgroup")) {
+            if let Some(path) = cg.lines().find_map(|l| l.strip_prefix("0::")) {
+                let path = path.trim();
+                if path != "/" {
+                    p.cgroup = Some(path.to_string());
+                    let cg_root =
+                        Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+                    if let Some(txt) = read_ok(&cg_root.join("memory.current")) {
+                        p.cgroup_mem_bytes = txt.trim().parse().ok();
+                    }
+                    if let Some(stat) = read_ok(&cg_root.join("cpu.stat")) {
+                        for line in stat.lines() {
+                            if let Some(v) = line.strip_prefix("usage_usec ") {
+                                p.cgroup_cpu_usec = v.trim().parse().ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
         p.capabilities = self.process_capabilities(brief.pid);
         p.hup_ignored = sigign_hup(brief.pid);
         p
@@ -1261,18 +1320,21 @@ mod tests {
 
     #[test]
     fn stat_parse() {
-        // fields after ')': state(3) ppid(4) tty_nr(7) ... starttime(22)=token 19,
-        // vsize(23), rss(24)=token 21. tty_nr 0 = no controlling terminal.
+        // fields after ')': state(3) ppid(4) pgid(5) sid(6) tty_nr(7) ...
+        // starttime(22)=token 19, vsize(23), rss(24)=token 21. tty_nr 0 =
+        // no controlling terminal.
         let line = "1234 (nginx: worker) S 350 1234 1234 0 -1 4194560 ... 0 0 0 0 0 0 0 0 0 0 0 123456 789012 123";
-        let (comm, ppid, state, start, cpu_ticks, rss, tty_nr) = parse_stat(line).unwrap();
-        assert_eq!(comm, "nginx: worker");
-        assert_eq!(ppid, 350);
-        assert_eq!(state, 'S');
-        assert_eq!(start, 123456);
-        assert_eq!(cpu_ticks, 0);
-        assert_eq!(rss, 123);
-        assert_eq!(tty_nr, 0);
-        assert_eq!(tty_name(tty_nr), "-");
+        let s = parse_stat(line).unwrap();
+        assert_eq!(s.comm, "nginx: worker");
+        assert_eq!(s.ppid, 350);
+        assert_eq!(s.pgid, 1234);
+        assert_eq!(s.sid, 1234);
+        assert_eq!(s.state, 'S');
+        assert_eq!(s.starttime, 123456);
+        assert_eq!(s.cpu_ticks, 0);
+        assert_eq!(s.rss_pages, 123);
+        assert_eq!(s.tty_nr, 0);
+        assert_eq!(tty_name(s.tty_nr), "-");
         // kernel MKDEV: (major << 8) | (minor & 0xff) | ((minor >> 8) << 12)
         assert_eq!(tty_name((136 << 8) | 3), "pts/3");
         // high pty minor (>=256) is stored above bit 20 in the raw dev_t

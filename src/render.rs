@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use crate::model::{Process, TargetReport};
+use crate::model::{Pid, Process, TargetReport};
 use crate::util::{fmt_age, fmt_time};
 
 /// One-line explanation for a socket state, shown for `--port` targets
@@ -379,6 +380,130 @@ pub fn render_by_name_markdown(groups: &[NameGroup]) -> String {
             g.rss_mb,
             fmt_age((g.cpu_time_ms / 1000) as i64),
             g.oldest_secs.map(fmt_age).unwrap_or_default(),
+        );
+    }
+    out
+}
+
+/// One `--zombies` row: a dead-but-unreaped process plus its parent (the
+/// process whose job it is to reap it — the fix is almost always there).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ZombieRow {
+    pub pid: Pid,
+    pub name: String,
+    pub ppid: Option<Pid>,
+    /// Parent's process name; None when the parent isn't in the table
+    /// (already exited — its zombie should have been reparented and reaped,
+    /// so a lingering one here is the interesting case).
+    pub parent: Option<String>,
+    pub age_secs: Option<i64>,
+}
+
+/// Filter the table to zombies (state Z) and resolve each one's parent
+/// name. Oldest first — the three-day-old zombie is the interesting one.
+pub fn collect_zombies(procs: &[Process]) -> Vec<ZombieRow> {
+    let names: HashMap<Pid, String> = procs.iter().map(|p| (p.pid, p.name.clone())).collect();
+    let mut rows: Vec<ZombieRow> = procs
+        .iter()
+        .filter(|p| p.state.as_deref() == Some("Z"))
+        .map(|p| ZombieRow {
+            pid: p.pid,
+            name: p.name.clone(),
+            ppid: p.ppid,
+            parent: p.ppid.and_then(|pp| names.get(&pp).cloned()),
+            age_secs: p.started.map(|t| crate::util::now_unix() - t),
+        })
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.age_secs));
+    rows
+}
+
+/// `--zombies` text table: PID / NAME / PARENT / AGE, oldest first.
+pub fn render_zombies(rows: &[ZombieRow], p: &Painter) -> String {
+    if rows.is_empty() {
+        return "no zombie processes — clean\n".to_string();
+    }
+    let pid_w = rows.iter().map(|r| r.pid.to_string().len()).max().unwrap_or(3).max(3);
+    let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).clamp(4, 48);
+    let parent_w = rows
+        .iter()
+        .map(|r| {
+            r.parent
+                .as_ref()
+                .map(|n| n.len() + 8)
+                .unwrap_or_else(|| "(gone)".len())
+        })
+        .max()
+        .unwrap_or(6)
+        .clamp(6, 48);
+    let mut out = String::new();
+    let pid_h = "PID";
+    let name_h = "NAME";
+    let parent_h = "PARENT";
+    let age_h = "AGE";
+    let _ = writeln!(
+        out,
+        "{pid_h:>pid_w$}  {name_h:<name_w$}  {parent_h:<parent_w$}  {age_h}"
+    );
+    for r in rows {
+        let parent = match (&r.parent, r.ppid) {
+            (Some(n), Some(pp)) => format!("{n} (pid {pp})"),
+            (Some(n), None) => n.clone(),
+            (None, Some(pp)) => format!("(pid {pp})"),
+            (None, None) => "(gone)".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "{:>pid_w$}  {:<name_w$}  {}  {}",
+            r.pid,
+            r.name,
+            p.yellow(&parent),
+            r.age_secs.map(fmt_age).unwrap_or_default(),
+        );
+    }
+    out
+}
+
+/// `--locks` text table: PID / OWNER / MODE / TYPE / PATH, pid then path.
+pub fn render_locks_table(entries: &[crate::model::LockEntry], p: &Painter) -> String {
+    if entries.is_empty() {
+        return "no file locks found\n".to_string();
+    }
+    let mut sorted: Vec<&crate::model::LockEntry> = entries.iter().collect();
+    sorted.sort_by_key(|l| (l.pid.unwrap_or(0), l.path.clone()));
+    let pid_w = sorted
+        .iter()
+        .map(|l| l.pid.map(|p| p.to_string().len()).unwrap_or(1))
+        .max()
+        .unwrap_or(3)
+        .max(3);
+    let owner_w = sorted
+        .iter()
+        .map(|l| l.owner.len())
+        .max()
+        .unwrap_or(5)
+        .clamp(5, 32);
+    let mode_w = sorted.iter().map(|l| l.mode.len()).max().unwrap_or(4).max(4);
+    let kind_w = sorted.iter().map(|l| l.kind.len()).max().unwrap_or(5).max(5);
+    let mut out = String::new();
+    let pid_h = "PID";
+    let owner_h = "OWNER";
+    let mode_h = "MODE";
+    let kind_h = "TYPE";
+    let path_h = "PATH";
+    let _ = writeln!(
+        out,
+        "{pid_h:>pid_w$}  {owner_h:<owner_w$}  {mode_h:<mode_w$}  {kind_h:<kind_w$}  {path_h}"
+    );
+    for l in sorted {
+        let _ = writeln!(
+            out,
+            "{:>pid_w$}  {:<owner_w$}  {:<mode_w$}  {:<kind_w$}  {}",
+            l.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            p.dim(&l.owner),
+            l.mode,
+            l.kind,
+            l.path,
         );
     }
     out
@@ -882,6 +1007,31 @@ fn render_standard(r: &TargetReport, p: &Painter) -> String {
                 let _ = writeln!(out, "  tty {t}");
             }
         }
+        if m.pgid.is_some() || m.sid.is_some() {
+            let mut line = String::from("  ");
+            if let Some(g) = m.pgid {
+                line.push_str(&format!("pgid {g}"));
+            }
+            if m.pgid.is_some() && m.sid.is_some() {
+                line.push_str(" · ");
+            }
+            if let Some(s) = m.sid {
+                line.push_str(&format!("sid {s}"));
+            }
+            let _ = writeln!(out, "{line}");
+        }
+        // cgroup v2 (Linux detail-time): path plus the group's own memory
+        // and CPU totals — the container/service view a bare RSS can't give
+        if let Some(cg) = &m.cgroup {
+            let mut line = format!("  cgroup {cg}");
+            if let Some(bytes) = m.cgroup_mem_bytes {
+                line.push_str(&format!(" · mem {}", crate::util::fmt_bytes(bytes)));
+            }
+            if let Some(usec) = m.cgroup_cpu_usec {
+                line.push_str(&format!(" · cpu {:.1}s", usec as f64 / 1_000_000.0));
+            }
+            let _ = writeln!(out, "{}", p.dim(&line));
+        }
         if m.git_repo.is_some() || m.git_branch.is_some() {
             let mut line = String::from("  git ");
             if let Some(repo) = &m.git_repo {
@@ -1073,6 +1223,17 @@ pub fn render_export(reports: &[TargetReport]) -> String {
                 t.clone()
             };
             kv(&mut out, "tty", v);
+        }
+        if let Some(g) = m.pgid {
+            kv(&mut out, "pgid", g.to_string());
+        }
+        if let Some(s) = m.sid {
+            kv(&mut out, "sid", s.to_string());
+        }
+        // cgroup v2 (Linux detail-time): bare path in the key/value export —
+        // the memory/cpu numbers live on the human block above
+        if let Some(cg) = &m.cgroup {
+            kv(&mut out, "cgroup", cg.clone());
         }
         if let Some(exe) = &m.exe {
             let mut line = exe.clone();
@@ -1397,6 +1558,73 @@ mod tests {
             "name,user,count,cpu_pct,rss_mb,cpu_time_ms,oldest_age_secs"
         );
         assert!(csv.contains("nginx,root,2,3.0,3,180000,100\n"), "{csv}");
+    }
+
+    #[test]
+    fn zombies_resolve_parents_and_sort_oldest_first() {
+        let mk = |pid: i32, ppid: Option<i32>, state: Option<&str>, name: &str, started: Option<i64>| Process {
+            pid,
+            ppid,
+            state: state.map(|s| s.into()),
+            name: name.into(),
+            started,
+            ..Default::default()
+        };
+        let now = crate::util::now_unix();
+        let procs = vec![
+            mk(1, None, Some("S"), "init", Some(now - 500)),
+            // oldest zombie first, parent resolved by ppid
+            mk(2, Some(1), Some("Z"), "old-zombie", Some(now - 100)),
+            mk(4, Some(2), Some("Z"), "young-zombie", Some(now - 10)),
+            // parent 999 not in the table → parent None, age None sorts last
+            mk(5, Some(999), Some("Z"), "orphan-zombie", None),
+            // a healthy process is not a zombie
+            mk(6, Some(1), Some("S"), "live", Some(now - 50)),
+        ];
+        let rows = collect_zombies(&procs);
+        let pids: Vec<i32> = rows.iter().map(|r| r.pid).collect();
+        assert_eq!(pids, vec![2, 4, 5]);
+        assert_eq!(rows[0].parent.as_deref(), Some("init"));
+        assert_eq!(rows[0].age_secs, Some(100));
+        assert_eq!(rows[2].parent, None);
+        assert_eq!(rows[2].age_secs, None);
+        let p = Painter::new(false);
+        assert!(render_zombies(&[], &p).contains("clean"));
+        let table = render_zombies(&rows, &p);
+        assert!(table.contains("old-zombie"), "{table}");
+        assert!(table.contains("init (pid 1)"), "{table}");
+    }
+
+    #[test]
+    fn locks_table_sorts_by_pid_then_path() {
+        let e = |pid, owner: &str, mode: &str, path: &str| crate::model::LockEntry {
+            id: String::new(),
+            kind: "FLOCK".into(),
+            mode: mode.into(),
+            pid: Some(pid),
+            owner: owner.into(),
+            path: path.into(),
+        };
+        let entries = vec![
+            e(9, "b", "READ", "/z.lock"),
+            e(9, "b", "RW", "/a.lock"),
+            e(2, "a", "WRITE", "/m.lock"),
+            e(1, "c", "READ", "/k.lock"),
+        ];
+        let p = Painter::new(false);
+        let out = render_locks_table(&entries, &p);
+        let body: Vec<String> = out
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect();
+        // pid ascending, path ascending within one pid
+        assert!(body[0].contains("/k.lock"), "{out}");
+        assert!(body[1].contains("/m.lock"), "{out}");
+        assert!(body[2].contains("/a.lock"), "{out}");
+        assert!(body[3].contains("/z.lock"), "{out}");
+        assert!(render_locks_table(&[], &p).contains("no file locks"));
     }
 
     #[test]
