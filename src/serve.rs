@@ -1,7 +1,8 @@
 //! `--serve [HOST]:PORT`: a Prometheus text-format endpoint (/metrics) and
 //! a small JSON API — /api/ps (process table), /api/ports (listeners),
-//! /api/tree (nested forest), all in the same versioned envelopes the CLI
-//! prints. Every scrape samples the process table fresh — no background
+//! /api/tree (nested forest), /api/top?metric=&n= (ranked slice), all in
+//! the same versioned envelopes the CLI prints. Every scrape samples the
+//! process table fresh — no background
 //! sampler, no interval to tune; scrape frequency IS the sample rate.
 //!
 //! Hand-rolled on std::net (one thread per connection, sequential reads)
@@ -241,13 +242,110 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
                 );
                 return;
             }
+            // /api/top?metric=cpu|mem|fd|age&n=N: a ranked slice of the
+            // process table — the `--top` view over HTTP. One entry per
+            // process ({pid, name, user, value}); value's unit follows the
+            // metric (percent / bytes / count / seconds).
+            if path == "/api/top" || path.starts_with("/api/top?") {
+                let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+                let mut metric = "cpu".to_string();
+                let mut n: usize = 10;
+                for kv in query.split('&').filter(|s| !s.is_empty()) {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        match k {
+                            "metric" => metric = v.to_string(),
+                            "n" => n = v.parse().unwrap_or(10),
+                            _ => {}
+                        }
+                    }
+                }
+                n = n.clamp(1, 500);
+                if !matches!(metric.as_str(), "cpu" | "mem" | "fd" | "age") {
+                    respond(
+                        &mut stream,
+                        "400 Bad Request",
+                        "text/plain",
+                        "metric must be one of: cpu, mem, fd, age\n",
+                    );
+                    return;
+                }
+                let platform = crate::platform::get();
+                let procs = platform.list_processes().unwrap_or_default();
+                let fd_map = if metric == "fd" {
+                    platform.fd_counts()
+                } else {
+                    None
+                };
+                if metric == "fd" && fd_map.is_none() {
+                    respond(
+                        &mut stream,
+                        "400 Bad Request",
+                        "text/plain",
+                        "fd counts not available on this platform\n",
+                    );
+                    return;
+                }
+                // (sort key, pid, name, user, value) — sorted by value desc,
+                // pid asc as the tiebreak so equal values stay stable
+                let mut ranked: Vec<(f64, Pid, String, String, serde_json::Value)> = Vec::new();
+                for p in &procs {
+                    let value = match metric.as_str() {
+                        "cpu" => p.cpu.map(|c| serde_json::json!(c)),
+                        "mem" => p.mem_kb.map(|kb| serde_json::json!(kb * 1024)),
+                        "fd" => fd_map
+                            .as_ref()
+                            .and_then(|m| m.get(&p.pid))
+                            .map(|v| serde_json::json!(v)),
+                        _ => p
+                            .started
+                            .map(|t| serde_json::json!(crate::util::now_unix() - t)),
+                    };
+                    if let Some(value) = value {
+                        ranked.push((
+                            value.as_f64().unwrap_or(0.0),
+                            p.pid,
+                            p.name.clone(),
+                            p.user.clone().unwrap_or_else(|| "-".into()),
+                            value,
+                        ));
+                    }
+                }
+                ranked.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+                ranked.truncate(n);
+                let entries: Vec<serde_json::Value> = ranked
+                    .into_iter()
+                    .map(|(_, pid, name, user, value)| {
+                        serde_json::json!({
+                            "pid": pid, "name": name, "user": user, "value": value
+                        })
+                    })
+                    .collect();
+                let doc = serde_json::json!({
+                    "schema_version": crate::SCHEMA_VERSION,
+                    "generated_at": crate::util::now_unix(),
+                    "metric": metric,
+                    "n": entries.len(),
+                    "entries": entries,
+                });
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    &serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()),
+                );
+                return;
+            }
             if !path.starts_with("/metrics") {
                 match path {
                     "/" => respond(
                         &mut stream,
                         "200 OK",
                         "text/plain; charset=utf-8",
-                        "witr-rs: /metrics (Prometheus) · /api/ps (process table) · /api/ports (listeners) · /api/tree (forest)\n",
+                        "witr-rs: /metrics (Prometheus) · /api/ps (process table) · /api/ports (listeners) · /api/tree (forest) · /api/top?metric=cpu|mem|fd|age&n=N (rankings)\n",
                     ),
                     _ => respond(&mut stream, "404 Not Found", "text/plain", "not found\n"),
                 }

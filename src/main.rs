@@ -690,8 +690,16 @@ fn main() {
     let cli = match cli::Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
-            // invalid input → exit code 4 (matches the witr convention)
             let _ = e.print();
+            // --help / --version are informational, not failures — clap
+            // surfaces them as Display* errors printing to stdout; real
+            // invalid input keeps the witr convention of exit code 4
+            if matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                std::process::exit(0);
+            }
             std::process::exit(4);
         }
     };
@@ -945,12 +953,11 @@ fn main() {
             std::process::exit(4);
         }
     }
-    // --ports: a one-shot listener table — its own standalone mode like
-    // --serve (pairs with --csv/--json only)
+    // --ports: a listener table — standalone like --serve (pairs with
+    // --csv/--json one-shot, or a --watch redraw of the human table)
     if cli.ports_list {
         let clash = !specs.is_empty()
             || cli.interactive
-            || cli.watch.is_some()
             || cli.top.is_some()
             || cli.markdown
             || cli.report_html.is_some()
@@ -963,11 +970,16 @@ fn main() {
             || cli.serve.is_some()
             || cli.recent.is_some();
         if clash {
-            eprintln!("--ports is a standalone listing; drop the targets and other modes (it pairs with --csv/--json)");
+            eprintln!("--ports is a standalone listing; drop the targets and other modes (it pairs with --csv/--json/--watch)");
+            std::process::exit(4);
+        }
+        if cli.watch.is_some() && (cli.csv || cli.json) {
+            eprintln!("machine-readable --ports is one-shot; drop --watch or the format flag");
             std::process::exit(4);
         }
     }
-    // --diff-auto rides the target-less --watch loop
+    // --diff-auto rides the target-less --watch loop (text drift lines or,
+    // under --json, one versioned envelope per drift check)
     if cli.diff_auto.is_some() {
         if cli.watch.is_none() {
             eprintln!("--diff-auto re-checks the table every --watch tick interval; add --watch SECONDS");
@@ -977,8 +989,88 @@ fn main() {
             eprintln!("--diff-auto watches the whole table; drop the targets");
             std::process::exit(4);
         }
-        if cli.json {
-            eprintln!("--diff-auto prints human-readable drift lines; drop --json (or use --events-log for machine-readable events)");
+    }
+    // --wait blocks on target resolution; --timeout is its time bound
+    if let Some(what) = cli.wait.as_deref() {
+        if specs.is_empty() {
+            eprintln!("--wait watches a target; give a name, --pid, --port, --file or --container");
+            std::process::exit(4);
+        }
+        if what != "here" && what != "gone" {
+            eprintln!("--wait expects `here` (the default) or `gone`");
+            std::process::exit(4);
+        }
+        let wait_clash = cli.watch.is_some()
+            || cli.interactive
+            || cli.follow
+            || cli.on_start.is_some()
+            || cli.on_exit.is_some()
+            || cli.kill
+            || cli.kill_tree
+            || cli.audit.is_some()
+            || cli.serve.is_some()
+            || cli.snap.is_some()
+            || cli.diff.is_some()
+            || cli.replay.is_some()
+            || cli.since.is_some()
+            || cli.diff_auto.is_some()
+            || cli.record.is_some()
+            || cli.ports_list
+            || cli.by_name
+            || cli.top.is_some();
+        if wait_clash {
+            eprintln!("--wait is a blocking one-shot; drop the other modes");
+            std::process::exit(4);
+        }
+    }
+    if cli.timeout.is_some() && cli.wait.is_none() {
+        eprintln!("--timeout bounds --wait; add --wait");
+        std::process::exit(4);
+    }
+    // --pids-only: a target query collapsed to its bare pid line
+    if cli.pids_only {
+        let clash = specs.is_empty()
+            || cli.interactive
+            || cli.json
+            || cli.env
+            || cli.warnings
+            || cli.short
+            || cli.tree
+            || cli.export
+            || cli.csv
+            || cli.markdown
+            || cli.report_html.is_some()
+            || cli.top.is_some()
+            || cli.ports_list
+            || cli.by_name
+            || cli.serve.is_some()
+            || cli.snap.is_some()
+            || cli.diff.is_some()
+            || cli.watch.is_some();
+        if clash {
+            eprintln!("--pids-only prints the matched pids of a target query; drop the other modes");
+            std::process::exit(4);
+        }
+    }
+    // --by-name: the whole table folded by (name, user) identity
+    if cli.by_name {
+        let clash = !specs.is_empty()
+            || cli.top.is_some()
+            || cli.ports_list
+            || cli.tree
+            || cli.short
+            || cli.env
+            || cli.warnings
+            || cli.report_html.is_some()
+            || cli.snap.is_some()
+            || cli.diff.is_some()
+            || cli.serve.is_some()
+            || cli.replay.is_some()
+            || cli.since.is_some()
+            || cli.pids_only
+            || cli.wait.is_some();
+        if clash {
+            eprintln!("--by-name aggregates the whole table; drop the targets and other modes (it pairs with --csv/--markdown/--json/--watch)");
             std::process::exit(4);
         }
     }
@@ -1289,10 +1381,42 @@ fn main() {
         std::process::exit(i32::from(!entries.is_empty()));
     }
 
-    // --ports: every LISTEN socket + owner as a one-shot table (the CLI
-    // twin of the TUI Ports overview), text / --csv / --json
+    // --ports: every LISTEN socket + owner as a table (the CLI twin of the
+    // TUI Ports overview), text / --csv / --json — text optionally refreshed
+    // in place under --watch
     if cli.ports_list {
         let platform = platform::get();
+        if let Some(secs) = cli.watch {
+            let interval = secs.max(1);
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            install_sigint_flag();
+            let mut ticks: u64 = 0;
+            loop {
+                let procs = match platform.list_processes() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("cannot list processes: {}", e);
+                        std::process::exit(5);
+                    }
+                };
+                let socks = platform.list_sockets().unwrap_or_default();
+                let mut listeners = snapshot::to_listeners(&socks, &procs);
+                listeners.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.proto.cmp(&b.proto)));
+                write_out("\x1b[2J\x1b[1;1H");
+                write_out(&format!(
+                    "witr-rs ports · every {interval}s · {} · Ctrl-C to stop",
+                    util::fmt_time(util::now_unix())
+                ));
+                write_out(&render::render_listeners(&listeners, &painter));
+                ticks += 1;
+                if cli.times.is_some_and(|n| ticks >= n.max(1)) {
+                    std::process::exit(0);
+                }
+                if !sleep_interruptible(interval) {
+                    std::process::exit(130);
+                }
+            }
+        }
         let procs = match platform.list_processes() {
             Ok(p) => p,
             Err(e) => {
@@ -1382,6 +1506,71 @@ fn main() {
             eprintln!("tui error: {}", e);
             std::process::exit(5);
         }
+        std::process::exit(0);
+    }
+
+    // --by-name: the whole table folded by (name, user) identity — text /
+    // --csv / --markdown / --json, optionally re-aggregated under --watch
+    if cli.by_name {
+        let platform = platform::get();
+        let emit = |groups: &[render::NameGroup]| -> String {
+            if cli.json {
+                let doc = serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "generated_at": util::now_unix(),
+                    "group_count": groups.len(),
+                    "groups": groups,
+                });
+                serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
+            } else if cli.csv {
+                render::render_by_name_csv(groups)
+            } else if cli.markdown {
+                render::render_by_name_markdown(groups)
+            } else {
+                let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+                render::render_by_name(groups, &painter)
+            }
+        };
+        if let Some(secs) = cli.watch {
+            let interval = secs.max(1);
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            install_sigint_flag();
+            let mut ticks: u64 = 0;
+            loop {
+                let mut listed = match platform.list_processes() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("cannot list processes: {}", e);
+                        std::process::exit(5);
+                    }
+                };
+                gpu::enrich(&mut listed);
+                let groups = render::aggregate_by_name(&recent_only(listed));
+                write_out("\x1b[2J\x1b[1;1H");
+                write_out(&format!(
+                    "witr-rs by-name · every {interval}s · {} · Ctrl-C to stop",
+                    util::fmt_time(util::now_unix())
+                ));
+                write_out(&render::render_by_name(&groups, &painter));
+                ticks += 1;
+                if cli.times.is_some_and(|n| ticks >= n.max(1)) {
+                    std::process::exit(0);
+                }
+                if !sleep_interruptible(interval) {
+                    std::process::exit(130);
+                }
+            }
+        }
+        let mut listed = match platform.list_processes() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cannot list processes: {}", e);
+                std::process::exit(5);
+            }
+        };
+        gpu::enrich(&mut listed);
+        let groups = render::aggregate_by_name(&recent_only(listed));
+        write_out(&emit(&groups));
         std::process::exit(0);
     }
 
@@ -1726,16 +1915,43 @@ fn main() {
                             let mut entries = snapshot::diff(&old, &procs);
                             entries.extend(snapshot::diff_listeners(&old_listeners, &listeners));
                             if !entries.is_empty() {
-                                write_out(&format!(
-                                    "== drift · {} new / {} gone / {} restarted / {} changed / {} listen+ / {} listen- ==",
-                                    entries.iter().filter(|e| e.kind == "new").count(),
-                                    entries.iter().filter(|e| e.kind == "gone").count(),
-                                    entries.iter().filter(|e| e.kind == "restarted").count(),
-                                    entries.iter().filter(|e| e.kind == "changed").count(),
-                                    entries.iter().filter(|e| e.kind == "listen-new").count(),
-                                    entries.iter().filter(|e| e.kind == "listen-gone").count(),
-                                ));
-                                write_out(&snapshot::render(&entries));
+                                // counts computed before the envelope move —
+                                // the closure can't borrow what json! takes
+                                let count =
+                                    |k: &str| entries.iter().filter(|e| e.kind == k).count();
+                                let (n_new, n_gone, n_restarted, n_changed) = (
+                                    count("new"),
+                                    count("gone"),
+                                    count("restarted"),
+                                    count("changed"),
+                                );
+                                let (n_lnew, n_lgone) =
+                                    (count("listen-new"), count("listen-gone"));
+                                if json_stream {
+                                    // the --diff --json envelope shape, one
+                                    // per drift check — jq can watch the pipe
+                                    let doc = serde_json::json!({
+                                        "schema_version": SCHEMA_VERSION,
+                                        "generated_at": util::now_unix(),
+                                        "summary": {
+                                            "new": n_new,
+                                            "gone": n_gone,
+                                            "restarted": n_restarted,
+                                            "changed": n_changed,
+                                            "listen_new": n_lnew,
+                                            "listen_gone": n_lgone,
+                                            "total": entries.len(),
+                                        },
+                                        "entries": entries,
+                                    });
+                                    write_out(&serde_json::to_string_pretty(&doc)
+                                        .unwrap_or_else(|_| "{}".into()));
+                                } else {
+                                    write_out(&format!(
+                                        "== drift · {n_new} new / {n_gone} gone / {n_restarted} restarted / {n_changed} changed / {n_lnew} listen+ / {n_lgone} listen- =="
+                                    ));
+                                    write_out(&snapshot::render(&entries));
+                                }
                             }
                         }
                         last_frame = Some((procs.clone(), listeners));
@@ -1928,7 +2144,67 @@ fn main() {
         }
     }
 
-    let reports = pipeline::run(platform.as_ref(), specs, &opts);
+    // --wait: poll the targets once a second until they all resolve
+    // (`here`, the default — falls through to the normal output) or all
+    // stop resolving (`gone` — one confirmation line, exit 0). --timeout
+    // turns "not yet" into exit 124.
+    let mut waited_reports: Option<Vec<TargetReport>> = None;
+    if let Some(what) = cli.wait.as_deref() {
+        let want_gone = what == "gone";
+        let deadline = cli
+            .timeout
+            .filter(|t| *t > 0)
+            .map(|t| Instant::now() + Duration::from_secs(t));
+        install_sigint_flag();
+        loop {
+            let reports = pipeline::run(platform.as_ref(), specs.clone(), &opts);
+            let all_present =
+                !reports.is_empty() && reports.iter().all(|r| !r.matches.is_empty());
+            if want_gone {
+                if !all_present {
+                    let names: Vec<String> =
+                        reports.iter().map(|r| r.target.describe()).collect();
+                    write_out(&format!("gone: {}", names.join(", ")));
+                    std::process::exit(0);
+                }
+            } else if all_present {
+                waited_reports = Some(reports);
+                break;
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                eprintln!(
+                    "--wait: gave up after {}s — target{} still {}",
+                    cli.timeout.unwrap_or(0),
+                    if specs.len() > 1 { "s" } else { "" },
+                    if want_gone { "running" } else { "absent" }
+                );
+                std::process::exit(124);
+            }
+            if !sleep_interruptible(1) {
+                std::process::exit(130);
+            }
+        }
+    }
+    let reports = match waited_reports {
+        Some(r) => r,
+        None => pipeline::run(platform.as_ref(), specs, &opts),
+    };
+
+    // --pids-only: the matched pids as one space-separated line — the
+    // xargs/kill pipe shape
+    if cli.pids_only {
+        let mut pids: Vec<Pid> = reports
+            .iter()
+            .flat_map(|r| r.matches.iter().map(|m| m.pid))
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        if pids.is_empty() {
+            std::process::exit(2);
+        }
+        write_out(&pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "));
+        std::process::exit(0);
+    }
 
     // --export: paste-ready diagnostic reports
     if cli.export {

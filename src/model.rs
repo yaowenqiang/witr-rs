@@ -72,6 +72,11 @@ pub struct Process {
     /// terminal close. Linux only (/proc/<pid>/status SigIgn).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub hup_ignored: bool,
+    /// Controlling terminal: "ttys004" / "pts/3" style name, "-" when the
+    /// process runs detached (no controlling terminal — daemons, and
+    /// anything nohup'd), None when the platform doesn't report one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tty: Option<String>,
 }
 
 impl Process {

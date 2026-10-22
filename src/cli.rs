@@ -111,6 +111,11 @@ const EXAMPLES_ZH: &str = "示例：
   witr-rs --top io-rate          按磁盘 I/O 速率排最忙
   witr-rs nginx --logs --grep error   最近 100 行日志，过滤后
   witr-rs --ports          所有监听端口及其归属进程，一张表
+  witr-rs --ports --watch 2   端口表常驻刷新（Ctrl-C 退出）
+  witr-rs --by-name        按程序身份聚合：几个实例、共吃多少 CPU/内存
+  witr-rs --port 8080 --wait          阻塞到有人监听 :8080（wait-for-deploy）
+  witr-rs --pid 1234 --wait gone --timeout 60   阻塞到 1234 退出，最多等一分钟
+  witr-rs nginx --pids-only | xargs kill   只打印匹配 pid，接管道
   witr-rs --watch 5 --alert-load 8 --alert-mem-pct 90   整机看门狗
   witr-rs --watch 30 --diff-auto 30   每 30 秒打印一次进程表漂移
   witr-rs --serve :9100    在 :9100 暴露 Prometheus 指标（curl :9100/api/ps 取 JSON）
@@ -149,6 +154,11 @@ const EXAMPLES_EN: &str = "Examples:
   witr-rs --top io-rate          hottest processes by disk-I/O rate
   witr-rs nginx --logs --grep error   last 100 log lines, filtered
   witr-rs --ports          every listening port and its owner, one table
+  witr-rs --ports --watch 2   keep the port table refreshed (Ctrl-C to stop)
+  witr-rs --by-name        aggregate by identity: how many instances, total cpu/memory
+  witr-rs --port 8080 --wait          block until something listens on :8080 (wait-for-deploy)
+  witr-rs --pid 1234 --wait gone --timeout 60   block until 1234 exits, at most a minute
+  witr-rs nginx --pids-only | xargs kill   print matching pids only, feed a pipe
   witr-rs --watch 5 --alert-load 8 --alert-mem-pct 90   machine-wide watchdog
   witr-rs --watch 30 --diff-auto 30   print process-table drift every 30s
   witr-rs --serve :9100    expose Prometheus metrics on :9100 (curl :9100/api/ps for JSON)
@@ -307,6 +317,15 @@ pub struct Cli {
     pub export: bool,
 
     #[arg(
+        long = "pids-only",
+        help = t(
+            "只打印目标匹配到的 pid（空格分隔一行）——`witr-rs nginx --pids-only | xargs kill` 的管道用法；无匹配退出码 2",
+            "Print only the pids the targets matched (space-separated, one line) — the `witr-rs nginx --pids-only | xargs kill` pipe; exit 2 when nothing matched"
+        )
+    )]
+    pub pids_only: bool,
+
+    #[arg(
         long = "recent",
         value_name = "DURATION",
         help = t(
@@ -333,6 +352,15 @@ pub struct Cli {
         help = t("--top 的行数（默认 15）", "Row count for --top (default 15)")
     )]
     pub count: Option<usize>,
+
+    #[arg(
+        long = "by-name",
+        help = t(
+            "按程序身份（名字 + 用户）聚合整张进程表：实例数 / ΣCPU / Σ内存 / Σ累计 CPU 时间——回答“8 个 node 进程一共吃了多少”。属于无目标操作；可搭配 --csv / --markdown / --json / --watch",
+            "Aggregate the whole table by program identity (name + user): instance count / ΣCPU / Σmemory / Σlifetime CPU time — \"what do the 8 node processes cost together\". A no-target operation; pairs with --csv / --markdown / --json / --watch"
+        )
+    )]
+    pub by_name: bool,
 
     #[arg(
         long,
@@ -392,6 +420,28 @@ pub struct Cli {
         )
     )]
     pub quiet: bool,
+
+    #[arg(
+        long = "wait",
+        value_name = "WHAT",
+        num_args = 0..=1,
+        default_missing_value = "here",
+        help = t(
+            "阻塞等待目标出现（--wait 或 --wait here）或消失（--wait gone）：每秒轮询一次，条件满足即退出——here 打印正常溯源结果，gone 打印一行 gone: 确认，两者退出码都是 0。配 --timeout 限时（超时退出码 124，GNU timeout 惯例）。需要目标",
+            "Block until the target appears (--wait or --wait here) or disappears (--wait gone): poll once a second; when the condition holds, exit 0 — `here` prints the normal trace, `gone` prints a one-line gone: confirmation. Add --timeout to bound it (exit 124 on timeout, the GNU timeout convention). Needs a target"
+        )
+    )]
+    pub wait: Option<String>,
+
+    #[arg(
+        long = "timeout",
+        value_name = "SECONDS",
+        help = t(
+            "--wait 的时间上界（秒）：超时以 124 退出。0 或缺省 = 一直等",
+            "Time bound for --wait in seconds: timeout exits 124. 0 or unset = wait forever"
+        )
+    )]
+    pub timeout: Option<u64>,
 
     #[arg(
         long = "logs",

@@ -222,6 +222,168 @@ pub fn render_listeners_csv(listeners: &[crate::snapshot::Listener]) -> String {
     out
 }
 
+/// One `--by-name` aggregate row: every visible process sharing a
+/// (name, user) identity folded into totals.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NameGroup {
+    pub name: String,
+    pub user: String,
+    /// How many processes share this identity.
+    pub count: usize,
+    /// Σ of the platform-reported (lifetime-average) CPU percent.
+    pub cpu_pct: f64,
+    /// Σ resident memory, MiB.
+    pub rss_mb: u64,
+    /// Σ cumulative CPU time, milliseconds — the honest "total cost".
+    pub cpu_time_ms: u64,
+    /// Age in seconds of the oldest instance in the group.
+    pub oldest_secs: Option<i64>,
+}
+
+/// Fold the visible table into `--by-name` groups, busiest (by total RSS)
+/// first.
+pub fn aggregate_by_name(procs: &[Process]) -> Vec<NameGroup> {
+    let now = crate::util::now_unix();
+    let mut map: std::collections::HashMap<(String, String), NameGroup> =
+        std::collections::HashMap::new();
+    for p in procs {
+        let key = (
+            p.name.clone(),
+            p.user.clone().unwrap_or_else(|| "-".into()),
+        );
+        let g = map.entry(key).or_insert(NameGroup {
+            name: p.name.clone(),
+            user: p.user.clone().unwrap_or_else(|| "-".into()),
+            count: 0,
+            cpu_pct: 0.0,
+            rss_mb: 0,
+            cpu_time_ms: 0,
+            oldest_secs: None,
+        });
+        g.count += 1;
+        g.cpu_pct += p.cpu.unwrap_or(0.0);
+        g.rss_mb += p.mem_kb.unwrap_or(0) / 1024;
+        g.cpu_time_ms += p.cpu_time_ms.unwrap_or(0);
+        if let Some(s) = p.started {
+            let age = now - s;
+            g.oldest_secs = Some(g.oldest_secs.map_or(age, |o: i64| o.max(age)));
+        }
+    }
+    let mut out: Vec<NameGroup> = map.into_values().collect();
+    out.sort_by(|a, b| {
+        b.rss_mb
+            .cmp(&a.rss_mb)
+            .then_with(|| {
+                b.cpu_pct
+                    .partial_cmp(&a.cpu_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.user.cmp(&b.user))
+    });
+    out
+}
+
+/// `--by-name`: one row per (name, user) identity with folded totals.
+pub fn render_by_name(groups: &[NameGroup], p: &Painter) -> String {
+    if groups.is_empty() {
+        return "(no processes)\n".to_string();
+    }
+    // column widths from the data, capped so one absurd process name (some
+    // comm fields are whole command lines) doesn't stretch every row
+    let name_w = groups
+        .iter()
+        .map(|g| g.name.len())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 48);
+    let user_w = groups
+        .iter()
+        .map(|g| g.user.len())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 24);
+    let n_w = groups
+        .iter()
+        .map(|g| g.count.to_string().len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let trunc = |s: &str, w: usize| -> String {
+        if s.len() > w {
+            let mut t: String = s.chars().take(w.saturating_sub(1)).collect();
+            t.push('…');
+            t
+        } else {
+            s.to_string()
+        }
+    };
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<name_w$}  {:<user_w$}  {:>n_w$}  {:>7}  {:>8}  {:>9}  AGE(OLDEST)",
+        "NAME", "USER", "N", "ΣCPU%", "ΣRSS MB", "ΣCPUTIME"
+    );
+    for g in groups {
+        let _ = writeln!(
+            out,
+            "{:<name_w$}  {:<user_w$}  {:>n_w$}  {:>7.1}  {:>8}  {:>9}  {}",
+            p.bold(&trunc(&g.name, name_w)),
+            p.dim(&trunc(&g.user, user_w)),
+            g.count,
+            g.cpu_pct,
+            g.rss_mb,
+            fmt_age((g.cpu_time_ms / 1000) as i64),
+            g.oldest_secs.map(fmt_age).unwrap_or_default(),
+        );
+    }
+    out
+}
+
+/// `--by-name --csv`: the same folded rows, RFC-4180.
+pub fn render_by_name_csv(groups: &[NameGroup]) -> String {
+    let mut out = String::from(
+        "name,user,count,cpu_pct,rss_mb,cpu_time_ms,oldest_age_secs\n",
+    );
+    for g in groups {
+        out.push_str(&format!(
+            "{},{},{},{:.1},{},{},{}\n",
+            csv_field(&g.name),
+            csv_field(&g.user),
+            g.count,
+            g.cpu_pct,
+            g.rss_mb,
+            g.cpu_time_ms,
+            g.oldest_secs
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+        ));
+    }
+    out
+}
+
+/// `--by-name --markdown`: the folded rows as a paste-ready pipe table.
+pub fn render_by_name_markdown(groups: &[NameGroup]) -> String {
+    let mut out = String::from(
+        "| NAME | USER | N | ΣCPU% | ΣRSS MB | ΣCPUTIME | AGE(OLDEST) |\n\
+         |---|---|---:|---:|---:|---:|---|\n",
+    );
+    for g in groups {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {:.1} | {} | {} | {} |",
+            g.name,
+            g.user,
+            g.count,
+            g.cpu_pct,
+            g.rss_mb,
+            fmt_age((g.cpu_time_ms / 1000) as i64),
+            g.oldest_secs.map(fmt_age).unwrap_or_default(),
+        );
+    }
+    out
+}
+
 /// Escape for HTML text content and double-quoted attributes.
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -713,6 +875,13 @@ fn render_standard(r: &TargetReport, p: &Painter) -> String {
         if let Some(cwd) = &m.cwd {
             let _ = writeln!(out, "  cwd {}", cwd);
         }
+        if let Some(t) = &m.tty {
+            if t == "-" {
+                let _ = writeln!(out, "  {}", p.dim("detached (no controlling terminal)"));
+            } else {
+                let _ = writeln!(out, "  tty {t}");
+            }
+        }
         if m.git_repo.is_some() || m.git_branch.is_some() {
             let mut line = String::from("  git ");
             if let Some(repo) = &m.git_repo {
@@ -896,6 +1065,14 @@ pub fn render_export(reports: &[TargetReport]) -> String {
         }
         if let Some(cwd) = &m.cwd {
             kv(&mut out, "cwd", cwd.clone());
+        }
+        if let Some(t) = &m.tty {
+            let v = if t == "-" {
+                "(detached)".to_string()
+            } else {
+                t.clone()
+            };
+            kv(&mut out, "tty", v);
         }
         if let Some(exe) = &m.exe {
             let mut line = exe.clone();
@@ -1172,6 +1349,54 @@ mod tests {
         assert_eq!(lines[1], "80,tcp,nginx (pid 7)");
         // two owners on one port: "; "-joined so the comma stays a separator
         assert_eq!(lines[2], "8080,tcp,a (pid 1); b (pid 2)");
+    }
+
+    #[test]
+    fn by_name_folds_identities_and_sorts_by_total_rss() {
+        let mk = |pid: i32, name: &str, user: Option<&str>, kb: u64, cpu: f64, ms: u64| Process {
+            pid,
+            name: name.into(),
+            user: user.map(|u| u.into()),
+            mem_kb: Some(kb),
+            cpu: Some(cpu),
+            cpu_time_ms: Some(ms),
+            started: Some(crate::util::now_unix() - 100),
+            ..Default::default()
+        };
+        // two nginx under root fold together; the same name under another
+        // user stays a separate identity
+        let procs = vec![
+            mk(1, "nginx", Some("root"), 1024, 1.0, 60_000),
+            mk(2, "nginx", Some("root"), 2048, 2.0, 120_000),
+            mk(3, "nginx", Some("www"), 4096, 4.0, 240_000),
+            mk(4, "idle", None, 0, 0.0, 0),
+        ];
+        let groups = aggregate_by_name(&procs);
+        assert_eq!(groups.len(), 3);
+        // heaviest total RSS first: www's 4 MB single instance
+        assert_eq!(&groups[0].name, "nginx");
+        assert_eq!(&groups[0].user, "www");
+        assert_eq!(groups[0].rss_mb, 4);
+        // root's pair folded: count 2, Σrss 3, Σcpu 3.0, Σcputime 180s
+        let root = groups.iter().find(|g| g.user == "root").unwrap();
+        assert_eq!(root.count, 2);
+        assert_eq!(root.rss_mb, 3);
+        assert!((root.cpu_pct - 3.0).abs() < 0.001, "{}", root.cpu_pct);
+        assert_eq!(root.cpu_time_ms, 180_000);
+        assert_eq!(root.oldest_secs, Some(100));
+        // a userless process still aggregates under "-"
+        assert_eq!(&groups.iter().find(|g| g.name == "idle").unwrap().user, "-");
+
+        let p = Painter::new(false);
+        let table = render_by_name(&groups, &p);
+        assert!(table.contains("NAME") && table.contains("ΣCPUTIME"), "{table}");
+        assert!(render_by_name(&[], &p).contains("no processes"));
+        let csv = render_by_name_csv(&groups);
+        assert_eq!(
+            csv.lines().next().unwrap(),
+            "name,user,count,cpu_pct,rss_mb,cpu_time_ms,oldest_age_secs"
+        );
+        assert!(csv.contains("nginx,root,2,3.0,3,180000,100\n"), "{csv}");
     }
 
     #[test]

@@ -902,10 +902,18 @@ impl TuiApp {
         }
         // FD sampling for the fd chart + leak suspicion: only while the
         // full detail page shows this pid (same gating as the system page;
-        // macOS pays one lsof per tick, Linux a /proc read, Windows none)
+        // macOS pays one lsof per tick, Linux a /proc read, Windows a
+        // full-table handle sweep via the fd_counts fallback)
         if self.page == Page::Detail {
             if let Some(pid) = self.detail_pid {
-                if let Some(n) = self.platform.fd_count(pid) {
+                let n = match self.platform.fd_count(pid) {
+                    Some(n) => Some(n),
+                    // per-pid unavailable (Windows): the whole-table sweep
+                    // answers for every pid at once — same cost class as
+                    // macOS's per-tick lsof, so it's fine behind this gate
+                    None => self.platform.fd_counts().and_then(|m| m.get(&pid).copied()),
+                };
+                if let Some(n) = n {
                     self.hist.record_fd(pid, n);
                 }
                 // live charts: re-render the page from the open-time cache
@@ -3301,6 +3309,14 @@ fn detail_lines(
     }
     if let Some(c) = &m.cwd {
         push_kv(&mut v, "Cwd", c.clone());
+    }
+    if let Some(t) = &m.tty {
+        let label = if t == "-" {
+            "(detached)".to_string()
+        } else {
+            t.clone()
+        };
+        push_kv(&mut v, "Tty", label);
     }
     if let Some(e) = &m.exe {
         push_kv(&mut v, "Exe", e.clone());

@@ -142,20 +142,49 @@ fn parse_loadavg(text: &str) -> (Option<f64>, Option<f64>, Option<f64>) {
 
 /// Parse /proc/<pid>/stat: comm may contain spaces and parentheses, so
 /// cut at the LAST ')'. Fields after it: state, ppid, ... (field 3+).
-fn parse_stat(raw: &str) -> Option<(String, Pid, char, u64, u64, u64)> {
-    // (comm, ppid, state, starttime_ticks, cpu_ticks_total, rss_pages)
+fn parse_stat(raw: &str) -> Option<(String, Pid, char, u64, u64, u64, u64)> {
+    // (comm, ppid, state, starttime_ticks, cpu_ticks_total, rss_pages, tty_nr)
     let rparen = raw.rfind(')')?;
     let comm = raw[raw.find('(')? + 1..rparen].to_string();
     let rest = raw[rparen + 2..].split_whitespace().collect::<Vec<_>>();
-    // rest[0]=state(3) rest[1]=ppid(4) rest[11]=utime(14) rest[12]=stime(15)
-    // rest[19]=starttime(22) rest[21]=rss(24, pages)
+    // rest[0]=state(3) rest[1]=ppid(4) rest[4]=tty_nr(7) rest[11]=utime(14)
+    // rest[12]=stime(15) rest[19]=starttime(22) rest[21]=rss(24, pages)
     let state = rest.first()?.chars().next()?;
     let ppid: Pid = rest.get(1)?.parse().ok()?;
+    let tty_nr: u64 = rest.get(4)?.parse().unwrap_or(0);
     let starttime: u64 = rest.get(19)?.parse().ok()?;
     let utime: u64 = rest.get(11)?.parse().unwrap_or(0);
     let stime: u64 = rest.get(12)?.parse().unwrap_or(0);
     let rss: i64 = rest.get(21)?.parse().unwrap_or(0);
-    Some((comm, ppid, state, starttime, utime + stime, rss.max(0) as u64))
+    Some((
+        comm,
+        ppid,
+        state,
+        starttime,
+        utime + stime,
+        rss.max(0) as u64,
+        tty_nr,
+    ))
+}
+
+/// Decode a /proc stat tty_nr (a dev_t) into the short terminal name ps
+/// prints: pts/N (major 136), ttyN (major 4), tty/console (major 5),
+/// otherwise dev(major:minor). 0 = no controlling terminal → "-".
+fn tty_name(tty_nr: u64) -> String {
+    if tty_nr == 0 {
+        return "-".to_string();
+    }
+    let major = (tty_nr >> 8) & 0xfff;
+    let minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xfff00);
+    match major {
+        136 => format!("pts/{minor}"),
+        4 => format!("tty{minor}"),
+        // /dev/tty (5:0), /dev/console (5:1); other major-5 minors are
+        // oddballs (ptmx…) — keep the dev() literal
+        5 if minor == 0 => "tty".to_string(),
+        5 if minor == 1 => "console".to_string(),
+        _ => format!("dev({major}:{minor})"),
+    }
 }
 
 fn parse_uid_from_status(raw: &str) -> Option<u32> {
@@ -581,7 +610,8 @@ impl Platform for Linux {
             let Some(stat) = read_ok(&base.join("stat")) else {
                 continue;
             };
-            let Some((comm, ppid, state, starttime, cpu_ticks, rss_pages)) = parse_stat(&stat)
+            let Some((comm, ppid, state, starttime, cpu_ticks, rss_pages, tty_nr)) =
+                parse_stat(&stat)
             else {
                 continue;
             };
@@ -616,6 +646,7 @@ impl Platform for Linux {
                 mem_kb: mem_kb.filter(|m| *m > 0),
                 cpu_time_ms,
                 state: Some(state.to_string()),
+                tty: Some(tty_name(tty_nr)),
                 ..Default::default()
             });
         }
@@ -629,7 +660,7 @@ impl Platform for Linux {
         // cut table noise, but in the detail pane 0.0% is meaningful)
         if !p.kernel_thread {
             if let (Some(stat), Some(btime)) = (read_ok(&base.join("stat")), self.boot_time()) {
-                if let Some((_, _, _, starttime, ticks, _)) = parse_stat(&stat) {
+                if let Some((_, _, _, starttime, ticks, _, _)) = parse_stat(&stat) {
                     let started_at = btime + (starttime as f64 / CLK_TCK).round() as i64;
                     let elapsed = now_unix() - started_at;
                     p.cpu = Some(if elapsed > 0 {
@@ -1230,15 +1261,29 @@ mod tests {
 
     #[test]
     fn stat_parse() {
-        // fields after ')': state(3) ppid(4) ... starttime(22)=token 19, vsize(23), rss(24)=token 21
+        // fields after ')': state(3) ppid(4) tty_nr(7) ... starttime(22)=token 19,
+        // vsize(23), rss(24)=token 21. tty_nr 0 = no controlling terminal.
         let line = "1234 (nginx: worker) S 350 1234 1234 0 -1 4194560 ... 0 0 0 0 0 0 0 0 0 0 0 123456 789012 123";
-        let (comm, ppid, state, start, cpu_ticks, rss) = parse_stat(line).unwrap();
+        let (comm, ppid, state, start, cpu_ticks, rss, tty_nr) = parse_stat(line).unwrap();
         assert_eq!(comm, "nginx: worker");
         assert_eq!(ppid, 350);
         assert_eq!(state, 'S');
         assert_eq!(start, 123456);
         assert_eq!(cpu_ticks, 0);
         assert_eq!(rss, 123);
+        assert_eq!(tty_nr, 0);
+        assert_eq!(tty_name(tty_nr), "-");
+        // kernel MKDEV: (major << 8) | (minor & 0xff) | ((minor >> 8) << 12)
+        assert_eq!(tty_name((136 << 8) | 3), "pts/3");
+        // high pty minor (>=256) is stored above bit 20 in the raw dev_t
+        // (it lands above bit 12 only after the >>12 decode shift)
+        assert_eq!(
+            tty_name((136 << 8) | (300 & 0xff) | ((300 >> 8) << 20)),
+            "pts/300"
+        );
+        assert_eq!(tty_name((4 << 8) | 2), "tty2");
+        assert_eq!(tty_name((5 << 8) | 1), "console");
+        assert_eq!(tty_name((5 << 8) | 2), "dev(5:2)");
     }
 
     #[test]
