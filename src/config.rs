@@ -79,6 +79,7 @@ impl Config {
     /// tests — and pure: env overrides live in [`Self::base_dir`], so a
     /// test passing a temp home can never be hijacked by an
     /// `XDG_CONFIG_HOME`/`APPDATA` the host happens to have set).
+    #[cfg(test)]
     pub fn path_under(home: &std::path::Path) -> PathBuf {
         #[cfg(target_os = "macos")]
         let base = home.join("Library/Application Support");
@@ -114,6 +115,7 @@ impl Config {
 
     /// save_watch under an explicit home dir (split out for tests; pure —
     /// see [`Self::path_under`]).
+    #[cfg(test)]
     pub fn save_watch_under(home: &std::path::Path, entries: &[String]) -> std::io::Result<()> {
         Self::save_watch_at(&Self::path_under(home), entries)
     }
@@ -122,7 +124,7 @@ impl Config {
         if entries.is_empty() && !path.exists() {
             return Ok(());
         }
-        let old = std::fs::read_to_string(&path).unwrap_or_default();
+        let old = std::fs::read_to_string(path).unwrap_or_default();
         let items: Vec<String> = entries
             .iter()
             .map(|e| format!("\"{}\"", e.replace('\\', "\\\\").replace('"', "\\\"")))
@@ -155,7 +157,7 @@ impl Config {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&path, out)
+        std::fs::write(path, out)
     }
 
     /// Persist the notes list — same surgical line rewrite as
@@ -168,6 +170,7 @@ impl Config {
     }
 
     /// save_notes under an explicit home dir (split out for tests; pure).
+    #[cfg(test)]
     pub fn save_notes_under(home: &std::path::Path, entries: &[String]) -> std::io::Result<()> {
         Self::save_notes_at(&Self::path_under(home), entries)
     }
@@ -176,7 +179,7 @@ impl Config {
         if entries.is_empty() && !path.exists() {
             return Ok(());
         }
-        let old = std::fs::read_to_string(&path).unwrap_or_default();
+        let old = std::fs::read_to_string(path).unwrap_or_default();
         let items: Vec<String> = entries
             .iter()
             .map(|e| format!("\"{}\"", e.replace('\\', "\\\\").replace('"', "\\\"")))
@@ -209,7 +212,7 @@ impl Config {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&path, out)
+        std::fs::write(path, out)
     }
 
     /// Parse the flat subset: `key = value` lines, `#` comments, `[section]`

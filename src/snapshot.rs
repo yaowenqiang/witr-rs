@@ -93,6 +93,7 @@ pub fn load(path: &str) -> Result<(Vec<Process>, Vec<Listener>), String> {
 /// Directory the auto snapshots live in: `<config dir>/snapshots`
 /// (split out with an explicit home for tests — pure, see
 /// [`Config::path_under`]).
+#[cfg(test)]
 pub fn auto_dir_under(home: &std::path::Path) -> std::path::PathBuf {
     crate::config::Config::path_under(home)
         .parent()
@@ -121,6 +122,7 @@ pub fn save_auto(
 }
 
 /// save_auto under an explicit home dir (split out for tests; pure).
+#[cfg(test)]
 pub fn save_auto_under(
     home: &std::path::Path,
     procs: &[Process],
@@ -171,11 +173,6 @@ pub fn newest_auto() -> Option<std::path::PathBuf> {
     newest_auto_dir(&auto_dir().ok()?)
 }
 
-/// newest_auto under an explicit home dir (split out for tests; pure).
-pub fn newest_auto_under(home: &std::path::Path) -> Option<std::path::PathBuf> {
-    newest_auto_dir(&auto_dir_under(home))
-}
-
 fn newest_auto_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .ok()?
@@ -204,6 +201,7 @@ pub fn resolve_ref(re: &str) -> Result<std::path::PathBuf, String> {
 }
 
 /// resolve_ref under an explicit home dir (split out for tests; pure).
+#[cfg(test)]
 pub fn resolve_ref_under(home: &std::path::Path, re: &str) -> Result<std::path::PathBuf, String> {
     resolve_ref_dir(&auto_dir_under(home), re)
 }
