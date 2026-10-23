@@ -91,7 +91,8 @@ pub fn load(path: &str) -> Result<(Vec<Process>, Vec<Listener>), String> {
 }
 
 /// Directory the auto snapshots live in: `<config dir>/snapshots`
-/// (split out with an explicit home for tests).
+/// (split out with an explicit home for tests — pure, see
+/// [`Config::path_under`]).
 pub fn auto_dir_under(home: &std::path::Path) -> std::path::PathBuf {
     crate::config::Config::path_under(home)
         .parent()
@@ -99,20 +100,46 @@ pub fn auto_dir_under(home: &std::path::Path) -> std::path::PathBuf {
         .unwrap_or_else(|| home.join("witr-rs-snapshots"))
 }
 
+/// The auto-snapshot dir for the current user — the env-resolved twin of
+/// [`auto_dir_under`]. Err carries user-facing guidance.
+fn auto_dir() -> Result<std::path::PathBuf, String> {
+    crate::config::Config::base_dir()
+        .map(|base| base.join("witr-rs").join("snapshots"))
+        .ok_or_else(|| "no config base dir — set $HOME (or $XDG_CONFIG_HOME)".to_string())
+}
+
 /// `--snap` without a FILE: write to `snap-<unixts>.json` in the auto dir
 /// and prune everything but the newest `keep` files. Returns the path
 /// written so the caller can print it.
 pub fn save_auto(
+    procs: &[Process],
+    listeners: &[Listener],
+    keep: usize,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = auto_dir().map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
+    save_auto_dir(&dir, procs, listeners, keep)
+}
+
+/// save_auto under an explicit home dir (split out for tests; pure).
+pub fn save_auto_under(
     home: &std::path::Path,
     procs: &[Process],
     listeners: &[Listener],
     keep: usize,
 ) -> std::io::Result<std::path::PathBuf> {
-    let dir = auto_dir_under(home);
-    std::fs::create_dir_all(&dir)?;
+    save_auto_dir(&auto_dir_under(home), procs, listeners, keep)
+}
+
+fn save_auto_dir(
+    dir: &std::path::Path,
+    procs: &[Process],
+    listeners: &[Listener],
+    keep: usize,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("snap-{}.json", crate::util::now_unix()));
     save(path.to_str().unwrap_or_default(), procs, listeners)?;
-    prune(&dir, keep);
+    prune(dir, keep);
     Ok(path)
 }
 
@@ -138,9 +165,18 @@ fn prune(dir: &std::path::Path, keep: usize) {
     }
 }
 
-/// Newest `snap-*.json` in the auto dir (lexicographic = chronological).
-pub fn newest_auto(home: &std::path::Path) -> Option<std::path::PathBuf> {
-    let dir = auto_dir_under(home);
+/// Newest `snap-*.json` in the user's auto dir (lexicographic =
+/// chronological). None when there is no base dir or no snapshots yet.
+pub fn newest_auto() -> Option<std::path::PathBuf> {
+    newest_auto_dir(&auto_dir().ok()?)
+}
+
+/// newest_auto under an explicit home dir (split out for tests; pure).
+pub fn newest_auto_under(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    newest_auto_dir(&auto_dir_under(home))
+}
+
+fn newest_auto_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
@@ -158,16 +194,29 @@ pub fn newest_auto(home: &std::path::Path) -> Option<std::path::PathBuf> {
 /// Resolve a `--diff` reference: `last` = newest auto snapshot, a duration
 /// (`1h`) = the newest snapshot at least that old (so you diff against the
 /// state as of roughly an hour ago), anything else = a literal path.
-pub fn resolve_ref(home: &std::path::Path, re: &str) -> Result<std::path::PathBuf, String> {
+/// Without a config base dir only literal paths make sense — same as the
+/// old no-`$HOME` behavior.
+pub fn resolve_ref(re: &str) -> Result<std::path::PathBuf, String> {
+    match auto_dir() {
+        Ok(dir) => resolve_ref_dir(&dir, re),
+        Err(_) => Ok(std::path::PathBuf::from(re)),
+    }
+}
+
+/// resolve_ref under an explicit home dir (split out for tests; pure).
+pub fn resolve_ref_under(home: &std::path::Path, re: &str) -> Result<std::path::PathBuf, String> {
+    resolve_ref_dir(&auto_dir_under(home), re)
+}
+
+fn resolve_ref_dir(dir: &std::path::Path, re: &str) -> Result<std::path::PathBuf, String> {
     if re == "last" {
-        return newest_auto(home)
+        return newest_auto_dir(dir)
             .ok_or_else(|| "no auto snapshots yet — run `witr-rs --snap` first".to_string());
     }
     if let Some(secs) = parse_age_ref(re) {
         let cutoff = crate::util::now_unix() - secs;
-        let dir = auto_dir_under(home);
         let mut best: Option<(i64, std::path::PathBuf)> = None;
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             return Err("no auto snapshots yet — run `witr-rs --snap` first".into());
         };
         for e in entries.flatten() {
@@ -571,7 +620,7 @@ mod tests {
         // so backdate the timestamps by renaming)
         let mut paths = Vec::new();
         for i in 0..12 {
-            let p = save_auto(&home, &[proc(i, "p", None, None, "")], &[], 10).unwrap();
+            let p = save_auto_under(&home, &[proc(i, "p", None, None, "")], &[], 10).unwrap();
             let backdated = p.with_file_name(format!(
                 "snap-{}.json",
                 crate::util::now_unix() - 3600 + i as i64 * 10
@@ -590,11 +639,11 @@ mod tests {
         assert!(kept.contains(paths.last().unwrap()), "newest kept");
 
         // `last` resolves to the newest
-        let last = resolve_ref(&home, "last").unwrap();
+        let last = resolve_ref_under(&home, "last").unwrap();
         assert_eq!(last, *paths.last().unwrap());
 
         // a duration resolves to the newest snapshot at least that old
-        let hour_ago = resolve_ref(&home, "59m").unwrap();
+        let hour_ago = resolve_ref_under(&home, "59m").unwrap();
         assert!(
             paths.iter().take(11).any(|p| *p == hour_ago),
             "59m ref picks an old snapshot, got {}",
@@ -603,13 +652,13 @@ mod tests {
 
         // a plain path passes through untouched (even when it doesn't exist)
         assert_eq!(
-            resolve_ref(&home, "/tmp/whatever.json").unwrap(),
+            resolve_ref_under(&home, "/tmp/whatever.json").unwrap(),
             std::path::PathBuf::from("/tmp/whatever.json")
         );
         // bare numbers are paths, not durations
-        assert_eq!(resolve_ref(&home, "42").unwrap(), std::path::PathBuf::from("42"));
+        assert_eq!(resolve_ref_under(&home, "42").unwrap(), std::path::PathBuf::from("42"));
         // an impossible window fails with guidance
-        assert!(resolve_ref(&home, "1d").is_err(), "nothing is 1d old yet");
+        assert!(resolve_ref_under(&home, "1d").is_err(), "nothing is 1d old yet");
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -617,7 +666,7 @@ mod tests {
     fn resolve_ref_without_auto_dir_fails_with_guidance() {
         let dir = std::env::temp_dir().join(format!("witr-snapnone-{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
-        let err = resolve_ref(&dir, "last").unwrap_err();
+        let err = resolve_ref_under(&dir, "last").unwrap_err();
         assert!(err.contains("--snap"), "{err}");
         std::fs::remove_dir_all(dir).ok();
     }

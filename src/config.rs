@@ -40,24 +40,52 @@ pub struct Config {
 
 impl Config {
     /// User-level config path for the current platform (XDG respected on
-    /// Linux). None when $HOME is unset.
+    /// Linux). None when no base dir is resolvable.
     pub fn path() -> Option<PathBuf> {
-        let home = PathBuf::from(std::env::var_os("HOME")?);
-        Some(Self::path_under(&home))
+        Some(Self::base_dir()?.join("witr-rs").join("config.toml"))
     }
 
-    /// Platform config path under a home dir (split out for tests).
+    /// Config base dir for the current user — `$XDG_CONFIG_HOME` on Linux
+    /// and `$APPDATA` on Windows when set, else the per-home location.
+    /// Every config-adjacent path (config file, snapshot dir) resolves
+    /// through this one fn so production and the pure per-home twins in
+    /// [`Self::path_under`] can't drift.
+    pub fn base_dir() -> Option<std::path::PathBuf> {
+        #[cfg(target_os = "macos")]
+        return std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(|h| PathBuf::from(h).join("Library/Application Support"));
+        #[cfg(target_os = "linux")]
+        return std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|h| !h.is_empty())
+                    .map(|h| PathBuf::from(h).join(".config"))
+            });
+        #[cfg(windows)]
+        return std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|h| !h.is_empty())
+                    .map(|h| PathBuf::from(h).join("AppData/Roaming"))
+            });
+    }
+
+    /// Platform config path under an explicit home dir (split out for
+    /// tests — and pure: env overrides live in [`Self::base_dir`], so a
+    /// test passing a temp home can never be hijacked by an
+    /// `XDG_CONFIG_HOME`/`APPDATA` the host happens to have set).
     pub fn path_under(home: &std::path::Path) -> PathBuf {
         #[cfg(target_os = "macos")]
         let base = home.join("Library/Application Support");
         #[cfg(target_os = "linux")]
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"));
+        let base = home.join(".config");
         #[cfg(windows)]
-        let base = std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join("AppData/Roaming"));
+        let base = home.join("AppData/Roaming");
         base.join("witr-rs").join("config.toml")
     }
 
@@ -78,15 +106,19 @@ impl Config {
     /// quoted and TOML-escaped. Never creates the file just to record an
     /// empty list.
     pub fn save_watch(entries: &[String]) -> std::io::Result<()> {
-        let Some(home) = std::env::var_os("HOME") else {
+        let Some(path) = Self::path() else {
             return Ok(());
         };
-        Self::save_watch_under(&std::path::PathBuf::from(home), entries)
+        Self::save_watch_at(&path, entries)
     }
 
-    /// save_watch under an explicit home dir (split out for tests).
+    /// save_watch under an explicit home dir (split out for tests; pure —
+    /// see [`Self::path_under`]).
     pub fn save_watch_under(home: &std::path::Path, entries: &[String]) -> std::io::Result<()> {
-        let path = Self::path_under(home);
+        Self::save_watch_at(&Self::path_under(home), entries)
+    }
+
+    fn save_watch_at(path: &std::path::Path, entries: &[String]) -> std::io::Result<()> {
         if entries.is_empty() && !path.exists() {
             return Ok(());
         }
@@ -129,15 +161,18 @@ impl Config {
     /// Persist the notes list — same surgical line rewrite as
     /// [`Config::save_watch`], for the `notes = [...]` key.
     pub fn save_notes(entries: &[String]) -> std::io::Result<()> {
-        let Some(home) = std::env::var_os("HOME") else {
+        let Some(path) = Self::path() else {
             return Ok(());
         };
-        Self::save_notes_under(&std::path::PathBuf::from(home), entries)
+        Self::save_notes_at(&path, entries)
     }
 
-    /// save_notes under an explicit home dir (split out for tests).
+    /// save_notes under an explicit home dir (split out for tests; pure).
     pub fn save_notes_under(home: &std::path::Path, entries: &[String]) -> std::io::Result<()> {
-        let path = Self::path_under(home);
+        Self::save_notes_at(&Self::path_under(home), entries)
+    }
+
+    fn save_notes_at(path: &std::path::Path, entries: &[String]) -> std::io::Result<()> {
         if entries.is_empty() && !path.exists() {
             return Ok(());
         }

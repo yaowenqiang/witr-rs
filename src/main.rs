@@ -1366,13 +1366,13 @@ fn main() {
         if let Some(path) = &cli.snap {
             if path.is_empty() {
                 // no FILE: the auto-rotate directory under the config dir
-                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-                let Some(home) = home else {
-                    eprintln!("--snap needs $HOME for the auto-rotate directory, or give a FILE");
+                // (XDG respected via Config::base_dir)
+                if crate::config::Config::base_dir().is_none() {
+                    eprintln!("--snap needs $HOME (or $XDG_CONFIG_HOME) for the auto-rotate directory, or give a FILE");
                     std::process::exit(4);
-                };
+                }
                 let keep = cli.keep.unwrap_or(10).max(1);
-                match snapshot::save_auto(&home, &procs, &listeners, keep) {
+                match snapshot::save_auto(&procs, &listeners, keep) {
                     Ok(written) => write_out(&format!(
                         "snapshot: {} processes{} → {} (keeping {keep})",
                         procs.len(),
@@ -1398,16 +1398,12 @@ fn main() {
             std::process::exit(0);
         }
         let raw_ref = cli.diff.as_deref().unwrap_or_default();
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let resolved = match &home {
-            Some(h) => match snapshot::resolve_ref(h, raw_ref) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("--diff {raw_ref}: {e}");
-                    std::process::exit(4);
-                }
-            },
-            None => std::path::PathBuf::from(raw_ref),
+        let resolved = match snapshot::resolve_ref(raw_ref) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("--diff {raw_ref}: {e}");
+                std::process::exit(4);
+            }
         };
         let path = resolved.to_string_lossy().into_owned();
         let (old, old_listeners) = match snapshot::load(&path) {

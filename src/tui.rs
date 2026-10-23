@@ -1119,11 +1119,7 @@ impl TuiApp {
     /// at open time — 'r' on the page re-diffs. The CLI's `--diff` is the
     /// scripted twin of this page.
     fn open_diff_page(&mut self) {
-        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-            self.status = "snapshot diff needs $HOME (no auto snapshots to compare)".into();
-            return;
-        };
-        let Some(path) = crate::snapshot::newest_auto(&home) else {
+        let Some(path) = crate::snapshot::newest_auto() else {
             self.status = "no auto snapshots yet — run `witr --snap` once to seed one".into();
             return;
         };
