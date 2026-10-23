@@ -872,6 +872,7 @@ fn main() {
         || cli.alert_load.is_some()
         || cli.alert_mem_pct.is_some()
         || cli.alert_count.is_some()
+        || cli.alert_disk.is_some()
         || !alert_ports.is_empty();
     if cli.alert_repeat.is_some() && !any_alert_armed {
         eprintln!(
@@ -927,6 +928,7 @@ fn main() {
         && cli.alert_load.is_none()
         && cli.alert_mem_pct.is_none()
         && cli.alert_count.is_none()
+        && cli.alert_disk.is_none()
         && cli.alert_port.is_empty()
     {
         eprintln!(
@@ -973,13 +975,46 @@ fn main() {
             || cli.snap.is_some()
             || cli.diff.is_some()
             || cli.serve.is_some()
-            || cli.recent.is_some();
+            || cli.recent.is_some()
+            || cli.conns
+            || cli.locks
+            || cli.zombies
+            || cli.services;
         if clash {
             eprintln!("--ports is a standalone listing; drop the targets and other modes (it pairs with --csv/--json/--watch)");
             std::process::exit(4);
         }
         if cli.watch.is_some() && (cli.csv || cli.json) {
             eprintln!("machine-readable --ports is one-shot; drop --watch or the format flag");
+            std::process::exit(4);
+        }
+    }
+    // --conns: every socket outside LISTEN, with owner + loopback peer
+    // attribution (the mirror of --ports)
+    if cli.conns {
+        let clash = !specs.is_empty()
+            || cli.interactive
+            || cli.top.is_some()
+            || cli.report_html.is_some()
+            || cli.tree
+            || cli.short
+            || cli.env
+            || cli.warnings
+            || cli.snap.is_some()
+            || cli.diff.is_some()
+            || cli.serve.is_some()
+            || cli.recent.is_some()
+            || cli.ports_list
+            || cli.locks
+            || cli.zombies
+            || cli.services
+            || cli.by_name;
+        if clash {
+            eprintln!("--conns is a standalone listing; drop the targets and other modes (it pairs with --csv/--markdown/--json/--watch)");
+            std::process::exit(4);
+        }
+        if cli.watch.is_some() && (cli.csv || cli.markdown || cli.json) {
+            eprintln!("machine-readable --conns is one-shot; drop --watch or the format flag");
             std::process::exit(4);
         }
     }
@@ -1079,20 +1114,24 @@ fn main() {
             std::process::exit(4);
         }
     }
-    // --zombies / --locks: whole-table no-target listings (text or --json)
-    for (flag, on) in [("--zombies", cli.zombies), ("--locks", cli.locks)] {
+    // --zombies / --locks / --services: whole-table no-target listings
+    // (text, --json, --csv or --markdown)
+    for (flag, on) in [
+        ("--zombies", cli.zombies),
+        ("--locks", cli.locks),
+        ("--services", cli.services),
+    ] {
         if on {
             let clash = !specs.is_empty()
                 || cli.interactive
                 || cli.top.is_some()
                 || cli.ports_list
+                || cli.conns
                 || cli.tree
                 || cli.short
                 || cli.env
                 || cli.warnings
                 || cli.report_html.is_some()
-                || cli.csv
-                || cli.markdown
                 || cli.snap.is_some()
                 || cli.diff.is_some()
                 || cli.serve.is_some()
@@ -1107,7 +1146,7 @@ fn main() {
                 || cli.kill
                 || cli.kill_tree;
             if clash {
-                eprintln!("{flag} is a whole-table listing; drop the targets and other modes (pairs with --json)");
+                eprintln!("{flag} is a whole-table listing; drop the targets and other modes (pairs with --json/--csv/--markdown)");
                 std::process::exit(4);
             }
         }
@@ -1536,6 +1575,7 @@ fn main() {
             alert_load: cli.alert_load,
             alert_mem_pct: cli.alert_mem_pct,
             alert_count: cli.alert_count,
+            alert_disk: cli.alert_disk,
             alert_repeat: cli.alert_repeat,
             watch: cfg.watch.clone(),
             notes: cfg.notes,
@@ -1636,6 +1676,10 @@ fn main() {
                 "zombies": rows,
             });
             write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if cli.csv {
+            write_out(&render::render_zombies_csv(&rows));
+        } else if cli.markdown {
+            write_out(&render::render_zombies_markdown(&rows));
         } else {
             let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
             write_out(&render::render_zombies(&rows, &painter));
@@ -1656,9 +1700,96 @@ fn main() {
                 "locks": locks,
             });
             write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if cli.csv {
+            write_out(&render::render_locks_csv(&locks));
+        } else if cli.markdown {
+            write_out(&render::render_locks_markdown(&locks));
         } else {
             let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
             write_out(&render::render_locks_table(&locks, &painter));
+        }
+        std::process::exit(0);
+    }
+
+    // --services: the service manager's units (the Services tab's CLI
+    // twin). One enumerate call per invocation — the table is meant for
+    // humans and scripts, not polling loops.
+    if cli.services {
+        let mut svcs = platform::enumerate_services();
+        render::sort_services(&mut svcs);
+        if cli.json {
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "service_count": svcs.len(),
+                "services": svcs,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if cli.csv {
+            write_out(&render::render_services_csv(&svcs));
+        } else if cli.markdown {
+            write_out(&render::render_services_markdown(&svcs));
+        } else {
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            write_out(&render::render_services(&svcs, &painter));
+        }
+        std::process::exit(0);
+    }
+
+    // --conns: the machine's sockets outside LISTEN, owners resolved and
+    // loopback peers attributed (the Ports tab's "all states" view, CLI
+    // twin of --ports)
+    if cli.conns {
+        let platform = platform::get();
+        let board = || -> Vec<render::ConnRow> {
+            let procs = match platform.list_processes() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("cannot list processes: {}", e);
+                    std::process::exit(5);
+                }
+            };
+            let socks = platform.list_all_sockets().unwrap_or_default();
+            render::collect_conns(&socks, &procs)
+        };
+        if let Some(secs) = cli.watch {
+            let interval = secs.max(1);
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            install_sigint_flag();
+            let mut ticks: u64 = 0;
+            loop {
+                let rows = board();
+                write_out("\x1b[2J\x1b[1;1H");
+                write_out(&format!(
+                    "witr-rs conns · every {interval}s · {} · Ctrl-C to stop",
+                    util::fmt_time(util::now_unix())
+                ));
+                write_out(&render::render_conns(&rows, &painter));
+                ticks += 1;
+                if cli.times.is_some_and(|n| ticks >= n.max(1)) {
+                    std::process::exit(0);
+                }
+                if !sleep_interruptible(interval) {
+                    std::process::exit(130);
+                }
+            }
+        }
+        let rows = board();
+        if cli.json {
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "connection_count": rows.len(),
+                "connections": rows,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if cli.csv {
+            write_out(&render::render_conns_csv(&rows));
+        } else if cli.markdown {
+            write_out(&render::render_conns_markdown(&rows));
+        } else {
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            write_out(&render::render_conns(&rows, &painter));
         }
         std::process::exit(0);
     }
@@ -1850,6 +1981,7 @@ fn main() {
                 alert_load: cli.alert_load,
                 alert_mem_pct: cli.alert_mem_pct,
                 alert_count: cli.alert_count,
+                alert_disk: cli.alert_disk,
                 alert_repeat: cli.alert_repeat,
                 watch: cfg.watch.clone(),
                 notes: cfg.notes,
@@ -1981,13 +2113,24 @@ fn main() {
                 // --alert-count): sample the whole system when armed —
                 // macOS's vm_stat spawn and Windows's PowerShell query are
                 // paid only when watched
-                if cli.alert_load.is_some() || cli.alert_mem_pct.is_some() || cli.alert_count.is_some() {
+                if cli.alert_load.is_some()
+                    || cli.alert_mem_pct.is_some()
+                    || cli.alert_count.is_some()
+                    || cli.alert_disk.is_some()
+                {
                     if let Some(stats) = platform.system_stats() {
+                        let mounts = if cli.alert_disk.is_some() {
+                            platform.mount_usage()
+                        } else {
+                            Vec::new()
+                        };
                         let limits = history::SysAlertLimits {
                             load: cli.alert_load,
                             mem_pct: cli.alert_mem_pct,
                             count: cli.alert_count,
                             proc_count: procs.len(),
+                            mounts,
+                            disk_pct: cli.alert_disk,
                             repeat: cli.alert_repeat,
                         };
                         for (name, detail) in history::system_alert_picks(

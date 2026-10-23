@@ -464,6 +464,45 @@ pub fn render_zombies(rows: &[ZombieRow], p: &Painter) -> String {
     out
 }
 
+/// `--zombies --csv`: age as raw seconds (scripts diff it, not read it);
+/// the parent stays split into pid + name so jq can group by either.
+pub fn render_zombies_csv(rows: &[ZombieRow]) -> String {
+    let mut out = String::from("pid,name,parent_pid,parent,age_secs\n");
+    for r in rows {
+        out.push_str(&format!(
+            "{},{},{},{},{}\n",
+            r.pid,
+            csv_field(&r.name),
+            r.ppid.map(|p| p.to_string()).unwrap_or_default(),
+            csv_field(r.parent.as_deref().unwrap_or("")),
+            r.age_secs.map(|a| a.to_string()).unwrap_or_default(),
+        ));
+    }
+    out
+}
+
+/// `--zombies --markdown`: the same rows, human-format ages.
+pub fn render_zombies_markdown(rows: &[ZombieRow]) -> String {
+    let mut out = String::from("| PID | NAME | PARENT | AGE |\n|---|---|---|---|\n");
+    for r in rows {
+        let parent = match (&r.parent, r.ppid) {
+            (Some(n), Some(pp)) => format!("{n} (pid {pp})"),
+            (Some(n), None) => n.clone(),
+            (None, Some(pp)) => format!("(pid {pp})"),
+            (None, None) => "(gone)".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} |",
+            r.pid,
+            r.name,
+            parent,
+            r.age_secs.map(fmt_age).unwrap_or_default(),
+        );
+    }
+    out
+}
+
 /// `--locks` text table: PID / OWNER / MODE / TYPE / PATH, pid then path.
 pub fn render_locks_table(entries: &[crate::model::LockEntry], p: &Painter) -> String {
     if entries.is_empty() {
@@ -504,6 +543,311 @@ pub fn render_locks_table(entries: &[crate::model::LockEntry], p: &Painter) -> S
             l.mode,
             l.kind,
             l.path,
+        );
+    }
+    out
+}
+
+/// `--locks --csv` / `--locks --markdown`: the same (pid, path)-sorted rows
+/// as the text table, machine-readable. Locks with no resolvable pid keep
+/// the empty field.
+fn sorted_locks(entries: &[crate::model::LockEntry]) -> Vec<&crate::model::LockEntry> {
+    let mut sorted: Vec<&crate::model::LockEntry> = entries.iter().collect();
+    sorted.sort_by_key(|l| (l.pid.unwrap_or(0), l.path.clone()));
+    sorted
+}
+
+pub fn render_locks_csv(entries: &[crate::model::LockEntry]) -> String {
+    let mut out = String::from("pid,owner,mode,type,path\n");
+    for l in sorted_locks(entries) {
+        out.push_str(&format!(
+            "{},{},{},{},{}\n",
+            l.pid.map(|p| p.to_string()).unwrap_or_default(),
+            csv_field(&l.owner),
+            csv_field(&l.mode),
+            csv_field(&l.kind),
+            csv_field(&l.path),
+        ));
+    }
+    out
+}
+
+pub fn render_locks_markdown(entries: &[crate::model::LockEntry]) -> String {
+    let mut out = String::from("| PID | OWNER | MODE | TYPE | PATH |\n|---|---|---|---|---|\n");
+    for l in sorted_locks(entries) {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} |",
+            l.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            l.owner,
+            l.mode,
+            l.kind,
+            l.path,
+        );
+    }
+    out
+}
+
+/// Shared `--services` row order: running units (a main pid in hand) float
+/// to the top — `| head` on a long launchd listing still shows the live
+/// ones — then manager, then name, case-insensitively. Applied by the
+/// dispatch so all four formats agree.
+pub fn sort_services(svcs: &mut [crate::model::Service]) {
+    svcs.sort_by(|a, b| {
+        (a.pid.is_none(), a.manager.as_str(), a.name.to_lowercase())
+            .cmp(&(b.pid.is_none(), b.manager.as_str(), b.name.to_lowercase()))
+    });
+}
+
+/// `--services` text table: MANAGER / NAME / STATE / PID / DESCRIPTION.
+pub fn render_services(svcs: &[crate::model::Service], p: &Painter) -> String {
+    if svcs.is_empty() {
+        return "no services reported (is a service manager running?)\n".to_string();
+    }
+    let mgr_w = svcs.iter().map(|s| s.manager.len()).max().unwrap_or(7).max(7);
+    let name_w = svcs
+        .iter()
+        .map(|s| s.name.len())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 48);
+    let state_w = svcs.iter().map(|s| s.state.len()).max().unwrap_or(5).max(5);
+    let pid_w = svcs
+        .iter()
+        .map(|s| s.pid.map(|p| p.to_string().len()).unwrap_or(1))
+        .max()
+        .unwrap_or(3)
+        .max(3);
+    let mut out = String::new();
+    let mgr_h = "MANAGER";
+    let name_h = "NAME";
+    let state_h = "STATE";
+    let pid_h = "PID";
+    let desc_h = "DESCRIPTION";
+    let _ = writeln!(
+        out,
+        "{mgr_h:<mgr_w$}  {name_h:<name_w$}  {state_h:<state_w$}  {pid_h:>pid_w$}  {desc_h}"
+    );
+    for s in svcs {
+        let _ = writeln!(
+            out,
+            "{:<mgr_w$}  {:<name_w$}  {:<state_w$}  {:>pid_w$}  {}",
+            s.manager,
+            s.name,
+            p.dim(&s.state),
+            s.pid.map(|pid| pid.to_string()).unwrap_or_else(|| "-".into()),
+            s.desc,
+        );
+    }
+    out
+}
+
+/// `--services --csv`: one row per unit (empty pid = not running).
+pub fn render_services_csv(svcs: &[crate::model::Service]) -> String {
+    let mut out = String::from("manager,name,state,pid,desc\n");
+    for s in svcs {
+        out.push_str(&format!(
+            "{},{},{},{},{}\n",
+            csv_field(&s.manager),
+            csv_field(&s.name),
+            csv_field(&s.state),
+            s.pid.map(|p| p.to_string()).unwrap_or_default(),
+            csv_field(&s.desc),
+        ));
+    }
+    out
+}
+
+/// `--services --markdown`: the same rows pasted into docs and issues.
+pub fn render_services_markdown(svcs: &[crate::model::Service]) -> String {
+    let mut out = String::from(
+        "| MANAGER | NAME | STATE | PID | DESCRIPTION |\n|---|---|---|---|---|\n",
+    );
+    for s in svcs {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} |",
+            s.manager,
+            s.name,
+            s.state,
+            s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            s.desc,
+        );
+    }
+    out
+}
+
+/// One `--conns` row: a socket in any state except LISTEN (listening is
+/// `--ports`' turf), with its owning process — and, when the peer is on
+/// this host, the process on the other end.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConnRow {
+    pub proto: String, // tcp / tcp6 / udp / udp6
+    pub local: String, // "addr:port"
+    /// "addr:port", or "" for unconnected UDP sockets.
+    pub peer: String,
+    pub state: String,
+    pub pid: Option<Pid>,
+    /// Owner display line "name (pid N)"; empty when nobody owns it.
+    pub owner: String,
+    /// Set only for loopback peers: the local process on the other end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_pid: Option<Pid>,
+    #[serde(skip_serializing_if = "std::string::String::is_empty")]
+    pub peer_owner: String,
+}
+
+fn loopback_addr(a: &str) -> bool {
+    let bare = a.trim_start_matches('[').trim_end_matches(']');
+    bare == "::1" || bare.starts_with("127.")
+}
+
+fn owned(pid: Option<Pid>, names: &HashMap<Pid, String>) -> String {
+    match pid {
+        Some(p) => match names.get(&p) {
+            Some(n) => format!("{n} (pid {p})"),
+            None => format!("(pid {p})"),
+        },
+        None => String::new(),
+    }
+}
+
+/// Fold a socket sweep into `--conns` rows: drop LISTEN, resolve each
+/// socket's owner against the process table, and attribute loopback peers
+/// by looking up which local socket holds the peer's port. Rows sort
+/// ownerless-last so the attributable connections read first.
+pub fn collect_conns(sockets: &[crate::model::Socket], procs: &[Process]) -> Vec<ConnRow> {
+    let names: HashMap<Pid, String> = procs.iter().map(|p| (p.pid, p.name.clone())).collect();
+    let mut by_port: HashMap<u16, Vec<&crate::model::Socket>> = HashMap::new();
+    for s in sockets {
+        by_port.entry(s.local_port).or_default().push(s);
+    }
+    let mut rows: Vec<ConnRow> = sockets
+        .iter()
+        .filter(|s| !s.state.eq_ignore_ascii_case("LISTEN"))
+        .map(|s| {
+            let peer = match (&s.peer_addr, s.peer_port) {
+                (Some(a), Some(p)) => format!("{}:{}", a, p),
+                _ => String::new(),
+            };
+            // loopback attribution: prefer the established socket on that
+            // port owned by someone else, else any other owned socket
+            let mut peer_attr: Option<(Pid, String)> = None;
+            let mut fallback: Option<(Pid, String)> = None;
+            if let (Some(a), Some(p)) = (&s.peer_addr, s.peer_port) {
+                if loopback_addr(a) {
+                    for c in by_port.get(&p).into_iter().flatten() {
+                        if c.pid.is_none() || c.pid == s.pid {
+                            continue;
+                        }
+                        let who = (c.pid.unwrap(), owned(c.pid, &names));
+                        if c.state.eq_ignore_ascii_case("ESTABLISHED") {
+                            peer_attr = Some(who);
+                            break;
+                        }
+                        if fallback.is_none() {
+                            fallback = Some(who);
+                        }
+                    }
+                }
+            }
+            let peer_attr = peer_attr.or(fallback);
+            ConnRow {
+                proto: s.proto.clone(),
+                local: format!("{}:{}", s.local_addr, s.local_port),
+                peer,
+                state: s.state.clone(),
+                pid: s.pid,
+                owner: owned(s.pid, &names),
+                peer_pid: peer_attr.as_ref().map(|(p, _)| *p),
+                peer_owner: peer_attr.map(|(_, o)| o).unwrap_or_default(),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        a.owner.is_empty()
+            .cmp(&b.owner.is_empty())
+            .then_with(|| a.owner.cmp(&b.owner))
+            .then_with(|| a.proto.cmp(&b.proto))
+            .then_with(|| a.local.cmp(&b.local))
+    });
+    rows
+}
+
+/// `--conns` text table: PROTO / LOCAL / PEER / STATE / OWNER; loopback
+/// peers get "↔ other end" appended to the owner cell.
+pub fn render_conns(rows: &[ConnRow], p: &Painter) -> String {
+    if rows.is_empty() {
+        return "no connections (nothing outside LISTEN)\n".to_string();
+    }
+    let proto_w = rows.iter().map(|r| r.proto.len()).max().unwrap_or(5).max(5);
+    let local_w = rows.iter().map(|r| r.local.len()).max().unwrap_or(5).clamp(5, 44);
+    let peer_w = rows.iter().map(|r| r.peer.len().max(4)).max().unwrap_or(4).clamp(4, 44);
+    let state_w = rows.iter().map(|r| r.state.len()).max().unwrap_or(5).max(5);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<proto_w$}  {:<local_w$}  {:<peer_w$}  {:<state_w$}  OWNER",
+        "PROTO", "LOCAL", "PEER", "STATE"
+    );
+    for r in rows {
+        let mut owner = if r.owner.is_empty() {
+            "-".to_string()
+        } else {
+            r.owner.clone()
+        };
+        if !r.peer_owner.is_empty() {
+            owner.push_str(&format!(" ↔ {}", r.peer_owner));
+        }
+        let _ = writeln!(
+            out,
+            "{:<proto_w$}  {:<local_w$}  {:<peer_w$}  {:<state_w$}  {}",
+            p.dim(&r.proto),
+            r.local,
+            r.peer,
+            p.dim(&r.state),
+            owner,
+        );
+    }
+    out
+}
+
+/// `--conns --csv`: peer attribution as its own columns.
+pub fn render_conns_csv(rows: &[ConnRow]) -> String {
+    let mut out = String::from("proto,local,peer,state,pid,owner,peer_pid,peer_owner\n");
+    for r in rows {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            csv_field(&r.proto),
+            csv_field(&r.local),
+            csv_field(&r.peer),
+            csv_field(&r.state),
+            r.pid.map(|p| p.to_string()).unwrap_or_default(),
+            csv_field(&r.owner),
+            r.peer_pid.map(|p| p.to_string()).unwrap_or_default(),
+            csv_field(&r.peer_owner),
+        ));
+    }
+    out
+}
+
+/// `--conns --markdown`: the same rows pasted into docs and issues.
+pub fn render_conns_markdown(rows: &[ConnRow]) -> String {
+    let mut out = String::from(
+        "| PROTO | LOCAL | PEER | STATE | PID | OWNER | PEER OWNER |\n\
+         |---|---|---|---|---|---|---|\n",
+    );
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            r.proto,
+            r.local,
+            r.peer,
+            r.state,
+            r.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            if r.owner.is_empty() { "-" } else { &r.owner },
+            r.peer_owner,
         );
     }
     out
@@ -1625,6 +1969,191 @@ mod tests {
         assert!(body[2].contains("/a.lock"), "{out}");
         assert!(body[3].contains("/z.lock"), "{out}");
         assert!(render_locks_table(&[], &p).contains("no file locks"));
+    }
+
+    #[test]
+    fn zombies_csv_and_markdown_keep_raw_age_and_parent_columns() {
+        let rows = vec![ZombieRow {
+            pid: 2,
+            name: "old-zombie, v1".into(),
+            ppid: Some(1),
+            parent: Some("init".into()),
+            age_secs: Some(100),
+        }];
+        let csv = render_zombies_csv(&rows);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "pid,name,parent_pid,parent,age_secs");
+        // comma inside the name must be quoted; age raw seconds
+        assert_eq!(lines[1], "2,\"old-zombie, v1\",1,init,100");
+        assert_eq!(render_zombies_csv(&[]), "pid,name,parent_pid,parent,age_secs\n");
+
+        // parent gone (None): empty cells, not "(gone)" prose
+        let orphan = vec![ZombieRow {
+            pid: 5,
+            name: "orphan-zombie".into(),
+            ppid: Some(999),
+            parent: None,
+            age_secs: None,
+        }];
+        let orphan_csv = render_zombies_csv(&orphan);
+        assert_eq!(orphan_csv.lines().nth(1).unwrap(), "5,orphan-zombie,999,,");
+
+        let md = render_zombies_markdown(&rows);
+        assert!(md.starts_with("| PID | NAME | PARENT | AGE |"));
+        assert!(md.contains("| init (pid 1) |"), "{md}");
+        assert!(md.contains("| 1m 40s |"), "{md}");
+    }
+
+    #[test]
+    fn locks_csv_and_markdown_sort_like_the_text_table() {
+        let e = |pid, owner: &str, mode: &str, path: &str| crate::model::LockEntry {
+            id: String::new(),
+            kind: "POSIX".into(),
+            mode: mode.into(),
+            pid: Some(pid),
+            owner: owner.into(),
+            path: path.into(),
+        };
+        let entries = vec![e(9, "b", "READ", "/z.lock"), e(2, "a", "WRITE", "/m.lock")];
+        let csv = render_locks_csv(&entries);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "pid,owner,mode,type,path");
+        assert_eq!(lines[1], "2,a,WRITE,POSIX,/m.lock");
+        assert_eq!(lines[2], "9,b,READ,POSIX,/z.lock");
+        assert_eq!(render_locks_csv(&[]), "pid,owner,mode,type,path\n");
+
+        let md = render_locks_markdown(&entries);
+        assert!(md.starts_with("| PID | OWNER | MODE | TYPE | PATH |"));
+        assert!(md.contains("| /m.lock |"), "{md}");
+    }
+
+    #[test]
+    fn services_table_sorts_running_first_and_formats_all_ways() {
+        let svc = |mgr: &str, name: &str, state: &str, pid: Option<i32>, desc: &str| {
+            crate::model::Service {
+                manager: mgr.into(),
+                name: name.into(),
+                state: state.into(),
+                desc: desc.into(),
+                pid,
+            }
+        };
+        let mut svcs = vec![
+            svc("launchd", "zeta.agent", "not running", None, ""),
+            svc("systemd", "nginx.service", "active/running", Some(7), "web server"),
+            svc("systemd", "alpha.service", "failed", None, "broken"),
+        ];
+        sort_services(&mut svcs);
+        // running first; then manager (launchd < systemd) and name
+        assert_eq!(svcs[0].name, "nginx.service");
+        assert_eq!(svcs[1].name, "zeta.agent");
+        assert_eq!(svcs[2].name, "alpha.service");
+
+        let p = Painter::new(false);
+        assert!(render_services(&[], &p).contains("no services reported"));
+        let table = render_services(&svcs, &p);
+        assert!(
+            table.contains("MANAGER") && table.contains("DESCRIPTION"),
+            "{table}"
+        );
+        assert!(table.contains("nginx.service"), "{table}");
+        assert!(table.lines().nth(1).unwrap().contains("web server"));
+
+        let csv = render_services_csv(&svcs);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "manager,name,state,pid,desc");
+        assert_eq!(lines[1], "systemd,nginx.service,active/running,7,web server");
+        // not running: empty pid field
+        assert!(
+            csv.lines()
+                .any(|l| l == "systemd,alpha.service,failed,,broken"),
+            "{csv}"
+        );
+
+        let md = render_services_markdown(&svcs);
+        assert!(md.starts_with("| MANAGER | NAME | STATE | PID | DESCRIPTION |"));
+        assert!(md.contains("| 7 |"), "{md}");
+    }
+
+    fn sock(
+        proto: &str,
+        local: &str,
+        lport: u16,
+        peer: Option<(&str, u16)>,
+        state: &str,
+        pid: Option<i32>,
+    ) -> crate::model::Socket {
+        crate::model::Socket {
+            proto: proto.into(),
+            local_addr: local.into(),
+            local_port: lport,
+            peer_addr: peer.map(|(a, _)| a.to_string()),
+            peer_port: peer.map(|(_, p)| p),
+            state: state.into(),
+            pid,
+        }
+    }
+
+    #[test]
+    fn conns_drop_listen_attribute_loopback_peers_and_sort_ownerless_last() {
+        let sockets = vec![
+            // a loopback request/response pair + its listener
+            sock("tcp", "127.0.0.1", 52000, Some(("127.0.0.1", 8080)), "ESTABLISHED", Some(100)),
+            sock("tcp", "127.0.0.1", 8080, Some(("127.0.0.1", 52000)), "ESTABLISHED", Some(200)),
+            sock("tcp", "127.0.0.1", 8080, None, "LISTEN", Some(200)),
+            // a remote connection and an ownerless time-wait leftover
+            sock("tcp", "10.0.0.5", 33976, Some(("8.8.8.8", 443)), "ESTABLISHED", Some(100)),
+            sock("tcp", "10.0.0.5", 40001, Some(("8.8.8.8", 443)), "TIME_WAIT", None),
+        ];
+        let procs = vec![proc(100, "curl", None, None), proc(200, "nginx", None, None)];
+        let rows = collect_conns(&sockets, &procs);
+        // LISTEN dropped: 4 rows
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        // both ends of the loopback pair attributed to each other
+        let client = rows.iter().find(|r| r.local.contains(":52000")).unwrap();
+        assert_eq!(client.owner, "curl (pid 100)");
+        assert_eq!(client.peer_pid, Some(200));
+        assert_eq!(client.peer_owner, "nginx (pid 200)");
+        let server = rows.iter().find(|r| r.local.contains(":8080")).unwrap();
+        assert_eq!(server.peer_pid, Some(100));
+        // remote peer stays unattributed
+        let remote = rows.iter().find(|r| r.peer.contains("8.8.8.8:443") && r.pid == Some(100)).unwrap();
+        assert_eq!(remote.peer_owner, "");
+        // ownerless rows sort last
+        assert_eq!(rows.last().unwrap().owner, "");
+        // don't attribute to yourself: a socket pair within one pid stays quiet
+        let solo = collect_conns(
+            &[sock(
+                "tcp",
+                "127.0.0.1",
+                9000,
+                Some(("127.0.0.1", 9001)),
+                "ESTABLISHED",
+                Some(100),
+            )],
+            &procs,
+        );
+        assert_eq!(solo[0].peer_owner, "");
+
+        let p = Painter::new(false);
+        assert!(render_conns(&[], &p).contains("no connections"));
+        let table = render_conns(&rows, &p);
+        assert!(table.contains("PROTO") && table.contains("OWNER"));
+        assert!(table.contains("↔ nginx (pid 200)"), "{table}");
+
+        let csv = render_conns_csv(&rows);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "proto,local,peer,state,pid,owner,peer_pid,peer_owner");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(":52000") && l.ends_with(",200,nginx (pid 200)")),
+            "{csv}"
+        );
+
+        let md = render_conns_markdown(&rows);
+        assert!(md.starts_with("| PROTO | LOCAL | PEER | STATE | PID | OWNER | PEER OWNER |"));
+        assert!(md.contains("| nginx (pid 200) |"), "{md}");
     }
 
     #[test]

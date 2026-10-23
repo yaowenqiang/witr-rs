@@ -1,7 +1,9 @@
 //! `--serve [HOST]:PORT`: a Prometheus text-format endpoint (/metrics) and
 //! a small JSON API — /api/ps (process table), /api/ports (listeners),
-//! /api/tree (nested forest), /api/top?metric=&n= (ranked slice), all in
-//! the same versioned envelopes the CLI prints. Every scrape samples the
+//! /api/tree (nested forest), /api/top?metric=&n= (ranked slice),
+//! /api/services (service-manager units), /api/conns (sockets outside
+//! LISTEN with owner + loopback peer attribution), all in the same
+//! versioned envelopes the CLI prints. Every scrape samples the
 //! process table fresh — no background
 //! sampler, no interval to tune; scrape frequency IS the sample rate.
 //!
@@ -188,6 +190,24 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
     out
 }
 
+/// Parse the /api/top query string: `metric=` and `n=` params, defaults
+/// cpu / 10, n clamped to 1..=500 (unknown params ignored, a bad n falls
+/// back to 10 — same leniency as the CLI's defaults).
+fn parse_top_query(query: &str) -> (String, usize) {
+    let mut metric = "cpu".to_string();
+    let mut n: usize = 10;
+    for kv in query.split('&').filter(|s| !s.is_empty()) {
+        if let Some((k, v)) = kv.split_once('=') {
+            match k {
+                "metric" => metric = v.to_string(),
+                "n" => n = v.parse().unwrap_or(10),
+                _ => {}
+            }
+        }
+    }
+    (metric, n.clamp(1, 500))
+}
+
 /// Self-monitoring counters (process-global — each connection thread bumps
 /// them around its scrape).
 static SCRAPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -270,35 +290,86 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
                 );
                 return;
             }
-            // /api/top?metric=cpu|mem|fd|age&n=N: a ranked slice of the
+            // /api/services: the service manager's units — the `--services`
+            // listing as JSON (running units first, same order the CLI prints)
+            if path == "/api/services" || path.starts_with("/api/services?") {
+                let mut svcs = crate::platform::enumerate_services();
+                crate::render::sort_services(&mut svcs);
+                let doc = serde_json::json!({
+                    "schema_version": crate::SCHEMA_VERSION,
+                    "generated_at": crate::util::now_unix(),
+                    "service_count": svcs.len(),
+                    "services": svcs,
+                });
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    &serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()),
+                );
+                return;
+            }
+            // /api/conns: every socket outside LISTEN, owners resolved and
+            // loopback peers attributed — the `--conns` board as JSON
+            if path == "/api/conns" || path.starts_with("/api/conns?") {
+                let platform = crate::platform::get();
+                let procs = platform.list_processes().unwrap_or_default();
+                let socks = platform.list_all_sockets().unwrap_or_default();
+                let rows = crate::render::collect_conns(&socks, &procs);
+                let doc = serde_json::json!({
+                    "schema_version": crate::SCHEMA_VERSION,
+                    "generated_at": crate::util::now_unix(),
+                    "connection_count": rows.len(),
+                    "connections": rows,
+                });
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    &serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()),
+                );
+                return;
+            }
+            // /api/top?metric=cpu|mem|fd|age|io|io-rate&n=N: a ranked slice of the
             // process table — the `--top` view over HTTP. One entry per
             // process ({pid, name, user, value}); value's unit follows the
             // metric (percent / bytes / count / seconds).
             if path == "/api/top" || path.starts_with("/api/top?") {
-                let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-                let mut metric = "cpu".to_string();
-                let mut n: usize = 10;
-                for kv in query.split('&').filter(|s| !s.is_empty()) {
-                    if let Some((k, v)) = kv.split_once('=') {
-                        match k {
-                            "metric" => metric = v.to_string(),
-                            "n" => n = v.parse().unwrap_or(10),
-                            _ => {}
-                        }
-                    }
-                }
-                n = n.clamp(1, 500);
-                if !matches!(metric.as_str(), "cpu" | "mem" | "fd" | "age") {
+                let (metric, n) = parse_top_query(
+                    path.split_once('?').map(|(_, q)| q).unwrap_or(""),
+                );
+                if !matches!(
+                    metric.as_str(),
+                    "cpu" | "mem" | "fd" | "age" | "io" | "io-rate"
+                ) {
                     respond(
                         &mut stream,
                         "400 Bad Request",
                         "text/plain",
-                        "metric must be one of: cpu, mem, fd, age\n",
+                        "metric must be one of: cpu, mem, fd, age, io, io-rate\n",
                     );
                     return;
                 }
                 let platform = crate::platform::get();
-                let procs = platform.list_processes().unwrap_or_default();
+                let mut procs = platform.list_processes().unwrap_or_default();
+                // the io metrics rank enriched counters — paid only when asked
+                if matches!(metric.as_str(), "io" | "io-rate") {
+                    platform.enrich_listing(&mut procs);
+                }
+                // io-rate is a delta metric: two enriched samples one second
+                // apart turn the cumulative counters into bytes/s (the CLI's
+                // one-shot --top io-rate works the same way)
+                let rates = if metric == "io-rate" {
+                    let mut hist = crate::history::History::new();
+                    let _ = hist.update(&procs);
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let mut again = platform.list_processes().unwrap_or_default();
+                    platform.enrich_listing(&mut again);
+                    let _ = hist.update(&again);
+                    Some(hist)
+                } else {
+                    None
+                };
                 let fd_map = if metric == "fd" {
                     platform.fd_counts()
                 } else {
@@ -324,6 +395,17 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
                             .as_ref()
                             .and_then(|m| m.get(&p.pid))
                             .map(|v| serde_json::json!(v)),
+                        // cumulative read+write bytes; zero-IO processes stay
+                        // out of the ranking rather than pinning the top
+                        "io" => {
+                            let r = p.io_read_bytes.unwrap_or(0);
+                            let w = p.io_write_bytes.unwrap_or(0);
+                            (r + w > 0).then(|| serde_json::json!(r + w))
+                        }
+                        "io-rate" => rates
+                            .as_ref()
+                            .and_then(|h| h.io_rate_of(p.pid))
+                            .map(|(r, w)| serde_json::json!(r + w)),
                         _ => p
                             .started
                             .map(|t| serde_json::json!(crate::util::now_unix() - t)),
@@ -373,7 +455,7 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
                         &mut stream,
                         "200 OK",
                         "text/plain; charset=utf-8",
-                        "witr-rs: /metrics (Prometheus) · /api/ps (process table) · /api/ports (listeners) · /api/tree (forest) · /api/top?metric=cpu|mem|fd|age&n=N (rankings)\n",
+                        "witr-rs: /metrics (Prometheus) · /api/ps (process table) · /api/ports (listeners) · /api/conns (connections) · /api/tree (forest) · /api/top?metric=cpu|mem|fd|age|io|io-rate&n=N (rankings) · /api/services (service units)\n",
                     ),
                     _ => respond(&mut stream, "404 Not Found", "text/plain", "not found\n"),
                 }
@@ -420,6 +502,17 @@ mod tests {
     #[test]
     fn label_escape_follows_prometheus_rules() {
         assert_eq!(label_escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[test]
+    fn top_query_defaults_ignores_unknown_and_clamps_n() {
+        assert_eq!(parse_top_query(""), ("cpu".into(), 10));
+        assert_eq!(parse_top_query("metric=age"), ("age".into(), 10));
+        assert_eq!(parse_top_query("metric=io-rate&n=25"), ("io-rate".into(), 25));
+        assert_eq!(parse_top_query("n=9999"), ("cpu".into(), 500));
+        assert_eq!(parse_top_query("n=0"), ("cpu".into(), 1));
+        assert_eq!(parse_top_query("n=bad&metric=mem"), ("mem".into(), 10));
+        assert_eq!(parse_top_query("foo=bar"), ("cpu".into(), 10));
     }
 
     #[test]

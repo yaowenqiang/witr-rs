@@ -334,6 +334,8 @@ struct TuiApp {
     alert_mem_pct: Option<u64>,
     /// --alert-count: machine-wide visible-process-count threshold
     alert_count: Option<u32>,
+    /// --alert-disk: machine-wide fullest-mount used-percent threshold
+    alert_disk: Option<u64>,
     /// streak/firing state for the machine-wide alerts
     sys_alert: crate::history::SysAlertState,
     /// --alert-exec: shell command per alert firing (context in env vars)
@@ -476,6 +478,8 @@ pub struct Seed {
     pub alert_mem_pct: Option<u64>,
     /// --alert-count: machine-wide visible-process-count threshold
     pub alert_count: Option<u32>,
+    /// --alert-disk: machine-wide used-percent threshold over local mounts
+    pub alert_disk: Option<u64>,
     /// --alert-exec: shell command run on every threshold-alert firing;
     /// context exported as WITR_ALERT_PID/NAME/DETAIL
     pub alert_exec: Option<String>,
@@ -647,6 +651,7 @@ impl TuiApp {
             alert_load: seed.alert_load,
             alert_mem_pct: seed.alert_mem_pct,
             alert_count: seed.alert_count,
+            alert_disk: seed.alert_disk,
             sys_alert: crate::history::SysAlertState::default(),
             alert_exec: seed.alert_exec.clone(),
             alert_state: HashMap::new(),
@@ -880,17 +885,28 @@ impl TuiApp {
                     &mut self.port_owner,
                 ));
             }
-            if self.alert_load.is_some() || self.alert_mem_pct.is_some() || self.alert_count.is_some() {
-                // --alert-load / --alert-mem-pct / --alert-count: sample the
-                // whole machine when armed (macOS's vm_stat spawn is paid
-                // only when watched)
+            if self.alert_load.is_some()
+                || self.alert_mem_pct.is_some()
+                || self.alert_count.is_some()
+                || self.alert_disk.is_some()
+            {
+                // --alert-load / --alert-mem-pct / --alert-count /
+                // --alert-disk: sample the whole machine when armed (macOS's
+                // vm_stat / df spawns are paid only when watched)
                 if let Some(stats) = self.platform.system_stats() {
                     let interval = self.refresh.max(Duration::from_secs(1)).as_secs();
+                    let mounts = if self.alert_disk.is_some() {
+                        self.platform.mount_usage()
+                    } else {
+                        Vec::new()
+                    };
                     let limits = crate::history::SysAlertLimits {
                         load: self.alert_load,
                         mem_pct: self.alert_mem_pct,
                         count: self.alert_count,
                         proc_count: self.procs.len(),
+                        mounts,
+                        disk_pct: self.alert_disk,
                         repeat: self.alert_repeat,
                     };
                     picks.extend(
@@ -8156,6 +8172,7 @@ mod tests {
                 alert_load: None,
                 alert_mem_pct: None,
                 alert_count: None,
+                alert_disk: None,
                 replay_follow: None,
                 notes: Vec::new(),
             },

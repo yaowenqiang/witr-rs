@@ -1,0 +1,36 @@
+name: ci
+
+# Regression gate for every push and PR — the release workflow only runs on
+# v* tags, so without this nothing is tested until someone releases. The
+# two cross-target checks keep all three platform modules type-validating
+# from one host (the reason they carry explicit non-native stubs).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: x86_64-unknown-linux-musl,x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Clippy (zero warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      # type-check the platform modules for the other hosts (no linking)
+      - name: Cross-target checks
+        run: |
+          cargo check --target x86_64-unknown-linux-musl
+          cargo check --target x86_64-pc-windows-msvc

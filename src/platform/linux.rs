@@ -224,7 +224,10 @@ fn parse_uid_from_status(raw: &str) -> Option<u32> {
 }
 
 fn socket_state_name(st: &str, proto: &str) -> String {
-    match (proto, st) {
+    // /proc/net/tcp6 carries the same state codes as tcp — strip the
+    // family suffix so the map covers both; otherwise every tcp6 state
+    // (LISTEN included) falls through to the udp catch-all.
+    match (proto.strip_suffix('6').unwrap_or(proto), st) {
         ("tcp", "01") => "ESTABLISHED".into(),
         ("tcp", "02") => "SYN_SENT".into(),
         ("tcp", "03") => "SYN_RECV".into(),
@@ -1317,6 +1320,20 @@ fn hup_bit(hex: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_state_names_cover_both_address_families() {
+        // tcp6 shares tcp's state codes; before the family-strip, every
+        // tcp6 socket (LISTEN included) fell through to "UNCONNECTED"
+        assert_eq!(socket_state_name("0A", "tcp"), "LISTEN");
+        assert_eq!(socket_state_name("0A", "tcp6"), "LISTEN");
+        assert_eq!(socket_state_name("01", "tcp6"), "ESTABLISHED");
+        assert_eq!(socket_state_name("06", "tcp6"), "TIME_WAIT");
+        // unknown tcp code keeps the raw hex; udp families stay UNCONNECTED
+        assert_eq!(socket_state_name("FF", "tcp6"), "0xFF");
+        assert_eq!(socket_state_name("01", "udp"), "UNCONNECTED");
+        assert_eq!(socket_state_name("01", "udp6"), "UNCONNECTED");
+    }
 
     #[test]
     fn stat_parse() {

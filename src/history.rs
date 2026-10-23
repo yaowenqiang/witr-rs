@@ -106,17 +106,25 @@ pub struct SysAlertState {
     pub count_streak: u32,
     pub count_firing: bool,
     pub count_fired_secs: u32,
+    pub disk_streak: u32,
+    pub disk_firing: bool,
+    pub disk_fired_secs: u32,
 }
 
 /// The armed machine-wide alert thresholds plus the inputs they compare
 /// against — one bundle so [`system_alert_picks`] stays readable. Fields
 /// left `None` are disarmed; `proc_count` is only read when `count` is
-/// armed.
+/// armed and `mounts` only when `disk_pct` is.
 pub struct SysAlertLimits {
     pub load: Option<f64>,
     pub mem_pct: Option<u64>,
     pub count: Option<u32>,
     pub proc_count: usize,
+    /// One device-backed mount sweep — only fetched when `disk_pct` is
+    /// armed (the df subprocess is paid by watchers, not everyone).
+    pub mounts: Vec<crate::platform::MountUsage>,
+    /// --alert-disk: fire when any mount's used percent exceeds this.
+    pub disk_pct: Option<u64>,
     pub repeat: Option<u64>,
 }
 
@@ -135,8 +143,16 @@ pub fn system_alert_picks(
         mem_pct: mem_pct_limit,
         count: count_limit,
         proc_count,
+        mounts,
+        disk_pct: disk_pct_limit,
         repeat: repeat_secs,
-    } = *limits;
+    } = limits;
+    let load_limit = *load_limit;
+    let mem_pct_limit = *mem_pct_limit;
+    let count_limit = *count_limit;
+    let proc_count = *proc_count;
+    let disk_pct_limit = *disk_pct_limit;
+    let repeat_secs = *repeat_secs;
     let mut out = Vec::new();
     if let Some(limit) = load_limit {
         let now = stats.load1;
@@ -197,6 +213,40 @@ pub fn system_alert_picks(
                 "system".to_string(),
                 format!(
                     "{proc_count} visible processes above {limit} for {}s",
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+            ));
+        }
+    }
+    if let Some(limit) = disk_pct_limit {
+        // the fullest mounts first, capped at three in the detail line —
+        // the message is a pointer, not a report
+        let mut over_mounts: Vec<(u64, &crate::platform::MountUsage)> = mounts
+            .iter()
+            .filter(|m| m.total_mb > 0)
+            .map(|m| ((m.used_mb * 100) / m.total_mb, m))
+            .filter(|(pct, _)| *pct > limit)
+            .collect();
+        over_mounts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.target.cmp(&b.1.target)));
+        let over = !over_mounts.is_empty();
+        if alert_cycle_repeat(
+            &mut state.disk_streak,
+            &mut state.disk_firing,
+            over,
+            &mut state.disk_fired_secs,
+            repeat_secs,
+            interval_secs,
+        ) {
+            let worst: Vec<String> = over_mounts
+                .iter()
+                .take(3)
+                .map(|(pct, m)| format!("{} {pct}%", m.target))
+                .collect();
+            out.push((
+                "system".to_string(),
+                format!(
+                    "disk {} above {limit}% for {}s",
+                    worst.join(", "),
                     ALERT_CYCLES as u64 * interval_secs.max(1)
                 ),
             ));
@@ -1153,6 +1203,8 @@ mod tests {
             mem_pct,
             count,
             proc_count,
+            mounts: Vec::new(),
+            disk_pct: None,
             repeat: None,
         };
         assert!(
@@ -1197,6 +1249,8 @@ mod tests {
             mem_pct: None,
             count,
             proc_count,
+            mounts: Vec::new(),
+            disk_pct: None,
             repeat: None,
         };
         // 5 visible, limit 10 → under, never fires
@@ -1217,6 +1271,56 @@ mod tests {
         for _ in 0..ALERT_CYCLES {
             system_alert_picks(&s, &mut state, &limits(Some(10), 5), 3);
         }
+    }
+
+    #[test]
+    fn system_alert_fires_on_full_disk_and_names_the_worst_mount() {
+        let s = crate::platform::SystemStats::default();
+        let mount = |target: &str, used: u64, total: u64| crate::platform::MountUsage {
+            target: target.into(),
+            total_mb: total,
+            used_mb: used,
+        };
+        let limits = |disk_pct: Option<u64>, mounts: Vec<crate::platform::MountUsage>| {
+            SysAlertLimits {
+                load: None,
+                mem_pct: None,
+                count: None,
+                proc_count: 0,
+                mounts,
+                disk_pct,
+                repeat: None,
+            }
+        };
+        // no mount sweeps in (never fetched) → nothing to compare, no fire
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(system_alert_picks(&s, &mut state, &limits(Some(90), Vec::new()), 3).is_empty());
+        }
+        // 80% used, limit 90 → under, never fires
+        let mut state = SysAlertState::default();
+        let under = vec![mount("/", 800, 1000)];
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                system_alert_picks(&s, &mut state, &limits(Some(90), under.clone()), 3).is_empty()
+            );
+        }
+        // two mounts over the line: fires after the cycle, worst first,
+        // both named
+        let over = vec![mount("/", 950, 1000), mount("/data", 990, 1000)];
+        let mut fires = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            fires = system_alert_picks(&s, &mut state, &limits(Some(90), over.clone()), 3);
+        }
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].0, "system");
+        assert!(
+            fires[0].1.contains("disk /data 99%, / 95% above 90%"),
+            "{}",
+            fires[0].1
+        );
+        // latched: no repeat without --alert-repeat
+        assert!(system_alert_picks(&s, &mut state, &limits(Some(90), over), 3).is_empty());
     }
 
     #[test]

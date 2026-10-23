@@ -365,8 +365,8 @@ pub struct Cli {
     #[arg(
         long,
         help = t(
-            "列出全部僵尸进程（state Z）及其父进程——谁的锅一眼可见。发现僵尸退出码 1，干净则 0，脚本可直接判断。属于无目标操作；--json 出版本化信封",
-            "List every zombie process (state Z) with its parent — whose fault it is, at a glance. Exit 1 when any zombie exists, 0 when clean, so scripts can branch. A no-target operation; --json emits the versioned envelope"
+            "列出全部僵尸进程（state Z）及其父进程——谁的锅一眼可见。发现僵尸退出码 1，干净则 0，脚本可直接判断。属于无目标操作；--csv / --markdown / --json 同样支持",
+            "List every zombie process (state Z) with its parent — whose fault it is, at a glance. Exit 1 when any zombie exists, 0 when clean, so scripts can branch. A no-target operation; --csv / --markdown / --json work too"
         )
     )]
     pub zombies: bool,
@@ -374,11 +374,29 @@ pub struct Cli {
     #[arg(
         long,
         help = t(
-            "列出全系统当前持有的文件锁（持锁进程 / 模式 / 文件路径）——“哪个进程锁着这个文件”一条命令。属于无目标操作；--json 出版本化信封",
-            "List every file lock currently held system-wide (holder / mode / file path) — \"which process locks this file\" in one command. A no-target operation; --json emits the versioned envelope"
+            "列出全系统当前持有的文件锁（持锁进程 / 模式 / 文件路径）——“哪个进程锁着这个文件”一条命令。属于无目标操作；--csv / --markdown / --json 同样支持",
+            "List every file lock currently held system-wide (holder / mode / file path) — \"which process locks this file\" in one command. A no-target operation; --csv / --markdown / --json work too"
         )
     )]
     pub locks: bool,
+
+    #[arg(
+        long,
+        help = t(
+            "列出服务管理器当前的单元（Linux systemd / macOS launchd / Windows SCM 服务）：管理器 / 名称 / 状态 / 主 pid / 描述。Services 页（6）的 CLI 孪生。属于无目标操作；--csv / --markdown / --json 同样支持",
+            "List the service manager's current units (Linux systemd / macOS launchd / Windows SCM services): manager / name / state / main pid / description. The Services tab's (6) CLI twin. A no-target operation; --csv / --markdown / --json work too"
+        )
+    )]
+    pub services: bool,
+
+    #[arg(
+        long,
+        help = t(
+            "列出全机的网络连接（LISTEN 之外的所有状态：ESTABLISHED / TIME_WAIT / …）——本地地址 / 对端 / 状态 / 属主进程；回环对端自动归因到本机另一端的进程。--ports 的镜像面。属于无目标操作；--csv / --markdown / --json / --watch 同样支持",
+            "List the machine's network connections (every state except LISTEN: ESTABLISHED / TIME_WAIT / ...) — local / peer / state / owning process; loopback peers are attributed to the local process on the other end. The mirror of --ports. A no-target operation; --csv / --markdown / --json / --watch work too"
+        )
+    )]
+    pub conns: bool,
 
     #[arg(
         long,
@@ -598,6 +616,16 @@ pub struct Cli {
         )
     )]
     pub alert_count: Option<u32>,
+
+    #[arg(
+        long = "alert-disk",
+        value_name = "PCT",
+        help = t(
+            "整机告警：任一本地磁盘的已用百分比连续 5 次采样（约 15s）超过该值时触发——磁盘写满之前喊一嗓子，详情列出最满的挂载点。TUI 和 --watch",
+            "Machine-wide alert: fire when any local disk's used percent exceeds this value for 5 consecutive samples (~15s) — a shout before the disk fills; the detail names the fullest mounts. TUI and --watch"
+        )
+    )]
+    pub alert_disk: Option<u64>,
 
     #[arg(
         long = "alert-port",
