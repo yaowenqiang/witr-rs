@@ -8542,7 +8542,11 @@ mod tests {
         });
         app.conn_counts = counts;
         for _ in 0..ALERT_CYCLES - 1 {
-            assert!(app.alert_picks().is_empty(), "no fire before the streak");
+            let picks = app.alert_picks();
+            assert!(
+                picks.is_empty(),
+                "no fire before the streak (cycles={ALERT_CYCLES}): {picks:?}"
+            );
         }
         let fired = app.alert_picks();
         assert_eq!(fired.len(), 1, "{fired:?}");
