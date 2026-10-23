@@ -23,8 +23,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # debug, not --release: profile.release carries fat LTO and the
+      # release *test*-binary link OOM-kills rustc on memory-capped runners
+      # (SIGKILL in under a minute, both on a 1GB box and in CI). The
+      # assertions are identical; the release workflow builds the real
+      # fat-LTO artifact per target on tags.
       - name: Test
-        run: cargo test --release
+        run: cargo test
 
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets -- -D warnings

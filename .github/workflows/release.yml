@@ -49,9 +49,14 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # the gate runs in debug: profile.release carries fat LTO and the
+      # release *test*-binary link OOM-kills rustc on memory-capped runners
+      # (SIGKILL in under a minute, both on a 1GB box and in CI). The
+      # assertions are identical; the Build step below still exercises the
+      # real fat-LTO release link per target.
       - name: Tests (linux x86_64 gate)
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: cargo test --release
+        run: cargo test
 
       - name: Build
         shell: bash
