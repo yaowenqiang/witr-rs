@@ -8528,6 +8528,10 @@ mod tests {
         assert_eq!(counts.get(&8), Some(&1));
         assert!(!counts.contains_key(&7));
 
+        // new() runs an initial refresh(), so on a low-pid host the table
+        // already holds a real pid 9 (e.g. kworker) — clear it or the
+        // pushed row below shares pid 9's alert track and doubles every
+        // streak increment
         let mut app = TuiApp::new(
             crate::platform::get(),
             Seed {
@@ -8535,6 +8539,7 @@ mod tests {
                 ..Seed::default()
             },
         );
+        app.procs.clear();
         app.procs.push(crate::model::Process {
             pid: 9,
             name: "chatty".into(),

@@ -10,12 +10,6 @@ on:
     branches: [main]
   pull_request:
 
-# contents: write lets the failure path append the captured test log to the
-# ci-logs branch — the one place readable without repo-admin API access
-# (raw logs, job summaries and artifacts are all sign-in-gated).
-permissions:
-  contents: write
-
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -30,11 +24,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # debug, not --release: profile.release carries fat LTO and the
-      # release *test*-binary link OOM-kills rustc on memory-capped runners
-      # (SIGKILL in under a minute, both on a 1GB box and in CI). The
-      # assertions are identical; the release workflow builds the real
-      # fat-LTO artifact per target on tags. Tee the log so a failure can
-      # be diagnosed from the step below without repo-admin API access.
+      # release *test*-binary link OOM-kills rustc on memory-capped hosts
+      # (reproduced on a 1GB box). The assertions are identical; the
+      # release workflow builds the real fat-LTO artifact per target on
+      # tags. Tee the log so a failure can be diagnosed from the steps
+      # below without repo-admin API access.
       - name: Test
         run: |
           set -o pipefail
@@ -65,35 +59,6 @@ jobs:
           name: test-log
           path: /tmp/test-log.txt
           if-no-files-found: ignore
-
-      - name: Persist test log to ci-logs branch
-        if: failure()
-        run: |
-          set -e
-          git config user.name "witr-ci-bot"
-          git config user.email "actions@users.noreply.github.com"
-          if git ls-remote --exit-code origin ci-logs >/dev/null 2>&1; then
-            git fetch --depth=1 origin ci-logs
-            git checkout -B ci-logs FETCH_HEAD
-          else
-            git checkout --orphan ci-logs
-            git rm -rf --cached . -q
-          fi
-          mkdir -p logs
-          {
-            echo "run: ${{ github.run_id }}  sha: ${{ github.sha }}"
-            echo
-            echo '$ nproc'; nproc
-            echo '$ free -h'; free -h
-            echo '$ df -h /'; df -h /
-            echo '$ rustc/cargo'; rustc --version || true; cargo --version || true
-            echo
-            echo '== cargo test log =='
-            cat /tmp/test-log.txt
-          } > "logs/run-${{ github.run_id }}.txt"
-          git add logs
-          git commit -m "ci: test log for run ${{ github.run_id }}"
-          git push origin ci-logs
 
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets -- -D warnings
