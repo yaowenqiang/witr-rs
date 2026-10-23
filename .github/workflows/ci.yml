@@ -27,9 +27,38 @@ jobs:
       # release *test*-binary link OOM-kills rustc on memory-capped runners
       # (SIGKILL in under a minute, both on a 1GB box and in CI). The
       # assertions are identical; the release workflow builds the real
-      # fat-LTO artifact per target on tags.
+      # fat-LTO artifact per target on tags. Tee the log so a failure can
+      # be diagnosed from the step below without repo-admin API access.
       - name: Test
-        run: cargo test
+        run: |
+          set -o pipefail
+          cargo test 2>&1 | tee /tmp/test-log.txt
+
+      - name: Failure diagnostics
+        if: failure()
+        run: |
+          {
+            echo "## CI failure diagnostics"
+            echo '```'
+            echo '$ nproc'; nproc
+            echo '$ free -h'; free -h
+            echo '$ df -h /'; df -h /
+            echo '$ rustc --version'; rustc --version || true
+            echo '$ cargo --version'; cargo --version || true
+            echo '```'
+            echo "## test log (last 200 lines)"
+            echo '```'
+            tail -n 200 /tmp/test-log.txt 2>/dev/null || echo "(no test log captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: /tmp/test-log.txt
+          if-no-files-found: ignore
 
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets -- -D warnings
