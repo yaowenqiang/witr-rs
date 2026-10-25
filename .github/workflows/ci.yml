@@ -37,6 +37,11 @@ jobs:
       - name: Failure diagnostics
         if: failure()
         run: |
+          # failing test names as check annotations — the annotations API is
+          # anonymously readable, unlike logs and artifacts
+          awk '/^failures:$/{f=1;next} f&&/^    /{sub(/^ +/,"");print} f&&/^$/{f=0}' /tmp/test-log.txt 2>/dev/null \
+            | sort -u | head -n 20 \
+            | while read -r t; do echo "::error title=failing test::$t"; done
           {
             echo "## CI failure diagnostics"
             echo '```'

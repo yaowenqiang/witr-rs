@@ -116,6 +116,9 @@ pub struct SysAlertState {
     pub net_streak: u32,
     pub net_firing: bool,
     pub net_fired_secs: u32,
+    pub psi_streak: u32,
+    pub psi_firing: bool,
+    pub psi_fired_secs: u32,
 }
 
 /// The armed machine-wide alert thresholds plus the inputs they compare
@@ -139,6 +142,9 @@ pub struct SysAlertLimits {
     /// [`machine_net_rate`] just before this call. `None` (first sample or
     /// counters unreadable) disarms the check for that tick.
     pub net_rate: Option<f64>,
+    /// --alert-psi threshold in percent: fire when any resource's PSI full
+    /// stall (avg10) exceeds it. Disarmed when the platform reports no PSI.
+    pub psi_limit: Option<f64>,
     pub repeat: Option<u64>,
 }
 
@@ -181,6 +187,7 @@ pub fn system_alert_picks(
         disk_pct: disk_pct_limit,
         net_limit: net_limit_opt,
         net_rate: net_rate_opt,
+        psi_limit: psi_limit_opt,
         repeat: repeat_secs,
     } = limits;
     let load_limit = *load_limit;
@@ -190,6 +197,7 @@ pub fn system_alert_picks(
     let disk_pct_limit = *disk_pct_limit;
     let net_limit = *net_limit_opt;
     let net_rate = *net_rate_opt;
+    let psi_limit = *psi_limit_opt;
     let repeat_secs = *repeat_secs;
     let mut out = Vec::new();
     if let Some(limit) = load_limit {
@@ -309,6 +317,46 @@ pub fn system_alert_picks(
             ));
         }
     }
+    if let Some(limit) = psi_limit {
+        // full stall on any resource — cpu has no full line (0), so this is
+        // really mem/io. detail names the resources over the line.
+        let over_resources: Vec<(&str, f64)> = stats
+            .psi
+            .as_ref()
+            .map(|p| {
+                [
+                    ("cpu", p.cpu_full),
+                    ("mem", p.mem_full),
+                    ("io", p.io_full),
+                ]
+                .into_iter()
+                .filter(|(_, v)| *v > limit)
+                .collect()
+            })
+            .unwrap_or_default();
+        let over = !over_resources.is_empty();
+        if alert_cycle_repeat(
+            &mut state.psi_streak,
+            &mut state.psi_firing,
+            over,
+            &mut state.psi_fired_secs,
+            repeat_secs,
+            interval_secs,
+        ) {
+            let named: Vec<String> = over_resources
+                .iter()
+                .map(|(r, v)| format!("{r} {v:.1}%"))
+                .collect();
+            out.push((
+                "system".to_string(),
+                format!(
+                    "PSI full {} above {limit}% for {}s",
+                    named.join(", "),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+            ));
+        }
+    }
     out
 }
 
@@ -336,6 +384,11 @@ struct RestartState {
     total: u32,
     events: Vec<Instant>,
     last_seen: Option<Instant>,
+    /// argv of the last pid under this identity — a restart that changed
+    /// its command line (or env, when both sides sampled it) says so in
+    /// the event detail
+    last_cmdline: Option<Vec<String>>,
+    last_env: Option<Vec<(String, String)>>,
 }
 
 /// One thing that happened while the TUI watched the system: a process
@@ -645,20 +698,43 @@ impl History {
                 rs.events.push(now);
             }
             let total = rs.total;
+            let argv_changed = is_restart
+                && match (&rs.last_cmdline, &p.cmdline) {
+                    (Some(old), new) if !new.is_empty() => old != new,
+                    _ => false,
+                };
+            let env_changed = is_restart
+                && matches!((&rs.last_env, &p.env), (Some(old), Some(new)) if old != new);
             rs.last_pid = p.pid;
             rs.last_seen = Some(now);
+            if !p.cmdline.is_empty() {
+                rs.last_cmdline = Some(p.cmdline.clone());
+            }
+            if p.env.is_some() {
+                rs.last_env = p.env.clone();
+            }
 
             // appear / restart events for the Events tab
             match self.prev_seen.remove(&p.pid) {
                 Some(_) => {}
-                None if is_restart => event(
-                    self,
-                    &mut fresh,
-                    "restarted",
-                    p.pid,
-                    &p.name,
-                    format!("came back after exiting ({total} restarts total)"),
-                ),
+                None if is_restart => {
+                    let mut detail =
+                        format!("came back after exiting ({total} restarts total)");
+                    if argv_changed {
+                        let argv: String = p
+                            .command_line()
+                            .chars()
+                            .take(100)
+                            .collect();
+                        detail = format!(
+                            "{detail} — argv changed to `{argv}`"
+                        );
+                    }
+                    if env_changed {
+                        detail.push_str(" — env changed");
+                    }
+                    event(self, &mut fresh, "restarted", p.pid, &p.name, detail);
+                }
                 None => event(self, &mut fresh, "started", p.pid, &p.name, String::new()),
             }
         }
@@ -1264,6 +1340,7 @@ mod tests {
             disk_pct: None,
             net_limit: None,
             net_rate: None,
+            psi_limit: None,
             repeat: None,
         };
         assert!(
@@ -1312,6 +1389,7 @@ mod tests {
             disk_pct: None,
             net_limit: None,
             net_rate: None,
+            psi_limit: None,
             repeat: None,
         };
         // 5 visible, limit 10 → under, never fires
@@ -1352,6 +1430,7 @@ mod tests {
                 disk_pct,
                 net_limit: None,
                 net_rate: None,
+                psi_limit: None,
                 repeat: None,
             }
         };
@@ -1395,7 +1474,7 @@ mod tests {
         assert_eq!(machine_net_rate((0, 0), &mut state), Some(0.0));
 
         let s = crate::platform::SystemStats::default();
-        let limits = |net_limit: Option<u64>, net_rate: Option<f64>| SysAlertLimits {
+        let limits = |net_limit: Option<u64>, net_rate: Option<f64>, psi_limit: Option<f64>| SysAlertLimits {
             load: None,
             mem_pct: None,
             count: None,
@@ -1404,13 +1483,14 @@ mod tests {
             disk_pct: None,
             net_limit,
             net_rate,
+            psi_limit,
             repeat: None,
         };
         // first tick has no rate (None disarms) — even over the line
         let mut state = SysAlertState::default();
         for _ in 0..ALERT_CYCLES + 2 {
             assert!(
-                system_alert_picks(&s, &mut state, &limits(Some(10), None), 3).is_empty(),
+                system_alert_picks(&s, &mut state, &limits(Some(10), None, None), 3).is_empty(),
                 "no measurement → no fire"
             );
         }
@@ -1418,16 +1498,64 @@ mod tests {
         // samples, then one fire naming the rate and window
         let mut fires = Vec::new();
         for _ in 0..ALERT_CYCLES {
-            fires = system_alert_picks(&s, &mut state, &limits(Some(40), Some(50.0)), 3);
+            fires = system_alert_picks(&s, &mut state, &limits(Some(40), Some(50.0), None), 3);
         }
         assert_eq!(fires.len(), 1);
         assert_eq!(fires[0].0, "system");
         assert!(fires[0].1.contains("net 50.0 MB/s above 40"), "{}", fires[0].1);
         // latched; dropping back under re-arms
-        assert!(system_alert_picks(&s, &mut state, &limits(Some(40), Some(50.0)), 3).is_empty());
+        assert!(system_alert_picks(&s, &mut state, &limits(Some(40), Some(50.0), None), 3).is_empty());
         for _ in 0..ALERT_CYCLES {
-            assert!(system_alert_picks(&s, &mut state, &limits(Some(40), Some(5.0)), 3).is_empty());
+            assert!(system_alert_picks(&s, &mut state, &limits(Some(40), Some(5.0), None), 3).is_empty());
         }
+    }
+
+    #[test]
+    fn psi_full_stall_alert_fires_and_names_resources() {
+        // mem full-stall over the line; cpu/io quiet
+        let s = crate::platform::SystemStats {
+            psi: Some(crate::platform::PsiStats {
+                mem_full: 12.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let limits = |psi_limit: Option<f64>| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit,
+            repeat: None,
+        };
+        // no PSI report at all → silent even with the limit armed
+        let none = crate::platform::SystemStats::default();
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                system_alert_picks(&none, &mut state, &limits(Some(10.0)), 3).is_empty(),
+                "no measurement → no fire"
+            );
+        }
+        // 12% mem full over a 10% line: quiet for the arming samples, then
+        // one fire naming the resource
+        let mut fires = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            fires = system_alert_picks(&s, &mut state, &limits(Some(10.0)), 3);
+        }
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].0, "system");
+        assert!(
+            fires[0].1.contains("PSI full mem 12.0% above 10"),
+            "{}",
+            fires[0].1
+        );
+        // latched; repeat=None means one fire per excursion
+        assert!(system_alert_picks(&s, &mut state, &limits(Some(10.0)), 3).is_empty());
     }
 
     #[test]
@@ -1770,6 +1898,75 @@ mod tests {
         assert!(s.to_text().starts_with("Session summary (whole session): started 2"));
         // windowing math itself is pinned by summary_from_events (synthetic
         // timestamps); live events can't be backdated
+    }
+
+    #[test]
+    fn restart_events_report_changed_argv_and_env() {
+        let with_argv = |cmdline: &[&str], pid: Pid| {
+            let mut p = proc(pid, "/bin/worker", None);
+            p.cmdline = cmdline.iter().map(|s| s.to_string()).collect();
+            p
+        };
+        // same identity across pids; argv unchanged → plain restart detail
+        let mut h = History::new();
+        h.update(&[with_argv(&["worker", "-q"], 1)]);
+        h.update(&[]);
+        h.update(&[with_argv(&["worker", "-q"], 2)]);
+        let ev = h
+            .events
+            .iter()
+            .find(|e| e.kind == "restarted")
+            .expect("restart event");
+        assert!(
+            ev.detail.contains("(1 restarts total)") && !ev.detail.contains("argv"),
+            "{}",
+            ev.detail
+        );
+
+        // argv changed → the new command line rides the detail
+        let mut h = History::new();
+        h.update(&[with_argv(&["worker", "-q"], 1)]);
+        h.update(&[]);
+        h.update(&[with_argv(&["worker", "--daemon"], 2)]);
+        let ev = h
+            .events
+            .iter()
+            .find(|e| e.kind == "restarted")
+            .expect("restart event");
+        assert!(
+            ev.detail.contains("argv changed to `worker --daemon`"),
+            "{}",
+            ev.detail
+        );
+
+        // env compared only when both sides sampled it
+        let env_proc = |pid: Pid, flag: &str| {
+            let mut p = proc(pid, "/bin/worker", None);
+            p.env = Some(vec![("MODE".to_string(), flag.to_string())]);
+            p
+        };
+        let mut h = History::new();
+        h.update(&[env_proc(1, "a")]);
+        h.update(&[]);
+        h.update(&[env_proc(2, "b")]);
+        let ev = h
+            .events
+            .iter()
+            .find(|e| e.kind == "restarted")
+            .expect("restart event");
+        assert!(ev.detail.contains("env changed"), "{}", ev.detail);
+
+        // one side unsampled → no env claim
+        let mut h = History::new();
+        h.update(&[proc(1, "/bin/worker", None)]);
+        h.update(&[]);
+        h.update(&[env_proc(2, "a")]);
+        let ev = h
+            .events
+            .iter()
+            .find(|e| e.kind == "restarted")
+            .expect("restart event");
+        assert!(!ev.detail.contains("env"), "{}", ev.detail);
     }
 
     #[test]

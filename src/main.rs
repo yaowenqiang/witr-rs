@@ -298,6 +298,7 @@ fn top_procs(
                 cli::TopMetric::Age => {
                     p.started.map(|t| (util::now_unix().saturating_sub(t)) as f64)
                 }
+                cli::TopMetric::Gpu => p.gpu_sm_pct.map(|v| v as f64),
             }?;
             Some((v, p))
         })
@@ -617,7 +618,7 @@ impl RecordWriter {
         if !jsonl {
             writeln!(
                 f,
-                "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps,\
+                "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps,gpu_sm,\
                  sys_load1,sys_mem_pct,sys_procs,sys_net_bps"
             )?;
         }
@@ -654,6 +655,7 @@ impl RecordWriter {
                         "io_write_bps": (p.io_read_bytes.is_some()
                             || p.io_write_bytes.is_some())
                         .then_some(io_w),
+                        "gpu_sm_pct": p.gpu_sm_pct,
                     })
                 })
                 .collect();
@@ -695,7 +697,7 @@ impl RecordWriter {
                 .unwrap_or_default();
             let _ = writeln!(
                 self.file,
-                "{},{},{},{},{},{},{},{},,,,",
+                "{},{},{},{},{},{},{},{},{},,,,",
                 ts,
                 p.pid,
                 render::csv_field(p.user.as_deref().unwrap_or("-")),
@@ -704,6 +706,7 @@ impl RecordWriter {
                 rss,
                 io.0,
                 io.1,
+                p.gpu_sm_pct.map(|g| g.to_string()).unwrap_or_default(),
             );
         }
         // the machine's own row: cpu_pct/rss_mb reuse their columns (whole-
@@ -716,7 +719,7 @@ impl RecordWriter {
             };
             let _ = writeln!(
                 self.file,
-                "{},_system,-,system,{},{},,,{},{},{},{}",
+                "{},_system,-,system,{},{},,,,{},{},{},{}",
                 ts,
                 s.cpu_percent.map(|c| format!("{c:.1}")).unwrap_or_default(),
                 s.mem_used_mb.map(|mb| mb.to_string()).unwrap_or_default(),
@@ -727,6 +730,172 @@ impl RecordWriter {
             );
         }
     }
+}
+
+/// One machine-level sample pulled from a `--record` file: the `_system`
+/// row (CSV) or the `system` key (JSONL).
+#[derive(Debug, Clone)]
+pub(crate) struct SysPoint {
+    pub(crate) at: i64,
+    pub(crate) cpu: Option<f64>,
+    pub(crate) mem_pct: Option<f64>,
+    pub(crate) load1: Option<f64>,
+    pub(crate) procs: usize,
+    pub(crate) net_bps: Option<f64>,
+}
+
+/// Collect the machine samples from a record file's text (either format —
+/// the extension only changed what --record wrote, the reader accepts
+/// both). Unparseable lines are skipped; empty input is an error.
+pub(crate) fn parse_record_system(text: &str) -> Result<Vec<SysPoint>, String> {
+    let mut out = Vec::new();
+    let mut lines = text.lines().peekable();
+    // CSV: a header naming the columns (order-tolerant), then `_system` rows
+    if let Some(first) = lines.peek() {
+        if first.starts_with("timestamp,") {
+            let header: Vec<&str> = first.split(',').collect();
+            let col = |name: &str| header.iter().position(|c| *c == name);
+            let (t, pid, cpu, load, mem, procs, net) = (
+                col("timestamp"),
+                col("pid"),
+                col("cpu_pct"),
+                col("sys_load1"),
+                col("sys_mem_pct"),
+                col("sys_procs"),
+                col("sys_net_bps"),
+            );
+            let (Some(t), Some(pid)) = (t, pid) else {
+                return Err("csv missing timestamp/pid columns".into());
+            };
+            for line in lines {
+                let f: Vec<&str> = line.split(',').collect();
+                if f.len() <= t.max(pid) || f[pid] != "_system" {
+                    continue;
+                }
+                let num = |i: Option<usize>| -> Option<f64> {
+                    i.and_then(|i| f.get(i)).and_then(|v| v.trim().parse().ok())
+                };
+                let procs_n = procs
+                    .and_then(|i| f.get(i))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                out.push(SysPoint {
+                    at: f[t].trim().parse().unwrap_or(0),
+                    cpu: num(cpu),
+                    mem_pct: num(mem),
+                    load1: num(load),
+                    procs: procs_n,
+                    net_bps: num(net),
+                });
+            }
+            if out.is_empty() {
+                return Err("no _system rows in the csv".to_string());
+            }
+            return Ok(out);
+        }
+    }
+    // JSONL: one envelope per line with a `system` key
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(sys) = v.get("system").filter(|s| !s.is_null()) else {
+            continue;
+        };
+        out.push(SysPoint {
+            at: v
+                .get("generated_at")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0),
+            cpu: sys.get("cpu_pct").and_then(|x| x.as_f64()),
+            mem_pct: sys.get("mem_pct").and_then(|x| x.as_f64()),
+            load1: sys.get("load1").and_then(|x| x.as_f64()),
+            procs: sys
+                .get("proc_count")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0) as usize,
+            net_bps: sys.get("net_bps").and_then(|x| x.as_f64()),
+        });
+    }
+    if out.is_empty() {
+        return Err("no system samples in the jsonl".to_string());
+    }
+    Ok(out)
+}
+
+/// One inline-SVG line chart of `values` (None gaps skipped), w×h, with a
+/// last-value label. Self-contained: polyline + text only.
+fn svg_series(name: &str, unit: &str, values: &[Option<f64>], t0: i64, t1: i64) -> String {
+    let pts: Vec<(f64, f64)> = values
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| v.map(|v| (i as f64, v)))
+        .collect();
+    if pts.is_empty() {
+        return String::new();
+    }
+    let (w, h, pad) = (560.0, 110.0, 6.0);
+    let max = pts.iter().map(|(_, v)| *v).fold(0.0f64, f64::max);
+    let max = if max <= 0.0 { 1.0 } else { max * 1.1 };
+    let n = values.len().saturating_sub(1).max(1) as f64;
+    let x = |i: f64| pad + i / n * (w - 2.0 * pad);
+    let y = |v: f64| h - pad - v / max * (h - 2.0 * pad - 14.0);
+    let poly: String = pts
+        .iter()
+        .map(|(i, v)| format!("{:.1},{:.1}", x(*i), y(*v)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let last = pts.last().unwrap().1;
+    let at = |t: i64| {
+        // HH:MM from unix seconds (local time via the util formatter)
+        crate::util::fmt_time(t).get(11..16).unwrap_or("").to_string()
+    };
+    let s = format!(
+        "<div style=\"display:inline-block;margin:8px\"><svg width=\"{w}\" height=\"{h}\" xmlns=\"http://www.w3.org/2000/svg\">\
+<text x=\"{pad}\" y=\"14\" font-size=\"12\" fill=\"#8899a6\">{name}</text>\
+<text x=\"{w:.0}\" y=\"14\" font-size=\"12\" fill=\"#e1e8ed\" text-anchor=\"end\">{last:.1} {unit} · max {max:.1}</text>\
+<polyline fill=\"none\" stroke=\"#4dc3ff\" stroke-width=\"1.5\" points=\"{poly}\"/>\
+<text x=\"{pad}\" y=\"{h:.0}\" font-size=\"10\" fill=\"#657786\">{}</text>\
+<text x=\"{w:.0}\" y=\"{h:.0}\" font-size=\"10\" fill=\"#657786\" text-anchor=\"end\">{}</text>\
+</svg></div>",
+        at(t0),
+        at(t1),
+    );
+    s
+}
+
+/// `--plot`: the self-contained HTML — a dark page with one chart per
+/// series the record actually carried.
+fn plot_html(points: &[SysPoint]) -> String {
+    let t0 = points.first().map(|p| p.at).unwrap_or(0);
+    let t1 = points.last().map(|p| p.at).unwrap_or(0);
+    let col = |f: fn(&SysPoint) -> Option<f64>| -> Vec<Option<f64>> {
+        points.iter().map(&f).collect()
+    };
+    let mut charts = String::new();
+    for (name, unit, series) in [
+        ("cpu %", "%", col(|p| p.cpu)),
+        ("memory %", "%", col(|p| p.mem_pct)),
+        ("load 1m", "", col(|p| p.load1)),
+        (
+            "network",
+            "MB/s",
+            col(|p| p.net_bps.map(|b| b / 1048576.0)),
+        ),
+    ] {
+        charts.push_str(&svg_series(name, unit, &series, t0, t1));
+    }
+    // process count is a plain usize series — same chart shape
+    let procs: Vec<Option<f64>> = points.iter().map(|p| Some(p.procs as f64)).collect();
+    charts.push_str(&svg_series("processes", "", &procs, t0, t1));
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>witr-rs plot</title>\
+<style>body{{background:#15202b;font-family:ui-monospace,Menlo,monospace;color:#e1e8ed;margin:24px}}</style>\
+</head><body><h3>witr-rs · {} samples · {} – {}</h3><div>{charts}</div></body></html>",
+        points.len(),
+        crate::util::fmt_time(t0),
+        crate::util::fmt_time(t1),
+    )
 }
 
 fn main() {
@@ -753,7 +922,9 @@ fn main() {
     let no_color = cli.no_color || std::env::var_os("NO_COLOR").is_some();
 
     // user config (flat toml subset): defaults only — CLI flags win
+    let mut cli = cli;
     let cfg = config::Config::load();
+    cli.apply_config(&cfg);
 
     // --completions: emit the shell script and exit (before anything else —
     // it must work everywhere, including without a process table)
@@ -955,6 +1126,10 @@ fn main() {
         eprintln!("--replay opens the TUI; drop the targets or use -i");
         std::process::exit(4);
     }
+    if cli.samples.is_some() && !cli.interactive && !specs.is_empty() {
+        eprintln!("--samples opens the TUI; drop the targets or use -i");
+        std::process::exit(4);
+    }
     if since_secs.is_some() && !specs.is_empty() {
         eprintln!("--since digests a recorded events log or sets the TUI summary window; it does not filter targets");
         std::process::exit(4);
@@ -1003,6 +1178,7 @@ fn main() {
             || cli.record.is_some()
             || cli.events_log.is_some()
             || cli.replay.is_some()
+            || cli.samples.is_some()
             || cli.since.is_some();
         if serve_clash {
             eprintln!("--serve is a standalone mode; drop the other output/operation flags");
@@ -1302,6 +1478,30 @@ fn main() {
         }
     }
 
+    // --samples: parse the record file once, up front — a bad file is an
+    // exit-5 error before any TUI starts; the parsed points ride the Seed
+    let (mut samples, mut samples_source) = (Vec::new(), String::new());
+    if let Some(path) = &cli.samples {
+        match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| parse_record_system(&t))
+        {
+            Ok(pts) => {
+                samples = pts;
+                samples_source = path.clone();
+            }
+            Err(e) => {
+                eprintln!("--samples {path}: {e}");
+                std::process::exit(5);
+            }
+        }
+        if !(std::io::stdout().is_terminal() && std::io::stdin().is_terminal()) && !cli.interactive
+        {
+            eprintln!("--samples opens the TUI; it needs a terminal");
+            std::process::exit(4);
+        }
+    }
+
     // --audit: run a command under observation — its own standalone mode,
     // exit code mirrors the audited command's
     if let Some(cmd) = &cli.audit {
@@ -1373,6 +1573,43 @@ fn main() {
             }
         }
         std::process::exit(i32::from(failed > 0));
+    }
+
+    // --plot: render a --record file into a self-contained HTML chart —
+    // a no-target operation like --snap/--diff.
+    if let Some(path) = &cli.plot {
+        if !specs.is_empty() || cli.interactive {
+            eprintln!("--plot renders the machine samples from a record file; drop the targets or -i");
+            std::process::exit(4);
+        }
+        if cli.watch.is_some() {
+            eprintln!("--plot writes one chart and exits; drop --watch");
+            std::process::exit(4);
+        }
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("--plot {path}: {e}");
+                std::process::exit(5);
+            }
+        };
+        let points = match parse_record_system(&text) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("--plot {path}: {e}");
+                std::process::exit(5);
+            }
+        };
+        let out = format!("{path}.html");
+        if let Err(e) = std::fs::write(&out, plot_html(&points)) {
+            eprintln!("--plot: cannot write {out}: {e}");
+            std::process::exit(5);
+        }
+        write_out(&format!(
+            "plot: {} samples → {out}",
+            points.len()
+        ));
+        return;
     }
 
     // --snap / --diff: whole-process-table snapshots, listing operations —
@@ -1606,6 +1843,8 @@ fn main() {
             events_log: cli.events_log.clone(),
             notify: cli.notify || cfg.notify.unwrap_or(false),
             replayed,
+            samples,
+            samples_source,
             since: since_secs,
             refresh_secs: cfg.refresh_secs,
             sort: cfg.sort.clone(),
@@ -1622,6 +1861,8 @@ fn main() {
             alert_count: cli.alert_count,
             alert_disk: cli.alert_disk,
             alert_net: cli.alert_net,
+            alert_psi: cli.alert_psi,
+            alert_webhook: cli.alert_webhook.clone(),
             alert_repeat: cli.alert_repeat,
             watch: cfg.watch.clone(),
             notes: cfg.notes,
@@ -1810,7 +2051,11 @@ fn main() {
                     "witr-rs conns · every {interval}s · {} · Ctrl-C to stop",
                     util::fmt_time(util::now_unix())
                 ));
-                write_out(&render::render_conns(&rows, &painter));
+                write_out(&if cli.by_peer {
+                    render::render_conns_by_peer(&render::collect_conns_by_peer(&rows), &painter)
+                } else {
+                    render::render_conns(&rows, &painter)
+                });
                 ticks += 1;
                 if cli.times.is_some_and(|n| ticks >= n.max(1)) {
                     std::process::exit(0);
@@ -1821,6 +2066,26 @@ fn main() {
             }
         }
         let rows = board();
+        if cli.by_peer {
+            let peers = render::collect_conns_by_peer(&rows);
+            if cli.json {
+                let doc = serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "generated_at": util::now_unix(),
+                    "peer_count": peers.len(),
+                    "peers": peers,
+                });
+                write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+            } else if cli.csv {
+                write_out(&render::render_conns_by_peer_csv(&peers));
+            } else if cli.markdown {
+                write_out(&render::render_conns_by_peer_markdown(&peers));
+            } else {
+                let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+                write_out(&render::render_conns_by_peer(&peers, &painter));
+            }
+            std::process::exit(0);
+        }
         if cli.json {
             let doc = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
@@ -2013,6 +2278,8 @@ fn main() {
                 events_log: cli.events_log.clone(),
                 notify: cli.notify || cfg.notify.unwrap_or(false),
                 replayed,
+                samples,
+                samples_source,
                 since: since_secs,
                 refresh_secs: cfg.refresh_secs,
                 sort: cfg.sort.clone(),
@@ -2029,6 +2296,8 @@ fn main() {
                 alert_count: cli.alert_count,
                 alert_disk: cli.alert_disk,
                 alert_net: cli.alert_net,
+                alert_psi: cli.alert_psi,
+                alert_webhook: cli.alert_webhook.clone(),
                 alert_repeat: cli.alert_repeat,
                 watch: cfg.watch.clone(),
                 notes: cfg.notes,
@@ -2177,6 +2446,7 @@ fn main() {
                     || cli.alert_count.is_some()
                     || cli.alert_disk.is_some()
                     || cli.alert_net.is_some()
+                    || cli.alert_psi.is_some()
                 {
                     if let Some(stats) = platform.system_stats() {
                         let mounts = if cli.alert_disk.is_some() {
@@ -2202,6 +2472,7 @@ fn main() {
                             disk_pct: cli.alert_disk,
                             net_limit: cli.alert_net,
                             net_rate,
+                            psi_limit: cli.alert_psi,
                             repeat: cli.alert_repeat,
                         };
                         for (name, detail) in history::system_alert_picks(
@@ -2296,6 +2567,9 @@ fn main() {
                     }
                     if let Some(cmd) = &cli.alert_exec {
                         tui::spawn_alert_exec(cmd, pid, &name, &detail);
+                    }
+                    if let Some(hook) = &cli.alert_webhook {
+                        tui::send_alert_webhook(hook, pid, &name, &detail);
                     }
                     recent_alerts.push(format!("{who} — {detail}"));
                     let excess = recent_alerts.len().saturating_sub(5);
@@ -2775,31 +3049,103 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps,\
+            "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps,gpu_sm,\
              sys_load1,sys_mem_pct,sys_procs,sys_net_bps"
         );
         assert_eq!(lines.len(), 3, "header + process row + _system row");
         let row = lines[1];
         // first sample: no cpu/io deltas yet → empty cells; rss 2048 KiB → 2
         let fields: Vec<&str> = row.split(',').collect();
-        assert_eq!(fields.len(), 12, "{row}");
+        assert_eq!(fields.len(), 13, "{row}");
         assert_eq!((fields[1], fields[2], fields[3]), ("3", "-", "worker"), "{row}");
         assert_eq!(fields[4], "", "no cpu delta on the first sample: {row}");
         assert_eq!(fields[5], "2", "2048 KiB → 2 MB rss: {row}");
-        assert_eq!((fields[6], fields[7]), ("", ""), "no io yet: {row}");
+        assert_eq!((fields[6], fields[7], fields[8]), ("", "", ""), "no io/gpu yet: {row}");
         assert!(
-            (fields[8], fields[9], fields[10], fields[11]) == ("", "", "", ""),
+            (fields[9], fields[10], fields[11], fields[12]) == ("", "", "", ""),
             "per-process rows leave the sys_* columns empty: {row}"
         );
         // the machine's own row: load, mem pct (4096/16384 = 25) and the
         // visible count land in the sys_* columns; no net rate on tick one
         let sys: Vec<&str> = lines[2].split(',').collect();
-        assert_eq!(sys.len(), 12, "{}", lines[2]);
+        assert_eq!(sys.len(), 13, "{}", lines[2]);
         assert_eq!(sys[1], "_system");
         assert_eq!(sys[4], "", "machine cpu is a delta — empty on tick one");
         assert_eq!(sys[5], "4096", "used MB rides the rss column");
-        assert_eq!((sys[8], sys[9], sys[10], sys[11]), ("1.25", "25", "1", ""), "{}", lines[2]);
+        assert_eq!((sys[9], sys[10], sys[11], sys[12]), ("1.25", "25", "1", ""), "{}", lines[2]);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parse_record_system_reads_writer_csv_round_trip() {
+        let path = std::env::temp_dir().join(format!("witr-plot-{}.csv", std::process::id()));
+        let mut w = RecordWriter::create(path.to_str().unwrap()).unwrap();
+        let mut hist = history::History::new();
+        let procs = vec![proc(3, "worker", None, None)];
+        let _ = hist.update(&procs);
+        let stats = crate::platform::SystemStats {
+            load1: Some(1.5),
+            mem_used_mb: Some(4096),
+            mem_total_mb: Some(16384),
+            ..Default::default()
+        };
+        w.append(&procs, &hist, Some(&stats), Some(8_388_608.0)); // 8 MB/s
+        w.append(&procs, &hist, Some(&stats), None);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let pts = parse_record_system(&text).unwrap();
+        assert_eq!(pts.len(), 2, "one point per _system row");
+        assert_eq!(pts[0].load1, Some(1.5));
+        assert_eq!(pts[0].mem_pct, Some(25.0), "4096/16384");
+        assert_eq!(pts[0].procs, 1);
+        assert_eq!(pts[0].net_bps, Some(8_388_608.0));
+        assert_eq!(pts[0].cpu, None, "machine cpu is a delta — empty on tick one");
+        assert!(pts[0].at > 1_600_000_000 && pts[1].at >= pts[0].at, "timestamps parse as unix seconds");
+        assert_eq!(pts[1].net_bps, None);
+        // the process row must not leak into the samples
+        // (already implied by len == 2)
+    }
+
+    #[test]
+    fn parse_record_system_reads_jsonl_and_errors_on_empty() {
+        let jsonl = concat!(
+            r#"{"generated_at":1700000100,"system":{"load1":0.5,"cpu_pct":12.5,"mem_pct":40.0,"proc_count":210,"net_bps":1024.0}}"#, "\n",
+            "not json at all\n",
+            r#"{"generated_at":1700000160,"system":null}"#, "\n",
+            r#"{"generated_at":1700000220,"system":{"load1":1.0,"mem_pct":50.0,"proc_count":220}}"#, "\n",
+        );
+        let pts = parse_record_system(jsonl).unwrap();
+        assert_eq!(pts.len(), 2, "null-system ticks and unparseable lines are skipped");
+        assert_eq!(pts[0].at, 1_700_000_100);
+        assert_eq!(pts[0].cpu, Some(12.5));
+        assert_eq!(pts[0].procs, 210);
+        assert_eq!(pts[1].cpu, None);
+        assert_eq!(pts[1].net_bps, None);
+        // error surface: empty / headerless / no system rows at all
+        assert!(parse_record_system("").is_err());
+        assert!(parse_record_system("timestamp,pid\n").is_err(), "csv without _system rows");
+        assert!(parse_record_system("no system key\n").is_err(), "jsonl without system samples");
+    }
+
+    #[test]
+    fn plot_html_embeds_one_chart_per_series() {
+        let pts = vec![
+            SysPoint { at: 1_700_000_100, cpu: Some(12.5), mem_pct: Some(40.0), load1: Some(0.5), procs: 210, net_bps: Some(1_048_576.0) },
+            SysPoint { at: 1_700_000_160, cpu: Some(25.0), mem_pct: Some(50.0), load1: Some(1.0), procs: 220, net_bps: None },
+        ];
+        let html = plot_html(&pts);
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(
+            html.contains("2 samples"),
+            "{}",
+            html.get(..120).unwrap_or("")
+        );
+        assert_eq!(html.matches("<svg").count(), 5, "cpu/mem/load/net/processes");
+        assert_eq!(html.matches("<polyline").count(), 5);
+        assert!(html.contains("network"), "the MB/s conversion is labelled");
+        // every chart carries its last-value label
+        assert!(html.contains("25.0 %"), "cpu last label");
+        assert!(html.contains("max 27.5"), "max is 25 * 1.1");
     }
 
     #[test]

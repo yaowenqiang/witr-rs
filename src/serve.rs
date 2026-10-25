@@ -6,6 +6,9 @@
 //! versioned envelopes the CLI prints. Every scrape samples the
 //! process table fresh — no background
 //! sampler, no interval to tune; scrape frequency IS the sample rate.
+//! Container gauges ride a background `stats --no-stream` sweep (seconds
+//! per runtime CLI) refreshed at most every 30s — scrapes never block on
+//! it.
 //!
 //! Hand-rolled on std::net (one thread per connection, sequential reads)
 //! so the binary keeps zero extra dependencies. Cardinality stays bounded:
@@ -17,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Mutex;
 
 use crate::model::{Pid, Process};
 use crate::platform::Platform;
@@ -205,18 +209,30 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
         }
     }
     // listening sockets: one series per (proto, port), owner a comma-joined
-    // "name (pid N)" list — port sprawl and unexpected listeners at a glance
+    // "name (pid N)" list, scope the exposure class (internet/loopback/
+    // iface) — port sprawl and unexpected listeners at a glance
     let socks = platform.list_sockets().unwrap_or_default();
     let listeners = crate::snapshot::to_listeners(&socks, &procs);
     out.push_str("# HELP witr_port_listeners Listening sockets by proto and port\n");
     out.push_str("# TYPE witr_port_listeners gauge\n");
     for l in &listeners {
         out.push_str(&format!(
-            "witr_port_listeners{{proto=\"{}\",port=\"{}\",owner=\"{}\"}} 1\n",
+            "witr_port_listeners{{proto=\"{}\",port=\"{}\",scope=\"{}\",owner=\"{}\"}} 1\n",
             label_escape(&l.proto),
             l.port,
+            l.scope(),
             label_escape(&l.who.join(", ")),
         ));
+    }
+    // container gauges: one info series per container from the runtime
+    // listing (a cheap `ps --all`), cpu/mem from the cached background
+    // `stats --no-stream` sweep (seconds per runtime — it rides a thread
+    // so a scrape never blocks on the runtime CLI; the first scrapes
+    // report only the info series)
+    let containers = crate::platform::enumerate_containers();
+    if !containers.is_empty() {
+        let stats = refresh_container_stats();
+        render_container_metrics(&mut out, &containers, &stats);
     }
     // self-monitoring: total scrapes served and how long the last one took
     out.push_str("# HELP witr_scrapes_total Scrapes served since startup\n");
@@ -238,6 +254,112 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
         crate::util::now_unix()
     ));
     out
+}
+
+/// The cached `stats --no-stream` sweep: one in flight at a time, results
+/// older than 30s trigger a refresh on the next scrape. Scrapes read the
+/// last completed sweep and never wait on the runtime CLI.
+fn refresh_container_stats() -> HashMap<String, (f64, u64, u64)> {
+    let mut g = stats_cache().lock().unwrap();
+    let stale = g
+        .at
+        .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(30));
+    if stale && !g.in_flight {
+        g.in_flight = true;
+        std::thread::spawn(|| {
+            let fresh = crate::platform::container_stats();
+            let mut g = stats_cache().lock().unwrap();
+            g.stats = fresh;
+            g.at = Some(std::time::Instant::now());
+            g.in_flight = false;
+        });
+    }
+    g.stats.clone()
+}
+
+struct ContainerStatsCache {
+    at: Option<std::time::Instant>,
+    in_flight: bool,
+    stats: HashMap<String, (f64, u64, u64)>,
+}
+
+/// The shared cache cell — module-level so both the scrape path and the
+/// spawned sweep thread see the same state.
+fn stats_cache() -> &'static Mutex<ContainerStatsCache> {
+    static CACHE: std::sync::OnceLock<Mutex<ContainerStatsCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(ContainerStatsCache {
+            at: None,
+            in_flight: false,
+            stats: HashMap::new(),
+        })
+    })
+}
+
+/// Container series: `witr_container_info` one per container, plus
+/// cpu/mem gauges where the sweep has a sample. Pure so tests can feed
+/// fixtures; id matching is exact then 12-char prefix (runtimes
+/// abbreviate either side).
+fn render_container_metrics(
+    out: &mut String,
+    containers: &[crate::model::Container],
+    stats: &HashMap<String, (f64, u64, u64)>,
+) {
+    out.push_str("# HELP witr_container_info Container metadata, one series per container\n");
+    out.push_str("# TYPE witr_container_info gauge\n");
+    let mut emitted = false;
+    for c in containers {
+        let id = &c.id;
+        let sample = stats
+            .get(id)
+            .or_else(|| {
+                let prefix: String = id.chars().take(12).collect();
+                stats
+                    .iter()
+                    .find(|(k, _)| k.starts_with(&prefix))
+                    .map(|(_, v)| v)
+            })
+            .copied();
+        if let Some((cpu, used, total)) = sample {
+            if !emitted {
+                out.push_str("# HELP witr_container_cpu_percent Live CPU percent from the runtime's stats sweep\n");
+                out.push_str("# TYPE witr_container_cpu_percent gauge\n");
+                out.push_str("# HELP witr_container_mem_used_bytes Resident memory in use, from the runtime's stats sweep\n");
+                out.push_str("# TYPE witr_container_mem_used_bytes gauge\n");
+                out.push_str("# HELP witr_container_mem_total_bytes Memory limit visible to the container\n");
+                out.push_str("# TYPE witr_container_mem_total_bytes gauge\n");
+                emitted = true;
+            }
+            out.push_str(&format!(
+                "witr_container_cpu_percent{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {cpu:.2}\n",
+                label_escape(&c.runtime),
+                label_escape(id),
+                label_escape(&c.name),
+            ));
+            out.push_str(&format!(
+                "witr_container_mem_used_bytes{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {used}\n",
+                label_escape(&c.runtime),
+                label_escape(id),
+                label_escape(&c.name),
+            ));
+            out.push_str(&format!(
+                "witr_container_mem_total_bytes{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {total}\n",
+                label_escape(&c.runtime),
+                label_escape(id),
+                label_escape(&c.name),
+            ));
+        }
+    }
+    for c in containers {
+        out.push_str(&format!(
+            "witr_container_info{{runtime=\"{}\",id=\"{}\",name=\"{}\",image=\"{}\",state=\"{}\"}} 1\n",
+            label_escape(&c.runtime),
+            label_escape(&c.id),
+            label_escape(&c.name),
+            label_escape(&c.image),
+            label_escape(&c.state),
+        ));
+    }
 }
 
 /// Parse the /api/top query string: `metric=` and `n=` params, defaults
@@ -631,6 +753,56 @@ mod tests {
                 || out.contains("witr_machine_mem_total_bytes ");
             assert!(has_mem, "memory gauges emit whenever the platform measures");
         }
+    }
+
+    #[test]
+    fn container_metrics_match_ids_and_skip_missing_samples() {
+        let c = |id: &str, name: &str| crate::model::Container {
+            runtime: "docker".into(),
+            id: id.into(),
+            name: name.into(),
+            image: "alpine".into(),
+            command: String::new(),
+            state: "running".into(),
+            status: "Up".into(),
+            ports: String::new(),
+            pod: None,
+            restarts: None,
+            cpu_pct: None,
+            mem_used_mb: None,
+            mem_total_mb: None,
+        };
+        let containers = vec![
+            c("abc123def456fullid", "web"),
+            c("ffffffffffffnostat", "idle"),
+        ];
+        // the sweep keyed the 12-char prefix; the full id in the listing
+        // must still match
+        let stats: HashMap<String, (f64, u64, u64)> = [(
+            "abc123def456".to_string(),
+            (12.5, 1024 * 1024, 100 * 1024 * 1024),
+        )]
+        .into();
+        let mut out = String::new();
+        render_container_metrics(&mut out, &containers, &stats);
+        assert!(
+            out.contains("witr_container_cpu_percent{runtime=\"docker\",id=\"abc123def456fullid\",name=\"web\"} 12.50"),
+            "{out}"
+        );
+        assert!(
+            out.contains("witr_container_mem_used_bytes{runtime=\"docker\",id=\"abc123def456fullid\",name=\"web\"} 1048576"),
+            "{out}"
+        );
+        // info series: every container, one each
+        assert_eq!(out.matches("witr_container_info{").count(), 2);
+        assert!(out.contains("name=\"idle\",image=\"alpine\",state=\"running\"} 1"), "{out}");
+        // no sample → no cpu/mem series for that container
+        assert!(!out.contains("name=\"idle\"} 12"), "{out}");
+        // empty sweep → only info series, no cpu HELP/TYPE block
+        let mut out = String::new();
+        render_container_metrics(&mut out, &containers, &HashMap::new());
+        assert_eq!(out.matches("witr_container_info{").count(), 2);
+        assert!(!out.contains("witr_container_cpu_percent"), "{out}");
     }
 }
 

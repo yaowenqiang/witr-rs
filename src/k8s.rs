@@ -11,11 +11,23 @@ use std::sync::OnceLock;
 use crate::model::Container;
 
 /// Minimal pod identity: "namespace/name" + the runtime container ids as
-/// kubectl reports them ("docker://<64hex>", "containerd://<hex>", ...).
+/// kubectl reports them ("docker://<64hex>", "containerd://<hex>", ...),
+/// plus the status fields the alert edges watch (phase, restart total,
+/// first abnormal waiting reason).
 #[derive(Debug, Clone, Serialize)]
 pub struct Pod {
     pub key: String,
     pub container_ids: Vec<String>,
+    /// Pod phase (Pending / Running / Succeeded / Failed / Unknown); None
+    /// when the pod has no status yet.
+    pub phase: Option<String>,
+    /// Σ containerStatuses[].restartCount — k8s-level restarts (container
+    /// crashes inside the pod), not the runtime's restart policy.
+    pub restarts: u32,
+    /// First non-routine waiting reason among the containers
+    /// (CrashLoopBackOff, ImagePullBackOff, ...). ContainerCreating and
+    /// PodInitializing are deploy-time noise, not faults — excluded.
+    pub waiting: Option<String>,
 }
 
 /// All pods visible to the current context. None once the probe has failed
@@ -73,7 +85,39 @@ pub fn parse_pods(json: &str) -> Vec<Pod> {
                     .collect()
             })
             .unwrap_or_default();
-        out.push(Pod { key: format!("{ns}/{name}"), container_ids });
+        let statuses = item
+            .get("status")
+            .and_then(|s| s.get("containerStatuses"))
+            .and_then(|x| x.as_array());
+        let phase = item
+            .get("status")
+            .and_then(|s| s.get("phase"))
+            .and_then(|x| x.as_str())
+            .map(str::to_string);
+        let restarts = statuses
+            .map(|ss| {
+                ss.iter()
+                    .filter_map(|st| st.get("restartCount").and_then(|x| x.as_u64()))
+                    .sum::<u64>() as u32
+            })
+            .unwrap_or(0);
+        let waiting = statuses.and_then(|ss| {
+            ss.iter().find_map(|st| {
+                st.get("state")
+                    .and_then(|w| w.get("waiting"))
+                    .and_then(|w| w.get("reason"))
+                    .and_then(|x| x.as_str())
+                    .filter(|r| !r.is_empty() && *r != "ContainerCreating" && *r != "PodInitializing")
+                    .map(str::to_string)
+            })
+        });
+        out.push(Pod {
+            key: format!("{ns}/{name}"),
+            container_ids,
+            phase,
+            restarts,
+            waiting,
+        });
     }
     out
 }
@@ -97,11 +141,6 @@ pub fn find_pod(pods: &[Pod], container_id: &str) -> Option<String> {
 }
 
 /// Fill the pod field of each container. Existing values are kept.
-pub fn annotate(containers: &mut [Container]) {
-    let Some(pods) = pods() else { return };
-    annotate_with(&pods, containers);
-}
-
 pub fn annotate_with(pods: &[Pod], containers: &mut [Container]) {
     for c in containers.iter_mut() {
         if c.pod.is_none() {
@@ -117,26 +156,42 @@ mod tests {
     const SAMPLE: &str = r#"{
       "items": [
         {"metadata": {"name": "web", "namespace": "prod"},
-         "status": {"containerStatuses": [
-            {"containerID": "docker://aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999"}]}},
+         "status": {"phase": "Running", "containerStatuses": [
+            {"containerID": "docker://aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999",
+             "restartCount": 2}]}},
         {"metadata": {"name": "pending-pod", "namespace": "dev"}, "status": {}},
         {"metadata": {"name": "queue", "namespace": "prod"},
-         "status": {"containerStatuses": [
-            {"containerID": "containerd://1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"}]}},
+         "status": {"phase": "Running", "containerStatuses": [
+            {"containerID": "containerd://1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff",
+             "restartCount": 5,
+             "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}},
+        {"metadata": {"name": "pulling", "namespace": "dev"},
+         "status": {"phase": "Pending", "containerStatuses": [
+            {"state": {"waiting": {"reason": "ImagePullBackOff"}}}]}},
         {"metadata": {"name": "no-namespace"}}
       ]}"#;
 
     #[test]
     fn parse_extracts_ns_name_and_ids() {
         let pods = parse_pods(SAMPLE);
-        assert_eq!(pods.len(), 4);
+        assert_eq!(pods.len(), 5);
         assert_eq!(pods[0].key, "prod/web");
         assert_eq!(pods[0].container_ids.len(), 1);
+        assert_eq!(pods[0].phase.as_deref(), Some("Running"));
+        assert_eq!(pods[0].restarts, 2);
+        assert_eq!(pods[0].waiting, None);
         // pending pod: no statuses — empty id list, still listed
         assert!(pods[1].container_ids.is_empty());
+        assert_eq!(pods[1].phase, None);
         assert_eq!(pods[2].key, "prod/queue");
+        assert_eq!(pods[2].restarts, 5);
+        assert_eq!(pods[2].waiting.as_deref(), Some("CrashLoopBackOff"));
+        // deploy-time noise reasons would have been excluded — this one is real
+        assert_eq!(pods[3].waiting.as_deref(), Some("ImagePullBackOff"));
+        assert_eq!(pods[3].phase.as_deref(), Some("Pending"));
         // missing namespace falls back to "default"
-        assert_eq!(pods[3].key, "default/no-namespace");
+        assert_eq!(pods[4].key, "default/no-namespace");
+        assert_eq!(pods[4].phase, None);
     }
 
     #[test]

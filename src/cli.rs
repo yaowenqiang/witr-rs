@@ -61,6 +61,11 @@ pub enum TopMetric {
         "Time since start — oldest first (\"what has been running since boot\")"
     ))]
     Age,
+    #[value(help = t(
+        "GPU SM 占用率（NVIDIA，需要 nvidia-smi；无 GPU 或非 NVIDIA 时没有该指标）",
+        "GPU SM utilization (NVIDIA, needs nvidia-smi; absent without an NVIDIA GPU)"
+    ))]
+    Gpu,
 }
 
 impl TopMetric {
@@ -72,6 +77,7 @@ impl TopMetric {
             TopMetric::Io => "IO",
             TopMetric::IoRate => "IO/S",
             TopMetric::Age => "AGE",
+            TopMetric::Gpu => "GPU%",
         }
     }
 }
@@ -169,6 +175,35 @@ fn examples() -> &'static str {
         EXAMPLES_EN
     } else {
         EXAMPLES_ZH
+    }
+}
+
+impl Cli {
+    /// Fold the user config under the CLI flags: the file holds defaults,
+    /// an explicit flag wins. Applied once right after load so every
+    /// downstream consumer (validation, watch loop, TUI seeds) sees the
+    /// resolved value. Only the alert knobs participate — the TUI keys
+    /// (refresh_secs/sort/notify/paused/watch/notes) are read at their own
+    /// use sites.
+    pub fn apply_config(&mut self, cfg: &crate::config::Config) {
+        self.alert_cpu = self.alert_cpu.or(cfg.alert_cpu);
+        self.alert_mem = self.alert_mem.or(cfg.alert_mem);
+        self.alert_fd = self.alert_fd.or(cfg.alert_fd);
+        self.alert_io = self.alert_io.or(cfg.alert_io);
+        self.alert_conn = self.alert_conn.or(cfg.alert_conn);
+        self.alert_load = self.alert_load.or(cfg.alert_load);
+        self.alert_mem_pct = self.alert_mem_pct.or(cfg.alert_mem_pct);
+        self.alert_count = self.alert_count.or(cfg.alert_count);
+        self.alert_disk = self.alert_disk.or(cfg.alert_disk);
+        self.alert_net = self.alert_net.or(cfg.alert_net);
+        self.alert_psi = self.alert_psi.or(cfg.alert_psi);
+        self.alert_repeat = self.alert_repeat.or(cfg.alert_repeat);
+        if self.alert_exec.is_none() {
+            self.alert_exec = cfg.alert_exec.clone();
+        }
+        if self.alert_webhook.is_none() {
+            self.alert_webhook = cfg.alert_webhook.clone();
+        }
     }
 }
 
@@ -291,8 +326,8 @@ pub struct Cli {
     #[arg(
         long = "ports",
         help = t(
-            "列出所有 LISTEN 套接字及其归属进程——一次性表格版的端口总览（端口、协议、归属进程）。可搭配 --csv / --json。属于无目标操作：不能与目标同时使用",
-            "List every LISTEN socket with its owning processes — the Ports overview as a one-shot table (port, proto, owners). Pairs with --csv / --json. A no-target operation: cannot be combined with targets"
+            "列出所有 LISTEN 套接字及其归属进程——一次性表格版的端口总览（端口、协议、暴露范围、归属进程；SCOPE：internet=0.0.0.0/:: 通配绑定、外网可达，loopback=仅本机，iface=具体地址）。可搭配 --csv / --json。属于无目标操作：不能与目标同时使用",
+            "List every LISTEN socket with its owning processes — the Ports overview as a one-shot table (port, proto, exposure scope, owners; SCOPE: internet = wildcard 0.0.0.0/:: bind, reachable from anywhere; loopback = this host only; iface = specific addresses). Pairs with --csv / --json. A no-target operation: cannot be combined with targets"
         )
     )]
     pub ports_list: bool,
@@ -397,6 +432,16 @@ pub struct Cli {
         )
     )]
     pub conns: bool,
+
+    #[arg(
+        long = "by-peer",
+        requires = "conns",
+        help = t(
+            "把 --conns 的连接按远端地址聚合（本地属主）：每个对端一行，连接数 / ESTABLISHED 数 / 其余状态 / 本地属主列表——回答“这台机器在和谁说话”。可搭配 --csv / --markdown / --json / --watch",
+            "Aggregate --conns by remote address: one row per peer with connection count / ESTABLISHED count / remaining states / local owners — \"who is this machine talking to\". Pairs with --csv / --markdown / --json / --watch"
+        )
+    )]
+    pub by_peer: bool,
 
     #[arg(
         long,
@@ -638,6 +683,16 @@ pub struct Cli {
     pub alert_net: Option<u64>,
 
     #[arg(
+        long = "alert-psi",
+        value_name = "PCT",
+        help = t(
+            "整机告警：任一资源的 PSI full 停滞（10 秒窗）连续 5 次采样（约 15s）超过该百分比时触发——所有任务都卡在 cpu/memory/io 上的“机器喘不过气”信号（Linux，内核需开 PSI）。TUI 和 --watch",
+            "Machine-wide alert: fire when any resource's PSI full stall (10s window) exceeds this percent for 5 consecutive samples (~15s) — every task stuck on cpu/memory/io at once, the machine-gasping signal (Linux, kernel PSI required). TUI and --watch"
+        )
+    )]
+    pub alert_psi: Option<f64>,
+
+    #[arg(
         long = "alert-port",
         value_name = "PORT|!PORT",
         help = t(
@@ -666,6 +721,16 @@ pub struct Cli {
         )
     )]
     pub alert_exec: Option<String>,
+
+    #[arg(
+        long = "alert-webhook",
+        value_name = "URL",
+        help = t(
+            "每次阈值告警触发时向该 URL POST 一条 JSON 告警（与 --events-log 信封同构；仅支持 http://——标准库无 TLS，https:// 会被拒绝并提示）。发送在后台线程进行（3 秒超时），失败只打一行 stderr，绝不拖慢采样。TUI 和 --watch",
+            "POST one JSON alert to this URL each time a threshold alert fires (same shape as the --events-log envelope; http:// only — std has no TLS, https:// is refused with a note). Sending runs on a background thread (3s timeout); failures print one stderr line and never stall the sampler. TUI and --watch"
+        )
+    )]
+    pub alert_webhook: Option<String>,
 
     #[arg(
         long = "audit",
@@ -714,6 +779,26 @@ pub struct Cli {
         )
     )]
     pub report_html: Option<String>,
+
+    #[arg(
+        long = "plot",
+        value_name = "FILE",
+        help = t(
+            "把 --record 产出的样本文件（.csv 或 .jsonl）画成自包含 HTML 时序图（内联 SVG：整机 cpu%、内存%、负载、进程数、网络速率），写入 FILE.html 后退出——无 JS、无外部资源，离线可看。属于无目标操作：不能与目标同时使用",
+            "Render a --record sample file (.csv or .jsonl) into a self-contained HTML time-series chart (inline SVG: machine cpu%, memory%, load, process count, network rate), written to FILE.html, then exit — no JS, no external assets, viewable offline. A no-target operation: cannot be combined with targets"
+        )
+    )]
+    pub plot: Option<String>,
+
+    #[arg(
+        long = "samples",
+        value_name = "FILE",
+        help = t(
+            "把 --record 产出的样本文件（.csv 或 .jsonl）导入 TUI 的 Samples 页做时序浏览：五条曲线（cpu%/内存%/负载/网络/进程数）sparkline，←→ 移动光标逐时刻读数，实时采样继续。属于无目标操作：不能与目标同时使用",
+            "Import a --record sample file (.csv or .jsonl) into the TUI's Samples page for time-series browsing: five sparkline series (cpu%/memory%/load/network/process count), ←→ move the cursor to read individual instants; live sampling continues. A no-target operation: cannot be combined with targets"
+        )
+    )]
+    pub samples: Option<String>,
 
     #[arg(
         long = "on-exit",
@@ -849,5 +934,22 @@ mod tests {
         ENGLISH.store(true, Ordering::Relaxed);
         assert_eq!(t("中文", "english"), "english");
         ENGLISH.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn apply_config_fills_defaults_flags_win() {
+        let (cfg, _) = crate::config::Config::parse(
+            "alert_cpu = 80\nalert_webhook = \"http://cfg/hook\"\nalert_exec = cfg-cmd\n",
+        );
+        // flag wins over the file, file fills the rest
+        let mut cli = Cli::parse_from(["witr-rs", "--alert-cpu", "95"]);
+        cli.apply_config(&cfg);
+        assert_eq!(cli.alert_cpu, Some(95.0));
+        assert_eq!(cli.alert_webhook.as_deref(), Some("http://cfg/hook"));
+        assert_eq!(cli.alert_exec.as_deref(), Some("cfg-cmd"));
+        // nothing set anywhere stays unset
+        let mut cli = Cli::parse_from(["witr-rs"]);
+        cli.apply_config(&crate::config::Config::default());
+        assert!(cli.alert_cpu.is_none() && cli.alert_webhook.is_none());
     }
 }

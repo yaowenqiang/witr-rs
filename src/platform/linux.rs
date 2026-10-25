@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::model::{FileOverview, LockEntry, Pid, Process, Socket, Source};
@@ -138,6 +138,102 @@ fn parse_loadavg(text: &str) -> (Option<f64>, Option<f64>, Option<f64>) {
         it.next().and_then(|v| v.parse().ok()),
         it.next().and_then(|v| v.parse().ok()),
     )
+}
+
+/// One /proc/pressure/<res> body: `some avg10=0.00 avg60=… total=…` plus
+/// (usually) a `full …` line. cpu has no `full` line (a fully stalled CPU
+/// can't exist) — reported 0. → (some, full) avg10 percents.
+fn parse_psi_file(text: &str) -> (f64, f64) {
+    let get_avg10 = |line: &str| -> Option<f64> {
+        line.split_whitespace()
+            .find(|f| f.starts_with("avg10="))
+            .and_then(|f| f.strip_prefix("avg10="))
+            .and_then(|v| v.parse().ok())
+    };
+    let mut out = (0.0, 0.0);
+    for line in text.lines() {
+        if line.starts_with("some ") {
+            out.0 = get_avg10(line).unwrap_or(0.0);
+        } else if line.starts_with("full ") {
+            out.1 = get_avg10(line).unwrap_or(0.0);
+        }
+    }
+    out
+}
+
+/// The three /proc/pressure reads → one [`super::PsiStats`]. Any missing
+/// resource (pre-4.20 kernel, PSI disabled) leaves that resource zeroed;
+/// all three missing still yields Some — the page then shows zeros rather
+/// than hiding a section the kernel merely doesn't instrument.
+fn read_psi() -> Option<super::PsiStats> {
+    let read = |res: &str| -> (f64, f64) {
+        read_ok(&Path::new("/proc/pressure").join(res))
+            .map(|t| parse_psi_file(&t))
+            .unwrap_or((0.0, 0.0))
+    };
+    let (cpu_some, cpu_full) = read("cpu");
+    let (mem_some, mem_full) = read("memory");
+    let (io_some, io_full) = read("io");
+    Some(super::PsiStats {
+        cpu_some,
+        cpu_full,
+        mem_some,
+        mem_full,
+        io_some,
+        io_full,
+    })
+}
+
+/// Hottest readable sensor under /sys/class/hwmon: tempN_input
+/// (millidegrees) labeled by tempN_label, else the chip's `name` file,
+/// else "hwmon<i>". The kernel only exposes what drivers publish — this
+/// needs no root and covers the common x86/ARM server parts.
+fn thermal_sensor() -> Option<(String, f64)> {
+    let mut best: Option<(String, f64)> = None;
+    let mut chips: Vec<PathBuf> = std::fs::read_dir("/sys/class/hwmon")
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    chips.sort();
+    for chip in chips {
+        let chip_name = std::fs::read_to_string(chip.join("name"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let mut temps: Vec<PathBuf> = match std::fs::read_dir(&chip) {
+            Ok(d) => d.flatten().map(|e| e.path()).collect(),
+            Err(_) => continue,
+        };
+        temps.sort();
+        for t in temps {
+            let Some(name) = t.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(idx) = name.strip_prefix("temp").and_then(|r| r.strip_suffix("_input")) else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(&t) else {
+                continue;
+            };
+            let Ok(milli) = text.trim().parse::<i64>() else {
+                continue;
+            };
+            let label = std::fs::read_to_string(chip.join(format!("temp{idx}_label")))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| {
+                    if chip_name.is_empty() {
+                        format!("hwmon{idx}")
+                    } else {
+                        chip_name.clone()
+                    }
+                });
+            let c = milli as f64 / 1000.0;
+            if best.as_ref().is_none_or(|(_, bc)| c > *bc) {
+                best = Some((label, c));
+            }
+        }
+    }
+    best
 }
 
 /// /proc/net/dev → cumulative per-interface counters. Two header lines,
@@ -877,6 +973,10 @@ impl Platform for Linux {
             out.load5 = l5;
             out.load15 = l15;
         }
+        // PSI (kernel 4.20+; also gated on the kernel command line): three
+        // more µs-cheap /proc reads, same cadence as the rest
+        out.psi = read_psi();
+        out.temp = thermal_sensor();
         Some(out)
     }
 
@@ -1041,39 +1141,24 @@ impl Platform for Linux {
             let Some(path) = line.splitn(3, ':').nth(2) else {
                 continue;
             };
-            let (runtime, id) = if let Some(rest) = path.strip_prefix("/docker/") {
-                ("docker", rest)
-            } else if let Some(rest) = path
-                .strip_prefix("/system.slice/docker-")
-                .and_then(|s| s.strip_suffix(".scope"))
-            {
-                ("docker", rest)
-            } else if let Some(rest) = path
-                .strip_prefix("/system.slice/containerd-")
-                .or_else(|| path.split("cri-containerd:").nth(1))
-                .or_else(|| path.split("cri-containerd-").nth(1))
-            {
-                ("containerd", rest)
-            } else if let Some(rest) = path
-                .split("libpod-")
-                .nth(1)
-                .and_then(|s| s.split(".scope").next())
-            {
-                ("podman", rest)
-            } else if path.contains("kubepods") {
-                // .../kubepods/<qos>/pod<uid>/<container-id>
-                let id = path.rsplit('/').next().unwrap_or(path);
-                ("kubernetes", id)
-            } else if path.contains("colima") {
-                // colima's docker cgroups live under its own slice
-                let id = path.rsplit('/').next().unwrap_or(path);
-                ("colima", id)
-            } else if let Some(rest) = path.strip_prefix("/lxc/") {
-                ("lxc", rest)
-            } else {
+            let Some((runtime, id)) = classify_cgroup(path) else {
                 continue;
             };
-            let id = id.split('/').next().unwrap_or(id);
+            // a plain systemd unit is its own attribution — no runtime
+            // lookup applies (the cgroup path is authoritative and cheaper
+            // than `systemctl status <pid>`)
+            if runtime == "systemd" {
+                return Some(Source {
+                    kind: "systemd".into(),
+                    label: Some(id.clone()),
+                    detail: Some(if path.contains(".slice/user@") {
+                        format!("systemd user unit {id}")
+                    } else {
+                        format!("systemd unit {id}")
+                    }),
+                    ..Default::default()
+                });
+            }
             let mut label = id.chars().take(12).collect::<String>();
             let mut detail = format!("runtime: {}", runtime);
             if runtime == "docker" || runtime == "colima" {
@@ -1086,6 +1171,17 @@ impl Platform for Linux {
                     if !name.is_empty() {
                         detail = format!("docker container \"{}\"", name);
                         label = name.to_string();
+                    }
+                }
+            }
+            if runtime == "kubernetes" {
+                // resolve the owning pod from the cluster (best effort:
+                // no kubectl / no access leaves the bare container id)
+                if let Some(pods) = crate::k8s::pods() {
+                    if let Some(pod) = crate::k8s::find_pod(&pods, &id) {
+                        let short = id.chars().take(12).collect::<String>();
+                        detail = format!("kubernetes pod {pod} · container {short}");
+                        label = pod;
                     }
                 }
             }
@@ -1353,6 +1449,72 @@ fn hup_bit(hex: &str) -> bool {
     u64::from_str_radix(hex, 16).is_ok_and(|m| m & 0x1 != 0)
 }
 
+/// Classify a cgroup v2 path into an ownership context: the runtime that
+/// owns the container ("docker" / "containerd" / "podman" / "kubernetes" /
+/// "colima" / "lxc") plus its container id, or ("systemd", unit) for plain
+/// systemd units, or None for anything else (root cgroup, init.scope,
+/// session scopes — everything the paths above didn't claim). Pure so the
+/// whole classification table is unit-testable.
+fn classify_cgroup(path: &str) -> Option<(String, String)> {
+    let (runtime, id) = if let Some(rest) = path.strip_prefix("/docker/") {
+        ("docker", rest)
+    } else if let Some(rest) = path
+        .strip_prefix("/system.slice/docker-")
+        .and_then(|s| s.strip_suffix(".scope"))
+    {
+        ("docker", rest)
+    } else if let Some(rest) = path
+        .strip_prefix("/system.slice/containerd-")
+        .and_then(|s| s.strip_suffix(".scope"))
+        .or_else(|| path.split("cri-containerd:").nth(1))
+        .or_else(|| path.split("cri-containerd-").nth(1))
+    {
+        ("containerd", rest)
+    } else if let Some(rest) = path
+        .split("libpod-")
+        .nth(1)
+        .and_then(|s| s.split(".scope").next())
+    {
+        ("podman", rest)
+    } else if path.contains("kubepods") {
+        // .../kubepods/<qos>/pod<uid>/<container-id>, often wrapped in a
+        // systemd scope whose name prefixes the id (docker-, cri-o-,
+        // cri-containerd-)
+        let raw = path.rsplit('/').next().unwrap_or(path);
+        let bare = raw
+            .strip_suffix(".scope")
+            .unwrap_or(raw)
+            .trim_start_matches("docker-")
+            .trim_start_matches("cri-containerd-")
+            .trim_start_matches("crio-");
+        ("kubernetes", bare)
+    } else if path.contains("colima") {
+        // colima's docker cgroups live under its own slice
+        let id = path.rsplit('/').next().unwrap_or(path);
+        ("colima", id)
+    } else if let Some(rest) = path.strip_prefix("/lxc/") {
+        ("lxc", rest)
+    } else if path.contains(".slice/") {
+        // a plain systemd unit: the leaf is a unit file (nginx.service,
+        // foo.timer, user manager's app.slice units). .scope is excluded —
+        // container and session scopes were matched (or deliberately
+        // skipped) above, and init.scope is systemd itself, not a unit.
+        let leaf = path.rsplit('/').next().unwrap_or(path);
+        let is_unit = [".service", ".socket", ".timer", ".mount", ".path", ".swap", ".target"]
+            .iter()
+            .any(|ext| leaf.ends_with(ext));
+        if is_unit {
+            ("systemd", leaf)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    let id = id.split('/').next().unwrap_or(id);
+    Some((runtime.to_string(), id.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1519,6 +1681,75 @@ wlp3s0: 5000 50 0 0 0 0 0 0  6000 60 0 0 0 0 0 0
     }
 
     #[test]
+    fn classify_cgroup_spans_runtimes_units_and_unknown() {
+        let full = "aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999";
+        let cases = [
+            // classic runtime placements
+            (
+                format!("/docker/{full}"),
+                Some(("docker", full)),
+            ),
+            (
+                format!("/system.slice/docker-{full}.scope"),
+                Some(("docker", full)),
+            ),
+            (
+                format!("/system.slice/containerd-{full}.scope"),
+                Some(("containerd", full)),
+            ),
+            (
+                format!("/system.slice/libpod-{full}.scope"),
+                Some(("podman", full)),
+            ),
+            // kubepods: scope-wrapped container ids lose their wrapper
+            (
+                format!("/kubepods.slice/kubepods-besteffort-pod1234.slice/docker-{full}.scope"),
+                Some(("kubernetes", full)),
+            ),
+            (
+                format!("/kubepods.slice/kubepods-burstable-pod1234.slice/crio-{full}.scope"),
+                Some(("kubernetes", full)),
+            ),
+            // plain systemd units (system + user manager)
+            (
+                "/system.slice/nginx.service".to_string(),
+                Some(("systemd", "nginx.service")),
+            ),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/firefox.service"
+                    .to_string(),
+                Some(("systemd", "firefox.service")),
+            ),
+        ];
+        for (path, want) in cases {
+            let got = classify_cgroup(&path);
+            assert_eq!(
+                got.as_ref().map(|(r, i)| (r.as_str(), i.as_str())),
+                want,
+                "{path}"
+            );
+        }
+        // everything else stays unclassified: the root group, systemd
+        // itself, session scopes, a machine scope, an lxc id still found
+        assert_eq!(classify_cgroup("/"), None);
+        assert_eq!(classify_cgroup("/init.scope"), None);
+        assert_eq!(
+            classify_cgroup("/user.slice/user-1000.slice/session-2.scope"),
+            None
+        );
+        assert_eq!(
+            classify_cgroup("/machine.slice/machine-qemu\\x2dvm.scope"),
+            None
+        );
+        assert_eq!(
+            classify_cgroup("/lxc/abc123")
+                .as_ref()
+                .map(|(r, i)| (r.as_str(), i.as_str())),
+            Some(("lxc", "abc123"))
+        );
+    }
+
+    #[test]
     fn hup_bit_detects_sighup_ignores() {
         // SigIgn hex masks: bit 0 = SIGHUP (signal 1)
         assert!(hup_bit("0000000000000001")); // only SIGHUP ignored (nohup)
@@ -1582,5 +1813,34 @@ HugePages_Total:       0
         assert_eq!((su, st), (Some(1_024_000), Some(2_048_000)));
         let (l1, l5, l15) = parse_loadavg("0.52 0.58 0.59 2/1234 5678\n");
         assert_eq!((l1, l5, l15), (Some(0.52), Some(0.58), Some(0.59)));
+    }
+
+    #[test]
+    fn psi_file_parses_some_full_avg10() {
+        // the exact /proc/pressure/cpu shape: no `full` line on cpu
+        let cpu = "some avg10=1.23 avg60=0.50 avg300=0.20 total=12345678\n";
+        assert_eq!(parse_psi_file(cpu), (1.23, 0.0));
+        // memory/io carry both lines
+        let mem = "some avg10=4.00 avg60=2.00 avg300=1.00 total=999\n\
+                   full avg10=0.10 avg60=0.05 avg300=0.01 total=5\n";
+        assert_eq!(parse_psi_file(mem), (4.0, 0.1));
+        // garbage / empty degrades to zeros, never a panic
+        assert_eq!(parse_psi_file(""), (0.0, 0.0));
+        assert_eq!(parse_psi_file("some avg10=oops avg60=0 total=0\n"), (0.0, 0.0));
+    }
+
+    #[test]
+    fn psi_stats_line_and_worst_full() {
+        let mut s = super::super::PsiStats {
+            cpu_some: 1.0,
+            mem_full: 7.5,
+            io_some: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(s.worst_full(), 7.5, "mem full is the worst");
+        s.io_full = 9.9;
+        assert_eq!(s.worst_full(), 9.9);
+        let line = super::super::PsiStats::default().line();
+        assert!(line.contains("cpu 0.0/0.0") && line.contains("io 0.0/0.0"), "{line}");
     }
 }

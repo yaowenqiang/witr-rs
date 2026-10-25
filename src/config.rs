@@ -14,6 +14,8 @@
 //! paused = false          # start with sampling frozen (as 'P')
 //! watch = ["nginx|nginx|www"]  # TUI watchlist ('w'), one "name|exe|user" per entry
 //! notes = ["nginx|nginx|www|reverse proxy for the lab"]  # 'N' annotations
+//! alert_cpu = 80          # persistent defaults for the --alert-* flags
+//! alert_webhook = "http://127.0.0.1:9000/hook"
 //! ```
 
 use std::path::PathBuf;
@@ -36,6 +38,24 @@ pub struct Config {
     /// so note text may itself contain `|`). Written back by `save_notes`
     /// when 'N' commits in the TUI.
     pub notes: Vec<String>,
+    /// Persistent defaults for the `--alert-*` flags (thresholds in the
+    /// same units the flags take). [`crate::cli::Cli::apply_config`] folds
+    /// these under the CLI flags once at startup, so every consumer —
+    /// watch loop, TUI seeds, webhook — sees the resolved value.
+    pub alert_cpu: Option<f64>,
+    pub alert_mem: Option<u64>,
+    pub alert_fd: Option<u64>,
+    pub alert_io: Option<f64>,
+    pub alert_conn: Option<u64>,
+    pub alert_load: Option<f64>,
+    pub alert_mem_pct: Option<u64>,
+    pub alert_count: Option<u32>,
+    pub alert_disk: Option<u64>,
+    pub alert_net: Option<u64>,
+    pub alert_psi: Option<f64>,
+    pub alert_repeat: Option<u64>,
+    pub alert_exec: Option<String>,
+    pub alert_webhook: Option<String>,
 }
 
 impl Config {
@@ -263,6 +283,11 @@ impl Config {
                         "line {n}: {key} {quoted:?} is not true/false, skipped"
                     )),
                 },
+                k if k.starts_with("alert_") => {
+                    if let Err(e) = set_alert(k, quoted, &mut cfg) {
+                        warnings.push(format!("line {n}: {e}, skipped"));
+                    }
+                }
                 _ => warnings.push(format!("line {n}: unknown key {key:?}, skipped")),
             }
         }
@@ -277,6 +302,50 @@ fn strip_comment(value: &str) -> &str {
         &value[..pos]
     } else {
         value
+    }
+}
+
+/// Store one `alert_*` config value into its Config slot — same names and
+/// units as the CLI flags. Returns the message for a skipped line (bad
+/// number, or an alert_ name that no flag answers to).
+fn set_alert(key: &str, value: &str, cfg: &mut Config) -> Result<(), String> {
+    let num = |slot: &mut Option<f64>| {
+        value
+            .parse::<f64>()
+            .map(|v| *slot = Some(v))
+            .map_err(|_| format!("{key} {value:?} is not a number"))
+    };
+    let int = |slot: &mut Option<u64>| {
+        value
+            .parse::<u64>()
+            .map(|v| *slot = Some(v))
+            .map_err(|_| format!("{key} {value:?} is not a number"))
+    };
+    match key {
+        "alert_cpu" => num(&mut cfg.alert_cpu),
+        "alert_io" => num(&mut cfg.alert_io),
+        "alert_load" => num(&mut cfg.alert_load),
+        "alert_psi" => num(&mut cfg.alert_psi),
+        "alert_mem" => int(&mut cfg.alert_mem),
+        "alert_fd" => int(&mut cfg.alert_fd),
+        "alert_mem_pct" => int(&mut cfg.alert_mem_pct),
+        "alert_net" => int(&mut cfg.alert_net),
+        "alert_disk" => int(&mut cfg.alert_disk),
+        "alert_conn" => int(&mut cfg.alert_conn),
+        "alert_repeat" => int(&mut cfg.alert_repeat),
+        "alert_count" => value
+            .parse::<u32>()
+            .map(|v| cfg.alert_count = Some(v))
+            .map_err(|_| format!("{key} {value:?} is not a number")),
+        "alert_exec" => {
+            cfg.alert_exec = Some(value.to_string());
+            Ok(())
+        }
+        "alert_webhook" => {
+            cfg.alert_webhook = Some(value.to_string());
+            Ok(())
+        }
+        _ => Err(format!("unknown key {key:?}")),
     }
 }
 
@@ -327,6 +396,7 @@ watch = [\"nginx|nginx|www\", \"tailspid|sleep|\"]
                 paused: Some(false),
                 watch: vec!["nginx|nginx|www".into(), "tailspid|sleep|".into()],
                 notes: Vec::new(),
+                ..Default::default()
             }
         );
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -398,6 +468,32 @@ watch = [\"nginx|nginx|www\", \"tailspid|sleep|\"]
         assert!(!text.contains("old|exe|u"), "stale entry replaced");
         assert_eq!(text.matches("watch =").count(), 1, "exactly one watch line");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn parse_alert_keys_types_units_and_warnings() {
+        let (cfg, w) = Config::parse(
+            "\
+alert_cpu = 80.5
+alert_mem = 512
+alert_psi = 10
+alert_count = 3
+alert_exec = notify-send hi
+alert_webhook = \"http://127.0.0.1:9000/hook\"
+alert_load = fast
+alert_nope = 1
+",
+        );
+        assert_eq!(cfg.alert_cpu, Some(80.5));
+        assert_eq!(cfg.alert_mem, Some(512));
+        assert_eq!(cfg.alert_psi, Some(10.0));
+        assert_eq!(cfg.alert_count, Some(3));
+        assert_eq!(cfg.alert_exec.as_deref(), Some("notify-send hi"));
+        assert_eq!(cfg.alert_webhook.as_deref(), Some("http://127.0.0.1:9000/hook"));
+        assert_eq!(cfg.alert_load, None, "bad number skipped");
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w.iter().any(|x| x.contains("alert_load") && x.contains("not a number")));
+        assert!(w.iter().any(|x| x.contains("unknown key") && x.contains("alert_nope")));
     }
 
     #[test]

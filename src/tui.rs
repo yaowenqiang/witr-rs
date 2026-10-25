@@ -2,7 +2,7 @@
 //! tab bar, mode line, search box, process table + live details panel with
 //! the ancestry tree, footer key hints, 3s auto refresh.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Result;
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,36 @@ const GREEN: Color = Color::Rgb(34, 170, 34);
 const GRAY: Color = Color::Rgb(88, 88, 88);
 const MID: Color = Color::Rgb(118, 118, 118);
 const ACCENT: Color = Color::Rgb(95, 95, 215);
+/// how many series the Samples page cycles through (↑/↓)
+const SAMPLE_SERIES: usize = 5;
+
+/// One sparkline row for `values`: downsampled to `width` block cells
+/// (per-cell max, so peaks survive shrinking), gaps (None) as a space.
+/// Returns the cells plus which cell the sample at `cursor` landed on.
+fn spark_row(values: &[Option<f64>], width: usize, cursor: usize) -> (Vec<char>, Option<usize>) {
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if values.is_empty() || width == 0 {
+        return (Vec::new(), None);
+    }
+    let max = values.iter().filter_map(|v| *v).fold(0.0f64, f64::max);
+    let max = if max <= 0.0 { 1.0 } else { max * 1.05 };
+    let n = values.len();
+    let cell_of = |i: usize| i * width / n;
+    let mut cells = vec![' '; width];
+    for (i, v) in values.iter().enumerate() {
+        if let Some(v) = v {
+            let level = ((v / max) * 7.0).round().clamp(0.0, 7.0) as usize;
+            let cell = cell_of(i);
+            // keep the tallest sample seen in the cell (peaks read better
+            // than the last one in)
+            if BLOCKS[level] > cells[cell] || cells[cell] == ' ' {
+                cells[cell] = BLOCKS[level];
+            }
+        }
+    }
+    let cur = if cursor < n { Some(cell_of(cursor)) } else { None };
+    (cells, cur)
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Tab {
@@ -275,7 +305,7 @@ struct TuiApp {
     /// first enumeration finished — afterwards refreshes keep the stale
     /// table visible instead of flashing the loading placeholder
     containers_loaded: bool,
-    containers_rx: Option<std::sync::mpsc::Receiver<Vec<Container>>>,
+    containers_rx: Option<std::sync::mpsc::Receiver<(Vec<Container>, Vec<crate::k8s::Pod>)>>,
     /// live per-container CPU% + memory (full id → stats): a background
     /// `stats --no-stream` sweep rides the containers thread path — stats
     /// cost ~2s per runtime, so they refresh on a slower cadence than the
@@ -358,10 +388,23 @@ struct TuiApp {
     alert_disk: Option<u64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
     alert_net: Option<u64>,
+    /// --alert-psi: PSI "full" stall percent threshold (Linux only)
+    alert_psi: Option<f64>,
     /// streak/firing state for the machine-wide alerts
     sys_alert: crate::history::SysAlertState,
+    /// last (state, restarts) per "runtime/id" — the container-alert edge
+    /// detector's memory (first sighting arms, no alerts)
+    container_seen: HashMap<String, (String, Option<u32>)>,
+    /// last (phase, restarts, waiting reason) per "ns/name" — the pod-alert
+    /// edge detector's memory (first sighting arms, no alerts)
+    pod_seen: HashMap<String, (Option<String>, u32, Option<String>)>,
+    /// container alerts (death edge / climbing restarts) waiting for the
+    /// next refresh's picks loop to dispatch them
+    pending_alerts: Vec<(Pid, String, String)>,
     /// --alert-exec: shell command per alert firing (context in env vars)
     alert_exec: Option<String>,
+    /// --alert-webhook: POST each alert firing as JSON to this URL
+    alert_webhook: Option<String>,
     /// pid → per-metric streak/firing state (pruned to live pids)
     alert_state: HashMap<Pid, AlertTrack>,
     /// process annotations ("name|exe|user|note"), identity-keyed like the
@@ -376,6 +419,12 @@ struct TuiApp {
     diff_source: String,
     /// 'D' page: selected entry
     diff_sel: usize,
+    /// --samples: the record file's machine samples + browse state
+    /// (cursor into `samples`, which of the 5 series is charted)
+    samples: Vec<crate::SysPoint>,
+    samples_source: String,
+    samples_cursor: usize,
+    samples_series: usize,
     /// where '?' was pressed — the Help overlay returns here
     help_prev: Page,
 }
@@ -391,6 +440,8 @@ enum Page {
     System,
     /// 'D': newest auto snapshot vs the live table, one row per DiffEntry
     Diff,
+    /// --samples: a --record file's machine samples browsed as sparklines
+    Samples,
     /// '?' overlay: the keymap for the current tab; returns to
     /// `help_prev` on close
     Help,
@@ -470,6 +521,11 @@ pub struct Seed {
     /// --replay FILE --follow: keep tailing the file — events appended by
     /// the recording side stream into the ring live
     pub replay_follow: Option<String>,
+    /// --samples: machine samples parsed out of a --record file (csv or
+    /// jsonl), browsed on the Samples page while live sampling continues
+    pub samples: Vec<crate::SysPoint>,
+    /// the --samples file path, shown as the page's source line
+    pub samples_source: String,
     /// --notify: desktop notifications on restarts / repeated exits
     /// ('!' toggles live inside the TUI)
     pub notify: bool,
@@ -509,9 +565,13 @@ pub struct Seed {
     pub alert_disk: Option<u64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
     pub alert_net: Option<u64>,
+    /// --alert-psi: PSI "full" stall percent threshold (Linux only)
+    pub alert_psi: Option<f64>,
     /// --alert-exec: shell command run on every threshold-alert firing;
     /// context exported as WITR_ALERT_PID/NAME/DETAIL
     pub alert_exec: Option<String>,
+    /// --alert-webhook: POST each alert firing as JSON to this URL
+    pub alert_webhook: Option<String>,
     /// config notes — per-process annotations ("name|exe|user|note"),
     /// identity-keyed like the watchlist so they survive restarts
     pub notes: Vec<String>,
@@ -682,14 +742,23 @@ impl TuiApp {
             alert_count: seed.alert_count,
             alert_disk: seed.alert_disk,
             alert_net: seed.alert_net,
+            alert_psi: seed.alert_psi,
             sys_alert: crate::history::SysAlertState::default(),
+            container_seen: HashMap::new(),
+            pod_seen: HashMap::new(),
+            pending_alerts: Vec::new(),
             alert_exec: seed.alert_exec.clone(),
+            alert_webhook: seed.alert_webhook.clone(),
             alert_state: HashMap::new(),
             notes: seed.notes,
             note_input: None,
             diff_entries: Vec::new(),
             diff_source: String::new(),
             diff_sel: 0,
+            samples: Vec::new(),
+            samples_source: String::new(),
+            samples_cursor: 0,
+            samples_series: 0,
             help_prev: Page::Browse,
             confirm_tree_kill: None,
             table_rect: None,
@@ -794,6 +863,14 @@ impl TuiApp {
             app.hist.events = seed.replayed;
             app.switch_tab(Tab::Events);
             app.rebuild_event_view();
+        }
+        // --samples FILE: import the record's machine samples and open on
+        // the Samples page (cursor at the newest sample)
+        if !seed.samples.is_empty() {
+            app.samples = seed.samples;
+            app.samples_source = seed.samples_source.clone();
+            app.samples_cursor = app.samples.len() - 1;
+            app.page = Page::Samples;
         }
         // --replay FILE --follow: after the one-shot history load, tail the
         // file from its current end so only new appends stream in
@@ -932,6 +1009,7 @@ impl TuiApp {
                 || self.alert_count.is_some()
                 || self.alert_disk.is_some()
                 || self.alert_net.is_some()
+                || self.alert_psi.is_some()
             {
                 // --alert-load / --alert-mem-pct / --alert-count /
                 // --alert-disk / --alert-net: sample the whole machine when
@@ -962,6 +1040,7 @@ impl TuiApp {
                         disk_pct: self.alert_disk,
                         net_limit: self.alert_net,
                         net_rate,
+                        psi_limit: self.alert_psi,
                         repeat: self.alert_repeat,
                     };
                     picks.extend(
@@ -976,7 +1055,10 @@ impl TuiApp {
                     );
                 }
             }
-            for (pid, name, detail) in picks {
+            for (pid, name, detail) in picks
+                .into_iter()
+                .chain(self.pending_alerts.drain(..))
+            {
                 let e = self.hist.push_alert(pid, &name, &detail);
                 if let Some(f) = self.events_log.as_mut() {
                     use std::io::Write as _;
@@ -988,6 +1070,9 @@ impl TuiApp {
                 send_desktop_notify("witr-rs", &format!("{name}: {detail}"));
                 if let Some(cmd) = &self.alert_exec {
                     spawn_alert_exec(cmd, pid, &name, &detail);
+                }
+                if let Some(hook) = &self.alert_webhook {
+                    send_alert_webhook(hook, pid, &name, &detail);
                 }
                 self.status = format!("ALERT {name} — {detail}");
             }
@@ -1071,9 +1156,18 @@ impl TuiApp {
         std::thread::spawn(move || {
             let mut cs = crate::platform::enumerate_containers();
             // pod attribution rides the same background thread (kubectl
-            // adds ~1s when a cluster is reachable)
-            crate::k8s::annotate(&mut cs);
-            let _ = tx.send(cs);
+            // adds ~1s when a cluster is reachable); the pod snapshot also
+            // feeds the pod-alert edges (phase / waiting / restart climbs)
+            let pods = crate::k8s::pods().unwrap_or_default();
+            crate::k8s::annotate_with(&pods, &mut cs);
+            // restart counts per running container (one inspect each) feed
+            // the crash-loop edge detector; None is fine on failure
+            for c in cs.iter_mut().filter(|c| c.state == "running") {
+                if c.restarts.is_none() {
+                    c.restarts = crate::platform::container_restarts(&c.runtime, &c.id);
+                }
+            }
+            let _ = tx.send((cs, pods));
         });
         self.containers_rx = Some(rx);
     }
@@ -1084,14 +1178,111 @@ impl TuiApp {
             return;
         }
         let arrived = self.containers_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-        if let Some(cs) = arrived {
+        if let Some((cs, pods)) = arrived {
             self.containers = cs;
             self.containers_loading = false;
             self.containers_loaded = true;
             self.containers_rx = None;
+            self.container_alert_edges(&self.containers.clone(), &pods);
             self.apply_container_stats();
             self.rebuild_container_view();
         }
+    }
+
+    /// Container death / crash-loop edges: the fresh enumeration vs the
+    /// previous one. First sighting arms quietly; afterwards a running →
+    /// exited/dead transition fetches the exit reason (OOMKilled wins) and
+    /// a climbing restart count reports the jump. `pods` (empty without a
+    /// cluster) feeds the pod edges the same way: CrashLoopBackOff /
+    /// ImagePullBackOff appearing, a running pod going Pending again,
+    /// Failed phase, climbing k8s restart totals. Inspect calls happen
+    /// only on the death edge.
+    fn container_alert_edges(
+        &mut self,
+        cs: &[crate::model::Container],
+        pods: &[crate::k8s::Pod],
+    ) {
+        for c in cs {
+            let key = format!("{}/{}", c.runtime, c.id);
+            if let Some((st, rst)) = self.container_seen.get(&key) {
+                let pod_tag = match &c.pod {
+                    Some(p) => format!(" · pod {p}"),
+                    None => String::new(),
+                };
+                let was_running = st == "running";
+                let now_dead = matches!(c.state.as_str(), "exited" | "dead");
+                if was_running && now_dead {
+                    let reason = crate::platform::container_exit_reason(&c.runtime, &c.id)
+                        .unwrap_or_else(|| c.status.clone());
+                    self.pending_alerts.push((
+                        0,
+                        format!("container {}", c.name),
+                        format!("exited — {reason}{pod_tag}"),
+                    ));
+                }
+                if let (Some(old), Some(new)) = (*rst, c.restarts) {
+                    if new > old {
+                        self.pending_alerts.push((
+                            0,
+                            format!("container {}", c.name),
+                            format!("restart count {old} → {new} (crash loop?){pod_tag}"),
+                        ));
+                    }
+                }
+            }
+            self.container_seen
+                .insert(key, (c.state.clone(), c.restarts));
+        }
+        // removed containers drop out of the edge detector's memory
+        let live: HashSet<String> = cs
+            .iter()
+            .map(|c| format!("{}/{}", c.runtime, c.id))
+            .collect();
+        self.container_seen.retain(|k, _| live.contains(k));
+        self.pod_alert_edges(pods);
+    }
+
+    /// Pod-level edges against `pod_seen`'s snapshot: a waiting reason
+    /// appearing (CrashLoopBackOff & co), a Running pod back to Pending,
+    /// a Failed phase, a climbing restart total. First sighting arms.
+    fn pod_alert_edges(&mut self, pods: &[crate::k8s::Pod]) {
+        for p in pods {
+            if let Some((phase, restarts, waiting)) = self.pod_seen.get(&p.key) {
+                if p.waiting.is_some() && *waiting != p.waiting {
+                    self.pending_alerts.push((
+                        0,
+                        format!("pod {}", p.key),
+                        format!(
+                            "containers waiting: {}{}",
+                            p.waiting.clone().unwrap_or_default(),
+                            match &p.phase {
+                                Some(ph) => format!(" (phase {ph})"),
+                                None => String::new(),
+                            }
+                        ),
+                    ));
+                }
+                if phase.as_deref() == Some("Running") && p.phase.as_deref() == Some("Pending") {
+                    self.pending_alerts
+                        .push((0, format!("pod {}", p.key), "went Pending again".into()));
+                }
+                if p.phase.as_deref() == Some("Failed") && phase.as_deref() != Some("Failed") {
+                    self.pending_alerts
+                        .push((0, format!("pod {}", p.key), "phase Failed".into()));
+                }
+                if p.restarts > *restarts {
+                    self.pending_alerts.push((
+                        0,
+                        format!("pod {}", p.key),
+                        format!("restart count {} → {} (crash loop?)", restarts, p.restarts),
+                    ));
+                }
+            }
+            self.pod_seen
+                .insert(p.key.clone(), (p.phase.clone(), p.restarts, p.waiting.clone()));
+        }
+        let live: HashSet<&str> = pods.iter().map(|p| p.key.as_str()).collect();
+        self.pod_seen.retain(|k, _| live.contains(k.as_str()));
     }
 
     /// Kick off a background `stats --no-stream` sweep (no-op while one is
@@ -1338,6 +1529,88 @@ impl TuiApp {
         lines
     }
 
+    /// The Samples page's chartable series: label, unit, per-sample values.
+    fn samples_series(&self, k: usize) -> (&'static str, &'static str, Vec<Option<f64>>) {
+        let pts = &self.samples;
+        match k % SAMPLE_SERIES {
+            0 => ("cpu %", "%", pts.iter().map(|p| p.cpu).collect()),
+            1 => ("memory %", "%", pts.iter().map(|p| p.mem_pct).collect()),
+            2 => ("load 1m", "", pts.iter().map(|p| p.load1).collect()),
+            3 => (
+                "network",
+                "MB/s",
+                pts.iter().map(|p| p.net_bps.map(|b| b / 1048576.0)).collect(),
+            ),
+            _ => (
+                "processes",
+                "",
+                pts.iter().map(|p| Some(p.procs as f64)).collect(),
+            ),
+        }
+    }
+
+    /// Lines for the --samples page — shared by the renderer and the 'c'
+    /// copy. `width` bounds the sparkline (the copy path passes 0 → a
+    /// modest default).
+    fn samples_page_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if self.samples.is_empty() {
+            lines.push(Line::from(styled(
+                Style::new().fg(MID),
+                "no samples loaded — open one with --samples FILE (a --record .csv/.jsonl)",
+            )));
+            return lines;
+        }
+        let n = self.samples.len();
+        let t0 = crate::util::fmt_time(self.samples[0].at);
+        let t1 = crate::util::fmt_time(self.samples[n - 1].at);
+        lines.push(Line::from(vec![
+            Span::styled("from      ", Style::new().bold()),
+            Span::raw(format!("{0} · {n} samples · {t0} – {t1}", self.samples_source)),
+        ]));
+        let k = self.samples_series % SAMPLE_SERIES;
+        let (name, _unit, values) = self.samples_series(k);
+        let inner = width.saturating_sub(12).clamp(20, 400);
+        let (cells, cur) = spark_row(&values, inner, self.samples_cursor);
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(
+            format!("{name:<12}"),
+            Style::new().fg(ACCENT).bold(),
+        )];
+        for (i, ch) in cells.iter().enumerate() {
+            let style = if Some(i) == cur {
+                Style::new().fg(Color::White).bg(ACCENT)
+            } else {
+                Style::new().fg(ACCENT)
+            };
+            spans.push(Span::styled(ch.to_string(), style));
+        }
+        lines.push(Line::from(spans));
+        // every series' value at the cursor — the numeric readout under
+        // the chart
+        let p = &self.samples[self.samples_cursor];
+        let at = crate::util::fmt_time(p.at);
+        let f = |v: Option<f64>, unit: &str| match v {
+            Some(v) => format!("{v:.1}{unit}"),
+            None => "-".into(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>10}", at.get(at.len() - 8..).unwrap_or("")), Style::new().bold()),
+            Span::raw(format!(
+                "  cpu {}  mem {}  load {}  net {}  procs {}",
+                f(p.cpu, "%"),
+                f(p.mem_pct, "%"),
+                f(p.load1, ""),
+                f(p.net_bps.map(|b| b / 1048576.0), "MB/s"),
+                p.procs,
+            )),
+        ]));
+        lines.push(Line::from(styled(
+            Style::new().fg(MID),
+            "←/→ h/l: move · ↑/↓ j/k: series · g/G: ends · Esc: back",
+        )));
+        lines
+    }
+
     /// Lines for the system resources page ('y') — shared by the renderer
     /// and the 'c' copy. Charts come from the history rings, "now" values
     /// (load, swap, per-core grid) from the latest snapshot.
@@ -1531,6 +1804,40 @@ impl TuiApp {
                     "  {name:<24}↓ {rx:>7.1}  ↑ {tx:>7.1} MB/s"
                 )));
             }
+        }
+        // pressure stall information (Linux PSI): some/full avg10 per
+        // resource; full ≥10% paints red — everything stalled on that
+        // resource is the "machine is dying" signature
+        if let Some(psi) = &stats.psi {
+            lines.push(Line::from(vec![
+                Span::styled("pressure", Style::new().bold()),
+                Span::raw(format!(
+                    "  (some/full %, last 10s)  {}",
+                    psi.line()
+                )),
+            ]));
+            let worst = psi.worst_full();
+            if worst > 0.0 {
+                let text = format!("  worst full {worst:.1}%");
+                lines.push(Line::from(if worst >= 10.0 {
+                    Span::styled(text, Style::new().fg(Color::Red).bold())
+                } else if worst >= 1.0 {
+                    Span::styled(text, Style::new().fg(Color::Yellow))
+                } else {
+                    Span::styled(text, Style::new().fg(MID))
+                }));
+            }
+        }
+        // hottest thermal sensor (Linux hwmon): ≥80°C red, ≥65°C yellow
+        if let Some((label, c)) = &stats.temp {
+            let text = format!("temp    {c:.1}°C  ({label})");
+            lines.push(Line::from(if *c >= 80.0 {
+                Span::styled(text, Style::new().fg(Color::Red).bold())
+            } else if *c >= 65.0 {
+                Span::styled(text, Style::new().fg(Color::Yellow))
+            } else {
+                Span::raw(text)
+            }));
         }
         lines
     }
@@ -2750,6 +3057,7 @@ impl TuiApp {
                 .unwrap_or_default(),
             Page::System => self.system_page_lines(),
             Page::Diff => self.diff_page_lines(),
+            Page::Samples => self.samples_page_lines(80),
             Page::Help => help_lines(self.tab),
             Page::Browse => Vec::new(),
         };
@@ -2950,10 +3258,13 @@ struct PortOverviewRow {
     user: String,
     protos: String,
     addrs: usize,
+    /// Exposure class from the bind addresses: "internet" (a wildcard
+    /// 0.0.0.0/::/* bind), "loopback", "iface", "unknown".
+    scope: &'static str,
 }
 
 /// Accumulated overview data per (port, owner): protocols seen, and the
-/// distinct local addr:port endpoints the port is reachable on.
+/// distinct local bind addresses the port is reachable on.
 type PortGroup = (Vec<String>, std::collections::HashSet<String>);
 
 /// Processes-tab 'B' grouping: aggregate the (search-filtered) table into
@@ -3092,7 +3403,7 @@ fn port_overview_rows(sockets: &[Socket], procs: &[Process]) -> Vec<PortOverview
         if !e.0.contains(&s.proto) {
             e.0.push(s.proto.clone());
         }
-        e.1.insert(format!("{}:{}", s.local_addr, s.local_port));
+        e.1.insert(s.local_addr.clone());
     }
     order.sort();
     order
@@ -3109,13 +3420,15 @@ fn port_overview_rows(sockets: &[Socket], procs: &[Process]) -> Vec<PortOverview
                     )
                 })
                 .unwrap_or_else(|| ("-".into(), "-".into()));
+            let binds: Vec<String> = addrs.iter().cloned().collect();
             PortOverviewRow {
                 port,
                 pid,
                 name,
                 user,
                 protos: protos.join("/"),
-                addrs: addrs.len(),
+                addrs: binds.len(),
+                scope: crate::snapshot::bind_scope(&binds),
             }
         })
         .collect()
@@ -3479,6 +3792,67 @@ pub fn spawn_alert_exec(cmd: &str, pid: Pid, name: &str, detail: &str) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         let _ = c.status();
+    });
+}
+
+/// POST one alert as JSON to `--alert-webhook` (same payload shape as the
+/// --events-log envelope). http:// only — std has no TLS, https:// URLs are
+/// refused with a note. Fire-and-forget on a throwaway thread with a 3s
+/// timeout: a slow or dead webhook must never stall the sampler; failures
+/// print to stderr once per miss.
+pub fn send_alert_webhook(url: &str, pid: Pid, name: &str, detail: &str) {
+    let Some(rest) = url.strip_prefix("http://") else {
+        eprintln!("--alert-webhook: only http:// URLs are supported (no TLS): {url}");
+        return;
+    };
+    let (host_port, path) = match rest.split_once('/') {
+        Some((hp, p)) => (hp.to_string(), format!("/{p}")),
+        None => (rest.to_string(), "/".to_string()),
+    };
+    if host_port.is_empty() {
+        eprintln!("--alert-webhook: no host in {url}");
+        return;
+    }
+    let url = url.to_string();
+    let name = name.to_string();
+    let detail = detail.to_string();
+    let _ = std::thread::spawn(move || {
+        let body = serde_json::json!({
+            "schema_version": crate::SCHEMA_VERSION,
+            "kind": "alert",
+            "at_unix": crate::util::now_unix(),
+            "pid": pid,
+            "name": name,
+            "detail": detail,
+        });
+        let payload = serde_json::to_string(&body).unwrap_or_default();
+        let addrs = match std::net::ToSocketAddrs::to_socket_addrs(&host_port.as_str()) {
+            Ok(a) => a.collect::<Vec<_>>(),
+            Err(e) => {
+                eprintln!("--alert-webhook {url}: {e}");
+                return;
+            }
+        };
+        for addr in addrs {
+            let Ok(mut stream) =
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+            else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len(),
+            );
+            use std::io::Write as _;
+            if stream.write_all(req.as_bytes()).is_ok() {
+                // drain the response best-effort so the server sees a clean close
+                let mut buf = [0u8; 256];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                return;
+            }
+        }
+        eprintln!("--alert-webhook {url}: unreachable");
     });
 }
 
@@ -4145,18 +4519,26 @@ fn ports_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>
 /// row per socket — answers "who is serving what" at a glance. Enter jumps
 /// to the owning process's detail page.
 fn ports_overview_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
-    let header = Row::new(["Port", "Proto(s)", "Process", "PID", "User", "Addrs"])
+    let header = Row::new(["Port", "Proto(s)", "Process", "PID", "User", "Scope", "Addrs"])
         .style(Style::new().fg(ACCENT).bold());
     let rows: Vec<Row> = app
         .port_overview_view
         .iter()
         .map(|r| {
+            // internet-reachable bindings shout (yellow); loopback-only
+            // ones recede
+            let scope_cell = match r.scope {
+                "internet" => Cell::from(r.scope).style(Style::new().fg(Color::Yellow).bold()),
+                "loopback" => Cell::from(r.scope).style(Style::new().fg(MID)),
+                _ => Cell::from(r.scope),
+            };
             Row::new([
                 Cell::from(r.port.to_string()),
                 Cell::from(r.protos.clone()),
                 Cell::from(r.name.clone()),
                 Cell::from(r.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
                 Cell::from(r.user.clone()),
+                scope_cell,
                 Cell::from(r.addrs.to_string()),
             ])
         })
@@ -4167,6 +4549,7 @@ fn ports_overview_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut 
         Constraint::Min(24),
         Constraint::Length(9),
         Constraint::Length(16),
+        Constraint::Length(9),
         Constraint::Length(8),
     ];
     let table = Table::new(rows, widths)
@@ -5141,6 +5524,46 @@ fn ui_summary_page(app: &mut TuiApp, f: &mut Frame<'_>) {
 /// Full-page snapshot diff ('D'): the newest auto snapshot vs the live
 /// table. Computed when the page opens; 'r' re-diffs. j/k move the
 /// selection, Enter opens the entry's process detail page.
+/// --samples page: the record file's machine samples as a sparkline with
+/// a movable cursor (←/→), one of five series charted (↑/↓).
+fn ui_samples_page(app: &mut TuiApp, f: &mut Frame<'_>) {
+    let outer = Block::bordered().border_style(Style::new().fg(GRAY));
+    f.render_widget(&outer, f.area());
+    let inner = outer.inner(f.area());
+    let v = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Min(4),    // chart + readout
+        Constraint::Length(1), // footer
+    ])
+    .split(inner);
+
+    let header = Line::from(vec![
+        styled(Style::new().bg(PURPLE).fg(Color::White).bold(), " witr-rs "),
+        Span::raw("  "),
+        styled(Style::new().fg(ACCENT).bold(), "Samples"),
+    ]);
+    f.render_widget(Paragraph::new(header), v[0]);
+
+    app.tab_rect = None;
+    app.table_rect = Some(v[1]);
+    app.detail_rect = Some(v[1]);
+
+    let lines = app.samples_page_lines(v[1].width as usize);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        v[1],
+    );
+
+    let mut footer = "←/→: Move | ↑/↓: Series | g/G: Ends | Esc: Back | c: Copy".to_string();
+    if !app.status.is_empty() {
+        footer.push_str(&format!("  ·  {}", app.status));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(styled(Style::new().fg(MID), footer))),
+        v[2],
+    );
+}
+
 fn ui_diff_page(app: &mut TuiApp, f: &mut Frame<'_>) {
     let outer = Block::bordered().border_style(Style::new().fg(GRAY));
     f.render_widget(&outer, f.area());
@@ -5211,6 +5634,7 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
         Page::Summary => ui_summary_page(app, f),
         Page::System => ui_system_page(app, f),
         Page::Diff => ui_diff_page(app, f),
+        Page::Samples => ui_samples_page(app, f),
         Page::Help => ui_help_page(app, f),
         Page::Browse => {}
     }
@@ -5602,6 +6026,7 @@ fn focused_scroll_mut(app: &mut TuiApp) -> Option<&mut u16> {
         (Page::Summary, _, _, _) => Some(&mut app.logs_scroll),
         (Page::System, _, _, _) => Some(&mut app.logs_scroll),
         (Page::Diff, _, _, _) => Some(&mut app.logs_scroll),
+        (Page::Samples, _, _, _) => Some(&mut app.logs_scroll),
         (Page::Help, _, _, _) => Some(&mut app.logs_scroll),
         (Page::Browse, _, _, _) => None,
     }
@@ -6259,6 +6684,43 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                                 format!("pid {e} is gone — it only exists in the snapshot");
                         }
                     }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // samples page: ←/→ (h/l) walk the cursor, ↑/↓ (j/k) switch the
+        // charted series, g/G jump to the ends
+        if app.page == Page::Samples && !app.samples.is_empty() {
+            let last = app.samples.len() - 1;
+            let move_cursor = |app: &mut TuiApp, d: isize| {
+                app.samples_cursor = (app.samples_cursor as isize + d).clamp(0, last as isize)
+                    as usize;
+            };
+            match key {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    move_cursor(app, -1);
+                    return true;
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    move_cursor(app, 1);
+                    return true;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.samples_series =
+                        (app.samples_series + SAMPLE_SERIES - 1) % SAMPLE_SERIES;
+                    return true;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.samples_series = (app.samples_series + 1) % SAMPLE_SERIES;
+                    return true;
+                }
+                KeyCode::Char('g') => {
+                    app.samples_cursor = 0;
+                    return true;
+                }
+                KeyCode::Char('G') => {
+                    app.samples_cursor = last;
                     return true;
                 }
                 _ => {}
@@ -7032,6 +7494,13 @@ mod tests {
         assert_eq!(rows[2].name, "nginx");
         assert_eq!(rows[2].user, "root");
         assert_eq!(rows[2].addrs, 2, "v4 + v6 listener both counted");
+        // exposure scope comes from the bind addresses: the wildcard
+        // 0.0.0.0/:: listeners read as internet-reachable even merged
+        assert_eq!(rows[2].scope, "internet");
+        assert_eq!(
+            rows[0].scope, "internet",
+            "ownerless still has a wildcard bind"
+        );
     }
 
     #[test]
@@ -7263,18 +7732,22 @@ mod tests {
             assert!(app.sys_net_rows.is_empty());
             return;
         }
-        // first sweep only armed the counters — no rates yet, no chart
-        assert!(app.sys_net_rows.is_empty());
-        assert!(app.sys_net_hist.is_empty());
-        on_key(&mut app, KeyCode::Char('r'));
-        // a second sweep produces rows whose rx+tx sums to the history sample
-        if !app.sys_net_rows.is_empty() {
-            assert!(!app.sys_net_hist.is_empty());
-            let total: f64 = app.sys_net_rows.iter().map(|(_, rx, tx)| rx + tx).sum();
-            let last = app.sys_net_hist.last().copied().unwrap();
-            assert!((last - total).abs() < 1e-6, "{last} vs {total}");
-            for (_, rx, tx) in &app.sys_net_rows {
-                assert!(*rx >= 0.0 && *tx >= 0.0, "rates never negative");
+        // new()'s initial refresh armed the counters at an unknown
+        // wall-clock instant — on a slow host the sweep behind on_key('y')
+        // is already past the rate window, so rows can exist here (same
+        // startup race 624df02 fixed for the pid table). No "rows must be
+        // empty yet" assertion; only the timing-free rows⇔history
+        // invariant. Advance two refreshes and check it holds throughout.
+        for _ in 0..2 {
+            on_key(&mut app, KeyCode::Char('r'));
+            if !app.sys_net_rows.is_empty() {
+                assert!(!app.sys_net_hist.is_empty());
+                let total: f64 = app.sys_net_rows.iter().map(|(_, rx, tx)| rx + tx).sum();
+                let last = app.sys_net_hist.last().copied().unwrap();
+                assert!((last - total).abs() < 1e-6, "{last} vs {total}");
+                for (_, rx, tx) in &app.sys_net_rows {
+                    assert!(*rx >= 0.0 && *tx >= 0.0, "rates never negative");
+                }
             }
         }
     }
@@ -7670,6 +8143,48 @@ mod tests {
         assert!(evil.contains("bad''); x"), "hostile quotes doubled: {evil}");
         // elsewhere: nothing to call
         assert!(notify_command_for("plan9", "witr-rs", "x").is_none());
+    }
+
+    #[test]
+    fn alert_webhook_posts_the_envelope() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        send_alert_webhook(
+            &format!("http://127.0.0.1:{port}/hook"),
+            42,
+            "nginx",
+            "cpu 95% over line",
+        );
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking accept loop");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(x) => break x,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => panic!("no webhook connection arrived: {e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 512];
+        loop {
+            match std::io::Read::read(&mut stream, &mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("POST /hook HTTP/1.1"), "{text}");
+        assert!(text.contains("Content-Type: application/json"), "{text}");
+        assert!(text.contains("\"pid\":42"), "{text}");
+        assert!(text.contains("\"name\":\"nginx\""), "{text}");
+        assert!(text.contains("cpu 95% over line"), "{text}");
     }
 
     #[test]
@@ -8405,6 +8920,102 @@ mod tests {
     }
 
     #[test]
+    fn container_alert_edges_fire_on_death_and_restart_climb() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        let mk = |id: &str, name: &str, state: &str, restarts: Option<u32>| Container {
+            runtime: "docker".into(),
+            id: id.into(),
+            name: name.into(),
+            image: String::new(),
+            command: String::new(),
+            state: state.into(),
+            status: "Up".into(),
+            ports: String::new(),
+            pod: Some("prod/web".into()),
+            restarts,
+            cpu_pct: None,
+            mem_used_mb: None,
+            mem_total_mb: None,
+        };
+        // first sighting arms quietly — no alerts
+        app.container_alert_edges(&[mk("a1", "web", "running", Some(0))], &[]);
+        assert!(app.pending_alerts.is_empty());
+        assert!(app.container_seen.contains_key("docker/a1"));
+
+        // restart count climbs: crash-loop alert, latched until the next climb
+        app.container_alert_edges(&[mk("a1", "web", "running", Some(3))], &[]);
+        assert_eq!(app.pending_alerts.len(), 1, "{:?}", app.pending_alerts);
+        assert!(
+            app.pending_alerts[0].2.contains("restart count 0 → 3 (crash loop?)")
+                && app.pending_alerts[0].2.contains("· pod prod/web"),
+            "{:?}",
+            app.pending_alerts
+        );
+        app.pending_alerts.clear();
+        app.container_alert_edges(&[mk("a1", "web", "running", Some(3))], &[]);
+        assert!(app.pending_alerts.is_empty(), "same count → no re-fire");
+
+        // running → exited: death edge (the inspect fetch here hits no
+        // daemon for the fixture id and falls back to the status line)
+        app.container_alert_edges(&[mk("a1", "web", "exited", Some(3))], &[]);
+        assert_eq!(app.pending_alerts.len(), 1, "{:?}", app.pending_alerts);
+        assert!(
+            app.pending_alerts[0].1 == "container web"
+                && app.pending_alerts[0].2.starts_with("exited — "),
+            "{:?}",
+            app.pending_alerts
+        );
+        app.pending_alerts.clear();
+        app.container_alert_edges(&[mk("a1", "web", "exited", Some(3))], &[]);
+        assert!(app.pending_alerts.is_empty(), "still dead → no re-fire");
+
+        // a removed container leaves the edge detector's memory
+        app.container_alert_edges(&[], &[]);
+        assert!(app.container_seen.is_empty());
+    }
+
+    #[test]
+    fn pod_alert_edges_fire_on_waiting_pending_failed_and_climbs() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        let mk = |restarts: u32, phase: &str, waiting: Option<&str>| crate::k8s::Pod {
+            key: "prod/web".into(),
+            container_ids: Vec::new(),
+            phase: Some(phase.into()),
+            restarts,
+            waiting: waiting.map(str::to_string),
+        };
+        // first sighting arms quietly
+        app.pod_alert_edges(&[mk(0, "Running", None)]);
+        assert!(app.pending_alerts.is_empty());
+        // CrashLoopBackOff appears
+        app.pod_alert_edges(&[mk(2, "Running", Some("CrashLoopBackOff"))]);
+        assert!(app.pending_alerts[0]
+            .2
+            .contains("containers waiting: CrashLoopBackOff (phase Running)"));
+        app.pending_alerts.clear();
+        // same waiting reason → latched; restart climb fires independently
+        app.pod_alert_edges(&[mk(5, "Running", Some("CrashLoopBackOff"))]);
+        assert_eq!(app.pending_alerts.len(), 1);
+        assert!(app.pending_alerts[0].2.contains("restart count 2 → 5"));
+        app.pending_alerts.clear();
+        // Running → Pending (rescheduled) fires; the reason gone clears the latch
+        app.pod_alert_edges(&[mk(5, "Pending", None)]);
+        assert_eq!(app.pending_alerts.len(), 1);
+        assert!(app.pending_alerts[0].2.contains("went Pending again"));
+        app.pending_alerts.clear();
+        // Pending → Failed fires once
+        app.pod_alert_edges(&[mk(5, "Failed", None)]);
+        assert_eq!(app.pending_alerts.len(), 1);
+        assert!(app.pending_alerts[0].2.contains("phase Failed"));
+        app.pending_alerts.clear();
+        app.pod_alert_edges(&[mk(5, "Failed", None)]);
+        assert!(app.pending_alerts.is_empty(), "Failed latches");
+        // vanished pods leave the memory
+        app.pod_alert_edges(&[]);
+        assert!(app.pod_seen.is_empty());
+    }
+
+    #[test]
     fn detail_page_opens_and_closes() {
         let mut app = TuiApp::new(crate::platform::get(), Seed::default());
         let pid = app.selected_pid().unwrap();
@@ -8704,6 +9315,10 @@ mod tests {
                 alert_count: None,
                 alert_disk: None,
                 alert_net: None,
+                alert_psi: None,
+                alert_webhook: None,
+                samples: Vec::new(),
+                samples_source: String::new(),
                 replay_follow: None,
                 notes: Vec::new(),
             },
@@ -9036,6 +9651,89 @@ mod tests {
         );
 
         // Esc leaves the diff page
+        on_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.page, Page::Browse);
+    }
+
+    #[test]
+    fn samples_page_browses_cursor_series_and_series_wrap() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        let pt = |at: i64, cpu: Option<f64>| crate::SysPoint {
+            at,
+            cpu,
+            mem_pct: Some(40.0),
+            load1: Some(1.0),
+            procs: 200,
+            net_bps: Some(1_048_576.0),
+        };
+        app.samples = vec![pt(1_700_000_100, Some(10.0)), pt(1_700_000_160, Some(20.0))];
+        app.samples_source = "/tmp/rec.csv".into();
+        app.samples_cursor = 1;
+        app.page = Page::Samples;
+
+        // cursor movement with both key sets, clamped
+        on_key(&mut app, KeyCode::Left);
+        assert_eq!(app.samples_cursor, 0);
+        on_key(&mut app, KeyCode::Left);
+        assert_eq!(app.samples_cursor, 0, "clamped at the first sample");
+        on_key(&mut app, KeyCode::Right);
+        on_key(&mut app, KeyCode::Right);
+        assert_eq!(app.samples_cursor, 1, "clamped at the last sample");
+        on_key(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.samples_cursor, 0);
+        on_key(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.samples_cursor, 1);
+
+        // series cycling wraps over the five chartable series
+        app.samples_series = 4;
+        on_key(&mut app, KeyCode::Down);
+        assert_eq!(app.samples_series % SAMPLE_SERIES, 0);
+        on_key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.samples_series % SAMPLE_SERIES, 4);
+
+        // the page text: source, count, series label and the cursor readout
+        let text = app
+            .samples_page_lines(80)
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("/tmp/rec.csv"), "{text}");
+        assert!(text.contains("2 samples"), "{text}");
+        assert!(text.contains("processes"), "series 4 % 5 is the process count: {text}");
+        assert!(text.contains("procs 200"), "{text}");
+
+        // switching to the cpu series shows its label and cursor value
+        app.samples_series = 0;
+        let text = app
+            .samples_page_lines(80)
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("cpu %"), "{text}");
+        assert!(text.contains("20.0%"), "cursor sits on the 2nd sample: {text}");
+
+        // the sparkline row: peaks survive downsampling, cursor maps in
+        let values: Vec<Option<f64>> = (0..100).map(|i| Some(i as f64)).collect();
+        let (cells, cur) = spark_row(&values, 20, 99);
+        assert_eq!(cells.len(), 20);
+        assert_eq!(cur, Some(19), "cursor at the last sample → last cell");
+        assert_eq!(cells.iter().rfind(|c| **c == '█'), Some(&'█'), "the max lands at the top block");
+        let (cells, _) = spark_row(&[None, None], 10, 0);
+        assert!(cells.iter().all(|c| *c == ' '), "gaps render as spaces");
+
+        // empty page says how to load a file
+        app.samples.clear();
+        let text = app
+            .samples_page_lines(80)
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("--samples FILE"), "{text}");
+
+        // Esc leaves the samples page
         on_key(&mut app, KeyCode::Esc);
         assert_eq!(app.page, Page::Browse);
     }

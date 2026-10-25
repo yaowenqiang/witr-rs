@@ -123,6 +123,46 @@ pub fn container_restarts(runtime: &str, id: &str) -> Option<u32> {
     out.trim().parse().ok()
 }
 
+/// Why a container is not running: one `inspect` of the state's status,
+/// OOMKilled flag, exit code and error. None while it is running/paused
+/// (nothing to report) or the daemon is unreachable.
+pub fn container_exit_reason(runtime: &str, id: &str) -> Option<String> {
+    let out = crate::util::run(
+        runtime,
+        &[
+            "inspect",
+            "--format",
+            "{{.State.Status}}\t{{.State.OOMKilled}}\t{{.State.ExitCode}}\t{{.State.Error}}",
+            id,
+        ],
+        std::time::Duration::from_secs(6),
+    )
+    .ok()?;
+    parse_container_exit(&out)
+}
+
+/// One inspect tab-row → "OOMKilled (exit 137)" (the headline reason),
+/// "exit 1: <daemon error>" when the runtime reported one, or plain
+/// "exit 143". running/paused/created → None (not an exit).
+pub fn parse_container_exit(line: &str) -> Option<String> {
+    let mut parts = line.trim_end().splitn(4, '\t');
+    let status = parts.next()?.trim();
+    let oom = parts.next()?.trim().eq_ignore_ascii_case("true");
+    let code = parts.next()?.trim();
+    let error = parts.next().unwrap_or("").trim();
+    match status {
+        "exited" | "dead" => {}
+        _ => return None,
+    }
+    if oom {
+        return Some(format!("OOMKilled (exit {code})"));
+    }
+    if !error.is_empty() {
+        return Some(format!("exit {code}: {error}"));
+    }
+    Some(format!("exit {code}"))
+}
+
 /// Live CPU% + memory usage for every running container, from one
 /// `stats --no-stream` sweep per runtime CLI (~2s each; stats can't be
 /// sampled cheaply like /proc). Returns full-id → (cpu_pct, mem_used_bytes,
@@ -456,6 +496,44 @@ pub struct SystemStats {
     pub load1: Option<f64>,
     pub load5: Option<f64>,
     pub load15: Option<f64>,
+    /// Pressure Stall Information (Linux /proc/pressure/*): share of time
+    /// (percent) tasks were stalled per resource. `None` off Linux or on
+    /// kernels without PSI — the page hides the section then.
+    pub psi: Option<PsiStats>,
+    /// Hottest readable thermal sensor: (label, celsius). `None` when the
+    /// platform exposes none (macOS SMC and Windows thermal zones need
+    /// privileges this tool doesn't take).
+    pub temp: Option<(String, f64)>,
+}
+
+/// Pressure Stall Information, avg10 window (the last 10 seconds): the
+/// percentage of time some task (`some`) and every task (`full`) was
+/// stalled waiting on the resource. `full` is the sharper pain signal —
+/// nothing makes progress; cpu has no `full` line in /proc, reported 0.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PsiStats {
+    pub cpu_some: f64,
+    pub cpu_full: f64,
+    pub mem_some: f64,
+    pub mem_full: f64,
+    pub io_some: f64,
+    pub io_full: f64,
+}
+
+impl PsiStats {
+    /// The worst `full` stall across resources — what `--alert-psi`
+    /// thresholds compare against (cpu's missing `full` counts as 0).
+    pub fn worst_full(&self) -> f64 {
+        self.cpu_full.max(self.mem_full).max(self.io_full)
+    }
+    /// "cpu 1.2/0.0 · mem 4.0/0.1 · io 0.8/0.0" — some/full avg10 pair
+    /// per resource, for the system page.
+    pub fn line(&self) -> String {
+        format!(
+            "cpu {:.1}/{:.1} · mem {:.1}/{:.1} · io {:.1}/{:.1}",
+            self.cpu_some, self.cpu_full, self.mem_some, self.mem_full, self.io_some, self.io_full
+        )
+    }
 }
 
 /// One device-backed mounted filesystem for the system page's disk
@@ -785,6 +863,29 @@ tmpfs             131072    65536     65536    50%    /run
         assert!(parse_container_stats_line("").is_none());
         assert!(parse_container_stats_line("\t10%\t1MiB / 2MiB").is_none());
         assert!(parse_container_stats_line("id\tnot-a-float\t1MiB / 2MiB").is_none());
+    }
+
+    #[test]
+    fn container_exit_parses_oom_error_and_running() {
+        // OOMKilled headlines over everything else
+        assert_eq!(
+            parse_container_exit("exited\ttrue\t137\t"),
+            Some("OOMKilled (exit 137)".to_string())
+        );
+        // a daemon error message rides the exit code
+        assert_eq!(
+            parse_container_exit("dead\tfalse\t255\texec: cannot run"),
+            Some("exit 255: exec: cannot run".to_string())
+        );
+        // plain exit
+        assert_eq!(parse_container_exit("exited\tfalse\t1\t"), Some("exit 1".to_string()));
+        // running / paused / created → nothing to report
+        assert_eq!(parse_container_exit("running\tfalse\t0\t"), None);
+        assert_eq!(parse_container_exit("paused\tfalse\t0\t"), None);
+        assert_eq!(parse_container_exit("created\tfalse\t0\t"), None);
+        // garbage
+        assert_eq!(parse_container_exit(""), None);
+        assert_eq!(parse_container_exit("exited"), None);
     }
 
     #[test]

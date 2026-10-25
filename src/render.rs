@@ -184,7 +184,8 @@ pub fn csv_field(s: &str) -> String {
 }
 
 /// `--ports`: the listener table — one row per (proto, port), owners
-/// comma-joined. Empty input prints the nothing-to-see note.
+/// comma-joined, plus the exposure SCOPE (internet / loopback / iface /
+/// unknown). Empty input prints the nothing-to-see note.
 pub fn render_listeners(
     listeners: &[crate::snapshot::Listener],
     p: &Painter,
@@ -194,12 +195,28 @@ pub fn render_listeners(
     }
     let port_w = listeners.iter().map(|l| l.port.to_string().len()).max().unwrap_or(4);
     let proto_w = listeners.iter().map(|l| l.proto.len()).max().unwrap_or(5).max(5);
+    let scope_w = listeners
+        .iter()
+        .map(|l| l.scope().len())
+        .max()
+        .unwrap_or(4)
+        .max(5);
     let mut out = String::new();
-    let _ = writeln!(out, "{:>port_w$}  {:proto_w$}  OWNER(S)", "PORT", "PROTO");
+    let _ = writeln!(
+        out,
+        "{:>port_w$}  {:proto_w$}  {:scope_w$}  OWNER(S)",
+        "PORT", "PROTO", "SCOPE"
+    );
     for l in listeners {
+        let scope = l.scope();
+        let scope_cell = match scope {
+            "internet" => p.yellow(scope),
+            "loopback" => p.dim(scope),
+            _ => scope.to_string(),
+        };
         let _ = writeln!(
             out,
-            "{:>port_w$}  {:proto_w$}  {}",
+            "{:>port_w$}  {:proto_w$}  {scope_cell:scope_w$}  {}",
             p.bold(&l.port.to_string()),
             p.dim(&l.proto),
             l.who.join(", "),
@@ -209,15 +226,16 @@ pub fn render_listeners(
 }
 
 /// `--ports --csv`: the same rows as RFC-4180 (owners are "; "-joined so
-/// the comma stays a field separator).
+/// the comma stays a field separator; scope rides as the last column).
 pub fn render_listeners_csv(listeners: &[crate::snapshot::Listener]) -> String {
-    let mut out = String::from("port,proto,owners\n");
+    let mut out = String::from("port,proto,owners,scope\n");
     for l in listeners {
         out.push_str(&format!(
-            "{},{},{}\n",
+            "{},{},{},{}\n",
             l.port,
             csv_field(&l.proto),
             csv_field(&l.who.join("; ")),
+            l.scope(),
         ));
     }
     out
@@ -853,6 +871,162 @@ pub fn render_conns_markdown(rows: &[ConnRow]) -> String {
     out
 }
 
+/// `--conns --by-peer` row: one remote address, with the connection count,
+/// the established subset, the remaining states and the local owners that
+/// reach it — "who is this machine talking to".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerRow {
+    /// Remote address without the port ("1.2.3.4"); "(no peer)" groups
+    /// unconnected UDP sockets.
+    pub peer: String,
+    pub conns: usize,
+    pub established: usize,
+    /// Every state → count, ESTABLISHED included (JSON keeps the full map).
+    pub states: std::collections::BTreeMap<String, usize>,
+    /// Distinct local owner lines ("name (pid N)"); empty when all unowned.
+    pub owners: Vec<String>,
+}
+
+/// Fold `--conns` rows into per-peer aggregates, busiest first. The peer is
+/// the address only — the aggregate answers "which hosts", the per-port
+/// detail stays in the plain table.
+pub fn collect_conns_by_peer(rows: &[ConnRow]) -> Vec<PeerRow> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_peer: HashMap<String, PeerRow> = HashMap::new();
+    for r in rows {
+        let peer = if r.peer.is_empty() {
+            "(no peer)".to_string()
+        } else {
+            // rsplit survives both "1.2.3.4:443" and "[::1]:443"
+            r.peer
+                .rsplit_once(':')
+                .map(|(a, _)| a.to_string())
+                .unwrap_or_else(|| r.peer.clone())
+        };
+        let e = by_peer.entry(peer.clone()).or_insert_with(|| {
+            order.push(peer.clone());
+            PeerRow {
+                peer: peer.clone(),
+                conns: 0,
+                established: 0,
+                states: Default::default(),
+                owners: Vec::new(),
+            }
+        });
+        e.conns += 1;
+        *e.states.entry(r.state.clone()).or_default() += 1;
+        if r.state.eq_ignore_ascii_case("ESTABLISHED") {
+            e.established += 1;
+        }
+        if !r.owner.is_empty() && !e.owners.contains(&r.owner) {
+            e.owners.push(r.owner.clone());
+        }
+    }
+    let mut out: Vec<PeerRow> = order
+        .into_iter()
+        .map(|p| by_peer.remove(&p).unwrap())
+        .collect();
+    out.sort_by(|a, b| b.conns.cmp(&a.conns).then_with(|| a.peer.cmp(&b.peer)));
+    out
+}
+
+/// States other than ESTABLISHED, compact: "TIME_WAIT 2 · CLOSE_WAIT 1".
+fn non_est_states(states: &std::collections::BTreeMap<String, usize>) -> String {
+    let rest: Vec<String> = states
+        .iter()
+        .filter(|(s, _)| !s.eq_ignore_ascii_case("ESTABLISHED"))
+        .map(|(s, n)| format!("{s} {n}"))
+        .collect();
+    rest.join(" · ")
+}
+
+/// `--conns --by-peer` text table: PEER / CONNS / EST / STATES / OWNERS.
+pub fn render_conns_by_peer(rows: &[PeerRow], p: &Painter) -> String {
+    if rows.is_empty() {
+        return "no connections (nothing outside LISTEN)\n".to_string();
+    }
+    let peer_w = rows
+        .iter()
+        .map(|r| r.peer.len())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 44);
+    let states_w = rows
+        .iter()
+        .map(|r| non_est_states(&r.states).len())
+        .max()
+        .unwrap_or(6)
+        .clamp(6, 40);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<peer_w$}  {:>5}  {:>3}  {:<states_w$}  OWNERS",
+        "PEER", "CONNS", "EST", ""
+    );
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "{:<peer_w$}  {:>5}  {:>3}  {:<states_w$}  {}",
+            r.peer,
+            r.conns,
+            r.established,
+            p.dim(&non_est_states(&r.states)),
+            if r.owners.is_empty() {
+                "-".to_string()
+            } else {
+                r.owners.join(", ")
+            },
+        );
+    }
+    out
+}
+
+/// `--conns --by-peer --csv`: states packed as "STATE:n;STATE:n".
+pub fn render_conns_by_peer_csv(rows: &[PeerRow]) -> String {
+    let mut out = String::from("peer,conns,established,states,owners\n");
+    for r in rows {
+        let states = r
+            .states
+            .iter()
+            .map(|(s, n)| format!("{s}:{n}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        out.push_str(&format!(
+            "{},{},{},{},{}\n",
+            csv_field(&r.peer),
+            r.conns,
+            r.established,
+            csv_field(&states),
+            csv_field(&r.owners.join(";")),
+        ));
+    }
+    out
+}
+
+/// `--conns --by-peer --markdown`.
+pub fn render_conns_by_peer_markdown(rows: &[PeerRow]) -> String {
+    let mut out = String::from(
+        "| PEER | CONNS | EST | STATES | OWNERS |\n\
+         |---|---|---|---|---|\n",
+    );
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} |",
+            r.peer,
+            r.conns,
+            r.established,
+            non_est_states(&r.states),
+            if r.owners.is_empty() {
+                "-".to_string()
+            } else {
+                r.owners.join(", ")
+            },
+        );
+    }
+    out
+}
+
 /// Escape for HTML text content and double-quoted attributes.
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -970,6 +1144,7 @@ pub fn render_top(
                     .map(|(r, w)| r + w),
                 // age in seconds — desc order puts the oldest first
                 crate::cli::TopMetric::Age => pr.started.map(|t| (now.saturating_sub(t)) as f64),
+                crate::cli::TopMetric::Gpu => pr.gpu_sm_pct.map(|v| v as f64),
             }?;
             Some((v, pr))
         })
@@ -997,6 +1172,7 @@ pub fn render_top(
                 format!("{}/s", crate::util::fmt_bytes(*v as u64))
             }
             crate::cli::TopMetric::Age => fmt_age(*v as i64),
+            crate::cli::TopMetric::Gpu => format!("{v:.1}"),
         };
         let extra = if metric == crate::cli::TopMetric::Age {
             pr.state.clone().unwrap_or_else(|| "-".into())
@@ -1832,28 +2008,38 @@ mod tests {
         let p = Painter::new(false);
         // empty: the nothing-to-see note, no panic on max() over nothing
         assert!(render_listeners(&[], &p).contains("no listening sockets"));
-        assert_eq!(render_listeners_csv(&[]), "port,proto,owners\n");
+        assert_eq!(render_listeners_csv(&[]), "port,proto,owners,scope\n");
 
-        let mk = |proto: &str, port: u16, who: &[&str]| crate::snapshot::Listener {
+        let mk = |proto: &str, port: u16, who: &[&str], binds: &[&str]| crate::snapshot::Listener {
             proto: proto.into(),
             port,
             who: who.iter().map(|s| s.to_string()).collect(),
+            binds: binds.iter().map(|s| s.to_string()).collect(),
         };
         let listeners = vec![
-            mk("tcp", 80, &["nginx (pid 7)"]),
-            mk("tcp", 8080, &["a (pid 1)", "b (pid 2)"]),
+            mk("tcp", 80, &["nginx (pid 7)"], &["0.0.0.0"]),
+            mk("tcp", 8080, &["a (pid 1)", "b (pid 2)"], &["127.0.0.1"]),
         ];
         let table = render_listeners(&listeners, &p);
-        assert!(table.contains("PORT") && table.contains("PROTO") && table.contains("OWNER(S)"));
+        assert!(
+            table.contains("PORT")
+                && table.contains("PROTO")
+                && table.contains("SCOPE")
+                && table.contains("OWNER(S)")
+        );
         let l80 = table.lines().find(|l| l.contains(" 80 ")).unwrap();
         assert!(l80.contains("nginx (pid 7)"), "{table}");
+        // the wildcard listener reads as internet-reachable, the loopback
+        // one as local-only
+        assert!(table.contains("internet"), "{table}");
+        assert!(table.contains("loopback"), "{table}");
 
         let csv = render_listeners_csv(&listeners);
         let lines: Vec<&str> = csv.lines().collect();
-        assert_eq!(lines[0], "port,proto,owners");
-        assert_eq!(lines[1], "80,tcp,nginx (pid 7)");
+        assert_eq!(lines[0], "port,proto,owners,scope");
+        assert_eq!(lines[1], "80,tcp,nginx (pid 7),internet");
         // two owners on one port: "; "-joined so the comma stays a separator
-        assert_eq!(lines[2], "8080,tcp,a (pid 1); b (pid 2)");
+        assert_eq!(lines[2], "8080,tcp,a (pid 1); b (pid 2),loopback");
     }
 
     #[test]
@@ -2154,6 +2340,49 @@ mod tests {
         let md = render_conns_markdown(&rows);
         assert!(md.starts_with("| PROTO | LOCAL | PEER | STATE | PID | OWNER | PEER OWNER |"));
         assert!(md.contains("| nginx (pid 200) |"), "{md}");
+    }
+
+    #[test]
+    fn conns_by_peer_folds_ports_and_sorts_busiest_first() {
+        let sockets = vec![
+            sock("tcp", "10.0.0.5", 33976, Some(("8.8.8.8", 443)), "ESTABLISHED", Some(100)),
+            sock("tcp", "10.0.0.5", 40001, Some(("8.8.8.8", 443)), "TIME_WAIT", None),
+            sock("tcp", "10.0.0.5", 41000, Some(("8.8.4.4", 53)), "ESTABLISHED", Some(100)),
+            // unconnected UDP folds under the (no peer) bucket
+            sock("udp", "0.0.0.0", 5353, None, "UNCONNECTED", Some(200)),
+        ];
+        let procs = vec![proc(100, "curl", None, None), proc(200, "mdns", None, None)];
+        let rows = collect_conns(&sockets, &procs);
+        let peers = collect_conns_by_peer(&rows);
+        assert_eq!(peers.len(), 3, "{peers:?}");
+        // the two :443 connections fold into one peer, ports stripped
+        let dns = peers.iter().find(|p| p.peer == "8.8.4.4").unwrap();
+        let gw = peers.iter().find(|p| p.peer == "8.8.8.8").unwrap();
+        assert_eq!(gw.conns, 2);
+        assert_eq!(gw.established, 1);
+        assert_eq!(gw.states.get("TIME_WAIT"), Some(&1));
+        assert_eq!(gw.owners, vec!["curl (pid 100)"], "TIME_WAIT unowned adds no owner");
+        // busiest first
+        assert_eq!(peers[0].peer, "8.8.8.8");
+        assert_eq!(dns.conns, 1);
+        let none = peers.iter().find(|p| p.peer == "(no peer)").unwrap();
+        assert_eq!(none.conns, 1);
+        assert_eq!(none.established, 0);
+
+        let p = Painter::new(false);
+        assert!(render_conns_by_peer(&[], &p).contains("no connections"));
+        let table = render_conns_by_peer(&peers, &p);
+        assert!(table.contains("PEER") && table.contains("CONNS") && table.contains("EST"));
+        assert!(table.contains("TIME_WAIT 1"), "{table}");
+        let csv = render_conns_by_peer_csv(&peers);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "peer,conns,established,states,owners");
+        assert!(
+            lines.iter().any(|l| l.starts_with("8.8.8.8,2,1,")),
+            "{csv}"
+        );
+        let md = render_conns_by_peer_markdown(&peers);
+        assert!(md.starts_with("| PEER | CONNS | EST | STATES | OWNERS |"), "{md}");
     }
 
     #[test]

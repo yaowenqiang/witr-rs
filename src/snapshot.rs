@@ -27,13 +27,55 @@ pub struct Listener {
     pub port: u16,
     /// Owners as "name (pid N)" — one per process bound to the port.
     pub who: Vec<String>,
+    /// Every bind address this (proto, port) listens on ("0.0.0.0", "::",
+    /// "*", "127.0.0.1", a specific interface address). Empty in snapshots
+    /// written before the field existed — [`Listener::scope`] reports
+    /// "unknown" then.
+    #[serde(default)]
+    pub binds: Vec<String>,
 }
+
+/// Classify bind addresses: "internet" when any wildcard bind
+/// (0.0.0.0 / :: / * — reachable from anywhere), "loopback" when every
+/// address is 127.x/::1, "iface" when bound to specific addresses, and
+/// "unknown" when nothing was recorded.
+pub fn bind_scope(binds: &[String]) -> &'static str {
+    if binds.is_empty() {
+        return "unknown";
+    }
+    let wildcard = binds
+        .iter()
+        .any(|b| b == "0.0.0.0" || b == "::" || b == "*");
+    if wildcard {
+        return "internet";
+    }
+    let all_local = binds.iter().all(|b| {
+        let bare = b.trim_start_matches('[').trim_end_matches(']');
+        bare == "::1" || bare == "localhost" || bare.starts_with("127.")
+    });
+    if all_local {
+        "loopback"
+    } else {
+        "iface"
+    }
+}
+
+impl Listener {
+    /// Where this listener accepts from — see [`bind_scope`].
+    pub fn scope(&self) -> &'static str {
+        bind_scope(&self.binds)
+    }
+}
+
+/// Accumulated listener state per (proto, port): the (pid, label) owners
+/// and the distinct bind addresses.
+type ListenerGroup = (Vec<(Pid, String)>, Vec<String>);
 
 /// LISTEN sockets + the process table → listener records. Sockets without
 /// a visible owner are skipped (nothing to attribute, nothing to compare).
 pub fn to_listeners(sockets: &[crate::model::Socket], procs: &[Process]) -> Vec<Listener> {
     let names: HashMap<Pid, &str> = procs.iter().map(|p| (p.pid, p.name.as_str())).collect();
-    let mut map: std::collections::BTreeMap<(String, u16), Vec<(Pid, String)>> = Default::default();
+    let mut map: std::collections::BTreeMap<(String, u16), ListenerGroup> = Default::default();
     for s in sockets {
         if s.state != "LISTEN" {
             continue;
@@ -43,16 +85,21 @@ pub fn to_listeners(sockets: &[crate::model::Socket], procs: &[Process]) -> Vec<
             Some(n) => format!("{n} (pid {pid})"),
             None => format!("pid {pid}"),
         };
-        map.entry((s.proto.clone(), s.local_port)).or_default().push((pid, label));
+        let e = map.entry((s.proto.clone(), s.local_port)).or_default();
+        e.0.push((pid, label));
+        if !e.1.contains(&s.local_addr) {
+            e.1.push(s.local_addr.clone());
+        }
     }
     map.into_iter()
-        .map(|((proto, port), mut who)| {
+        .map(|((proto, port), (mut who, binds))| {
             who.sort();
             who.dedup();
             Listener {
                 proto,
                 port,
                 who: who.into_iter().map(|(_, l)| l).collect(),
+                binds,
             }
         })
         .collect()
@@ -535,6 +582,7 @@ mod tests {
             proto: "tcp".into(),
             port: 80,
             who: vec!["nginx (pid 7)".into()],
+            binds: vec!["0.0.0.0".into()],
         }];
         save(path.to_str().unwrap(), &procs, &listeners).unwrap();
         let (loaded, lis) = load(path.to_str().unwrap()).unwrap();
@@ -579,8 +627,31 @@ mod tests {
         assert_eq!(l.len(), 2, "{l:?}");
         assert_eq!(l[0].port, 80);
         assert_eq!(l[0].who, vec!["nginx (pid 7)".to_string()]);
+        // the bind address rides along — a wildcard 0.0.0.0 bind reads as
+        // internet-reachable
+        assert_eq!(l[0].binds, vec!["0.0.0.0".to_string()]);
+        assert_eq!(l[0].scope(), "internet");
         assert_eq!(l[1].port, 6379);
         assert_eq!(l[1].who, vec!["redis (pid 9)".to_string()]);
+    }
+
+    #[test]
+    fn bind_scope_classifies_wildcard_loopback_and_iface() {
+        let b = |addrs: &[&str]| -> Vec<String> { addrs.iter().map(|s| s.to_string()).collect() };
+        // wildcard in any spelling wins
+        assert_eq!(bind_scope(&b(&["0.0.0.0"])), "internet");
+        assert_eq!(bind_scope(&b(&["::"])), "internet");
+        assert_eq!(bind_scope(&b(&["*"])), "internet");
+        // one wildcard among several is still exposed
+        assert_eq!(bind_scope(&b(&["127.0.0.1", "0.0.0.0"])), "internet");
+        // loopback-only in both families
+        assert_eq!(bind_scope(&b(&["127.0.0.1"])), "loopback");
+        assert_eq!(bind_scope(&b(&["127.0.0.1", "::1"])), "loopback");
+        // a specific interface address
+        assert_eq!(bind_scope(&b(&["192.168.1.10"])), "iface");
+        assert_eq!(bind_scope(&b(&["2001:db8::1"])), "iface");
+        // snapshots without bind data
+        assert_eq!(bind_scope(&[]), "unknown");
     }
 
     #[test]
@@ -589,6 +660,7 @@ mod tests {
             proto: "tcp".into(),
             port,
             who: vec![who.into()],
+            binds: Vec::new(),
         };
         let old = vec![mk(80, "nginx (pid 7)"), mk(443, "nginx (pid 7)")];
         let now = vec![mk(80, "nginx (pid 9)"), mk(8080, "webpack (pid 20)")];
