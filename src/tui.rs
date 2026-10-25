@@ -78,6 +78,8 @@ enum SortKey {
     User,
     Cpu,
     Mem,
+    /// combined read+write bytes/s from the IO sampling history
+    Io,
     Started,
 }
 
@@ -274,6 +276,14 @@ struct TuiApp {
     /// table visible instead of flashing the loading placeholder
     containers_loaded: bool,
     containers_rx: Option<std::sync::mpsc::Receiver<Vec<Container>>>,
+    /// live per-container CPU% + memory (full id → stats): a background
+    /// `stats --no-stream` sweep rides the containers thread path — stats
+    /// cost ~2s per runtime, so they refresh on a slower cadence than the
+    /// listing itself and outlive re-enumerations (merged back by id)
+    container_stats: ContainerStatsMap,
+    container_stats_at: Option<Instant>,
+    container_stats_loading: bool,
+    container_stats_rx: Option<ContainerStatsRx>,
     /// sampling history: instantaneous cpu, sparklines, restart detection
     hist: crate::history::History,
     /// open files fetched when the full detail page opens
@@ -293,6 +303,16 @@ struct TuiApp {
     /// device-backed mounts for the system page's disk section — one df /
     /// CIM sweep per refresh while the page is open
     sys_mounts: Vec<crate::platform::MountUsage>,
+    /// per-NIC cumulative byte counters from the previous y-page sample —
+    /// the net section's rates are diffs between consecutive sweeps
+    sys_net_prev: HashMap<String, (u64, u64)>,
+    /// when `sys_net_prev` was taken (the rate's denominator)
+    sys_net_prev_at: Option<Instant>,
+    /// last computed per-NIC (name, rx MB/s, tx MB/s); empty until two
+    /// sweeps — the first only arms the counters
+    sys_net_rows: Vec<(String, f64, f64)>,
+    /// total rx+tx MB/s history for the net sparkline (oldest first)
+    sys_net_hist: Vec<f64>,
     /// sampling interval (config refresh_secs, built-in default REFRESH)
     refresh: Duration,
     status: String,
@@ -336,6 +356,8 @@ struct TuiApp {
     alert_count: Option<u32>,
     /// --alert-disk: machine-wide fullest-mount used-percent threshold
     alert_disk: Option<u64>,
+    /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
+    alert_net: Option<u64>,
     /// streak/firing state for the machine-wide alerts
     sys_alert: crate::history::SysAlertState,
     /// --alert-exec: shell command per alert firing (context in env vars)
@@ -402,6 +424,11 @@ enum ContainerSort {
     Image,
     Status,
 }
+
+/// One full-id → (cpu_pct, mem_used_bytes, mem_total_bytes) stats sweep,
+/// delivered from the background sampler thread.
+type ContainerStatsMap = HashMap<String, (f64, u64, u64)>;
+type ContainerStatsRx = std::sync::mpsc::Receiver<ContainerStatsMap>;
 
 /// Events-tab sort columns — keys t/e/p/n (Time defaults newest-first).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -480,6 +507,8 @@ pub struct Seed {
     pub alert_count: Option<u32>,
     /// --alert-disk: machine-wide used-percent threshold over local mounts
     pub alert_disk: Option<u64>,
+    /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
+    pub alert_net: Option<u64>,
     /// --alert-exec: shell command run on every threshold-alert firing;
     /// context exported as WITR_ALERT_PID/NAME/DETAIL
     pub alert_exec: Option<String>,
@@ -652,6 +681,7 @@ impl TuiApp {
             alert_mem_pct: seed.alert_mem_pct,
             alert_count: seed.alert_count,
             alert_disk: seed.alert_disk,
+            alert_net: seed.alert_net,
             sys_alert: crate::history::SysAlertState::default(),
             alert_exec: seed.alert_exec.clone(),
             alert_state: HashMap::new(),
@@ -691,6 +721,10 @@ impl TuiApp {
             containers_loading: false,
             containers_loaded: false,
             containers_rx: None,
+            container_stats: HashMap::new(),
+            container_stats_at: None,
+            container_stats_loading: false,
+            container_stats_rx: None,
             hist: crate::history::History::new(),
             open_files: None,
             last_refresh: Instant::now() - REFRESH, // force first refresh
@@ -708,6 +742,10 @@ impl TuiApp {
             summary_window: seed.since.unwrap_or(u64::MAX),
             sys_stats: None,
             sys_mounts: Vec::new(),
+            sys_net_prev: HashMap::new(),
+            sys_net_prev_at: None,
+            sys_net_rows: Vec::new(),
+            sys_net_hist: Vec::new(),
             refresh,
             status: String::new(),
             confirm_kill: None,
@@ -855,8 +893,12 @@ impl TuiApp {
             // per refresh, only when the alert is armed (one lsof scan per
             // tick on macOS; a cheap /proc walk on Linux). A failed sweep
             // keeps the previous sample — a missing count just doesn't
-            // advance any streak.
-            if self.alert_fd.is_some() {
+            // advance any streak. An `fd>` search filter samples too, so
+            // the comparison has data after the next tick.
+            if self.alert_fd.is_some()
+                || parse_metric_filter(&self.search)
+                    .is_some_and(|f| f.metric == FilterMetric::Fd)
+            {
                 if let Some(counts) = self.platform.fd_counts() {
                     self.fd_counts = counts;
                 }
@@ -889,16 +931,27 @@ impl TuiApp {
                 || self.alert_mem_pct.is_some()
                 || self.alert_count.is_some()
                 || self.alert_disk.is_some()
+                || self.alert_net.is_some()
             {
                 // --alert-load / --alert-mem-pct / --alert-count /
-                // --alert-disk: sample the whole machine when armed (macOS's
-                // vm_stat / df spawns are paid only when watched)
+                // --alert-disk / --alert-net: sample the whole machine when
+                // armed (macOS's vm_stat / df spawns are paid only when
+                // watched)
                 if let Some(stats) = self.platform.system_stats() {
                     let interval = self.refresh.max(Duration::from_secs(1)).as_secs();
                     let mounts = if self.alert_disk.is_some() {
                         self.platform.mount_usage()
                     } else {
                         Vec::new()
+                    };
+                    let net_rate = if self.alert_net.is_some() {
+                        let nics = self.platform.net_counters();
+                        let total = nics
+                            .iter()
+                            .fold((0u64, 0u64), |(rx, tx), n| (rx + n.rx_bytes, tx + n.tx_bytes));
+                        crate::history::machine_net_rate(total, &mut self.sys_alert)
+                    } else {
+                        None
                     };
                     let limits = crate::history::SysAlertLimits {
                         load: self.alert_load,
@@ -907,6 +960,8 @@ impl TuiApp {
                         proc_count: self.procs.len(),
                         mounts,
                         disk_pct: self.alert_disk,
+                        net_limit: self.alert_net,
+                        net_rate,
                         repeat: self.alert_repeat,
                     };
                     picks.extend(
@@ -949,6 +1004,15 @@ impl TuiApp {
             if self.page == Page::System {
                 self.sys_mounts = self.platform.mount_usage();
             }
+            // net section: Windows pays a PowerShell subprocess per sweep
+            // (page open only); Linux's /proc/net/dev and macOS's
+            // NET_RT_IFLIST2 sysctl reads are µs-cheap, so they sample with
+            // system_stats and the chart is already full when the page
+            // opens. An empty sweep (no NICs reported) keeps the previous
+            // rows visible rather than flashing the section off.
+            if self.page == Page::System || self.platform.name() != "windows" {
+                self.sample_net_rates();
+            }
         }
         // FD sampling for the fd chart + leak suspicion: only while the
         // full detail page shows this pid (same gating as the system page;
@@ -977,6 +1041,7 @@ impl TuiApp {
         }
         if self.tab == Tab::Containers {
             self.request_containers();
+            self.request_container_stats();
         }
         if self.tab == Tab::Services {
             self.request_services();
@@ -1024,7 +1089,73 @@ impl TuiApp {
             self.containers_loading = false;
             self.containers_loaded = true;
             self.containers_rx = None;
+            self.apply_container_stats();
             self.rebuild_container_view();
+        }
+    }
+
+    /// Kick off a background `stats --no-stream` sweep (no-op while one is
+    /// in flight or the last one is younger than ~10s — each runtime CLI
+    /// needs ~2s to sample, so this can't follow the listing's cadence).
+    fn request_container_stats(&mut self) {
+        if self.container_stats_loading
+            || self
+                .container_stats_at
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+        {
+            return;
+        }
+        self.container_stats_loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::platform::container_stats());
+        });
+        self.container_stats_rx = Some(rx);
+    }
+
+    /// Pick up a finished stats sweep and fold it into the table.
+    fn poll_container_stats(&mut self) {
+        if !self.container_stats_loading {
+            return;
+        }
+        let arrived = self
+            .container_stats_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        if let Some(stats) = arrived {
+            self.container_stats = stats;
+            self.container_stats_at = Some(Instant::now());
+            self.container_stats_loading = false;
+            self.container_stats_rx = None;
+            self.apply_container_stats();
+            self.rebuild_container_view();
+        }
+    }
+
+    /// Merge cached stats sweeps into `self.containers` by id (exact, then
+    /// 12-char prefix — runtimes may abbreviate either side). Re-enumerations
+    /// wipe the merged fields; this reapplies them.
+    fn apply_container_stats(&mut self) {
+        if self.container_stats.is_empty() {
+            return;
+        }
+        for c in &mut self.containers {
+            let hit = self
+                .container_stats
+                .get(&c.id)
+                .or_else(|| {
+                    let prefix: String = c.id.chars().take(12).collect();
+                    self.container_stats
+                        .iter()
+                        .find(|(k, _)| k.starts_with(&prefix))
+                        .map(|(_, v)| v)
+                })
+                .copied();
+            if let Some((cpu, used, total)) = hit {
+                c.cpu_pct = Some(cpu);
+                c.mem_used_mb = Some(used / (1024 * 1024));
+                c.mem_total_mb = Some(total / (1024 * 1024));
+            }
         }
     }
 
@@ -1210,6 +1341,45 @@ impl TuiApp {
     /// Lines for the system resources page ('y') — shared by the renderer
     /// and the 'c' copy. Charts come from the history rings, "now" values
     /// (load, swap, per-core grid) from the latest snapshot.
+    /// One net_counters sweep → per-NIC MB/s rows + the total-rate history
+    /// sample for the y page. The first sweep only arms the counters (no
+    /// previous to diff against, rows stay empty); counter resets (NIC
+    /// bounce) diff as zero rather than a negative rate.
+    fn sample_net_rates(&mut self) {
+        let nics = self.platform.net_counters();
+        if nics.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = self
+            .sys_net_prev_at
+            .map(|t| now.duration_since(t).as_secs_f64());
+        let mut rows = Vec::new();
+        let mut total = 0.0f64;
+        for n in nics {
+            let (rx, tx) = match self.sys_net_prev.get(&n.name) {
+                Some((prx, ptx)) => (
+                    n.rx_bytes.saturating_sub(*prx) as f64,
+                    n.tx_bytes.saturating_sub(*ptx) as f64,
+                ),
+                None => (0.0, 0.0),
+            };
+            let (rx, tx) = match elapsed {
+                Some(e) if e > 0.0 => (rx / e / 1048576.0, tx / e / 1048576.0),
+                _ => (0.0, 0.0),
+            };
+            total += rx + tx;
+            rows.push((n.name.clone(), rx, tx));
+            self.sys_net_prev.insert(n.name, (n.rx_bytes, n.tx_bytes));
+        }
+        self.sys_net_prev_at = Some(now);
+        self.sys_net_rows = rows;
+        self.sys_net_hist.push(total);
+        while self.sys_net_hist.len() > 60 {
+            self.sys_net_hist.remove(0);
+        }
+    }
+
     fn system_page_lines(&self) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let Some(stats) = self.sys_stats.as_ref() else {
@@ -1324,6 +1494,42 @@ impl TuiApp {
                 } else {
                     Span::raw(text)
                 }));
+            }
+        }
+        // network: total-rate sparkline (window peak annotated) plus one
+        // row per non-loopback NIC — ↓ rx ↑ tx MB/s. Rates need two sweeps,
+        // so the section appears on the second refresh.
+        if !self.sys_net_rows.is_empty() {
+            lines.push(Line::from(Span::styled("net", Style::new().bold())));
+            let peak = self
+                .sys_net_hist
+                .iter()
+                .copied()
+                .fold(0.0f64, f64::max)
+                .max(1.0);
+            let bars: String = self
+                .sys_net_hist
+                .iter()
+                .map(|v| {
+                    let idx = ((v / peak).clamp(0.0, 0.999) * 8.0) as usize;
+                    crate::history::SPARK_LEVELS[idx]
+                })
+                .collect();
+            let now = self.sys_net_hist.last().copied().unwrap_or(0.0);
+            lines.push(Line::from(vec![
+                Span::raw(bars),
+                Span::raw(format!("  {now:.1} MB/s now · peak {peak:.1}")),
+            ]));
+            let mut rows = self.sys_net_rows.clone();
+            rows.sort_by(|a, b| {
+                (b.1 + b.2)
+                    .total_cmp(&(a.1 + a.2))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            for (name, rx, tx) in rows.iter().take(8) {
+                lines.push(Line::from(format!(
+                    "  {name:<24}↓ {rx:>7.1}  ↑ {tx:>7.1} MB/s"
+                )));
             }
         }
         lines
@@ -1916,27 +2122,64 @@ impl TuiApp {
     /// Apply search filter + sort, keeping the selection in range.
     fn rebuild_view(&mut self) {
         let needle = self.search.to_lowercase();
+        // a `/` query that parses as a numeric expression (cpu>50, age>1h…)
+        // filters by metric instead of substring
+        let metric_filter = parse_metric_filter(&self.search);
         let procs = &self.procs;
+        // snapshots for the sort/filter comparators (they can't borrow self
+        // while procs is held)
+        let cpu_disp: HashMap<Pid, f64> = procs
+            .iter()
+            .map(|p| (p.pid, self.hist.display_cpu(p).unwrap_or(-1.0)))
+            .collect();
+        let io_disp: HashMap<Pid, f64> = procs
+            .iter()
+            .map(|p| {
+                (
+                    p.pid,
+                    self.hist
+                        .io_rate_of(p.pid)
+                        .map(|(r, w)| r + w)
+                        .unwrap_or(-1.0),
+                )
+            })
+            .collect();
+        let fd_disp: HashMap<Pid, f64> = self
+            .fd_counts
+            .iter()
+            .map(|(pid, n)| (*pid, *n as f64))
+            .collect();
+        let now = crate::util::now_unix();
         let mut idx: Vec<usize> = procs
             .iter()
             .enumerate()
-            .filter(|(_, p)| {
-                needle.is_empty()
-                    || p.name.to_lowercase().contains(&needle)
-                    || p.user.as_deref().unwrap_or("").to_lowercase().contains(&needle)
-                    || p.pid.to_string().contains(&needle)
+            .filter(|(_, p)| match metric_filter {
+                Some(f) => {
+                    let v = match f.metric {
+                        FilterMetric::Cpu => cpu_disp.get(&p.pid).copied().unwrap_or(-1.0),
+                        FilterMetric::Mem => p.mem_kb.map(|kb| kb as f64).unwrap_or(-1.0),
+                        FilterMetric::Fd => fd_disp.get(&p.pid).copied().unwrap_or(-1.0),
+                        FilterMetric::Age => p.started.map(|t| (now - t) as f64).unwrap_or(-1.0),
+                        FilterMetric::Io => io_disp.get(&p.pid).copied().unwrap_or(-1.0),
+                    };
+                    if f.gt {
+                        v > f.value
+                    } else {
+                        v < f.value
+                    }
+                }
+                None => {
+                    needle.is_empty()
+                        || p.name.to_lowercase().contains(&needle)
+                        || p.user.as_deref().unwrap_or("").to_lowercase().contains(&needle)
+                        || p.pid.to_string().contains(&needle)
+                }
             })
             .map(|(i, _)| i)
             .collect();
 
         let key = self.sort_key;
         let desc = self.sort_desc;
-        // snapshot the display-cpu (instantaneous with lifetime fallback)
-        // so the sort comparator doesn't fight the borrow checker
-        let cpu_disp: HashMap<Pid, f64> = procs
-            .iter()
-            .map(|p| (p.pid, self.hist.display_cpu(p).unwrap_or(-1.0)))
-            .collect();
         idx.sort_by(|&a, &b| {
             let (x, y) = (&procs[a], &procs[b]);
             let ord = match key {
@@ -1954,6 +2197,12 @@ impl TuiApp {
                     .partial_cmp(&cpu_disp.get(&y.pid).copied().unwrap_or(-1.0))
                     .unwrap_or(std::cmp::Ordering::Equal),
                 SortKey::Mem => x.mem_kb.unwrap_or(0).cmp(&y.mem_kb.unwrap_or(0)),
+                SortKey::Io => io_disp
+                    .get(&x.pid)
+                    .copied()
+                    .unwrap_or(-1.0)
+                    .partial_cmp(&io_disp.get(&y.pid).copied().unwrap_or(-1.0))
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 SortKey::Started => x
                     .started
                     .unwrap_or(i64::MAX)
@@ -3717,7 +3966,7 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
         Constraint::Length(8),
     ];
     if has_io {
-        header.push(Cell::from("IO"));
+        header.push(Cell::from(format!("IO{}", arrow(k, SortKey::Io, d))));
         widths.push(Constraint::Length(8));
     }
     if has_gpu {
@@ -3942,10 +4191,45 @@ fn container_state_style(c: &crate::model::Container) -> Style {
     }
 }
 
+/// "12.50%" from the stats sweep; "-" until the first sweep lands.
+fn container_cpu_disp(c: &crate::model::Container) -> String {
+    c.cpu_pct.map(|p| format!("{p:.2}%")).unwrap_or_else(|| "-".into())
+}
+
+/// "12.3Mi/1.9Gi" from the stats sweep; "-" until the first sweep lands.
+fn container_mem_disp(c: &crate::model::Container) -> String {
+    match (c.mem_used_mb, c.mem_total_mb) {
+        (Some(u), Some(t)) if t > 0 => {
+            format!("{:.1}Mi/{:.1}Gi", u as f64 / 1024.0, t as f64 / 1024.0)
+        }
+        (Some(u), _) => format!("{u}Mi"),
+        _ => "-".into(),
+    }
+}
+
+/// Memory brightens as the container crowds its own limit (≥90% red,
+/// ≥70% yellow — a container bumping its cap is the usual OOM prologue).
+fn container_mem_style(c: &crate::model::Container) -> Style {
+    let frac = match (c.mem_used_mb, c.mem_total_mb) {
+        (Some(u), Some(t)) if t > 0 => u as f64 / t as f64,
+        _ => 0.0,
+    };
+    if frac >= 0.9 {
+        Style::new().fg(Color::Red).bold()
+    } else if frac >= 0.7 {
+        Style::new().fg(Color::Yellow)
+    } else {
+        Style::new()
+    }
+}
+
 fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
     // Pod column only when k8s attribution actually produced something —
-    // it's dead width on plain-docker hosts.
+    // it's dead width on plain-docker hosts. Same for the CPU%/MEM columns:
+    // they appear once the first stats sweep has landed (stats cost ~2s
+    // per runtime CLI, so they arrive after the listing).
     let has_pod = app.containers.iter().any(|c| c.pod.is_some());
+    let has_stats = app.containers.iter().any(|c| c.cpu_pct.is_some());
     let mut header: Vec<Cell> = vec![
         Cell::from("Runtime"),
         Cell::from("ID"),
@@ -3958,6 +4242,12 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
         Constraint::Length(10),
         Constraint::Length(24),
     ];
+    if has_stats {
+        header.push(Cell::from("CPU%"));
+        header.push(Cell::from("MEM"));
+        widths.push(Constraint::Length(8));
+        widths.push(Constraint::Length(15));
+    }
     if has_pod {
         header.push(Cell::from("Pod"));
         widths.push(Constraint::Length(24));
@@ -3978,6 +4268,10 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
                 Cell::from(c.state.clone()).style(container_state_style(c)),
                 Cell::from(c.status.clone()),
             ];
+            if has_stats {
+                cells.push(Cell::from(container_cpu_disp(c)));
+                cells.push(Cell::from(container_mem_disp(c)).style(container_mem_style(c)));
+            }
             if has_pod {
                 cells.push(Cell::from(c.pod.clone().unwrap_or_else(|| "-".into())));
             }
@@ -5108,7 +5402,7 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
     };
     let mut footer = match app.tab {
         Tab::Processes => format!(
-            "Total: {} | Enter: Detail | w: Watch{} | N: Note | a: Actions (K: tree-kill) | /: Search | z: Zoom | T: Tree{} | B: Group{} | S: Summary | Y: System | !: Notify{} | P: Pause | p/n/u/c/m/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | ?: Help | r: Refresh | q: Quit",
+            "Total: {} | Enter: Detail | w: Watch{} | N: Note | a: Actions (K: tree-kill) | /: Search | z: Zoom | T: Tree{} | B: Group{} | S: Summary | Y: System | !: Notify{} | P: Pause | p/n/u/c/m/i/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | ?: Help | r: Refresh | q: Quit",
             total,
             if app.watch.is_empty() {
                 String::new()
@@ -5350,7 +5644,10 @@ fn help_lines(tab: Tab) -> Vec<Line<'static>> {
                 ("j/k, arrows", "move selection"),
                 ("g/G", "top / bottom"),
                 ("Enter", "full detail page"),
-                ("/", "search (filters the table)"),
+                (
+                    "/",
+                    "search, or a numeric filter: cpu>50 · mem>500 (MB) · fd>=100 · age>1h · io<10m",
+                ),
                 ("a", "actions: kill/term/pause/resume/nice"),
                 ("K", "kill tree (process + descendants, y confirms)"),
                 ("x", "kill selection (y confirms)"),
@@ -5359,7 +5656,7 @@ fn help_lines(tab: Tab) -> Vec<Line<'static>> {
                 ("B", "group by user/command"),
                 ("T", "tree mode"),
                 ("z", "zoom the focused pane"),
-                ("p/n/u/c/m/t", "sort: pid/name/user/cpu/mem/time"),
+                ("p/n/u/c/m/i/t", "sort: pid/name/user/cpu/mem/io/time"),
                 ("S", "session summary"),
                 ("y", "system resources"),
                 ("D", "snapshot diff vs the newest auto snapshot"),
@@ -5384,6 +5681,7 @@ fn help_lines(tab: Tab) -> Vec<Line<'static>> {
                 ("l", "container logs"),
                 ("i/n/r/g/s", "sort: id/name/runtime/image/status"),
                 ("/", "search"),
+                ("CPU%/MEM", "live stats sweep, ~10s cadence"),
             ],
         ),
         Tab::Locks => section(
@@ -6449,6 +6747,7 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                     'u' => Some(SortKey::User),
                     'c' => Some(SortKey::Cpu),
                     'm' => Some(SortKey::Mem),
+                    'i' => Some(SortKey::Io),
                     't' => Some(SortKey::Started),
                     _ => None,
                 };
@@ -6484,9 +6783,105 @@ fn sort_key_from_str(s: &str) -> Option<SortKey> {
         "user" => Some(SortKey::User),
         "cpu" => Some(SortKey::Cpu),
         "mem" => Some(SortKey::Mem),
+        "io" => Some(SortKey::Io),
         "started" | "age" | "time" => Some(SortKey::Started),
         _ => None,
     }
+}
+
+/// One numeric `/` filter on the Processes tab (`cpu>50`, `mem<=2g`,
+/// `fd>=100`, `age>1h`, `io<10m`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MetricFilter {
+    metric: FilterMetric,
+    /// true = `>`, false = `<`; the parser normalizes >=/> and <=/< onto
+    /// the same comparison (equal values are edge noise, not a mode)
+    gt: bool,
+    /// comparison value in the metric's unit: cpu percent, mem KiB,
+    /// fd count, age seconds, io bytes/s
+    value: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FilterMetric {
+    Cpu,
+    Mem,
+    Fd,
+    Age,
+    Io,
+}
+
+/// `1.5g` → 1.5 × 10⁹ (k/m/g suffixes, case-insensitive; bare = plain).
+fn parse_scaled(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (num, mult) = if let Some(v) = s.strip_suffix(['k', 'K']) {
+        (v, 1e3)
+    } else if let Some(v) = s.strip_suffix(['m', 'M']) {
+        (v, 1e6)
+    } else if let Some(v) = s.strip_suffix(['g', 'G']) {
+        (v, 1e9)
+    } else {
+        (s, 1.0)
+    };
+    num.trim().parse::<f64>().ok().map(|n| n * mult)
+}
+
+/// Age suffixes: `30` seconds, `10m`, `2h`, `1d`.
+fn parse_age_secs(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (num, mult) = if let Some(v) = s.strip_suffix(['s', 'S']) {
+        (v, 1.0)
+    } else if let Some(v) = s.strip_suffix(['m', 'M']) {
+        (v, 60.0)
+    } else if let Some(v) = s.strip_suffix(['h', 'H']) {
+        (v, 3600.0)
+    } else if let Some(v) = s.strip_suffix(['d', 'D']) {
+        (v, 86400.0)
+    } else {
+        (s, 1.0)
+    };
+    num.trim().parse::<f64>().ok().map(|n| n * mult)
+}
+
+/// `cpu>50` / `mem<=2g` / `fd>=100` / `age>1h` / `io<10m` → a numeric
+/// filter; `None` means "not an expression" and the search falls back to
+/// substring. Bare `mem` is MB, bare `age` seconds, bare `io` bytes/s.
+fn parse_metric_filter(s: &str) -> Option<MetricFilter> {
+    let s = s.trim();
+    // longest operator first so >= wins over >
+    let (op_len, gt) = if s.contains(">=") {
+        (2, true)
+    } else if s.contains("<=") {
+        (2, false)
+    } else if s.contains('>') {
+        (1, true)
+    } else if s.contains('<') {
+        (1, false)
+    } else if s.contains('=') {
+        // `=` alone compares as ≥ (a name filter's job is substring)
+        (1, true)
+    } else {
+        return None;
+    };
+    let pos = s.find(['>', '<', '='])?;
+    let metric = s[..pos].trim().to_ascii_lowercase();
+    let raw = s[pos + op_len..].trim();
+    let fm = match metric.as_str() {
+        "cpu" => FilterMetric::Cpu,
+        "mem" => FilterMetric::Mem,
+        "fd" => FilterMetric::Fd,
+        "age" => FilterMetric::Age,
+        "io" => FilterMetric::Io,
+        _ => return None,
+    };
+    let value = match fm {
+        FilterMetric::Cpu | FilterMetric::Fd => raw.parse::<f64>().ok()?,
+        FilterMetric::Age => parse_age_secs(raw)?,
+        // bare mem is MB (stored as KiB), bare io is bytes/s
+        FilterMetric::Mem => parse_scaled(raw)? * 1024.0,
+        FilterMetric::Io => parse_scaled(raw)?,
+    };
+    (!raw.is_empty()).then_some(MetricFilter { metric: fm, gt, value })
 }
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()> {
@@ -6506,6 +6901,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()>
         }
         tick_refresh(&mut app);
         app.poll_containers();
+        app.poll_container_stats();
         app.poll_services();
         app.poll_logs();
         app.poll_death_logs();
@@ -6858,6 +7254,32 @@ mod tests {
     }
 
     #[test]
+    fn system_page_net_section_arms_then_shows_rates() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        on_key(&mut app, KeyCode::Char('y'));
+        if app.sys_net_prev.is_empty() {
+            // platform with no net counters (hermetic CI): the section
+            // stays hidden rather than showing an empty shell
+            assert!(app.sys_net_rows.is_empty());
+            return;
+        }
+        // first sweep only armed the counters — no rates yet, no chart
+        assert!(app.sys_net_rows.is_empty());
+        assert!(app.sys_net_hist.is_empty());
+        on_key(&mut app, KeyCode::Char('r'));
+        // a second sweep produces rows whose rx+tx sums to the history sample
+        if !app.sys_net_rows.is_empty() {
+            assert!(!app.sys_net_hist.is_empty());
+            let total: f64 = app.sys_net_rows.iter().map(|(_, rx, tx)| rx + tx).sum();
+            let last = app.sys_net_hist.last().copied().unwrap();
+            assert!((last - total).abs() < 1e-6, "{last} vs {total}");
+            for (_, rx, tx) in &app.sys_net_rows {
+                assert!(*rx >= 0.0 && *tx >= 0.0, "rates never negative");
+            }
+        }
+    }
+
+    #[test]
     fn config_seed_applies_sort_pause_and_interval() {
         let app = TuiApp::new(
             crate::platform::get(),
@@ -6888,11 +7310,114 @@ mod tests {
             ("user", SortKey::User),
             ("cpu", SortKey::Cpu),
             ("mem", SortKey::Mem),
+            ("io", SortKey::Io),
             ("started", SortKey::Started),
         ] {
             assert_eq!(sort_key_from_str(name), Some(key), "{name}");
         }
         assert_eq!(sort_key_from_str("wat"), None);
+    }
+
+    #[test]
+    fn io_sort_orders_by_sampled_rate() {
+        let mk = |pid: Pid, name: &str, rb: u64, wb: u64| Process {
+            pid,
+            name: name.into(),
+            io_read_bytes: Some(rb),
+            io_write_bytes: Some(wb),
+            ..Default::default()
+        };
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        app.procs = vec![
+            mk(1, "idle", 0, 0),
+            mk(2, "writer", 1000, 1000),
+            mk(3, "reader", 1000, 1000),
+        ];
+        app.search.clear();
+        // baseline sample seeds the counters; the second tick gives reader
+        // ~3 MB/s read vs writer ~1.5 MB/s write (real sleeps: the rate
+        // needs ≥50 ms between samples)
+        let baseline = app.procs.clone();
+        app.hist.update(&baseline);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let tick = vec![
+            mk(1, "idle", 0, 0),
+            mk(2, "writer", 1000, 1_500_000),
+            mk(3, "reader", 3_000_000, 1000),
+        ];
+        app.hist.update(&tick);
+        app.procs = tick;
+        app.sort_key = SortKey::Io;
+        app.sort_desc = true;
+        app.rebuild_view();
+        let names: Vec<&str> = app.view.iter().map(|&i| app.procs[i].name.as_str()).collect();
+        assert_eq!(names, vec!["reader", "writer", "idle"]);
+        // flipping direction puts the quiet first
+        app.sort_desc = false;
+        app.rebuild_view();
+        let names: Vec<&str> = app.view.iter().map(|&i| app.procs[i].name.as_str()).collect();
+        assert_eq!(names, vec!["idle", "writer", "reader"]);
+    }
+
+    #[test]
+    fn metric_filter_parses_expressions_and_falls_back() {
+        // substring searches stay the default
+        assert_eq!(parse_metric_filter("nginx"), None);
+        assert_eq!(parse_metric_filter(""), None);
+        assert_eq!(parse_metric_filter("cpu"), None, "bare metric isn't an expression");
+        assert_eq!(parse_metric_filter("cpu>"), None, "no value");
+        assert_eq!(parse_metric_filter("ram>50"), None, "unknown metric");
+        let f = |s: &str| parse_metric_filter(s).unwrap();
+        // cpu/fd compare plain numbers; >=/<= collapse onto >/<
+        assert_eq!(f("cpu>50"), MetricFilter { metric: FilterMetric::Cpu, gt: true, value: 50.0 });
+        assert_eq!(f("cpu >= 90.5"), MetricFilter { metric: FilterMetric::Cpu, gt: true, value: 90.5 });
+        assert_eq!(f("fd<10"), MetricFilter { metric: FilterMetric::Fd, gt: false, value: 10.0 });
+        // bare mem is MB (stored KiB), suffixes scale: 2g → 2 GiB in KiB
+        assert_eq!(f("mem>500"), MetricFilter { metric: FilterMetric::Mem, gt: true, value: 500.0 * 1024.0 });
+        assert_eq!(f("mem<=2g"), MetricFilter { metric: FilterMetric::Mem, gt: false, value: 2e9 * 1024.0 });
+        // age: bare seconds, m/h/d suffixes
+        assert_eq!(f("age>3600"), MetricFilter { metric: FilterMetric::Age, gt: true, value: 3600.0 });
+        assert_eq!(f("age>1h"), MetricFilter { metric: FilterMetric::Age, gt: true, value: 3600.0 });
+        assert_eq!(f("age<30m"), MetricFilter { metric: FilterMetric::Age, gt: false, value: 1800.0 });
+        // io: bare bytes/s, k/m/g scale — and "10m" means megabytes here,
+        // not minutes (the metric disambiguates the suffix)
+        assert_eq!(f("io>1048576"), MetricFilter { metric: FilterMetric::Io, gt: true, value: 1_048_576.0 });
+        assert_eq!(f("io>10m"), MetricFilter { metric: FilterMetric::Io, gt: true, value: 1e7 });
+    }
+
+    #[test]
+    fn metric_filter_narrows_the_table() {
+        let mk = |pid: Pid, name: &str, kb: Option<u64>| Process {
+            pid,
+            name: name.into(),
+            mem_kb: kb,
+            ..Default::default()
+        };
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        app.procs = vec![
+            mk(1, "small", Some(100 * 1024)),   // 100 MB
+            mk(2, "big", Some(600 * 1024)),     // 600 MB
+            mk(3, "unknown", None),
+        ];
+        app.search = "mem>500".into();
+        app.rebuild_view();
+        let names: Vec<&str> = app.view.iter().map(|&i| app.procs[i].name.as_str()).collect();
+        assert_eq!(names, vec!["big"], "only the >500 MB process survives");
+        // mem<500 keeps the small one and the unmeasured (unknown sorts low)
+        app.search = "mem<500".into();
+        app.rebuild_view();
+        let mut names: Vec<&str> = app.view.iter().map(|&i| app.procs[i].name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["small", "unknown"]);
+        // cpu>… uses the display cpu (unmeasured = -1.0, excluded)
+        app.search = "cpu>0".into();
+        app.rebuild_view();
+        assert!(app.view.is_empty(), "no samples yet → nothing measures above 0");
+        // non-expressions keep substring semantics
+        app.search = "big".into();
+        app.rebuild_view();
+        let names: Vec<&str> = app.view.iter().map(|&i| app.procs[i].name.as_str()).collect();
+        assert_eq!(names, vec!["big"]);
     }
 
     #[test]
@@ -7807,6 +8332,9 @@ mod tests {
             ports: String::new(),
             pod: None,
             restarts: None,
+            cpu_pct: None,
+            mem_used_mb: None,
+            mem_total_mb: None,
         };
         assert_eq!(
             container_state_style(&mk("running", "Up 2 weeks (healthy)")).fg,
@@ -7845,6 +8373,9 @@ mod tests {
                 ports: "".into(),
                 pod: None,
                 restarts: None,
+                cpu_pct: None,
+                mem_used_mb: None,
+                mem_total_mb: None,
             },
             Container {
                 runtime: "docker".into(),
@@ -7857,6 +8388,9 @@ mod tests {
                 ports: "".into(),
                 pod: None,
                 restarts: None,
+                cpu_pct: None,
+                mem_used_mb: None,
+                mem_total_mb: None,
             },
         ];
         app.rebuild_container_view();
@@ -8169,6 +8703,7 @@ mod tests {
                 alert_mem_pct: None,
                 alert_count: None,
                 alert_disk: None,
+                alert_net: None,
                 replay_follow: None,
                 notes: Vec::new(),
             },
@@ -8354,9 +8889,10 @@ mod tests {
 
     #[test]
     fn tree_kill_arms_confirms_and_cancels() {
-        // inject a fake family so the arm path is deterministic: 100 → 200
-        // → 300, all dead in reality (4-million-range pids) so confirming
-        // signals nothing for real
+        // inject a fake family so the arm path is deterministic: 99901 →
+        // 99902 → 99903, all dead in reality (macOS recycles low pids
+        // constantly — pids near the 99999 ceiling almost never come into
+        // existence, so confirming signals nothing for real
         let mk = |pid: Pid, ppid: Option<Pid>| Process {
             pid,
             ppid,
@@ -8364,7 +8900,7 @@ mod tests {
             ..Default::default()
         };
         let mut app = TuiApp::new(crate::platform::get(), Seed::default());
-        app.procs = vec![mk(100, None), mk(200, Some(100)), mk(300, Some(200))];
+        app.procs = vec![mk(99901, None), mk(99902, Some(99901)), mk(99903, Some(99902))];
         app.view = vec![0, 1, 2];
         app.table_state.select(Some(0));
         app.detail_pid = None; // else startup's real selection wins over ours
@@ -8375,10 +8911,10 @@ mod tests {
             .confirm_tree_kill
             .clone()
             .expect("'K' on a process with kin arms the confirmation");
-        assert_eq!(root, 100);
-        assert_eq!(tree, vec![200, 300], "descendants, root excluded");
+        assert_eq!(root, 99901);
+        assert_eq!(tree, vec![99902, 99903], "descendants, root excluded");
         assert!(
-            app.status.contains("kill pid 100 + 2 descendant(s)?"),
+            app.status.contains("kill pid 99901 + 2 descendant(s)?"),
             "prompt names root and count: {}",
             app.status
         );
@@ -8395,7 +8931,7 @@ mod tests {
         assert!(app.confirm_tree_kill.is_none());
         assert_eq!(
             app.status,
-            "SIGTERM sent to 0 process(es) in 100's tree",
+            "SIGTERM sent to 0 process(es) in 99901's tree",
             "confirm reports the honest count: {}",
             app.status
         );

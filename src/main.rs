@@ -602,6 +602,8 @@ pub(crate) fn port_alert_picks(
 /// platform doesn't report (empty cells), so the file stays loadable.
 /// A `.jsonl` path switches formats: one versioned JSON envelope per tick
 /// (richer — ppid, state, age ride along — and jq-friendly).
+/// Every tick also carries a machine-level sample: a `_system` row in CSV
+/// (dedicated `sys_*` columns) or a `system` key in the JSONL envelope.
 struct RecordWriter {
     file: std::fs::File,
     jsonl: bool,
@@ -613,12 +615,22 @@ impl RecordWriter {
         let mut f = std::fs::File::create(path)?;
         use std::io::Write as _;
         if !jsonl {
-            writeln!(f, "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps")?;
+            writeln!(
+                f,
+                "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps,\
+                 sys_load1,sys_mem_pct,sys_procs,sys_net_bps"
+            )?;
         }
         Ok(RecordWriter { file: f, jsonl })
     }
 
-    fn append(&mut self, procs: &[Process], hist: &history::History) {
+    fn append(
+        &mut self,
+        procs: &[Process],
+        hist: &history::History,
+        stats: Option<&crate::platform::SystemStats>,
+        net_bps: Option<f64>,
+    ) {
         use std::io::Write as _;
         if self.jsonl {
             let rows: Vec<serde_json::Value> = procs
@@ -645,10 +657,25 @@ impl RecordWriter {
                     })
                 })
                 .collect();
+            let system = stats.map(|s| {
+                let mem_pct = match (s.mem_used_mb, s.mem_total_mb) {
+                    (Some(u), Some(t)) if t > 0 => Some((u * 100) / t),
+                    _ => None,
+                };
+                serde_json::json!({
+                    "load1": s.load1,
+                    "cpu_pct": s.cpu_percent,
+                    "mem_used_mb": s.mem_used_mb,
+                    "mem_pct": mem_pct,
+                    "proc_count": procs.len(),
+                    "net_bps": net_bps,
+                })
+            });
             let doc = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "generated_at": util::now_unix(),
                 "process_count": rows.len(),
+                "system": system,
                 "processes": rows,
             });
             let _ = writeln!(self.file, "{}", serde_json::to_string(&doc).unwrap_or_default());
@@ -668,7 +695,7 @@ impl RecordWriter {
                 .unwrap_or_default();
             let _ = writeln!(
                 self.file,
-                "{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},,,,",
                 ts,
                 p.pid,
                 render::csv_field(p.user.as_deref().unwrap_or("-")),
@@ -677,6 +704,26 @@ impl RecordWriter {
                 rss,
                 io.0,
                 io.1,
+            );
+        }
+        // the machine's own row: cpu_pct/rss_mb reuse their columns (whole-
+        // machine cpu and used MB), the sys_* columns carry what no process
+        // row has — load, used-percent, visible count, combined net rate
+        if let Some(s) = stats {
+            let mem_pct = match (s.mem_used_mb, s.mem_total_mb) {
+                (Some(u), Some(t)) if t > 0 => Some((u * 100) / t),
+                _ => None,
+            };
+            let _ = writeln!(
+                self.file,
+                "{},_system,-,system,{},{},,,{},{},{},{}",
+                ts,
+                s.cpu_percent.map(|c| format!("{c:.1}")).unwrap_or_default(),
+                s.mem_used_mb.map(|mb| mb.to_string()).unwrap_or_default(),
+                s.load1.map(|l| format!("{l:.2}")).unwrap_or_default(),
+                mem_pct.map(|p| p.to_string()).unwrap_or_default(),
+                procs.len(),
+                net_bps.map(|b| format!("{b:.0}")).unwrap_or_default(),
             );
         }
     }
@@ -873,6 +920,7 @@ fn main() {
         || cli.alert_mem_pct.is_some()
         || cli.alert_count.is_some()
         || cli.alert_disk.is_some()
+        || cli.alert_net.is_some()
         || !alert_ports.is_empty();
     if cli.alert_repeat.is_some() && !any_alert_armed {
         eprintln!(
@@ -929,6 +977,7 @@ fn main() {
         && cli.alert_mem_pct.is_none()
         && cli.alert_count.is_none()
         && cli.alert_disk.is_none()
+        && cli.alert_net.is_none()
         && cli.alert_port.is_empty()
     {
         eprintln!(
@@ -1572,6 +1621,7 @@ fn main() {
             alert_mem_pct: cli.alert_mem_pct,
             alert_count: cli.alert_count,
             alert_disk: cli.alert_disk,
+            alert_net: cli.alert_net,
             alert_repeat: cli.alert_repeat,
             watch: cfg.watch.clone(),
             notes: cfg.notes,
@@ -1978,6 +2028,7 @@ fn main() {
                 alert_mem_pct: cli.alert_mem_pct,
                 alert_count: cli.alert_count,
                 alert_disk: cli.alert_disk,
+                alert_net: cli.alert_net,
                 alert_repeat: cli.alert_repeat,
                 watch: cfg.watch.clone(),
                 notes: cfg.notes,
@@ -2083,7 +2134,19 @@ fn main() {
                     let _ = f.flush();
                 }
                 if let Some(w) = recorder.as_mut() {
-                    w.append(&procs, &hist);
+                    // --record samples the machine alongside the processes —
+                    // a `_system` row (CSV) / `system` key (JSONL) per tick.
+                    // The net rate rides the shared SysAlertState so an
+                    // armed --alert-net and the recorder diff the same
+                    // counter stream.
+                    let stats = platform.system_stats();
+                    let nics = platform.net_counters();
+                    let total = nics
+                        .iter()
+                        .fold((0u64, 0u64), |(rx, tx), n| (rx + n.rx_bytes, tx + n.tx_bytes));
+                    let net_bps =
+                        history::machine_net_rate(total, &mut sys_alert).map(|mbps| mbps * 1048576.0);
+                    w.append(&procs, &hist, stats.as_ref(), net_bps);
                 }
                 let mut picks = watch_alert_picks(
                     platform.as_ref(),
@@ -2106,19 +2169,29 @@ fn main() {
                     ));
                 }
                 // machine-wide alerts (--alert-load / --alert-mem-pct /
-                // --alert-count): sample the whole system when armed —
-                // macOS's vm_stat spawn and Windows's PowerShell query are
-                // paid only when watched
+                // --alert-count / --alert-net): sample the whole system when
+                // armed — macOS's vm_stat spawn and Windows's PowerShell
+                // query are paid only when watched
                 if cli.alert_load.is_some()
                     || cli.alert_mem_pct.is_some()
                     || cli.alert_count.is_some()
                     || cli.alert_disk.is_some()
+                    || cli.alert_net.is_some()
                 {
                     if let Some(stats) = platform.system_stats() {
                         let mounts = if cli.alert_disk.is_some() {
                             platform.mount_usage()
                         } else {
                             Vec::new()
+                        };
+                        let net_rate = if cli.alert_net.is_some() {
+                            let nics = platform.net_counters();
+                            let total = nics
+                                .iter()
+                                .fold((0u64, 0u64), |(rx, tx), n| (rx + n.rx_bytes, tx + n.tx_bytes));
+                            history::machine_net_rate(total, &mut sys_alert)
+                        } else {
+                            None
                         };
                         let limits = history::SysAlertLimits {
                             load: cli.alert_load,
@@ -2127,6 +2200,8 @@ fn main() {
                             proc_count: procs.len(),
                             mounts,
                             disk_pct: cli.alert_disk,
+                            net_limit: cli.alert_net,
+                            net_rate,
                             repeat: cli.alert_repeat,
                         };
                         for (name, detail) in history::system_alert_picks(
@@ -2689,23 +2764,41 @@ mod tests {
         let mut hist = history::History::new();
         let procs = vec![proc(3, "worker", None, Some(2048))];
         let _ = hist.update(&procs); // first sample: no cpu/io deltas yet
-        w.append(&procs, &hist);
+        let stats = crate::platform::SystemStats {
+            load1: Some(1.25),
+            mem_used_mb: Some(4096),
+            mem_total_mb: Some(16384),
+            ..Default::default()
+        };
+        w.append(&procs, &hist, Some(&stats), None);
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps"
+            "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps,\
+             sys_load1,sys_mem_pct,sys_procs,sys_net_bps"
         );
-        assert_eq!(lines.len(), 2, "one header + one row");
+        assert_eq!(lines.len(), 3, "header + process row + _system row");
         let row = lines[1];
         // first sample: no cpu/io deltas yet → empty cells; rss 2048 KiB → 2
         let fields: Vec<&str> = row.split(',').collect();
-        assert_eq!(fields.len(), 8, "{row}");
+        assert_eq!(fields.len(), 12, "{row}");
         assert_eq!((fields[1], fields[2], fields[3]), ("3", "-", "worker"), "{row}");
         assert_eq!(fields[4], "", "no cpu delta on the first sample: {row}");
         assert_eq!(fields[5], "2", "2048 KiB → 2 MB rss: {row}");
         assert_eq!((fields[6], fields[7]), ("", ""), "no io yet: {row}");
-        assert!(fields[0].parse::<u64>().is_ok(), "unix timestamp: {row}");
+        assert!(
+            (fields[8], fields[9], fields[10], fields[11]) == ("", "", "", ""),
+            "per-process rows leave the sys_* columns empty: {row}"
+        );
+        // the machine's own row: load, mem pct (4096/16384 = 25) and the
+        // visible count land in the sys_* columns; no net rate on tick one
+        let sys: Vec<&str> = lines[2].split(',').collect();
+        assert_eq!(sys.len(), 12, "{}", lines[2]);
+        assert_eq!(sys[1], "_system");
+        assert_eq!(sys[4], "", "machine cpu is a delta — empty on tick one");
+        assert_eq!(sys[5], "4096", "used MB rides the rss column");
+        assert_eq!((sys[8], sys[9], sys[10], sys[11]), ("1.25", "25", "1", ""), "{}", lines[2]);
         std::fs::remove_file(&path).ok();
     }
 
@@ -2717,19 +2810,32 @@ mod tests {
         let mut hist = history::History::new();
         let procs = vec![proc(9, "daemon", None, Some(8192))];
         let _ = hist.update(&procs);
-        w.append(&procs, &hist);
-        w.append(&procs, &hist);
+        let stats = crate::platform::SystemStats {
+            load1: Some(2.5),
+            mem_used_mb: Some(8192),
+            mem_total_mb: Some(32768),
+            ..Default::default()
+        };
+        w.append(&procs, &hist, Some(&stats), Some(2_000_000.0));
+        w.append(&procs, &hist, None, None);
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one envelope per tick, no header");
-        for line in lines {
-            let v: serde_json::Value = serde_json::from_str(line).unwrap();
-            assert_eq!(v["schema_version"], SCHEMA_VERSION, "{line}");
-            assert_eq!(v["process_count"], 1);
-            assert_eq!(v["processes"][0]["pid"], 9);
-            assert_eq!(v["processes"][0]["rss_mb"], 8);
-            assert_eq!(v["processes"][0]["ppid"], serde_json::Value::Null);
-        }
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["schema_version"], SCHEMA_VERSION, "{}", lines[0]);
+        assert_eq!(v["process_count"], 1);
+        assert_eq!(v["processes"][0]["pid"], 9);
+        assert_eq!(v["processes"][0]["rss_mb"], 8);
+        assert_eq!(v["processes"][0]["ppid"], serde_json::Value::Null);
+        // the machine rides along: load, mem pct (8192/32768 = 25), visible
+        // count, and the net rate in bytes/s
+        assert_eq!(v["system"]["load1"], 2.5);
+        assert_eq!(v["system"]["mem_pct"], 25);
+        assert_eq!(v["system"]["proc_count"], 1);
+        assert_eq!(v["system"]["net_bps"], 2_000_000.0);
+        // a tick without a system sample keeps the key, null-filled
+        let v2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert!(v2["system"].is_null());
         std::fs::remove_file(&path).ok();
     }
 

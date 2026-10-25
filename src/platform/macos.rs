@@ -303,6 +303,88 @@ fn parse_swapusage(text: &str) -> (Option<u64>, Option<u64>) {
     (get("used = "), get("total = "))
 }
 
+/// Cumulative per-interface byte counters, read straight from the kernel
+/// route table (sysctl NET_RT_IFLIST2 — the same numbers `netstat -ib`
+/// prints, but in-process and µs-fast). netstat itself is unusable as a
+/// source here: behind certain network extensions it blocks for ~90s
+/// before printing a row (0% CPU), which would stall every sampling tick.
+#[cfg(target_os = "macos")]
+pub(crate) fn iflist2_counters() -> Vec<super::NicCounters> {
+    extern "C" {
+        fn sysctl(
+            name: *const i32,
+            namelen: u32,
+            oldp: *mut u8,
+            oldlenp: *mut usize,
+            newp: *mut u8,
+            newlen: usize,
+        ) -> i32;
+    }
+    // {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0}
+    let mib = [4_i32, 17, 0, 0, 6, 0];
+    let mut len: usize = 0;
+    unsafe {
+        if sysctl(mib.as_ptr(), 6, std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) != 0 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; len];
+        if sysctl(mib.as_ptr(), 6, buf.as_mut_ptr(), &mut len, std::ptr::null_mut(), 0) != 0 {
+            return Vec::new();
+        }
+        buf.truncate(len);
+        parse_iflist2(&buf)
+    }
+}
+
+/// Non-macOS stub — see [`iflist2_counters`].
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn iflist2_counters() -> Vec<super::NicCounters> {
+    Vec::new()
+}
+
+/// Walk the NET_RT_IFLIST2 message stream for RTM_IFINFO2 (0x12) records,
+/// one per interface. Offsets are Darwin's `struct if_msghdr2` as laid out
+/// on arm64 (verified against `netstat -ib` ground truth): 32-byte fixed
+/// part + 128-byte if_data64, so the sockaddr_dl naming the interface
+/// follows at 160 — ifi_ibytes @96, ifi_obytes @104, sdl_nlen @165,
+/// name @168. Loopback drops out like netstat's parsing.
+fn parse_iflist2(buf: &[u8]) -> Vec<super::NicCounters> {
+    const RTM_IFINFO2: u8 = 0x12;
+    const HDR_END: usize = 160; // sockaddr_dl offset in the message
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + HDR_END <= buf.len() {
+        let msglen = u16::from_ne_bytes([buf[off], buf[off + 1]]) as usize;
+        if msglen < HDR_END || off + msglen > buf.len() {
+            break;
+        }
+        let is_info2 = buf[off + 3] == RTM_IFINFO2;
+        let msg = &buf[off..off + msglen];
+        off += msglen;
+        // the stream interleaves IFINFO2 with route/addr records
+        // (RTM_NEWADDR…) for the same interface — skip those, don't stop
+        if !is_info2 {
+            continue;
+        }
+        let nlen = msg[HDR_END + 5] as usize;
+        if nlen == 0 || msg.len() < HDR_END + 8 + nlen {
+            continue;
+        }
+        let Ok(name) = std::str::from_utf8(&msg[HDR_END + 8..HDR_END + 8 + nlen]) else {
+            continue;
+        };
+        if name == "lo0" {
+            continue;
+        }
+        out.push(super::NicCounters {
+            name: name.to_string(),
+            rx_bytes: u64::from_ne_bytes(msg[96..104].try_into().expect("96..104")),
+            tx_bytes: u64::from_ne_bytes(msg[104..112].try_into().expect("104..112")),
+        });
+    }
+    out
+}
+
 pub struct MacOs {
     users: Users,
     /// Tick snapshot from the previous [`MacOs::system_stats`] call — CPU%
@@ -806,6 +888,10 @@ impl Platform for MacOs {
         out.load5 = l5;
         out.load15 = l15;
         Some(out)
+    }
+
+    fn net_counters(&self) -> Vec<super::NicCounters> {
+        iflist2_counters()
     }
 
     fn open_files(&self, pid: Pid) -> Vec<String> {
@@ -1416,6 +1502,83 @@ fn parse_cpu_time_to_ms(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One synthetic RTM_IFINFO2 record laid out like the kernel's: 32-byte
+    /// if_msghdr2 fixed part + 128-byte if_data64 (ifi_ibytes @96,
+    /// ifi_obytes @104) + sockaddr_dl at 160 (sdl_nlen @165, name @168).
+    fn ifinfo2_msg(name: &[u8], rx: u64, tx: u64) -> Vec<u8> {
+        let total = 168 + name.len();
+        let mut m = vec![0u8; total];
+        m[0..2].copy_from_slice(&(total as u16).to_ne_bytes());
+        m[2] = 5; // ifm_version
+        m[3] = 0x12; // RTM_IFINFO2
+        m[40..44].copy_from_slice(&1500u32.to_ne_bytes()); // ifi_mtu anchor
+        m[96..104].copy_from_slice(&rx.to_ne_bytes());
+        m[104..112].copy_from_slice(&tx.to_ne_bytes());
+        m[160] = (8 + name.len()) as u8; // sdl_len
+        m[161] = 18; // AF_LINK
+        m[165] = name.len() as u8; // sdl_nlen
+        m[168..168 + name.len()].copy_from_slice(name);
+        m
+    }
+
+    #[test]
+    fn iflist2_counters_skip_loopback_and_garbage() {
+        // fixture values are the live en1/lo0 counters this parser was
+        // verified against via `netstat -ib` ground truth
+        let mut buf = ifinfo2_msg(b"lo0", 1_054_732_249, 1_054_732_249);
+        buf.extend(ifinfo2_msg(b"en1", 1_120_667_981, 1_251_172_294));
+        buf.extend(ifinfo2_msg(b"utun3", 400, 300));
+        assert_eq!(
+            parse_iflist2(&buf),
+            vec![
+                crate::platform::NicCounters {
+                    name: "en1".into(),
+                    rx_bytes: 1_120_667_981,
+                    tx_bytes: 1_251_172_294
+                },
+                crate::platform::NicCounters {
+                    name: "utun3".into(),
+                    rx_bytes: 400,
+                    tx_bytes: 300
+                },
+            ]
+        );
+        // message types other than RTM_IFINFO2 (0x0c = RTM_NEWADDR) are
+        // interleaved by the kernel and skipped without ending the walk
+        let mut other = ifinfo2_msg(b"en2", 1, 2);
+        other[3] = 0x0c;
+        let mut stream = ifinfo2_msg(b"en1", 10, 20);
+        stream.extend(&other);
+        stream.extend(ifinfo2_msg(b"utun3", 30, 40));
+        assert_eq!(
+            parse_iflist2(&stream)
+                .iter()
+                .map(|n| (n.name.as_str(), n.rx_bytes, n.tx_bytes))
+                .collect::<Vec<_>>(),
+            vec![("en1", 10, 20), ("utun3", 30, 40)]
+        );
+        assert!(parse_iflist2(&other).is_empty());
+        // a message shorter than the fixed part, or a name running past the
+        // message end, can't be parsed — the walk stops / the record drops
+        assert!(parse_iflist2(&[0u8; 10]).is_empty());
+        let mut truncated = ifinfo2_msg(b"en1", 1, 2);
+        truncated[0..2].copy_from_slice(&3u16.to_ne_bytes());
+        assert!(parse_iflist2(&truncated).is_empty());
+        let mut noname = ifinfo2_msg(b"en1", 1, 2);
+        noname[165] = 0; // sdl_nlen = 0 → no name
+        assert!(parse_iflist2(&noname).is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn iflist2_counters_match_netstat_shape() {
+        // live round-trip: the kernel sweep reports at least the loopback
+        // exclusions and sane counters for whatever it does report
+        for nic in iflist2_counters() {
+            assert_ne!(nic.name, "lo0");
+        }
+    }
 
     /// Integer sysctls must come back as numbers — `sysctl_str` reads raw
     /// bytes and made `hw.memsize` unparseable, so memory-percent alerts

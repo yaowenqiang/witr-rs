@@ -79,6 +79,56 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
     out.push_str("# TYPE witr_rss_total_mb gauge\n");
     out.push_str(&format!("witr_rss_total_mb {rss_total}\n"));
 
+    // machine-wide gauges: whole-box cpu/memory/load so a witr scrape can
+    // be the only node exporter a small host needs. CPU is a delta between
+    // scrapes — the very first one reports nothing (same as the TUI's
+    // first tick).
+    if let Some(s) = platform.system_stats() {
+        if let Some(cpu) = s.cpu_percent {
+            out.push_str("# HELP witr_machine_cpu_percent Total CPU busy percent across all cores\n");
+            out.push_str("# TYPE witr_machine_cpu_percent gauge\n");
+            out.push_str(&format!("witr_machine_cpu_percent {cpu:.2}\n"));
+        }
+        if let Some(mb) = s.mem_used_mb {
+            out.push_str("# HELP witr_machine_mem_used_bytes Used physical memory in bytes\n");
+            out.push_str("# TYPE witr_machine_mem_used_bytes gauge\n");
+            out.push_str(&format!("witr_machine_mem_used_bytes {}\n", mb * 1024 * 1024));
+        }
+        if let Some(mb) = s.mem_total_mb {
+            out.push_str("# HELP witr_machine_mem_total_bytes Total physical memory in bytes\n");
+            out.push_str("# TYPE witr_machine_mem_total_bytes gauge\n");
+            out.push_str(&format!("witr_machine_mem_total_bytes {}\n", mb * 1024 * 1024));
+        }
+        if let Some(l) = s.load1 {
+            out.push_str("# HELP witr_machine_load1 1-minute load average\n");
+            out.push_str("# TYPE witr_machine_load1 gauge\n");
+            out.push_str(&format!("witr_machine_load1 {l:.2}\n"));
+        }
+    }
+    // cumulative NIC bytes as counters (loopback excluded) — rate() gives
+    // per-interface throughput
+    let nics = platform.net_counters();
+    if !nics.is_empty() {
+        out.push_str("# HELP witr_machine_net_rx_bytes_total Cumulative received bytes per non-loopback interface\n");
+        out.push_str("# TYPE witr_machine_net_rx_bytes_total counter\n");
+        for n in &nics {
+            out.push_str(&format!(
+                "witr_machine_net_rx_bytes_total{{nic=\"{}\"}} {}\n",
+                label_escape(&n.name),
+                n.rx_bytes,
+            ));
+        }
+        out.push_str("# HELP witr_machine_net_tx_bytes_total Cumulative transmitted bytes per non-loopback interface\n");
+        out.push_str("# TYPE witr_machine_net_tx_bytes_total counter\n");
+        for n in &nics {
+            out.push_str(&format!(
+                "witr_machine_net_tx_bytes_total{{nic=\"{}\"}} {}\n",
+                label_escape(&n.name),
+                n.tx_bytes,
+            ));
+        }
+    }
+
     let set = export_set(&procs, TOP_N);
     out.push_str("# HELP witr_process_cpu_percent CPU percent (lifetime average as reported by the platform)\n");
     out.push_str("# TYPE witr_process_cpu_percent gauge\n");
@@ -230,11 +280,15 @@ fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) {
 /// on Linux).
 pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
+    // one platform for every request: the delta-based metrics (machine
+    // CPU%) need consecutive calls on the same instance
+    let platform = crate::platform::get_shared();
     crate::write_out(&format!(
         "serving Prometheus metrics → http://{addr}/metrics (Ctrl-C to stop)"
     ));
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
+        let platform = platform.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 2048];
             let Ok(n) = stream.read(&mut buf) else { return };
@@ -244,9 +298,12 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
             // envelope `--json` prints — a machine-readable sibling to the
             // Prometheus gauges
             if path == "/api/ps" || path.starts_with("/api/ps?") {
-                let platform = crate::platform::get();
-                let mut procs = platform.list_processes().unwrap_or_default();
-                platform.enrich_listing(&mut procs);
+                let procs = {
+                    let platform = platform.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut procs = platform.list_processes().unwrap_or_default();
+                    platform.enrich_listing(&mut procs);
+                    procs
+                };
                 respond(
                     &mut stream,
                     "200 OK",
@@ -258,9 +315,12 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
             // /api/ports: the LISTEN table (proto, port, owners) — the
             // `--ports` listing as JSON
             if path == "/api/ports" || path.starts_with("/api/ports?") {
-                let platform = crate::platform::get();
-                let procs = platform.list_processes().unwrap_or_default();
-                let socks = platform.list_sockets().unwrap_or_default();
+                let (procs, socks) = {
+                    let platform = platform.lock().unwrap_or_else(|e| e.into_inner());
+                    let procs = platform.list_processes().unwrap_or_default();
+                    let socks = platform.list_sockets().unwrap_or_default();
+                    (procs, socks)
+                };
                 let mut listeners = crate::snapshot::to_listeners(&socks, &procs);
                 listeners.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.proto.cmp(&b.proto)));
                 let doc = serde_json::json!({
@@ -280,8 +340,10 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
             // /api/tree: the nested children forest — `--tree --json` over
             // HTTP
             if path == "/api/tree" || path.starts_with("/api/tree?") {
-                let platform = crate::platform::get();
-                let procs = platform.list_processes().unwrap_or_default();
+                let procs = {
+                    let platform = platform.lock().unwrap_or_else(|e| e.into_inner());
+                    platform.list_processes().unwrap_or_default()
+                };
                 respond(
                     &mut stream,
                     "200 OK",
@@ -312,9 +374,12 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
             // /api/conns: every socket outside LISTEN, owners resolved and
             // loopback peers attributed — the `--conns` board as JSON
             if path == "/api/conns" || path.starts_with("/api/conns?") {
-                let platform = crate::platform::get();
-                let procs = platform.list_processes().unwrap_or_default();
-                let socks = platform.list_all_sockets().unwrap_or_default();
+                let (procs, socks) = {
+                    let platform = platform.lock().unwrap_or_else(|e| e.into_inner());
+                    let procs = platform.list_processes().unwrap_or_default();
+                    let socks = platform.list_all_sockets().unwrap_or_default();
+                    (procs, socks)
+                };
                 let rows = crate::render::collect_conns(&socks, &procs);
                 let doc = serde_json::json!({
                     "schema_version": crate::SCHEMA_VERSION,
@@ -350,7 +415,8 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
                     );
                     return;
                 }
-                let platform = crate::platform::get();
+                let mut guard = platform.lock().unwrap_or_else(|e| e.into_inner());
+                let platform: &mut dyn crate::platform::Platform = &mut **guard;
                 let mut procs = platform.list_processes().unwrap_or_default();
                 // the io metrics rank enriched counters — paid only when asked
                 if matches!(metric.as_str(), "io" | "io-rate") {
@@ -461,12 +527,21 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
                 }
                 return;
             }
-            let platform = crate::platform::get();
-            let fds = if fds_enabled { platform.fd_counts() } else { None };
+            let fds = {
+                let platform = platform.lock().unwrap_or_else(|e| e.into_inner());
+                if fds_enabled {
+                    platform.fd_counts()
+                } else {
+                    None
+                }
+            };
             // bump before rendering so the current scrape counts itself
             SCRAPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let started = std::time::Instant::now();
-            let body = scrape(platform.as_ref(), fds.as_ref());
+            let body = {
+                let platform = platform.lock().unwrap_or_else(|e| e.into_inner());
+                scrape(platform.as_ref(), fds.as_ref())
+            };
             LAST_SCRAPE_MICROS.store(
                 started.elapsed().as_micros() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -537,4 +612,25 @@ mod tests {
         // top-2 cpu = {1,2}; top-2 mem = {4,3}; pid 5 neither
         assert_eq!(pids, vec![1, 2, 3, 4]);
     }
+
+    #[test]
+    fn scrape_includes_machine_gauges_when_measurable() {
+        let platform = crate::platform::get();
+        let out = scrape(platform.as_ref(), None);
+        assert!(out.contains("witr_process_count "));
+        // net counters ship as a matched rx/tx pair, labeled per interface
+        let has_rx = out.contains("witr_machine_net_rx_bytes_total ");
+        let has_tx = out.contains("witr_machine_net_tx_bytes_total ");
+        assert_eq!(has_rx, has_tx, "rx and tx counters ship together");
+        if has_rx {
+            assert!(out.contains("nic=\""), "per-interface label present");
+        }
+        // on a platform with system_stats, the always-known fields emit
+        if platform.system_stats().is_some() {
+            let has_mem = out.contains("witr_machine_mem_used_bytes ")
+                || out.contains("witr_machine_mem_total_bytes ");
+            assert!(has_mem, "memory gauges emit whenever the platform measures");
+        }
+    }
 }
+

@@ -628,6 +628,16 @@ pub struct Cli {
     pub alert_disk: Option<u64>,
 
     #[arg(
+        long = "alert-net",
+        value_name = "MB/S",
+        help = t(
+            "整机告警：全部非回环网卡的收发合计速率连续 5 次采样（约 15s）超过该值（MB/s）时触发——流量打满出口、进程偷偷外传数据的哨兵。TUI 和 --watch",
+            "Machine-wide alert: fire when the combined rx+tx rate across all non-loopback NICs exceeds this value (MB/s) for 5 consecutive samples (~15s) — a sentinel for saturated uplinks and processes quietly exfiltrating data. TUI and --watch"
+        )
+    )]
+    pub alert_net: Option<u64>,
+
+    #[arg(
         long = "alert-port",
         value_name = "PORT|!PORT",
         help = t(

@@ -178,6 +178,9 @@ mod tests {
                 ports: String::new(),
                 pod: None,
                 restarts: None,
+                cpu_pct: None,
+                mem_used_mb: None,
+                mem_total_mb: None,
             },
             Container {
                 runtime: "docker".into(),
@@ -190,6 +193,9 @@ mod tests {
                 ports: String::new(),
                 pod: Some("manually/set".into()),
                 restarts: None,
+                cpu_pct: None,
+                mem_used_mb: None,
+                mem_total_mb: None,
             },
             Container {
                 runtime: "docker".into(),
@@ -202,6 +208,9 @@ mod tests {
                 ports: String::new(),
                 pod: None,
                 restarts: None,
+                cpu_pct: None,
+                mem_used_mb: None,
+                mem_total_mb: None,
             },
         ];
         annotate_with(&pods, &mut cs);

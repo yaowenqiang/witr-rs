@@ -145,6 +145,16 @@ pub struct Container {
     /// restart policy never fired).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restarts: Option<u32>,
+    /// Live CPU percent + memory usage from a background
+    /// `stats --no-stream` sweep. None until the first sweep lands (stats
+    /// cost seconds per container, so they ride a slower cadence than the
+    /// listing itself).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_used_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_total_mb: Option<u64>,
 }
 
 /// One service-manager unit: a systemd unit (Linux), a launchd job (macOS)
@@ -421,6 +431,9 @@ mod tests {
             ports: String::new(),
             pod: None,
             restarts: None,
+            cpu_pct: None,
+            mem_used_mb: None,
+            mem_total_mb: None,
         }
     }
 

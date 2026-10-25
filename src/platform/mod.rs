@@ -91,6 +91,9 @@ pub fn parse_container_line(line: &str, runtime: &str) -> Option<Container> {
         ports: get("Ports").to_string(),
         pod: None,
         restarts: None,
+        cpu_pct: None,
+        mem_used_mb: None,
+        mem_total_mb: None,
     })
 }
 
@@ -118,6 +121,79 @@ pub fn container_restarts(runtime: &str, id: &str) -> Option<u32> {
     )
     .ok()?;
     out.trim().parse().ok()
+}
+
+/// Live CPU% + memory usage for every running container, from one
+/// `stats --no-stream` sweep per runtime CLI (~2s each; stats can't be
+/// sampled cheaply like /proc). Returns full-id → (cpu_pct, mem_used_bytes,
+/// mem_total_bytes). Runtimes that are missing or whose daemon is down are
+/// silently skipped.
+pub fn container_stats() -> std::collections::HashMap<String, (f64, u64, u64)> {
+    let mut out = std::collections::HashMap::new();
+    for rt in ["docker", "podman", "nerdctl"] {
+        let Ok(text) = crate::util::run(
+            rt,
+            &[
+                "stats",
+                "--no-stream",
+                "--format",
+                "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}",
+            ],
+            std::time::Duration::from_secs(20),
+        ) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Some((id, cpu, used, total)) = parse_container_stats_line(line) else {
+                continue;
+            };
+            out.entry(id).or_insert((cpu, used, total));
+        }
+    }
+    out
+}
+
+/// One tab-separated `stats --format` row: `abc123…\t12.50%\t12.5MiB /
+/// 1.944GiB` → (id, cpu_pct, mem_used_bytes, mem_total_bytes).
+#[allow(dead_code)] // every parse fn is unit-tested on all platforms
+pub fn parse_container_stats_line(line: &str) -> Option<(String, f64, u64, u64)> {
+    let mut parts = line.splitn(3, '\t');
+    let id = parts.next()?.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let cpu: f64 = parts.next()?.trim().trim_end_matches('%').trim().parse().ok()?;
+    let mem = parts.next()?;
+    let mut mem_parts = mem.splitn(2, '/');
+    let used = parse_size_bytes(mem_parts.next()?)?;
+    let total = mem_parts.next().and_then(parse_size_bytes).unwrap_or(0);
+    Some((id, cpu, used, total))
+}
+
+/// `12.5MiB` → bytes. docker's size units: B/kB/MB/GB/TB (binary values
+/// despite the decimal suffix), podman/nerdctl the same shape.
+#[allow(dead_code)] // every parse fn is unit-tested on all platforms
+pub fn parse_size_bytes(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let split = text.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-');
+    let (num, unit) = match split {
+        Some(i) => text.split_at(i),
+        None => (text, ""),
+    };
+    let value: f64 = num.trim().parse().ok()?;
+    let unit = unit.trim().to_ascii_lowercase();
+    let mult = match unit.as_str() {
+        "" | "b" => 1.0,
+        "kb" | "kib" => 1024.0,
+        "mb" | "mib" => 1024f64 * 1024.0,
+        "gb" | "gib" => 1024f64 * 1024.0 * 1024.0,
+        "tb" | "tib" => 1024f64 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((value * mult) as u64)
 }
 
 /// The container that publishes `port` on the host, found by matching the
@@ -392,6 +468,17 @@ pub struct MountUsage {
     pub used_mb: u64,
 }
 
+/// Cumulative per-interface byte counters (read from boot / driver load).
+/// Loopback is excluded — its traffic is intra-machine and would double
+/// count anything a user actually means by "network throughput".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NicCounters {
+    /// Interface name ("eth0", "en0", "Ethernet"...).
+    pub name: String,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
 /// The single seam between pipeline logic and OS specifics.
 pub trait Platform {
     fn name(&self) -> &'static str;
@@ -438,6 +525,14 @@ pub trait Platform {
         {
             Vec::new()
         }
+    }
+
+    /// Cumulative rx/tx byte counters per non-loopback interface, for the
+    /// `--alert-net` machine throughput alert and the system page's network
+    /// section (callers diff two samples into a rate). Best-effort — a
+    /// platform with no cheap source returns empty. Default: unsupported.
+    fn net_counters(&self) -> Vec<NicCounters> {
+        Vec::new()
     }
 
     /// All sockets whose local port equals `port` (any proto), with owning
@@ -563,6 +658,26 @@ pub fn get() -> Box<dyn Platform> {
     }
 }
 
+/// One platform instance shared by all `--serve` connection threads. The
+/// delta-based metrics (machine CPU% especially) need consecutive calls on
+/// the SAME instance — a throwaway per-request platform would report CPU
+/// only on its second call, which never comes. Send so the per-connection
+/// threads can hold it behind a mutex.
+pub fn get_shared() -> std::sync::Arc<std::sync::Mutex<Box<dyn Platform + Send>>> {
+    let users = Users::load();
+    #[cfg(target_os = "linux")]
+    let boxed: Box<dyn Platform + Send> = Box::new(linux::Linux::new(users));
+    #[cfg(target_os = "macos")]
+    let boxed: Box<dyn Platform + Send> = Box::new(macos::MacOs::new(users));
+    #[cfg(windows)]
+    let boxed: Box<dyn Platform + Send> = Box::new(windows::Windows::new(users));
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        compile_error!("witr-rs supports linux, macOS and Windows only")
+    }
+    std::sync::Arc::new(std::sync::Mutex::new(boxed))
+}
+
 #[cfg(test)]
 mod service_tests {
     use super::*;
@@ -649,5 +764,63 @@ tmpfs             131072    65536     65536    50%    /run
         // header / malformed lines are silently skipped
         assert!(parse_df("").is_empty());
         assert!(parse_df("garbage line\nanother\n").is_empty());
+    }
+
+    #[test]
+    fn container_stats_line_parses() {
+        // docker's exact shape: full id, cpu with %, "used / total" sizes
+        let (id, cpu, used, total) =
+            parse_container_stats_line("a1b2c3d4e5f6\t12.50%\t12.5MiB / 1.944GiB").unwrap();
+        assert_eq!(id, "a1b2c3d4e5f6");
+        assert!((cpu - 12.5).abs() < f64::EPSILON);
+        assert_eq!(used, (12.5 * 1024.0 * 1024.0) as u64);
+        assert_eq!(total, (1.944 * 1024.0 * 1024.0 * 1024.0) as u64);
+        // sub-1% values and a missing total column still parse
+        let (id, cpu, used, total) = parse_container_stats_line("beef\t0.09%\t352kB / 0B").unwrap();
+        assert_eq!(id, "beef");
+        assert!((cpu - 0.09).abs() < f64::EPSILON);
+        assert_eq!(used, 352 * 1024);
+        assert_eq!(total, 0);
+        // garbage → None
+        assert!(parse_container_stats_line("").is_none());
+        assert!(parse_container_stats_line("\t10%\t1MiB / 2MiB").is_none());
+        assert!(parse_container_stats_line("id\tnot-a-float\t1MiB / 2MiB").is_none());
+    }
+
+    #[test]
+    fn size_bytes_parses_docker_units() {
+        assert_eq!(parse_size_bytes("12.5MiB"), Some((12.5 * 1024.0 * 1024.0) as u64));
+        assert_eq!(parse_size_bytes("1.944GiB"), Some((1.944 * 1024.0 * 1024.0 * 1024.0) as u64));
+        assert_eq!(parse_size_bytes("352kB"), Some(352 * 1024));
+        assert_eq!(parse_size_bytes("732B"), Some(732));
+        assert_eq!(parse_size_bytes("0B"), Some(0));
+        // spaces between number and unit (podman style)
+        assert_eq!(parse_size_bytes("2.5 MiB"), Some((2.5 * 1024.0 * 1024.0) as u64));
+        assert_eq!(parse_size_bytes(""), None);
+        assert_eq!(parse_size_bytes("MiB"), None);
+    }
+
+    #[test]
+    fn container_stats_sweep_matches_listing_ids() {
+        // Live round-trip, skipped wherever no docker daemon answers in
+        // time (CI, offline machines): every id the stats sweep reports
+        // must be findable in the listing via the same exact/prefix merge
+        // the TUI applies.
+        let listing = enumerate_containers();
+        let docker_up = listing.iter().any(|c| c.runtime == "docker");
+        if !docker_up {
+            return;
+        }
+        let stats = container_stats();
+        assert!(!stats.is_empty(), "docker is up but the sweep returned nothing");
+        for c in listing.iter().filter(|c| c.state == "running") {
+            let prefix: String = c.id.chars().take(12).collect();
+            let hit = stats.get(&c.id)
+                .or_else(|| stats.iter().find(|(k, _)| k.starts_with(&prefix)).map(|(_, v)| v));
+            if let Some((cpu, used, total)) = hit {
+                assert!(*cpu >= 0.0 && *cpu <= 800.0, "implausible cpu {cpu}");
+                assert!(*total == 0 || *used <= *total * 2, "used {used} >> total {total}");
+            }
+        }
     }
 }

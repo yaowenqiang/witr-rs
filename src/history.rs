@@ -109,6 +109,13 @@ pub struct SysAlertState {
     pub disk_streak: u32,
     pub disk_firing: bool,
     pub disk_fired_secs: u32,
+    /// Total rx+tx bytes across non-loopback NICs at `net_prev_at` — the
+    /// previous sample [`machine_net_rate`] diffs against.
+    pub net_prev: Option<(u64, u64)>,
+    pub net_prev_at: Option<std::time::Instant>,
+    pub net_streak: u32,
+    pub net_firing: bool,
+    pub net_fired_secs: u32,
 }
 
 /// The armed machine-wide alert thresholds plus the inputs they compare
@@ -125,7 +132,34 @@ pub struct SysAlertLimits {
     pub mounts: Vec<crate::platform::MountUsage>,
     /// --alert-disk: fire when any mount's used percent exceeds this.
     pub disk_pct: Option<u64>,
+    /// --alert-net threshold in MB/s. Armed only when `net_rate` is too —
+    /// the counters sweep is paid by whoever arms it.
+    pub net_limit: Option<u64>,
+    /// Machine-wide rx+tx throughput in MB/s, computed by the caller via
+    /// [`machine_net_rate`] just before this call. `None` (first sample or
+    /// counters unreadable) disarms the check for that tick.
+    pub net_rate: Option<f64>,
     pub repeat: Option<u64>,
+}
+
+/// Diff cumulative NIC byte totals into a machine-wide throughput in MB/s.
+/// `total` is `(rx_bytes, tx_bytes)` summed over non-loopback interfaces.
+/// Returns `None` on the first sample (no previous to diff against); a
+/// counter reset (interface bounce producing a smaller total) counts as a
+/// zero delta rather than a huge negative rate.
+pub fn machine_net_rate(total: (u64, u64), state: &mut SysAlertState) -> Option<f64> {
+    let now = std::time::Instant::now();
+    let rate = state.net_prev.zip(state.net_prev_at).and_then(|(prev, at)| {
+        let elapsed = now.duration_since(at).as_secs_f64();
+        (elapsed > 0.0).then(|| {
+            let d_rx = total.0.saturating_sub(prev.0);
+            let d_tx = total.1.saturating_sub(prev.1);
+            (d_rx + d_tx) as f64 / elapsed / 1024.0 / 1024.0
+        })
+    });
+    state.net_prev = Some(total);
+    state.net_prev_at = Some(now);
+    rate
 }
 
 /// One tick of the machine-wide alerts. `stats` comes from the platform's
@@ -145,6 +179,8 @@ pub fn system_alert_picks(
         proc_count,
         mounts,
         disk_pct: disk_pct_limit,
+        net_limit: net_limit_opt,
+        net_rate: net_rate_opt,
         repeat: repeat_secs,
     } = limits;
     let load_limit = *load_limit;
@@ -152,6 +188,8 @@ pub fn system_alert_picks(
     let count_limit = *count_limit;
     let proc_count = *proc_count;
     let disk_pct_limit = *disk_pct_limit;
+    let net_limit = *net_limit_opt;
+    let net_rate = *net_rate_opt;
     let repeat_secs = *repeat_secs;
     let mut out = Vec::new();
     if let Some(limit) = load_limit {
@@ -252,6 +290,25 @@ pub fn system_alert_picks(
             ));
         }
     }
+    if let (Some(limit), Some(rate)) = (net_limit, net_rate) {
+        let over = rate > limit as f64;
+        if alert_cycle_repeat(
+            &mut state.net_streak,
+            &mut state.net_firing,
+            over,
+            &mut state.net_fired_secs,
+            repeat_secs,
+            interval_secs,
+        ) {
+            out.push((
+                "system".to_string(),
+                format!(
+                    "net {rate:.1} MB/s above {limit} MB/s for {}s",
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+            ));
+        }
+    }
     out
 }
 
@@ -260,7 +317,7 @@ const SAMPLES: usize = 8;
 const BIG_SAMPLES: usize = 120;
 const RESTART_WINDOW: Duration = Duration::from_secs(5 * 60);
 const PRUNE_AFTER: Duration = Duration::from_secs(10 * 60);
-const SPARK_LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+pub(crate) const SPARK_LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Leak suspicion: RSS up at least this many MB across this many trailing
 /// samples, rising at least this fraction of the time.
 const LEAK_SAMPLES: usize = 60; // ~5 min at the 3s TUI refresh
@@ -1205,6 +1262,8 @@ mod tests {
             proc_count,
             mounts: Vec::new(),
             disk_pct: None,
+            net_limit: None,
+            net_rate: None,
             repeat: None,
         };
         assert!(
@@ -1251,6 +1310,8 @@ mod tests {
             proc_count,
             mounts: Vec::new(),
             disk_pct: None,
+            net_limit: None,
+            net_rate: None,
             repeat: None,
         };
         // 5 visible, limit 10 → under, never fires
@@ -1289,6 +1350,8 @@ mod tests {
                 proc_count: 0,
                 mounts,
                 disk_pct,
+                net_limit: None,
+                net_rate: None,
                 repeat: None,
             }
         };
@@ -1321,6 +1384,50 @@ mod tests {
         );
         // latched: no repeat without --alert-repeat
         assert!(system_alert_picks(&s, &mut state, &limits(Some(90), over), 3).is_empty());
+    }
+
+    #[test]
+    fn net_rate_diffs_counters_and_alert_fires_over_the_line() {
+        // machine_net_rate: None on the first sample, MB/s after
+        let mut state = SysAlertState::default();
+        assert_eq!(machine_net_rate((1000, 1000), &mut state), None);
+        // a counter reset (total shrinks) diffs as zero, not negative
+        assert_eq!(machine_net_rate((0, 0), &mut state), Some(0.0));
+
+        let s = crate::platform::SystemStats::default();
+        let limits = |net_limit: Option<u64>, net_rate: Option<f64>| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit,
+            net_rate,
+            repeat: None,
+        };
+        // first tick has no rate (None disarms) — even over the line
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                system_alert_picks(&s, &mut state, &limits(Some(10), None), 3).is_empty(),
+                "no measurement → no fire"
+            );
+        }
+        // 50 MB/s sustained over a 40 MB/s line: quiet for the arming
+        // samples, then one fire naming the rate and window
+        let mut fires = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            fires = system_alert_picks(&s, &mut state, &limits(Some(40), Some(50.0)), 3);
+        }
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].0, "system");
+        assert!(fires[0].1.contains("net 50.0 MB/s above 40"), "{}", fires[0].1);
+        // latched; dropping back under re-arms
+        assert!(system_alert_picks(&s, &mut state, &limits(Some(40), Some(50.0)), 3).is_empty());
+        for _ in 0..ALERT_CYCLES {
+            assert!(system_alert_picks(&s, &mut state, &limits(Some(40), Some(5.0)), 3).is_empty());
+        }
     }
 
     #[test]

@@ -140,6 +140,36 @@ fn parse_loadavg(text: &str) -> (Option<f64>, Option<f64>, Option<f64>) {
     )
 }
 
+/// /proc/net/dev → cumulative per-interface counters. Two header lines,
+/// then `iface: rx_bytes …` with tx_bytes as the 9th whitespace field
+/// (index 8 after the iface piece). Loopback drops out — intra-machine
+/// traffic would double count a throughput alert.
+fn parse_net_dev(text: &str) -> Vec<super::NicCounters> {
+    let mut out = Vec::new();
+    for line in text.lines().skip(2) {
+        let Some((iface, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let iface = iface.trim();
+        if iface.is_empty() || iface == "lo" {
+            continue;
+        }
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.len() < 9 {
+            continue;
+        }
+        let (Ok(rx), Ok(tx)) = (fields[0].parse::<u64>(), fields[8].parse::<u64>()) else {
+            continue;
+        };
+        out.push(super::NicCounters {
+            name: iface.to_string(),
+            rx_bytes: rx,
+            tx_bytes: tx,
+        });
+    }
+    out
+}
+
 /// The /proc/<pid>/stat fields witr uses. comm may contain spaces and
 /// parentheses, so the parse cuts at the LAST ')' — everything after it is
 /// field 3+ of stat(5), indexed here by the canonical field number.
@@ -850,6 +880,12 @@ impl Platform for Linux {
         Some(out)
     }
 
+    fn net_counters(&self) -> Vec<super::NicCounters> {
+        read_ok(Path::new("/proc/net/dev"))
+            .map(|t| parse_net_dev(&t))
+            .unwrap_or_default()
+    }
+
     /// Effective capabilities from /proc/<pid>/status CapEff, decoded to the
     /// kernel's names. A process in another user namespace (rootless
     /// container) holds them only over that namespace — report none, like
@@ -1320,6 +1356,35 @@ fn hup_bit(hex: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn net_dev_parse_skips_headers_and_loopback() {
+        let text = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 1111 22 0 0 0 0 0 0  3333 44 0 0 0 0 0 0
+  eth0: 1000 10 0 0 0 0 0 0  2000 20 0 0 0 0 0 0
+wlp3s0: 5000 50 0 0 0 0 0 0  6000 60 0 0 0 0 0 0
+";
+        let nics = parse_net_dev(text);
+        assert_eq!(
+            nics,
+            vec![
+                crate::platform::NicCounters {
+                    name: "eth0".into(),
+                    rx_bytes: 1000,
+                    tx_bytes: 2000
+                },
+                crate::platform::NicCounters {
+                    name: "wlp3s0".into(),
+                    rx_bytes: 5000,
+                    tx_bytes: 6000
+                },
+            ]
+        );
+        // iface with no colon (corrupt line) and short rows drop out
+        assert!(parse_net_dev("garbage\n eth9: 1 2\n").is_empty());
+    }
 
     #[test]
     fn socket_state_names_cover_both_address_families() {

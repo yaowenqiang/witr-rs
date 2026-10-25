@@ -95,6 +95,39 @@ fn parse_windows_mounts(text: &str) -> Vec<MountUsage> {
     out
 }
 
+/// `nic <name> <rx_bytes> <tx_bytes>` lines → cumulative counters. Names
+/// with spaces survive because the numbers are read from the line's end.
+/// Loopback never appears as an adapter here, so no explicit skip.
+fn parse_windows_nics(text: &str) -> Vec<super::NicCounters> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        if it.next() != Some("nic") {
+            continue;
+        }
+        let fields: Vec<&str> = it.collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let (Ok(rx), Ok(tx)) = (
+            fields[fields.len() - 2].parse::<u64>(),
+            fields[fields.len() - 1].parse::<u64>(),
+        ) else {
+            continue;
+        };
+        let name = fields[..fields.len() - 2].join(" ");
+        if name.is_empty() {
+            continue;
+        }
+        out.push(super::NicCounters {
+            name,
+            rx_bytes: rx,
+            tx_bytes: tx,
+        });
+    }
+    out
+}
+
 // ---------- ToolHelp32 process snapshot ----------
 
 #[derive(Debug, Clone)]
@@ -675,6 +708,21 @@ impl Platform for Windows {
         parse_windows_mounts(&text)
     }
 
+    fn net_counters(&self) -> Vec<super::NicCounters> {
+        let script = concat!(
+            "Get-NetAdapterStatistics | ",
+            "ForEach-Object { \"nic {0} {1} {2}\" -f $_.Name, ",
+            "$_.ReceivedBytes, $_.SentBytes }\n",
+        );
+        let text = run(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", script],
+            PS_TIMEOUT,
+        )
+        .unwrap_or_default();
+        parse_windows_nics(&text)
+    }
+
     fn detail(&self, brief: &Process, _want_env: bool) -> Process {
         let mut p = brief.clone();
         let details = cim_details(&[brief.pid]);
@@ -824,6 +872,32 @@ mod tests {
         assert_eq!(m[0].target, "C:");
         assert_eq!(m[0].total_mb, 512110190592 / 1024 / 1024);
         assert_eq!(m[0].used_mb, 256055095296 / 1024 / 1024);
+    }
+
+    #[test]
+    fn windows_nics_parse() {
+        let text = "\
+nic Ethernet 1000 2000
+nic Wi-Fi 2 (Intel(R) Wi-Fi 6 AX201) 5000 6000
+nic Bad 1 2 x
+garbage
+";
+        let nics = parse_windows_nics(text);
+        assert_eq!(
+            nics,
+            vec![
+                crate::platform::NicCounters {
+                    name: "Ethernet".into(),
+                    rx_bytes: 1000,
+                    tx_bytes: 2000
+                },
+                crate::platform::NicCounters {
+                    name: "Wi-Fi 2 (Intel(R) Wi-Fi 6 AX201)".into(),
+                    rx_bytes: 5000,
+                    tx_bytes: 6000
+                },
+            ]
+        );
     }
 
     #[test]
