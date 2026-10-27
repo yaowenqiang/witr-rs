@@ -520,6 +520,28 @@ fn comm_of(pid: Pid) -> String {
         .unwrap_or_default()
 }
 
+/// Fast pid sweep for the brief-process poller: one /proc readdir, no
+/// per-pid stat parsing. None never happens on Linux (empty table is a
+/// valid answer).
+pub(crate) fn all_pids() -> Option<Vec<Pid>> {
+    let dirs = std::fs::read_dir("/proc").ok()?;
+    let mut out = Vec::new();
+    for d in dirs.flatten() {
+        if let Ok(pid) = d.file_name().to_string_lossy().parse::<Pid>() {
+            if pid > 0 {
+                out.push(pid);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Process name for the brief-process poller — one /proc/<pid>/comm read.
+pub(crate) fn comm_for(pid: Pid) -> Option<String> {
+    let comm = comm_of(pid);
+    (!comm.is_empty()).then_some(comm)
+}
+
 /// Read cumulative disk counters out of a /proc/<pid>/io file into `p`.
 /// Missing keys / unreadable file leave the fields untouched (None).
 fn fill_io_from_proc(io_path: &Path, p: &mut Process) {

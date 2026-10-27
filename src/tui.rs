@@ -405,6 +405,29 @@ struct TuiApp {
     alert_exec: Option<String>,
     /// --alert-webhook: POST each alert firing as JSON to this URL
     alert_webhook: Option<String>,
+    /// --alert-silence maintenance windows (reloaded on SIGHUP)
+    alert_silence: Vec<crate::history::SilenceRule>,
+    /// --alert-new-proc first-sighting tracker (None = not armed)
+    new_proc: Option<crate::history::NewProcWatch>,
+    /// time-replay ring — (sampled-at, capped frame) snapshots of the
+    /// live table; `<`/`>` scrub it on the Processes tab
+    replay_ring: std::collections::VecDeque<(i64, Vec<Process>)>,
+    /// position in the ring while scrubbing; None = live view
+    replay_pos: Option<usize>,
+    /// brief-process poller feed (spawned by run() when the platform has
+    /// a cheap pid sweep) + its stop flag (set on Drop)
+    brief_rx: Option<std::sync::mpsc::Receiver<crate::history::TuiEvent>>,
+    brief_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// docker/podman `events` stream — container death/OOM/health edges
+    /// in milliseconds. Spawned once the first container enumeration
+    /// succeeds; None keeps the enumeration-diff detector in charge.
+    container_events: Option<crate::history::ContainerEventStream>,
+    /// one-shot guard so a runtime-less host doesn't re-attempt the spawn
+    /// on every sweep (reset when a live stream disconnects)
+    container_events_tried: bool,
+    /// 'M' session-wide mute — no alert firing at all while set (the
+    /// picks still land in the ring as "silenced")
+    muted: bool,
     /// pid → per-metric streak/firing state (pruned to live pids)
     alert_state: HashMap<Pid, AlertTrack>,
     /// process annotations ("name|exe|user|note"), identity-keyed like the
@@ -412,6 +435,9 @@ struct TuiApp {
     notes: Vec<String>,
     /// 'N' on the Processes table: free-form note input for the selection
     note_input: Option<String>,
+    /// SIGHUP hot-reload builder (from the seed) — None where reload
+    /// doesn't apply
+    reseed_fn: Option<Box<dyn Fn() -> Seed>>,
     /// 'D' page: snapshot-diff entries (newest auto snapshot vs the live
     /// table), computed at open time — 'r' on the page recomputes
     diff_entries: Vec<crate::snapshot::DiffEntry>,
@@ -502,6 +528,11 @@ enum ServiceSort {
 const DEBOUNCE: Duration = Duration::from_millis(500);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
+/// Time-replay ring: how many past frames `<`/`>` can scrub through and
+/// how many rows each frame keeps (busiest-by-CPU win the slots).
+const REPLAY_FRAMES: usize = 30;
+const REPLAY_FRAME_ROWS: usize = 200;
+
 /// CLI targets carried into the TUI, so `witr -i --pid 42` opens where a
 /// one-shot run would have looked (Go witr parity).
 #[derive(Default)]
@@ -572,9 +603,18 @@ pub struct Seed {
     pub alert_exec: Option<String>,
     /// --alert-webhook: POST each alert firing as JSON to this URL
     pub alert_webhook: Option<String>,
+    /// --alert-silence: maintenance windows — matching alerts are held
+    /// down (one "silenced" event each, no side effects)
+    pub alert_silence: Vec<crate::history::SilenceRule>,
+    /// --alert-new-proc raw specs (parsed into the live tracker)
+    pub alert_new_proc: Vec<String>,
     /// config notes — per-process annotations ("name|exe|user|note"),
     /// identity-keyed like the watchlist so they survive restarts
     pub notes: Vec<String>,
+    /// SIGHUP hot-reload: builds a fresh Seed from the pre-apply CLI
+    /// snapshot plus a re-read of the config file. None where reload
+    /// doesn't apply (replay-only entry points).
+    pub reseed: Option<Box<dyn Fn() -> Seed>>,
 }
 
 impl Seed {
@@ -625,6 +665,40 @@ impl Seed {
         }
         s
     }
+
+    /// Fold the reloadable knobs (config keys + alert flags) onto this
+    /// seed — the exact mapping the --interactive entry point applies at
+    /// startup, reused by the SIGHUP reload so both paths stay in step.
+    /// Targets stay fixed; only knobs move.
+    pub fn with_knobs(mut self, cli: &crate::cli::Cli, cfg: &crate::config::Config) -> Seed {
+        self.notify = cli.notify || cfg.notify.unwrap_or(false);
+        self.refresh_secs = cfg.refresh_secs;
+        self.sort = cfg.sort.clone();
+        self.paused = cfg.paused.unwrap_or(false);
+        self.alert_cpu = cli.alert_cpu;
+        self.alert_mem = cli.alert_mem;
+        self.alert_fd = cli.alert_fd;
+        self.alert_io = cli.alert_io;
+        self.alert_conn = cli.alert_conn;
+        self.alert_repeat = cli.alert_repeat;
+        self.alert_load = cli.alert_load;
+        self.alert_mem_pct = cli.alert_mem_pct;
+        self.alert_count = cli.alert_count;
+        self.alert_disk = cli.alert_disk;
+        self.alert_net = cli.alert_net;
+        self.alert_psi = cli.alert_psi;
+        self.alert_exec = cli.alert_exec.clone();
+        self.alert_webhook = cli.alert_webhook.clone();
+        self.alert_silence = cli
+            .alert_silence
+            .iter()
+            .filter_map(|s| crate::history::SilenceRule::parse(s))
+            .collect();
+        self.alert_new_proc = cli.alert_new_proc.clone();
+        self.watch = cfg.watch.clone();
+        self.notes = cfg.notes.clone();
+        self
+    }
 }
 
 impl Tab {
@@ -655,6 +729,9 @@ impl Tab {
 impl Drop for TuiApp {
     fn drop(&mut self) {
         self.stop_logs_follow();
+        if let Some(stop) = &self.brief_stop {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -749,9 +826,21 @@ impl TuiApp {
             pending_alerts: Vec::new(),
             alert_exec: seed.alert_exec.clone(),
             alert_webhook: seed.alert_webhook.clone(),
+            alert_silence: seed.alert_silence,
+            new_proc: crate::history::NewProcWatch::parse(&seed.alert_new_proc)
+                .ok()
+                .flatten(),
+            replay_ring: std::collections::VecDeque::new(),
+            replay_pos: None,
+            brief_rx: None,
+            brief_stop: None,
+            container_events: None,
+            container_events_tried: false,
+            muted: false,
             alert_state: HashMap::new(),
             notes: seed.notes,
             note_input: None,
+            reseed_fn: seed.reseed,
             diff_entries: Vec::new(),
             diff_source: String::new(),
             diff_sel: 0,
@@ -929,12 +1018,100 @@ impl TuiApp {
         self.sockets = self.platform.list_all_sockets().unwrap_or_default();
     }
 
+    /// SIGHUP: fold a freshly built Seed's knobs onto the live app —
+    /// alert thresholds, exec/webhook, notify, notes/watch lists, sampling
+    /// cadence and default sort. Session state (alert latches, history,
+    /// recordings) is deliberately kept: a reload moves the goalposts,
+    /// not the scoreboard.
+    fn reseed(&mut self, seed: &Seed) {
+        self.refresh = Duration::from_secs(seed.refresh_secs.unwrap_or(REFRESH.as_secs()).max(1));
+        if let Some(k) = seed.sort.as_deref().and_then(sort_key_from_str) {
+            self.sort_key = k;
+            self.rebuild_view();
+        }
+        self.notify = seed.notify;
+        self.alert_cpu = seed.alert_cpu;
+        self.alert_mem = seed.alert_mem;
+        self.alert_fd = seed.alert_fd;
+        self.alert_io = seed.alert_io;
+        self.alert_conn = seed.alert_conn;
+        self.alert_port = seed.alert_port.clone();
+        self.alert_repeat = seed.alert_repeat;
+        self.alert_load = seed.alert_load;
+        self.alert_mem_pct = seed.alert_mem_pct;
+        self.alert_count = seed.alert_count;
+        self.alert_disk = seed.alert_disk;
+        self.alert_net = seed.alert_net;
+        self.alert_psi = seed.alert_psi;
+        self.alert_exec = seed.alert_exec.clone();
+        self.alert_webhook = seed.alert_webhook.clone();
+        self.alert_silence = seed.alert_silence.clone();
+        // a bad reload keeps the old tracker rather than disarming it
+        if let Ok(np) = crate::history::NewProcWatch::parse(&seed.alert_new_proc) {
+            self.new_proc = np;
+        }
+        self.watch = seed.watch.clone();
+        self.notes = seed.notes.clone();
+    }
+
     fn refresh(&mut self) {
+        // brief-process capture: drain the high-frequency poller —
+        // spawn-and-die events land in the ring (Events tab) and the log
+        if let Some(rx) = &self.brief_rx {
+            let mut briefs = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                briefs.push(e);
+            }
+            if !briefs.is_empty() {
+                if let Some(f) = self.events_log.as_mut() {
+                    use std::io::Write as _;
+                    for e in &briefs {
+                        if let Ok(json) = serde_json::to_string(e) {
+                            let _ = writeln!(f, "{json}");
+                        }
+                    }
+                    let _ = f.flush();
+                }
+                for e in briefs {
+                    self.hist.ingest(vec![e]);
+                }
+            }
+        }
+        if crate::take_sighup() {
+            let fresh = self.reseed_fn.as_ref().map(|build| build());
+            if let Some(f) = fresh {
+                self.reseed(&f);
+                self.status = "SIGHUP: config reloaded".into();
+            }
+        }
         if let Ok(mut p) = self.platform.list_processes() {
             crate::gpu::enrich(&mut p);
             self.platform.enrich_listing(&mut p);
-            self.procs = p;
-            let fresh = self.hist.update(&self.procs);
+            // time-replay ring: bounded frames, bounded rows — sampling
+            // keeps recording while you scrub, so nothing is lost while
+            // you inspect the past
+            let mut frame = p.clone();
+            if frame.len() > REPLAY_FRAME_ROWS {
+                frame.sort_by(|a, b| {
+                    b.cpu.unwrap_or(0.0)
+                        .partial_cmp(&a.cpu.unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                frame.truncate(REPLAY_FRAME_ROWS);
+            }
+            self.replay_ring.push_back((crate::util::now_unix(), frame));
+            while self.replay_ring.len() > REPLAY_FRAMES {
+                self.replay_ring.pop_front();
+            }
+            let replaying = self.replay_pos.is_some();
+            if !replaying {
+                self.procs = p;
+            }
+            let fresh = if replaying {
+                Vec::new()
+            } else {
+                self.hist.update(&self.procs)
+            };
             if !fresh.is_empty() {
                 if let Some(f) = self.events_log.as_mut() {
                     use std::io::Write as _;
@@ -967,8 +1144,8 @@ impl TuiApp {
                 }
             }
             // --alert-fd needs descriptor counts for every pid: one sweep
-            // per refresh, only when the alert is armed (one lsof scan per
-            // tick on macOS; a cheap /proc walk on Linux). A failed sweep
+            // per refresh, only when the alert is armed (cheap native reads
+            // on Linux/macOS; a PowerShell sweep on Windows). A failed sweep
             // keeps the previous sample — a missing count just doesn't
             // advance any streak. An `fd>` search filter samples too, so
             // the comparison has data after the next tick.
@@ -990,8 +1167,26 @@ impl TuiApp {
             // its limit for ALERT_CYCLES samples fires once per excursion —
             // ring record, --events-log line, desktop ping. Always notifies:
             // the flag IS the opt-in.
-            let mut picks = self.alert_picks();
-            if !self.alert_port.is_empty() {
+            // while scrubbing history the alert machinery pauses (like
+            // 'P') — evaluation runs on live rows, not replayed ones
+            let mut picks = if replaying { Vec::new() } else { self.alert_picks() };
+            // --alert-new-proc: one pick per first-seen name the mode
+            // covers (the tracker remembers, so a name never re-fires)
+            if !replaying {
+                if let Some(w) = self.new_proc.as_mut() {
+                    for p in &self.procs {
+                        if w.first_sighting(&p.name) {
+                            picks.push((
+                                p.pid,
+                                p.name.clone(),
+                                "first sighting of this process name".into(),
+                                false,
+                            ));
+                        }
+                    }
+                }
+            }
+            if !self.alert_port.is_empty() && !replaying {
                 // --alert-port: listener appear/gone edges from the same
                 // socket sweep the Ports tab uses; first sighting only arms,
                 // so listeners already up at startup don't fire
@@ -1002,14 +1197,15 @@ impl TuiApp {
                     &self.procs,
                     &mut self.port_seen,
                     &mut self.port_owner,
-                ));
+                ).into_iter().map(|(pid, n, d)| (pid, n, d, false)));
             }
-            if self.alert_load.is_some()
-                || self.alert_mem_pct.is_some()
-                || self.alert_count.is_some()
-                || self.alert_disk.is_some()
-                || self.alert_net.is_some()
-                || self.alert_psi.is_some()
+            if !replaying
+                && (self.alert_load.is_some()
+                    || self.alert_mem_pct.is_some()
+                    || self.alert_count.is_some()
+                    || self.alert_disk.is_some()
+                    || self.alert_net.is_some()
+                    || self.alert_psi.is_some())
             {
                 // --alert-load / --alert-mem-pct / --alert-count /
                 // --alert-disk / --alert-net: sample the whole machine when
@@ -1051,15 +1247,33 @@ impl TuiApp {
                             interval,
                         )
                         .into_iter()
-                        .map(|(name, detail)| (0, name, detail)),
+                        .map(|(name, detail, rec)| (0, name, detail, rec)),
                     );
                 }
             }
-            for (pid, name, detail) in picks
-                .into_iter()
-                .chain(self.pending_alerts.drain(..))
-            {
-                let e = self.hist.push_alert(pid, &name, &detail);
+            for (pid, name, detail, recovery) in picks.into_iter().chain(
+                self.pending_alerts
+                    .drain(..)
+                    .map(|(pid, n, d)| (pid, n, d, false)),
+            ) {
+                let kind = if recovery { "recovered" } else { "alert" };
+                // 'M' mutes the session; --alert-silence holds down
+                // maintenance windows — either way the pick lands in the
+                // ring as "silenced" (visible on the Events tab) with no
+                // line, notify, exec or webhook side effects
+                let now = crate::util::now_unix() as u64;
+                if self.muted || crate::history::silenced(&self.alert_silence, &name, now) {
+                    let e = self.hist.push_kind("silenced", pid, &name, &detail);
+                    if let Some(f) = self.events_log.as_mut() {
+                        use std::io::Write as _;
+                        if let Ok(json) = serde_json::to_string(&e) {
+                            let _ = writeln!(f, "{json}");
+                            let _ = f.flush();
+                        }
+                    }
+                    continue;
+                }
+                let e = self.hist.push_kind(kind, pid, &name, &detail);
                 if let Some(f) = self.events_log.as_mut() {
                     use std::io::Write as _;
                     if let Ok(json) = serde_json::to_string(&e) {
@@ -1069,12 +1283,15 @@ impl TuiApp {
                 }
                 send_desktop_notify("witr-rs", &format!("{name}: {detail}"));
                 if let Some(cmd) = &self.alert_exec {
-                    spawn_alert_exec(cmd, pid, &name, &detail);
+                    spawn_alert_exec(cmd, pid, &name, &detail, kind);
                 }
                 if let Some(hook) = &self.alert_webhook {
-                    send_alert_webhook(hook, pid, &name, &detail);
+                    send_alert_webhook(hook, pid, &name, &detail, kind);
                 }
-                self.status = format!("ALERT {name} — {detail}");
+                self.status = format!(
+                    "{} {name} — {detail}",
+                    if recovery { "RECOVERED" } else { "ALERT" }
+                );
             }
         }
         // System page ('y'): Linux's three /proc reads are µs-cheap, so
@@ -1101,15 +1318,15 @@ impl TuiApp {
         }
         // FD sampling for the fd chart + leak suspicion: only while the
         // full detail page shows this pid (same gating as the system page;
-        // macOS pays one lsof per tick, Linux a /proc read, Windows a
+        // Linux a /proc read, macOS a native libproc call, Windows a
         // full-table handle sweep via the fd_counts fallback)
         if self.page == Page::Detail {
             if let Some(pid) = self.detail_pid {
                 let n = match self.platform.fd_count(pid) {
                     Some(n) => Some(n),
                     // per-pid unavailable (Windows): the whole-table sweep
-                    // answers for every pid at once — same cost class as
-                    // macOS's per-tick lsof, so it's fine behind this gate
+                    // answers for every pid at once — same cost class as a
+                    // single read, so it's fine behind this gate
                     None => self.platform.fd_counts().and_then(|m| m.get(&pid).copied()),
                 };
                 if let Some(n) = n {
@@ -1183,9 +1400,52 @@ impl TuiApp {
             self.containers_loading = false;
             self.containers_loaded = true;
             self.containers_rx = None;
+            // the events stream rides the first successful enumeration: a
+            // runtime that answered `ps` should answer `events` too, moving
+            // death/OOM/health edges from sweep-diff to instant
+            if !self.container_events_tried {
+                self.container_events_tried = true;
+                self.container_events = crate::history::spawn_container_events();
+            }
             self.container_alert_edges(&self.containers.clone(), &pods);
             self.apply_container_stats();
             self.rebuild_container_view();
+        }
+    }
+
+    /// Drain the container events stream into the ring; a death edge also
+    /// kicks a fresh enumeration so the table reflects it within a tick.
+    /// A disconnected stream (runtime CLI exited — daemon restart?) resets
+    /// the one-shot spawn so the next sweep re-arms it, and the
+    /// enumeration-diff edges cover the gap meanwhile.
+    fn poll_container_events(&mut self) {
+        let mut events = Vec::new();
+        let mut dead_stream = false;
+        if let Some(stream) = &self.container_events {
+            loop {
+                match stream.rx.try_recv() {
+                    Ok(e) => events.push(e),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        dead_stream = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if dead_stream {
+            self.container_events = None;
+            self.container_events_tried = false;
+        }
+        let deaths = events
+            .iter()
+            .filter(|e| e.kind == "container-death")
+            .count();
+        for e in events {
+            self.hist.ingest(vec![e]);
+        }
+        if deaths > 0 {
+            self.request_containers();
         }
     }
 
@@ -1196,12 +1456,15 @@ impl TuiApp {
     /// cluster) feeds the pod edges the same way: CrashLoopBackOff /
     /// ImagePullBackOff appearing, a running pod going Pending again,
     /// Failed phase, climbing k8s restart totals. Inspect calls happen
-    /// only on the death edge.
+    /// only on the death edge — and never while the `events` stream is
+    /// live, which owns instant death reporting (this sweep-diff stays as
+    /// the fallback when the stream couldn't spawn).
     fn container_alert_edges(
         &mut self,
         cs: &[crate::model::Container],
         pods: &[crate::k8s::Pod],
     ) {
+        let stream_live = self.container_events.is_some();
         for c in cs {
             let key = format!("{}/{}", c.runtime, c.id);
             if let Some((st, rst)) = self.container_seen.get(&key) {
@@ -1211,7 +1474,7 @@ impl TuiApp {
                 };
                 let was_running = st == "running";
                 let now_dead = matches!(c.state.as_str(), "exited" | "dead");
-                if was_running && now_dead {
+                if was_running && now_dead && !stream_live {
                     let reason = crate::platform::container_exit_reason(&c.runtime, &c.id)
                         .unwrap_or_else(|| c.status.clone());
                     self.pending_alerts.push((
@@ -1935,13 +2198,14 @@ impl TuiApp {
     }
 
     /// Check every visible process against the alert thresholds. Returns
-    /// (pid, name, detail) for excursions that just crossed ALERT_CYCLES.
-    /// CPU comes from the sampler's instantaneous percents; RSS straight
-    /// from the current listing (mem_kb is KiB, thresholds are MB); fd
-    /// counts from the last sweep (only sampled when alert_fd is set);
-    /// I/O rates from the sampler's cumulative deltas (Linux). Also
+    /// (pid, name, detail, is_recovery) for excursions that just crossed
+    /// ALERT_CYCLES — or that just dropped back under after firing (the
+    /// recovery edge). CPU comes from the sampler's instantaneous percents;
+    /// RSS straight from the current listing (mem_kb is KiB, thresholds are
+    /// MB); fd counts from the last sweep (only sampled when alert_fd is
+    /// set); I/O rates from the sampler's cumulative deltas (Linux). Also
     /// prunes bookkeeping for pids that left the table.
-    fn alert_picks(&mut self) -> Vec<(Pid, String, String)> {
+    fn alert_picks(&mut self) -> Vec<(Pid, String, String, bool)> {
         if self.alert_cpu.is_none()
             && self.alert_mem.is_none()
             && self.alert_fd.is_none()
@@ -1958,50 +2222,64 @@ impl TuiApp {
             if let Some(limit) = self.alert_cpu {
                 let now = self.hist.cpu_now.get(&p.pid).copied();
                 let over = now.is_some_and(|c| c > limit);
-                if crate::history::alert_cycle_repeat(
+                let edge = crate::history::alert_cycle_repeat(
                     &mut track.cpu_streak,
                     &mut track.cpu_firing,
                     over,
                     &mut track.cpu_fired_secs,
                     self.alert_repeat,
                     interval,
-                ) {
+                );
+                if edge == crate::history::AlertEdge::Fire {
                     out.push((
                         p.pid,
                         p.name.clone(),
                         format!("CPU {:.0}% above {limit:.0}% for {secs}s", now.unwrap_or(0.0)),
+                        false,
+                    ));
+                } else if edge == crate::history::AlertEdge::Recover {
+                    out.push((
+                        p.pid,
+                        p.name.clone(),
+                        format!("CPU back under {limit:.0}%"),
+                        true,
                     ));
                 }
             }
             if let Some(limit_mb) = self.alert_mem {
                 let mb = p.mem_kb.map(|kb| kb / 1024);
                 let over = mb.is_some_and(|m| m > limit_mb);
-                if crate::history::alert_cycle_repeat(
+                let edge = crate::history::alert_cycle_repeat(
                     &mut track.mem_streak,
                     &mut track.mem_firing,
                     over,
                     &mut track.mem_fired_secs,
                     self.alert_repeat,
                     interval,
-                ) {
+                );
+                if edge == crate::history::AlertEdge::Fire {
                     out.push((
                         p.pid,
                         p.name.clone(),
                         format!("RSS {} MB above {limit_mb} MB for {secs}s", mb.unwrap_or(0)),
+                        false,
                     ));
+                } else if edge == crate::history::AlertEdge::Recover {
+                    out.push((p.pid, p.name.clone(), format!("RSS back under {limit_mb} MB"), true));
                 }
             }
             if let Some(limit) = self.alert_fd {
                 let n = self.fd_counts.get(&p.pid).copied();
                 let over = n.is_some_and(|c| c > limit);
-                if crate::history::alert_cycle_repeat(
+                let edge = crate::history::alert_cycle_repeat(
                     &mut track.fd_streak,
                     &mut track.fd_firing,
                     over,
                     &mut track.fd_fired_secs,
                     self.alert_repeat,
                     interval,
-                ) {
+                );
+                if edge == crate::history::AlertEdge::Fire {
                     out.push((
                         p.pid,
                         p.name.clone(),
@@ -2009,20 +2287,24 @@ impl TuiApp {
                             "{} open fds above {limit} for {secs}s",
                             n.unwrap_or(0)
                         ),
+                        false,
                     ));
+                } else if edge == crate::history::AlertEdge::Recover {
+                    out.push((p.pid, p.name.clone(), format!("open fds back under {limit}"), true));
                 }
             }
             if let Some(limit_mbps) = self.alert_io {
                 let bps = self.hist.io_rate_of(p.pid).map(|(r, w)| r + w);
                 let over = bps.is_some_and(|b| b > limit_mbps * 1024.0 * 1024.0);
-                if crate::history::alert_cycle_repeat(
+                let edge = crate::history::alert_cycle_repeat(
                     &mut track.io_streak,
                     &mut track.io_firing,
                     over,
                     &mut track.io_fired_secs,
                     self.alert_repeat,
                     interval,
-                ) {
+                );
+                if edge == crate::history::AlertEdge::Fire {
                     out.push((
                         p.pid,
                         p.name.clone(),
@@ -2030,20 +2312,29 @@ impl TuiApp {
                             "I/O {:.1} MB/s above {limit_mbps} MB/s for {secs}s",
                             bps.unwrap_or(0.0) / 1024.0 / 1024.0
                         ),
+                        false,
+                    ));
+                } else if edge == crate::history::AlertEdge::Recover {
+                    out.push((
+                        p.pid,
+                        p.name.clone(),
+                        format!("I/O back under {limit_mbps} MB/s"),
+                        true,
                     ));
                 }
             }
             if let Some(limit) = self.alert_conn {
                 let n = self.conn_counts.get(&p.pid).copied();
                 let over = n.is_some_and(|c| c > limit);
-                if crate::history::alert_cycle_repeat(
+                let edge = crate::history::alert_cycle_repeat(
                     &mut track.conn_streak,
                     &mut track.conn_firing,
                     over,
                     &mut track.conn_fired_secs,
                     self.alert_repeat,
                     interval,
-                ) {
+                );
+                if edge == crate::history::AlertEdge::Fire {
                     out.push((
                         p.pid,
                         p.name.clone(),
@@ -2051,6 +2342,14 @@ impl TuiApp {
                             "{} established connection(s) above {limit} for {secs}s",
                             n.unwrap_or(0)
                         ),
+                        false,
+                    ));
+                } else if edge == crate::history::AlertEdge::Recover {
+                    out.push((
+                        p.pid,
+                        p.name.clone(),
+                        format!("connections back under {limit}"),
+                        true,
                     ));
                 }
             }
@@ -3767,12 +4066,13 @@ fn send_desktop_notify(title: &str, body: &str) {
 
 /// Run the `--alert-exec` command for one firing — sh -c / cmd /C, throwaway
 /// thread (a webhook POST must never stall a refresh tick). The alert
-/// context rides in the child's environment: WITR_ALERT_PID / NAME / DETAIL.
-/// Shared with the headless `--watch` alert loop.
-pub fn spawn_alert_exec(cmd: &str, pid: Pid, name: &str, detail: &str) {
+/// context rides in the child's environment: WITR_ALERT_PID / NAME / DETAIL /
+/// KIND ("alert" or "recovered"). Shared with the headless `--watch` loop.
+pub fn spawn_alert_exec(cmd: &str, pid: Pid, name: &str, detail: &str, kind: &str) {
     let cmd = cmd.to_string();
     let name = name.to_string();
     let detail = detail.to_string();
+    let kind = kind.to_string();
     let _ = std::thread::spawn(move || {
         #[cfg(windows)]
         let mut c = {
@@ -3789,18 +4089,20 @@ pub fn spawn_alert_exec(cmd: &str, pid: Pid, name: &str, detail: &str) {
         c.env("WITR_ALERT_PID", pid.to_string())
             .env("WITR_ALERT_NAME", &name)
             .env("WITR_ALERT_DETAIL", &detail)
+            .env("WITR_ALERT_KIND", &kind)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         let _ = c.status();
     });
 }
 
-/// POST one alert as JSON to `--alert-webhook` (same payload shape as the
-/// --events-log envelope). http:// only — std has no TLS, https:// URLs are
-/// refused with a note. Fire-and-forget on a throwaway thread with a 3s
-/// timeout: a slow or dead webhook must never stall the sampler; failures
-/// print to stderr once per miss.
-pub fn send_alert_webhook(url: &str, pid: Pid, name: &str, detail: &str) {
+/// POST one alert (or recovery — `kind` is "alert" / "recovered") as JSON
+/// to `--alert-webhook` (same payload shape as the --events-log envelope).
+/// http:// only — std has no TLS, https:// URLs are refused with a note.
+/// Fire-and-forget on a throwaway thread with a 3s timeout: a slow or dead
+/// webhook must never stall the sampler; failures print to stderr once per
+/// miss.
+pub fn send_alert_webhook(url: &str, pid: Pid, name: &str, detail: &str, kind: &str) {
     let Some(rest) = url.strip_prefix("http://") else {
         eprintln!("--alert-webhook: only http:// URLs are supported (no TLS): {url}");
         return;
@@ -3816,10 +4118,11 @@ pub fn send_alert_webhook(url: &str, pid: Pid, name: &str, detail: &str) {
     let url = url.to_string();
     let name = name.to_string();
     let detail = detail.to_string();
+    let kind = kind.to_string();
     let _ = std::thread::spawn(move || {
         let body = serde_json::json!({
             "schema_version": crate::SCHEMA_VERSION,
-            "kind": "alert",
+            "kind": kind,
             "at_unix": crate::util::now_unix(),
             "pid": pid,
             "name": name,
@@ -4163,6 +4466,19 @@ fn tab_bar(app: &TuiApp) -> Line<'static> {
         styled(Style::new().bg(PURPLE).fg(Color::White).bold(), " witr-rs "),
         Span::raw("  "),
     ];
+    if let Some(i) = app.replay_pos {
+        let (at, _) = &app.replay_ring[i];
+        spans.push(styled(
+            Style::new().bg(Color::Yellow).fg(Color::Black).bold(),
+            format!(
+                " REPLAY {} ({}/{}) ",
+                crate::util::fmt_time(*at),
+                i + 1,
+                app.replay_ring.len()
+            ),
+        ));
+        spans.push(Span::raw(" "));
+    }
     for t in [
         Tab::Processes,
         Tab::Ports,
@@ -5826,7 +6142,7 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
     };
     let mut footer = match app.tab {
         Tab::Processes => format!(
-            "Total: {} | Enter: Detail | w: Watch{} | N: Note | a: Actions (K: tree-kill) | /: Search | z: Zoom | T: Tree{} | B: Group{} | S: Summary | Y: System | !: Notify{} | P: Pause | p/n/u/c/m/i/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | ?: Help | r: Refresh | q: Quit",
+            "Total: {} | Enter: Detail | w: Watch{} | N: Note | a: Actions (K: tree-kill) | /: Search | z: Zoom | T: Tree{} | B: Group{} | S: Summary | Y: System | !: Notify{} | P: Pause | M: Mute{} | p/n/u/c/m/i/t: Sort | j-k/g-G: Move | h-l: Tab | x: Kill | ?: Help | r: Refresh | q: Quit",
             total,
             if app.watch.is_empty() {
                 String::new()
@@ -5839,7 +6155,8 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
             } else {
                 String::new()
             },
-            if app.notify { " (on)" } else { "" }
+            if app.notify { " (on)" } else { "" },
+            if app.muted { " (on)" } else { "" }
         ),
         Tab::Ports => format!(
             "Total: {} | Enter: Detail | o: Overview{} | a: All States | p/t/n/s: Sort | /: Search | h-l: Tab | r: Refresh | q: Quit",
@@ -6941,6 +7258,69 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
                 "sampling resumed".into()
             };
         }
+        // 'M': mute/unmute every alert firing for this session — firings
+        // still land in the Events ring as "silenced", side-effect free
+        KeyCode::Char('M') => {
+            app.muted = !app.muted;
+            app.status = if app.muted {
+                "alerts muted — 'M' unmutes".into()
+            } else {
+                "alerts unmuted".into()
+            };
+        }
+        // '<' / '>': scrub the time-replay ring on the Processes tab —
+        // '<' steps one sampled frame into the past, '>' forward; the
+        // newest frame's '>' returns to live
+        KeyCode::Char('<') if app.tab == Tab::Processes && app.focus == Focus::Table => {
+            if app.replay_ring.is_empty() {
+                app.status = "no replay history yet — give it a few samples".into();
+            } else {
+                let pos = match app.replay_pos {
+                    None => app.replay_ring.len() - 1,
+                    Some(i) => i.saturating_sub(1),
+                };
+                if Some(pos) != app.replay_pos {
+                    let (at, frame) = {
+                        let (at, frame) = &app.replay_ring[pos];
+                        (at.to_string(), frame.clone())
+                    };
+                    app.replay_pos = Some(pos);
+                    app.procs = frame;
+                    app.rebuild_view();
+                    app.status = format!(
+                        "replay {} ({}/{}) — '>' forward, newest '>' returns to live",
+                        at,
+                        pos + 1,
+                        app.replay_ring.len()
+                    );
+                }
+            }
+        }
+        KeyCode::Char('>') if app.tab == Tab::Processes && app.focus == Focus::Table => {
+            match app.replay_pos {
+                None => app.status = "already live — '<' steps into the past".into(),
+                Some(i) => {
+                    if i + 1 >= app.replay_ring.len() {
+                        app.replay_pos = None;
+                        app.status = "back to live".into();
+                    } else {
+                        let (at, frame) = {
+                            let (at, frame) = &app.replay_ring[i + 1];
+                            (at.to_string(), frame.clone())
+                        };
+                        app.replay_pos = Some(i + 1);
+                        app.procs = frame;
+                        app.rebuild_view();
+                        app.status = format!(
+                            "replay {} ({}/{}) — '>' forward, newest '>' returns to live",
+                            at,
+                            i + 2,
+                            app.replay_ring.len()
+                        );
+                    }
+                }
+            }
+        }
         // 'S': session summary — what happened in the watched window
         KeyCode::Char('S') => {
             app.open_summary();
@@ -7348,6 +7728,13 @@ fn parse_metric_filter(s: &str) -> Option<MetricFilter> {
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()> {
     let mut app = TuiApp::new(crate::platform::get(), seed);
+    // brief-process poller: spawns and dies between the regular ticks
+    // would be invisible otherwise (not on Windows — no cheap pid sweep)
+    if crate::platform::quick_pids().is_some() {
+        let (rx, stop) = crate::history::spawn_brief_poller(250);
+        app.brief_rx = Some(rx);
+        app.brief_stop = Some(stop);
+    }
     loop {
         terminal.draw(|f| ui(&mut app, f))?;
         if event::poll(Duration::from_millis(200))? {
@@ -7363,6 +7750,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()>
         }
         tick_refresh(&mut app);
         app.poll_containers();
+        app.poll_container_events();
         app.poll_container_stats();
         app.poll_services();
         app.poll_logs();
@@ -8154,6 +8542,7 @@ mod tests {
             42,
             "nginx",
             "cpu 95% over line",
+            "alert",
         );
         listener
             .set_nonblocking(true)
@@ -8254,24 +8643,54 @@ mod tests {
 
     #[test]
     fn alert_cycle_fires_once_per_excursion() {
+        use crate::history::AlertEdge;
         let mut streak = 0u32;
         let mut firing = false;
         // four hot samples: quiet; the fifth fires exactly once
         for _ in 0..4 {
-            assert!(!alert_cycle(&mut streak, &mut firing, true));
+            assert_eq!(alert_cycle(&mut streak, &mut firing, true), AlertEdge::None);
         }
-        assert!(alert_cycle(&mut streak, &mut firing, true));
+        assert_eq!(alert_cycle(&mut streak, &mut firing, true), AlertEdge::Fire);
         assert_eq!(streak, 5);
         // still hot: stays quiet (already fired for this excursion)
-        assert!(!alert_cycle(&mut streak, &mut firing, true));
-        // drops under: re-arms
-        assert!(!alert_cycle(&mut streak, &mut firing, false));
+        assert_eq!(alert_cycle(&mut streak, &mut firing, true), AlertEdge::None);
+        // drops under: re-arms, and the recovery is reported exactly once
+        assert_eq!(alert_cycle(&mut streak, &mut firing, false), AlertEdge::Recover);
+        assert_eq!(alert_cycle(&mut streak, &mut firing, false), AlertEdge::None);
         assert_eq!(streak, 0);
         // a fresh excursion needs the full run again
         for _ in 0..4 {
-            assert!(!alert_cycle(&mut streak, &mut firing, true));
+            assert_eq!(alert_cycle(&mut streak, &mut firing, true), AlertEdge::None);
         }
-        assert!(alert_cycle(&mut streak, &mut firing, true));
+        assert_eq!(alert_cycle(&mut streak, &mut firing, true), AlertEdge::Fire);
+    }
+
+    #[test]
+    fn replay_ring_scrubs_back_then_returns_live() {
+        let mut app = TuiApp::new(crate::platform::get(), Seed::default());
+        app.refresh();
+        app.refresh(); // two samples → two frames
+        assert!(app.replay_ring.len() >= 2, "refresh fills the ring");
+        assert!(app.replay_pos.is_none(), "starts live");
+        // '<' steps to the newest past frame, then further back
+        on_key(&mut app, KeyCode::Char('<'));
+        assert!(app.replay_pos.is_some());
+        let back = app.replay_pos.unwrap();
+        on_key(&mut app, KeyCode::Char('<'));
+        assert_eq!(app.replay_pos, Some(back.saturating_sub(1)));
+        // '>' forward: reaches the newest frame, then returns to live
+        on_key(&mut app, KeyCode::Char('>'));
+        on_key(&mut app, KeyCode::Char('>'));
+        assert!(app.replay_pos.is_none(), "newest '>' returns to live");
+        // '>' while live is a no-op with a hint
+        on_key(&mut app, KeyCode::Char('>'));
+        assert!(app.replay_pos.is_none());
+        assert!(app.status.contains("already live"));
+        // replaying freezes the table: a refresh keeps the scrubbed frame
+        on_key(&mut app, KeyCode::Char('<'));
+        let frozen = app.procs.clone();
+        app.refresh();
+        assert_eq!(app.procs.len(), frozen.len(), "refresh leaves a replayed frame put");
     }
 
     #[test]
@@ -8296,13 +8715,17 @@ mod tests {
         // cycle 5: both fire, each with its metric named
         let picks = app.alert_picks();
         assert_eq!(picks.len(), 2);
-        assert!(picks.iter().any(|(pid, _, d)| *pid == 1 && d.contains("CPU")));
-        assert!(picks.iter().any(|(pid, _, d)| *pid == 2 && d.contains("RSS")));
+        assert!(picks.iter().any(|(pid, _, d, _)| *pid == 1 && d.contains("CPU")));
+        assert!(picks.iter().any(|(pid, _, d, _)| *pid == 2 && d.contains("RSS")));
         // cycle 6: still over but already fired → quiet
         assert!(app.alert_picks().is_empty());
-        // both drop under → re-arm; then another full run fires again
+        // both drop under → one recovery edge each, then quiet (re-armed)
         app.hist.cpu_now.insert(1, 1.0);
         app.procs[1].mem_kb = Some(10 * 1024);
+        let recs = app.alert_picks();
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert!(recs.iter().all(|(.., rec)| *rec));
+        assert!(recs.iter().any(|(pid, _, d, _)| *pid == 1 && d.contains("back under")));
         assert!(app.alert_picks().is_empty());
         app.hist.cpu_now.insert(1, 99.0);
         app.procs[1].mem_kb = Some(900 * 1024);
@@ -8329,7 +8752,7 @@ mod tests {
             "echo \"$WITR_ALERT_PID|$WITR_ALERT_NAME|$WITR_ALERT_DETAIL\" > {}",
             out.display()
         );
-        spawn_alert_exec(&cmd, 42, "nginx", "CPU 90% above 50% for 15s");
+        spawn_alert_exec(&cmd, 42, "nginx", "CPU 90% above 50% for 15s", "alert");
         let mut content = String::new();
         for _ in 0..100 {
             if let Ok(s) = std::fs::read_to_string(&out) {
@@ -9317,10 +9740,13 @@ mod tests {
                 alert_net: None,
                 alert_psi: None,
                 alert_webhook: None,
+                alert_silence: Vec::new(),
+                alert_new_proc: Vec::new(),
                 samples: Vec::new(),
                 samples_source: String::new(),
                 replay_follow: None,
                 notes: Vec::new(),
+                reseed: None,
             },
         );
         // port seed wins the tab, filter prefilled, extras reported
@@ -9574,7 +10000,7 @@ mod tests {
             fired = app
                 .alert_picks()
                 .into_iter()
-                .map(|(pid, _, msg)| (pid, msg))
+                .map(|(pid, _, msg, _)| (pid, msg))
                 .collect();
         }
         assert!(

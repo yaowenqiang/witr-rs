@@ -47,6 +47,105 @@ fn disk_io_of(_pid: Pid) -> Option<(u64, u64)> {
     None
 }
 
+// ---------- open-descriptor counts (libproc, native) ----------
+//
+// `proc_pidinfo(PROC_PIDLISTFDS)` with a NULL/0 buffer is the size-query
+// form: it returns the byte size the full proc_fdinfo table would occupy,
+// or -1 (dead pid, or EPERM on SIP-protected system processes — the same
+// processes lsof couldn't see either). One syscall per count, so the
+// --alert-fd sweep and the detail page's per-tick fd sample are effectively
+// free; the `lsof -F pf` spawn this replaces cost hundreds of ms.
+
+/// One entry of the kernel's PROC_PIDLISTFDS table (xnu `proc_fdinfo`): the
+/// fd number plus an opaque fileinfo blob counting never needs to read.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcFdInfo {
+    fd: std::ffi::c_int,
+    _fileinfo: [std::ffi::c_char; 16],
+}
+
+/// Open-descriptor count for one pid, straight from the kernel.
+#[cfg(target_os = "macos")]
+fn proc_fd_count(pid: Pid) -> Option<u64> {
+    extern "C" {
+        fn proc_pidinfo(
+            pid: std::ffi::c_int,
+            flavor: std::ffi::c_int,
+            arg: u64,
+            buffer: *mut std::ffi::c_void,
+            buffersize: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+    const PROC_PIDLISTFDS: std::ffi::c_int = 1;
+    let bytes = unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    (bytes > 0).then(|| bytes as u64 / std::mem::size_of::<ProcFdInfo>() as u64)
+}
+
+/// Every pid on the host in one call — the pid-list half of the native
+/// fd_counts sweep (NULL/0 returns the needed entry count).
+#[cfg(target_os = "macos")]
+pub(crate) fn proc_all_pids() -> Option<Vec<Pid>> {
+    extern "C" {
+        fn proc_listallpids(
+            buffer: *mut std::ffi::c_void,
+            buffersize: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+    let n = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
+    if n <= 0 {
+        return None;
+    }
+    let mut buf = vec![0 as std::ffi::c_int; n as usize];
+    let got = unsafe {
+        proc_listallpids(
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            (buf.len() * std::mem::size_of::<std::ffi::c_int>()) as std::ffi::c_int,
+        )
+    };
+    if got <= 0 {
+        return None;
+    }
+    buf.truncate(got as usize);
+    Some(buf)
+}
+
+/// Process name for the brief-process poller — one libproc call, no ps
+/// spawn. proc_name(3) copies the name and returns its length.
+#[cfg(target_os = "macos")]
+pub(crate) fn proc_short_name(pid: Pid) -> Option<String> {
+    extern "C" {
+        fn proc_name(pid: std::ffi::c_int, buffer: *mut std::ffi::c_char, buffersize: u32)
+            -> std::ffi::c_int;
+    }
+    let mut buf = [0 as std::ffi::c_char; 96];
+    let n = unsafe { proc_name(pid as std::ffi::c_int, buf.as_mut_ptr(), buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = buf[..(n as usize).min(buf.len())]
+        .iter()
+        .map(|&c| c as u8)
+        .take_while(|&b| b != 0)
+        .collect();
+    String::from_utf8(bytes).ok().filter(|s| !s.is_empty())
+}
+
+/// Non-macOS stubs — Linux walks /proc and Windows asks PowerShell; these
+/// only exist so the trait impl type-checks on every target.
+#[cfg(not(target_os = "macos"))]
+fn proc_fd_count(_pid: Pid) -> Option<u64> {
+    None
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn proc_all_pids() -> Option<Vec<Pid>> {
+    None
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn proc_short_name(_pid: Pid) -> Option<String> {
+    None
+}
+
 // ---------- system resources (system page 'y') ----------
 //
 // CPU comes from host_processor_info (the same per-core tick buckets top(1)
@@ -202,32 +301,6 @@ fn sysctl_u64(name: &str) -> Option<u64> {
 #[cfg(not(target_os = "macos"))]
 fn sysctl_u64(_name: &str) -> Option<u64> {
     None
-}
-
-/// Per-pid descriptor counts from one `lsof -F pf` scan: `p<pid>` opens a
-/// process section, each `f<fd>` line inside counts one descriptor. Pure —
-/// compiled everywhere so the trait impl does.
-#[cfg(any(target_os = "macos", test))]
-fn parse_lsof_fd_counts(text: &str) -> std::collections::HashMap<Pid, u64> {
-    let mut out: std::collections::HashMap<Pid, u64> = std::collections::HashMap::new();
-    let mut cur: Option<Pid> = None;
-    for l in text.lines() {
-        if let Some(rest) = l.strip_prefix('p') {
-            cur = rest.parse().ok();
-        } else if l.starts_with('f') {
-            if let Some(pid) = cur {
-                *out.entry(pid).or_insert(0) += 1;
-            }
-        }
-    }
-    out
-}
-
-/// Non-macOS stub — see [`parse_lsof_fd_counts`]. Not under `test`: there
-/// the pure implementation above is compiled on every platform.
-#[cfg(all(not(target_os = "macos"), not(test)))]
-fn parse_lsof_fd_counts(_text: &str) -> std::collections::HashMap<Pid, u64> {
-    std::collections::HashMap::new()
 }
 
 /// (1, 5, 15-minute load) via getloadavg — empty on platforms without it.
@@ -1062,29 +1135,20 @@ impl Platform for MacOs {
     }
 
     fn fd_count(&self, pid: Pid) -> Option<u64> {
-        // field mode (-F f) prints one `f<fd>` line per descriptor — the
-        // leanest lsof shape for a count-only probe
-        let out = crate::util::run_ok(
-            "lsof",
-            &["-w", "-p", &pid.to_string(), "-F", "f"],
-            std::time::Duration::from_secs(5),
-        )?;
-        let n = out
-            .lines()
-            .filter(|l| l.starts_with('f') && l[1..].chars().all(|c| c.is_ascii_digit()))
-            .count() as u64;
-        (n > 0).then_some(n)
+        proc_fd_count(pid)
     }
 
     fn fd_counts(&self) -> Option<std::collections::HashMap<Pid, u64>> {
-        // one system-wide field-mode scan: `p<pid>` opens each process's
-        // section, every `f<fd>` line inside counts one descriptor
-        let out = crate::util::run_ok(
-            "lsof",
-            &["-w", "-n", "-P", "-F", "pf"],
-            std::time::Duration::from_secs(10),
-        )?;
-        Some(parse_lsof_fd_counts(&out))
+        // one native sweep — proc_listallpids plus a proc_pidinfo size
+        // query per pid, microseconds each, no subprocess anywhere
+        let pids = proc_all_pids()?;
+        let mut out = std::collections::HashMap::new();
+        for pid in pids {
+            if let Some(n) = proc_fd_count(pid) {
+                out.insert(pid, n);
+            }
+        }
+        Some(out)
     }
 
     fn list_locks(&self, pid: Option<Pid>) -> Vec<LockEntry> {
@@ -1595,25 +1659,22 @@ mod tests {
     }
 
     #[test]
-    fn lsof_fd_counts_sections_and_garbage() {
-        let text = "\
-p42
-f0
-f1
-f2
-f256
-p7
-f3
-pnotapid
-f9
-f10
-";
-        let m = parse_lsof_fd_counts(text);
-        assert_eq!(m.get(&42), Some(&4));
-        assert_eq!(m.get(&7), Some(&1));
-        // an unparseable `p` line closes the section — the orphan fds that
-        // follow count into no pid instead of leaking into the previous one
-        assert_eq!(m.len(), 2, "{m:?}");
+    #[cfg(target_os = "macos")]
+    fn proc_fd_count_counts_self_fds() {
+        // the native size-query path answers for a live pid (this test's
+        // own process always has stdio open), and a dead/never pid fails
+        // cleanly with None rather than panicking
+        let n = proc_fd_count(std::process::id() as Pid).expect("own fd table readable");
+        assert!(n >= 3, "at least stdio, got {n}");
+        assert!(proc_fd_count(i32::MAX - 1).is_none(), "no such pid");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn proc_all_pids_includes_self() {
+        let pids = proc_all_pids().expect("pid table readable");
+        assert!(pids.contains(&(std::process::id() as Pid)));
+        assert!(pids.contains(&1), "init/pid 1 is always there");
     }
 
     #[test]

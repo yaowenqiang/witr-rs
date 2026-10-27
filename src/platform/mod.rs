@@ -736,6 +736,32 @@ pub fn get() -> Box<dyn Platform> {
     }
 }
 
+/// Fast pid sweep for the brief-process poller — a /proc readdir on
+/// Linux, one libproc call on macOS. None = unsupported (Windows: the
+/// poller stays off rather than paying a snapshot per 250ms).
+pub(crate) fn quick_pids() -> Option<Vec<Pid>> {
+    #[cfg(target_os = "linux")]
+    return linux::all_pids();
+    #[cfg(target_os = "macos")]
+    return macos::proc_all_pids();
+    #[cfg(windows)]
+    return None;
+}
+
+/// Cheap name lookup for one pid (one /proc/<pid>/comm read on Linux,
+/// one libproc call on macOS); None = gone or unavailable.
+pub(crate) fn quick_name(pid: Pid) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    return linux::comm_for(pid);
+    #[cfg(target_os = "macos")]
+    return macos::proc_short_name(pid);
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        return None;
+    }
+}
+
 /// One platform instance shared by all `--serve` connection threads. The
 /// delta-based metrics (machine CPU% especially) need consecutive calls on
 /// the SAME instance — a throwaway per-request platform would report CPU
@@ -759,6 +785,19 @@ pub fn get_shared() -> std::sync::Arc<std::sync::Mutex<Box<dyn Platform + Send>>
 #[cfg(test)]
 mod service_tests {
     use super::*;
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn quick_pids_includes_self_and_quick_name_resolves_it() {
+        let pids = quick_pids().expect("cheap pid sweep");
+        let me = std::process::id() as Pid;
+        assert!(pids.contains(&me), "own pid {} in a {}-pid sweep", me, pids.len());
+        let name = quick_name(me).unwrap_or_default();
+        assert!(
+            name.contains("witr") || name.is_empty(),
+            "own comm {name:?} should name this binary"
+        );
+    }
 
     #[test]
     fn systemctl_units_parse() {

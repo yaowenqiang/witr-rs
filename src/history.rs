@@ -38,28 +38,381 @@ pub struct AlertTrack {
     pub conn_fired_secs: u32,
 }
 
-/// Advance one metric's alert cycle by one sample. Returns true exactly
-/// when the streak first reaches [`ALERT_CYCLES`] on a not-yet-firing
-/// excursion; a sample under the threshold resets both counters.
-pub fn alert_cycle(streak: &mut u32, firing: &mut bool, over: bool) -> bool {
+/// What one sample did to a metric's alert cycle: nothing, a threshold
+/// crossing just fired, or a firing excursion dropped back under the line
+/// (a recovery — reported once, then the cycle re-arms from zero).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertEdge {
+    None,
+    Fire,
+    Recover,
+}
+
+/// One alert-silence rule: alerts about matching processes are held down
+/// for a window (a maintenance `--alert-silence backup=30m`). `!pattern`
+/// inverts the match (silence everything NOT matching). No duration means
+/// the whole session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SilenceRule {
+    /// substring matched against the process name
+    pub pattern: String,
+    /// true for a leading `!` — the rule covers names NOT containing it
+    pub negate: bool,
+    /// unix seconds the window ends; None = whole session
+    pub until: Option<u64>,
+}
+
+impl SilenceRule {
+    /// `backup=30m` / `backup` / `!backup=1h` — None on a bad duration.
+    pub fn parse(spec: &str) -> Option<SilenceRule> {
+        let (negate, spec) = match spec.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, spec),
+        };
+        let (pattern, dur) = match spec.split_once('=') {
+            Some((p, d)) => (p, Some(d)),
+            None => (spec, None),
+        };
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return None;
+        }
+        let until = match dur {
+            Some(d) => {
+                let secs = crate::util::parse_duration(d)?;
+                Some((crate::util::now_unix() + secs) as u64)
+            }
+            None => None,
+        };
+        Some(SilenceRule {
+            pattern: pattern.to_string(),
+            negate,
+            until,
+        })
+    }
+
+    /// Does the rule cover this name right now?
+    pub fn covers(&self, name: &str, now: u64) -> bool {
+        self.until.is_none_or(|t| now < t) && (name.contains(&self.pattern) != self.negate)
+    }
+}
+
+/// Any rule silences this pick?
+pub fn silenced(rules: &[SilenceRule], name: &str, now: u64) -> bool {
+    rules.iter().any(|r| r.covers(name, now))
+}
+
+/// `--alert-new-proc`: first-sighting alerts. Substring match on the
+/// process name (case-insensitive); `!`-prefixed specs switch the whole
+/// set to whitelist mode (alert when a name matches NONE of the
+/// patterns). Mixing plain and `!` specs is a usage error.
+#[derive(Default)]
+pub struct NewProcWatch {
+    pub patterns: Vec<String>,
+    /// whitelist mode — alert names NOT matching any pattern
+    pub negate: bool,
+    /// names already sighted this session (alert fires once per name)
+    pub seen: std::collections::HashSet<String>,
+}
+
+impl NewProcWatch {
+    /// Ok(None) when not armed (no specs); Err on mixed modes.
+    pub fn parse(specs: &[String]) -> Result<Option<NewProcWatch>, String> {
+        if specs.is_empty() {
+            return Ok(None);
+        }
+        let negate = specs.iter().any(|s| s.starts_with('!'));
+        let plain = specs.iter().any(|s| !s.starts_with('!'));
+        if negate && plain {
+            return Err("specs can't mix plain and '!'-prefixed (whitelist) forms".into());
+        }
+        Ok(Some(NewProcWatch {
+            patterns: specs
+                .iter()
+                .map(|s| s.trim_start_matches('!').to_lowercase())
+                .collect(),
+            negate,
+            seen: Default::default(),
+        }))
+    }
+
+    /// Does the mode cover this name? (case-insensitive substring)
+    pub fn matches(&self, name: &str) -> bool {
+        let n = name.to_lowercase();
+        let hit = self.patterns.iter().any(|p| n.contains(p));
+        hit != self.negate
+    }
+
+    /// True exactly once per session for a first-seen name the mode
+    /// covers — the alert edge.
+    pub fn first_sighting(&mut self, name: &str) -> bool {
+        if self.seen.insert(name.to_lowercase()) {
+            self.matches(name)
+        } else {
+            false
+        }
+    }
+}
+
+/// Processes that lived shorter than this never reach a regular tick's
+/// started/exited pair — the poller owns them.
+pub const BRIEF_MAX_MS: u64 = 5_000;
+
+/// Short-lived process capture: a high-frequency poller diffs cheap pid
+/// sweeps between the regular ticks; anything that spawns and dies in the
+/// gap (a crashing worker, a cron one-shot, an exec probe) surfaces as a
+/// "brief" event instead of vanishing. Departures older than
+/// [`BRIEF_MAX_MS`] are dropped — the regular sampler owns those.
+pub struct BriefTracker {
+    seen: HashMap<Pid, (Instant, Option<String>)>,
+}
+
+impl Default for BriefTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BriefTracker {
+    pub fn new() -> Self {
+        BriefTracker {
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Feed one fast poll: returns "brief" events for pids that vanished
+    /// since the previous poll. `name_of` resolves names at first
+    /// sighting (once the process is gone it's too late to ask).
+    pub fn poll(
+        &mut self,
+        pids: &[Pid],
+        name_of: &dyn Fn(Pid) -> Option<String>,
+    ) -> Vec<TuiEvent> {
+        let now_unix = crate::util::now_unix();
+        let mut events = Vec::new();
+        let current: std::collections::HashSet<Pid> = pids.iter().copied().collect();
+        for &pid in pids {
+            self.seen
+                .entry(pid)
+                .or_insert_with(|| (Instant::now(), name_of(pid)));
+        }
+        let entries: Vec<(Pid, (Instant, Option<String>))> = self.seen.drain().collect();
+        for (pid, (first, name)) in entries {
+            if current.contains(&pid) {
+                self.seen.insert(pid, (first, name));
+                continue;
+            }
+            let ms = first.elapsed().as_millis() as u64;
+            if ms <= BRIEF_MAX_MS {
+                let name = name.unwrap_or_else(|| format!("pid {pid}"));
+                events.push(TuiEvent {
+                    at_unix: now_unix,
+                    kind: "brief".into(),
+                    pid,
+                    name,
+                    detail: format!("spawned and exited within ~{}ms", ms.max(1)),
+                });
+            }
+        }
+        events
+    }
+}
+
+/// Background poller thread feeding "brief" events through a channel —
+/// the TUI and the headless `--watch` loop drain it per tick. Stop by
+/// setting the returned flag (the consumer's Drop does that); the thread
+/// also exits when the channel's receiver is gone.
+pub fn spawn_brief_poller(
+    interval_ms: u64,
+) -> (
+    std::sync::mpsc::Receiver<TuiEvent>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    std::thread::Builder::new()
+        .name("brief-poller".into())
+        .spawn(move || {
+            let mut tracker = BriefTracker::new();
+            while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(interval_ms.max(50)));
+                if let Some(pids) = crate::platform::quick_pids() {
+                    let events =
+                        tracker.poll(&pids, &|pid| crate::platform::quick_name(pid));
+                    for e in events {
+                        if tx.send(e).is_err() {
+                            return; // consumer gone
+                        }
+                    }
+                }
+            }
+        })
+        .ok();
+    (rx, stop)
+}
+
+/// A live `docker/podman/nerdctl events` follower: parsed container edges
+/// arrive on `rx`; killing the runtime CLI on drop is the struct's job
+/// (closing stdout is what ends the reader thread).
+pub struct ContainerEventStream {
+    pub rx: std::sync::mpsc::Receiver<TuiEvent>,
+    pub child: std::process::Child,
+}
+
+impl Drop for ContainerEventStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Spawn the first runtime CLI that answers: death, OOM and health edges
+/// arrive in milliseconds instead of waiting for the next enumeration
+/// sweep (whose diff-based detector stays as the fallback when no runtime
+/// is on PATH). The reader thread ends when the child is killed (owner
+/// drops the stream) or the channel closes.
+pub fn spawn_container_events() -> Option<ContainerEventStream> {
+    // each runtime spells `--format` its own way: docker speaks Go
+    // templates, podman/nerdctl take the `json` keyword
+    for (rt, fmt) in [
+        ("docker", vec!["--format", "{{json .}}"]),
+        ("podman", vec!["--format", "json"]),
+        ("nerdctl", vec!["--format", "json"]),
+    ] {
+        let mut child = match std::process::Command::new(rt)
+            .arg("events")
+            .args(&fmt)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => continue, // not on PATH — try the next runtime
+        };
+        let Some(out) = child.stdout.take() else {
+            let _ = child.kill();
+            continue;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("container-events".into())
+            .spawn(move || {
+                use std::io::BufRead as _;
+                let reader = std::io::BufReader::new(out);
+                for line in reader.lines().map_while(Result::ok) {
+                    let Some(e) = parse_container_event_line(&line) else {
+                        continue;
+                    };
+                    if tx.send(e).is_err() {
+                        break; // consumer gone
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => return Some(ContainerEventStream { rx, child }),
+            Err(_) => continue, // thread spawn failed — near-impossible
+        }
+    }
+    None
+}
+
+/// Parse one `docker/podman/nerdctl events` JSON line into a [`TuiEvent`] —
+/// only the alert-worthy edges: `die`/`died` (exit code in the detail),
+/// `oom`, and a health check flipping unhealthy. Everything else (start,
+/// create, exec, `health_status: healthy`…) is noise and returns None.
+/// Old daemons carry `status`/`id`/`from` instead of `Action`/`Actor` —
+/// the name then falls back to the image ref's last segment.
+pub fn parse_container_event_line(line: &str) -> Option<TuiEvent> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let typ = v.get("Type").and_then(|x| x.as_str()).unwrap_or("container");
+    if typ != "container" {
+        return None;
+    }
+    let action = v
+        .get("Action")
+        .or_else(|| v.get("Status"))
+        .or_else(|| v.get("status"))
+        .and_then(|x| x.as_str())?;
+    let attrs = v.pointer("/Actor/Attributes");
+    let attr = |k: &str| {
+        attrs
+            .and_then(|a| a.get(k))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+    };
+    let name = {
+        let n = attr("name");
+        if !n.is_empty() {
+            n.to_string()
+        } else {
+            let from = v.get("from").and_then(|x| x.as_str()).unwrap_or("");
+            from.rsplit('/').next().unwrap_or(from).to_string()
+        }
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let (kind, detail) = match action {
+        "die" | "died" => {
+            let code = attr("exitCode");
+            let why = if code.is_empty() {
+                "exited".to_string()
+            } else {
+                format!("exited (exit code {code})")
+            };
+            ("container-death", why)
+        }
+        "oom" => (
+            "container-death",
+            "hit its memory limit — killed by the kernel (OOM)".to_string(),
+        ),
+        a if a.starts_with("health_status") && a.ends_with("unhealthy") => {
+            ("container-health", "health check went unhealthy".to_string())
+        }
+        _ => return None,
+    };
+    Some(TuiEvent {
+        at_unix: v
+            .get("time")
+            .and_then(|x| x.as_i64())
+            .unwrap_or_else(crate::util::now_unix),
+        kind: kind.to_string(),
+        pid: 0,
+        name,
+        detail,
+    })
+}
+
+/// Advance one metric's alert cycle by one sample. Returns [`AlertEdge::Fire`]
+/// exactly when the streak first reaches [`ALERT_CYCLES`] on a not-yet-firing
+/// excursion and [`AlertEdge::Recover`] when a firing excursion's sample
+/// lands back under the threshold; any under sample resets the counters.
+pub fn alert_cycle(streak: &mut u32, firing: &mut bool, over: bool) -> AlertEdge {
     if over {
         *streak += 1;
         if *streak >= ALERT_CYCLES && !*firing {
             *firing = true;
-            return true;
+            return AlertEdge::Fire;
         }
     } else {
+        let recovering = *firing;
         *streak = 0;
         *firing = false;
+        if recovering {
+            return AlertEdge::Recover;
+        }
     }
-    false
+    AlertEdge::None
 }
 
 /// [`alert_cycle`] plus `--alert-repeat`: on an excursion that is already
-/// firing and still over the threshold, keep returning true about every
-/// `repeat_secs` seconds (samples arrive every `interval_secs`). `None`
-/// repeat keeps the classic once-per-excursion behavior. A first fire or a
-/// drop back under resets the repeat clock.
+/// firing and still over the threshold, keep returning [`AlertEdge::Fire`]
+/// about every `repeat_secs` seconds (samples arrive every `interval_secs`).
+/// `None` repeat keeps the classic once-per-excursion behavior. A first fire
+/// or a drop back under resets the repeat clock.
 pub fn alert_cycle_repeat(
     streak: &mut u32,
     firing: &mut bool,
@@ -67,15 +420,15 @@ pub fn alert_cycle_repeat(
     fired_secs: &mut u32,
     repeat_secs: Option<u64>,
     interval_secs: u64,
-) -> bool {
+) -> AlertEdge {
     let first = alert_cycle(streak, firing, over);
     if !over {
         *fired_secs = 0;
         return first;
     }
-    if first {
+    if first == AlertEdge::Fire {
         *fired_secs = 0;
-        return true;
+        return AlertEdge::Fire;
     }
     if let Some(rp) = repeat_secs {
         // only an excursion that is actually firing re-fires — the arming
@@ -84,11 +437,11 @@ pub fn alert_cycle_repeat(
             *fired_secs += interval_secs.max(1) as u32;
             if *fired_secs >= rp.max(1) as u32 {
                 *fired_secs = 0;
-                return true;
+                return AlertEdge::Fire;
             }
         }
     }
-    false
+    AlertEdge::None
 }
 
 /// Streak/firing/repeat-clock state for the machine-wide alerts
@@ -168,16 +521,22 @@ pub fn machine_net_rate(total: (u64, u64), state: &mut SysAlertState) -> Option<
     rate
 }
 
+/// One machine-wide alert edge: `(name, detail, is_recovery)` — name is
+/// always `"system"` (the machine has no pid); recoveries read
+/// `<metric> back under <limit>`.
+pub type SysPick = (String, String, bool);
+
 /// One tick of the machine-wide alerts. `stats` comes from the platform's
-/// `system_stats()`; firings are `(name, detail)` pairs with no pid (the
-/// machine is not a process). Same 5-samples-and-latch cycle as the
-/// per-process alerts, including --alert-repeat.
+/// `system_stats()`; firings are [`SysPick`]s with no pid (the machine is
+/// not a process). Same 5-samples-and-latch cycle as the per-process
+/// alerts, including --alert-repeat — plus a recovery edge when a firing
+/// excursion drops back under.
 pub fn system_alert_picks(
     stats: &crate::platform::SystemStats,
     state: &mut SysAlertState,
     limits: &SysAlertLimits,
     interval_secs: u64,
-) -> Vec<(String, String)> {
+) -> Vec<SysPick> {
     let SysAlertLimits {
         load: load_limit,
         mem_pct: mem_pct_limit,
@@ -203,14 +562,15 @@ pub fn system_alert_picks(
     if let Some(limit) = load_limit {
         let now = stats.load1;
         let over = now.is_some_and(|l| l > limit);
-        if alert_cycle_repeat(
+        let edge = alert_cycle_repeat(
             &mut state.load_streak,
             &mut state.load_firing,
             over,
             &mut state.load_fired_secs,
             repeat_secs,
             interval_secs,
-        ) {
+        );
+        if edge == AlertEdge::Fire {
             out.push((
                 "system".to_string(),
                 format!(
@@ -218,7 +578,10 @@ pub fn system_alert_picks(
                     now.unwrap_or(0.0),
                     ALERT_CYCLES as u64 * interval_secs.max(1)
                 ),
+                false,
             ));
+        } else if edge == AlertEdge::Recover {
+            out.push(("system".to_string(), format!("load average back under {limit}"), true));
         }
     }
     if let Some(limit) = mem_pct_limit {
@@ -227,14 +590,15 @@ pub fn system_alert_picks(
             _ => None,
         };
         let over = pct.is_some_and(|p| p > limit);
-        if alert_cycle_repeat(
+        let edge = alert_cycle_repeat(
             &mut state.mem_streak,
             &mut state.mem_firing,
             over,
             &mut state.mem_fired_secs,
             repeat_secs,
             interval_secs,
-        ) {
+        );
+        if edge == AlertEdge::Fire {
             out.push((
                 "system".to_string(),
                 format!(
@@ -242,25 +606,36 @@ pub fn system_alert_picks(
                     pct.unwrap_or(0),
                     ALERT_CYCLES as u64 * interval_secs.max(1)
                 ),
+                false,
             ));
+        } else if edge == AlertEdge::Recover {
+            out.push(("system".to_string(), format!("RAM back under {limit}%"), true));
         }
     }
     if let Some(limit) = count_limit {
         let over = proc_count > limit as usize;
-        if alert_cycle_repeat(
+        let edge = alert_cycle_repeat(
             &mut state.count_streak,
             &mut state.count_firing,
             over,
             &mut state.count_fired_secs,
             repeat_secs,
             interval_secs,
-        ) {
+        );
+        if edge == AlertEdge::Fire {
             out.push((
                 "system".to_string(),
                 format!(
                     "{proc_count} visible processes above {limit} for {}s",
                     ALERT_CYCLES as u64 * interval_secs.max(1)
                 ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("process count back under {limit}"),
+                true,
             ));
         }
     }
@@ -275,14 +650,15 @@ pub fn system_alert_picks(
             .collect();
         over_mounts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.target.cmp(&b.1.target)));
         let over = !over_mounts.is_empty();
-        if alert_cycle_repeat(
+        let edge = alert_cycle_repeat(
             &mut state.disk_streak,
             &mut state.disk_firing,
             over,
             &mut state.disk_fired_secs,
             repeat_secs,
             interval_secs,
-        ) {
+        );
+        if edge == AlertEdge::Fire {
             let worst: Vec<String> = over_mounts
                 .iter()
                 .take(3)
@@ -295,25 +671,40 @@ pub fn system_alert_picks(
                     worst.join(", "),
                     ALERT_CYCLES as u64 * interval_secs.max(1)
                 ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("disk back under {limit}%"),
+                true,
             ));
         }
     }
     if let (Some(limit), Some(rate)) = (net_limit, net_rate) {
         let over = rate > limit as f64;
-        if alert_cycle_repeat(
+        let edge = alert_cycle_repeat(
             &mut state.net_streak,
             &mut state.net_firing,
             over,
             &mut state.net_fired_secs,
             repeat_secs,
             interval_secs,
-        ) {
+        );
+        if edge == AlertEdge::Fire {
             out.push((
                 "system".to_string(),
                 format!(
                     "net {rate:.1} MB/s above {limit} MB/s for {}s",
                     ALERT_CYCLES as u64 * interval_secs.max(1)
                 ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("net back under {limit} MB/s"),
+                true,
             ));
         }
     }
@@ -335,14 +726,15 @@ pub fn system_alert_picks(
             })
             .unwrap_or_default();
         let over = !over_resources.is_empty();
-        if alert_cycle_repeat(
+        let edge = alert_cycle_repeat(
             &mut state.psi_streak,
             &mut state.psi_firing,
             over,
             &mut state.psi_fired_secs,
             repeat_secs,
             interval_secs,
-        ) {
+        );
+        if edge == AlertEdge::Fire {
             let named: Vec<String> = over_resources
                 .iter()
                 .map(|(r, v)| format!("{r} {v:.1}%"))
@@ -354,7 +746,10 @@ pub fn system_alert_picks(
                     named.join(", "),
                     ALERT_CYCLES as u64 * interval_secs.max(1)
                 ),
+                false,
             ));
+        } else if edge == AlertEdge::Recover {
+            out.push(("system".to_string(), format!("PSI back under {limit}%"), true));
         }
     }
     out
@@ -596,8 +991,8 @@ pub struct History {
     mem_big: HashMap<Pid, VecDeque<u64>>,
     /// pid → last BIG_SAMPLES open-descriptor counts (detail-page fd chart
     /// and fd leak suspicion). Only sampled for the selected process while
-    /// the detail page is open — cheap on Linux (/proc), one lsof per tick
-    /// on macOS, nothing on Windows.
+    /// the detail page is open — a cheap native read on Linux and macOS
+    /// (/proc, libproc), a full-table handle sweep on Windows.
     fd_big: HashMap<Pid, VecDeque<u64>>,
     /// pid → last SAMPLES fd counts as a sparkline (peak-normalized)
     pub fd_sparks: HashMap<Pid, String>,
@@ -1164,13 +1559,15 @@ impl History {
         ))
     }
 
-    /// Record a threshold alert in the event ring (kind "alert", newest
-    /// first, same cap) and return it so callers can persist it to
-    /// `--events-log`. Alerts are TUI-generated — `update` never emits them.
-    pub fn push_alert(&mut self, pid: Pid, name: &str, detail: &str) -> TuiEvent {
+    /// Record a threshold alert (kind "alert") or a recovery (kind
+    /// "recovered" — a firing excursion dropped back under its limit) in
+    /// the event ring (newest first, same cap) and return it so callers can
+    /// persist it to `--events-log`. Alerts are sampler-generated — `update`
+    /// never emits this kind itself.
+    pub fn push_kind(&mut self, kind: &str, pid: Pid, name: &str, detail: &str) -> TuiEvent {
         let e = TuiEvent {
             at_unix: crate::util::now_unix(),
-            kind: "alert".into(),
+            kind: kind.to_string(),
             pid,
             name: name.to_string(),
             detail: detail.to_string(),
@@ -1286,7 +1683,10 @@ mod tests {
         let run_over = |repeat: Option<u64>, n: usize, interval: u64,
                         streak: &mut u32, firing: &mut bool, fired: &mut u32| -> Vec<bool> {
             (0..n)
-                .map(|_| alert_cycle_repeat(streak, firing, true, fired, repeat, interval))
+                .map(|_| {
+                    alert_cycle_repeat(streak, firing, true, fired, repeat, interval)
+                        == AlertEdge::Fire
+                })
                 .collect()
         };
         let count = |hits: &[bool]| hits.iter().filter(|h| **h).count();
@@ -1310,12 +1710,52 @@ mod tests {
         assert_eq!(count(&hits), 3);
         assert!(hits[n - 1] && hits[6] && hits[8]);
 
-        // dropping back under resets the repeat clock — the next excursion
-        // fires on its own ALERT_CYCLES cadence, then repeats again
-        assert!(!alert_cycle_repeat(&mut streak, &mut firing, false, &mut fired, Some(10), 5));
+        // dropping back under resets the repeat clock — and reads as a
+        // recovery — then the next excursion fires on its own ALERT_CYCLES
+        // cadence and repeats again
+        assert_eq!(
+            alert_cycle_repeat(&mut streak, &mut firing, false, &mut fired, Some(10), 5),
+            AlertEdge::Recover
+        );
         assert_eq!(fired, 0);
         let hits = run_over(Some(10), n + 2, 5, &mut streak, &mut firing, &mut fired);
         assert_eq!(count(&hits), 2);
+    }
+
+    #[test]
+    fn alert_recovery_fires_once_when_a_firing_excursion_drops_under() {
+        fn step(over: bool, streak: &mut u32, firing: &mut bool, fired: &mut u32) -> AlertEdge {
+            alert_cycle_repeat(streak, firing, over, fired, None, 3)
+        }
+        let mut streak = 0;
+        let mut firing = false;
+        let mut fired = 0u32;
+        // arming samples stay quiet until the streak completes, which fires
+        for _ in 1..ALERT_CYCLES {
+            assert_eq!(step(true, &mut streak, &mut firing, &mut fired), AlertEdge::None);
+        }
+        assert_eq!(step(true, &mut streak, &mut firing, &mut fired), AlertEdge::Fire);
+        // the first under sample re-arms and reports recovery exactly once
+        assert_eq!(step(false, &mut streak, &mut firing, &mut fired), AlertEdge::Recover);
+        assert_eq!(step(false, &mut streak, &mut firing, &mut fired), AlertEdge::None);
+        assert!(!firing);
+        assert_eq!(streak, 0);
+        // an excursion that never reached the firing threshold has no
+        // recovery to report
+        for _ in 1..ALERT_CYCLES {
+            step(true, &mut streak, &mut firing, &mut fired);
+        }
+        assert_eq!(step(false, &mut streak, &mut firing, &mut fired), AlertEdge::None);
+        // the raw cycle primitive behaves the same way
+        let mut s = 0;
+        let mut f = false;
+        assert_eq!(alert_cycle(&mut s, &mut f, false), AlertEdge::None);
+        for _ in 0..ALERT_CYCLES {
+            alert_cycle(&mut s, &mut f, true);
+        }
+        assert_eq!(alert_cycle(&mut s, &mut f, true), AlertEdge::None);
+        assert_eq!(alert_cycle(&mut s, &mut f, false), AlertEdge::Recover);
+        assert_eq!(alert_cycle(&mut s, &mut f, false), AlertEdge::None);
     }
 
     #[test]
@@ -1503,8 +1943,11 @@ mod tests {
         assert_eq!(fires.len(), 1);
         assert_eq!(fires[0].0, "system");
         assert!(fires[0].1.contains("net 50.0 MB/s above 40"), "{}", fires[0].1);
-        // latched; dropping back under re-arms
+        // latched; dropping back under reports one recovery, then re-arms
         assert!(system_alert_picks(&s, &mut state, &limits(Some(40), Some(50.0), None), 3).is_empty());
+        let rec = system_alert_picks(&s, &mut state, &limits(Some(40), Some(5.0), None), 3);
+        assert_eq!(rec.len(), 1);
+        assert_eq!(rec[0], ("system".into(), "net back under 40 MB/s".into(), true));
         for _ in 0..ALERT_CYCLES {
             assert!(system_alert_picks(&s, &mut state, &limits(Some(40), Some(5.0), None), 3).is_empty());
         }
@@ -1984,6 +2427,145 @@ mod tests {
         let text = s.to_text();
         assert!(text.contains("last 5m"));
         assert!(text.contains("restart chains: worker ×1"));
+    }
+
+    #[test]
+    fn brief_tracker_catches_spawn_and_die_between_polls() {
+        let name_of = |pid: Pid| match pid {
+            1 => Some("init".into()),
+            42 => Some("worker.sh".into()),
+            _ => None,
+        };
+        let mut t = BriefTracker::new();
+        // first poll seeds; nothing has died yet
+        assert!(t.poll(&[1, 42], &name_of).is_empty());
+        // second poll: 42 is gone → one brief event with its name
+        let events = t.poll(&[1], &name_of);
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.kind, "brief");
+        assert_eq!(e.pid, 42);
+        assert_eq!(e.name, "worker.sh");
+        assert!(e.detail.contains("ms"), "{e:?}");
+        // 1 survives every poll — never reported, and re-polls stay quiet
+        assert!(t.poll(&[1], &name_of).is_empty());
+        // unnamed pids get a pid-N fallback name
+        let mut t = BriefTracker::new();
+        t.poll(&[7], &name_of);
+        let events = t.poll(&[], &name_of);
+        assert_eq!(events[0].name, "pid 7");
+    }
+
+    #[test]
+    fn container_event_lines_parse_to_death_oom_and_health_edges() {
+        // modern docker die: Actor.Attributes carries name + exit code
+        let e = parse_container_event_line(
+            r#"{"status":"die","id":"abc","from":"nginx:1.25","Type":"container","Action":"die","Actor":{"ID":"abc","Attributes":{"exitCode":"137","name":"web","image":"nginx:1.25"}},"scope":"local","time":1700000000}"#,
+        )
+        .unwrap();
+        assert_eq!(e.kind, "container-death");
+        assert_eq!(e.name, "web");
+        assert_eq!(e.detail, "exited (exit code 137)");
+        assert_eq!(e.at_unix, 1700000000);
+        // podman spells the exit "died" (no exit code attr → plain detail)
+        let e = parse_container_event_line(
+            r#"{"Status":"died","Type":"container","Actor":{"ID":"dd","Attributes":{"name":"db"}},"time":1700000001}"#,
+        )
+        .unwrap();
+        assert_eq!(e.kind, "container-death");
+        assert_eq!(e.name, "db");
+        assert_eq!(e.detail, "exited");
+        // oom is a death edge with its own wording
+        let e = parse_container_event_line(
+            r#"{"Type":"container","Action":"oom","Actor":{"Attributes":{"name":"hog"}},"time":1700000002}"#,
+        )
+        .unwrap();
+        assert_eq!(e.kind, "container-death");
+        assert!(e.detail.contains("OOM"), "{e:?}");
+        // health flip only when unhealthy
+        let e = parse_container_event_line(
+            r#"{"Type":"container","Action":"health_status: unhealthy","Actor":{"Attributes":{"name":"api"}},"time":1700000003}"#,
+        )
+        .unwrap();
+        assert_eq!(e.kind, "container-health");
+        assert!(parse_container_event_line(
+            r#"{"Type":"container","Action":"health_status: healthy","Actor":{"Attributes":{"name":"api"}},"time":4}"#,
+        )
+        .is_none());
+        // old-daemon shape: status/id/from only, image-ref fallback name
+        let e = parse_container_event_line(
+            r#"{"status":"die","id":"abc","from":"library/redis:7"}"#,
+        )
+        .unwrap();
+        assert_eq!(e.kind, "container-death");
+        assert_eq!(e.name, "redis:7");
+        // noise: lifecycle churn and non-container scopes
+        assert!(parse_container_event_line(
+            r#"{"Type":"container","Action":"start","Actor":{"Attributes":{"name":"web"}},"time":5}"#,
+        )
+        .is_none());
+        assert!(parse_container_event_line(
+            r#"{"Type":"image","Action":"die","Actor":{"Attributes":{"name":"web"}},"time":6}"#,
+        )
+        .is_none());
+        assert!(parse_container_event_line("not json at all").is_none());
+    }
+
+    #[test]
+    fn new_proc_watch_first_sighting_fires_once_per_name() {
+        // plain mode: substring, case-insensitive, once per name
+        let mut w = NewProcWatch::parse(&["xmrig".into(), "Miner".into()]).unwrap().unwrap();
+        assert!(w.first_sighting("XMRIG-proxy"));
+        assert!(!w.first_sighting("XMRIG-proxy"), "second sighting is silent");
+        assert!(w.first_sighting("coin-miner.sh"));
+        assert!(!w.first_sighting("nginx"));
+        assert!(!w.first_sighting("nginx"));
+        // whitelist mode: only names matching NO pattern alert
+        let mut w = NewProcWatch::parse(&["!nginx".into(), "!cron".into()]).unwrap().unwrap();
+        assert!(w.negate);
+        assert!(w.first_sighting("redis-server"));
+        assert!(!w.first_sighting("nginx worker"));
+        assert!(!w.first_sighting("crond"));
+        // not armed / mixed modes
+        assert!(NewProcWatch::parse(&[]).unwrap().is_none());
+        assert!(NewProcWatch::parse(&["nginx".into(), "!cron".into()]).is_err());
+    }
+
+    #[test]
+    fn silence_rules_parse_match_and_expire() {
+        let r = SilenceRule::parse("backup=30m").unwrap();
+        assert_eq!(r.pattern, "backup");
+        assert!(!r.negate);
+        assert!(r.until.is_some());
+        let now = crate::util::now_unix() as u64;
+        assert!(r.covers("pg_backup.sh", now), "substring match");
+        assert!(!r.covers("nginx", now));
+        // whole-session rule
+        let r = SilenceRule::parse("cron").unwrap();
+        assert!(r.until.is_none());
+        assert!(r.covers("crond", 0));
+        assert!(r.covers("crond", u64::MAX / 2));
+        // negation: silence everything NOT matching the pattern
+        let r = SilenceRule::parse("!nginx").unwrap();
+        assert!(r.negate);
+        assert!(r.covers("redis", now));
+        assert!(!r.covers("nginx worker", now));
+        // expired window stops covering
+        let r = SilenceRule {
+            pattern: "backup".into(),
+            negate: false,
+            until: Some(100),
+        };
+        assert!(!r.covers("backup", now));
+        // garbage specs
+        assert!(SilenceRule::parse("").is_none());
+        assert!(SilenceRule::parse("=30m").is_none());
+        assert!(SilenceRule::parse("backup=soon").is_none());
+        // the batch helper answers for any rule
+        let rules = vec![SilenceRule::parse("db=1h").unwrap()];
+        assert!(silenced(&rules, "pg_db_backup", now));
+        assert!(!silenced(&rules, "nginx", now));
+        assert!(!silenced(&[], "postgres", now));
     }
 
     #[test]

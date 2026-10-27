@@ -204,12 +204,21 @@ impl Cli {
         if self.alert_webhook.is_none() {
             self.alert_webhook = cfg.alert_webhook.clone();
         }
+        if self.serve_token.is_none() {
+            self.serve_token = cfg.serve_token.clone();
+        }
+        if self.alert_silence.is_empty() {
+            self.alert_silence = cfg.alert_silence.clone();
+        }
+        if self.alert_new_proc.is_empty() {
+            self.alert_new_proc = cfg.alert_new_proc.clone();
+        }
     }
 }
 
 // witr-rs 的命令行定义。帮助文本双语：默认中文，`--en` 切换英文——每个
 // 帮助串都经 t() 在 Command 构建时定稿，语言由 init_language() 预扫描决定。
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "witr-rs",
     version,
@@ -733,6 +742,40 @@ pub struct Cli {
     pub alert_webhook: Option<String>,
 
     #[arg(
+        long = "alert-silence",
+        value_name = "NAME[=DUR]",
+        num_args = 1..,
+        help = t(
+            "告警静默窗口：名字包含 NAME 的进程不再触发告警（维护窗口）。NAME=30m 只静默 30 分钟（从会话开始计），不带 =DUR 则整个会话静默；!NAME 反选（只静默名字不含 NAME 的）。可重复/可一次给多个，如 --alert-silence backup=30m db=1h。TUI 和 --watch",
+            "Alert silence window: processes whose name contains NAME stop raising alerts (a maintenance window). NAME=30m silences for 30 minutes from session start; without =DUR the whole session is silenced; !NAME inverts (silence names NOT matching). Repeatable / several at once: --alert-silence backup=30m db=1h. TUI and --watch"
+        )
+    )]
+    pub alert_silence: Vec<String>,
+
+    #[arg(
+        long = "alert-new-proc",
+        value_name = "NAME",
+        num_args = 1..,
+        help = t(
+            "首见进程告警：会话内第一次出现名字包含 NAME 的进程就告警（挖矿/后门检测）。!NAME 反选为白名单模式——只对名字不含任何模式的进程告警；两种形态不能混用。每个名字每次会话只报一次。可一次给多个：--alert-new-proc xmrig miner。TUI 和 --watch",
+            "First-sighting alerts: fire once the first time a process whose name contains NAME appears in the session (miner/backdoor detection). !NAME switches to whitelist mode — alert only on names matching NO pattern; the two forms can't be mixed. Once per name per session. Several at once: --alert-new-proc xmrig miner. TUI and --watch"
+        )
+    )]
+    pub alert_new_proc: Vec<String>,
+
+    #[arg(
+        long = "install-service",
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = "",
+        help = t(
+            "把当前这组 watch/alert 参数固化成系统服务并注册：Linux 写 systemd 用户单元（~/.config/systemd/user/witr-rs.service 并 enable --now），macOS 写 launchd plist（~/Library/LaunchAgents 并 launchctl load），Windows 写 schtasks XML 并提示注册命令。可给自定义路径 --install-service /tmp/w.service。至少要给一个 --watch 或 --alert-* 参数",
+            "Bake the current watch/alert flags into a system service and register it: Linux writes a systemd user unit (~/.config/systemd/user/witr-rs.service, enabled --now), macOS a launchd plist (~/Library/LaunchAgents, launchctl load), Windows a schtasks XML plus the registration command. Custom path: --install-service /tmp/w.service. Needs at least one --watch or --alert-* flag"
+        )
+    )]
+    pub install_service: Option<String>,
+
+    #[arg(
         long = "audit",
         value_name = "CMD",
         help = t(
@@ -783,12 +826,13 @@ pub struct Cli {
     #[arg(
         long = "plot",
         value_name = "FILE",
+        num_args = 1..,
         help = t(
-            "把 --record 产出的样本文件（.csv 或 .jsonl）画成自包含 HTML 时序图（内联 SVG：整机 cpu%、内存%、负载、进程数、网络速率），写入 FILE.html 后退出——无 JS、无外部资源，离线可看。属于无目标操作：不能与目标同时使用",
-            "Render a --record sample file (.csv or .jsonl) into a self-contained HTML time-series chart (inline SVG: machine cpu%, memory%, load, process count, network rate), written to FILE.html, then exit — no JS, no external assets, viewable offline. A no-target operation: cannot be combined with targets"
+            "把 --record 产出的样本文件（.csv 或 .jsonl）画成自包含 HTML 时序图（内联 SVG：整机 cpu%、内存%、负载、进程数、网络速率），写入 FILE.html 后退出——无 JS、无外部资源，离线可看。给多个文件则曲线叠加对比（发布前后各录一份，一图看清差异），输出 witr-plot.html。属于无目标操作：不能与目标同时使用",
+            "Render a --record sample file (.csv or .jsonl) into a self-contained HTML time-series chart (inline SVG: machine cpu%, memory%, load, process count, network rate), written to FILE.html, then exit — no JS, no external assets, viewable offline. Multiple files overlay their curves for before/after comparison (output witr-plot.html). A no-target operation: cannot be combined with targets"
         )
     )]
-    pub plot: Option<String>,
+    pub plot: Vec<String>,
 
     #[arg(
         long = "samples",
@@ -914,6 +958,26 @@ pub struct Cli {
     pub serve: Option<String>,
 
     #[arg(
+        long = "serve-token",
+        value_name = "TOKEN",
+        help = t(
+            "给 --serve 端点启用 Bearer 认证：所有请求须带 `Authorization: Bearer TOKEN` 头（Prometheus 的 authorization 凭据配置可直接对接），否则一律 401——指标里带进程名，绑到非回环地址前先用它把门",
+            "Require `Authorization: Bearer TOKEN` on every --serve request (Prometheus's authorization credentials plug right in); anything else gets 401 — the metrics name processes, so gate them before binding past localhost"
+        )
+    )]
+    pub serve_token: Option<String>,
+
+    #[arg(
+        long = "remote",
+        value_name = "URL",
+        help = t(
+            "查询远端 witr-rs --serve 端点而不是本机：给定 http://host:port（不带 TLS），拉取 /api/ps（--tree 时拉 /api/tree）并按本地同样的表格/JSON/CSV 渲染；配合 --watch 周期重拉。属于无目标操作",
+            "Query a remote witr-rs --serve endpoint instead of this machine: give http://host:port (no TLS); /api/ps is fetched (or /api/tree under --tree) and rendered with the same table/JSON/CSV as local; --watch re-fetches on an interval. A no-target operation"
+        )
+    )]
+    pub remote: Option<String>,
+
+    #[arg(
         long = "en",
         help = t(
             "以英文输出帮助说明（默认中文）",
@@ -939,7 +1003,7 @@ mod tests {
     #[test]
     fn apply_config_fills_defaults_flags_win() {
         let (cfg, _) = crate::config::Config::parse(
-            "alert_cpu = 80\nalert_webhook = \"http://cfg/hook\"\nalert_exec = cfg-cmd\n",
+            "alert_cpu = 80\nalert_webhook = \"http://cfg/hook\"\nalert_exec = cfg-cmd\nalert_silence = [\"backup=30m\"]\n",
         );
         // flag wins over the file, file fills the rest
         let mut cli = Cli::parse_from(["witr-rs", "--alert-cpu", "95"]);
@@ -947,9 +1011,17 @@ mod tests {
         assert_eq!(cli.alert_cpu, Some(95.0));
         assert_eq!(cli.alert_webhook.as_deref(), Some("http://cfg/hook"));
         assert_eq!(cli.alert_exec.as_deref(), Some("cfg-cmd"));
+        assert_eq!(cli.alert_silence, vec!["backup=30m"]);
+        // explicit flags beat the file on every knob, silence included
+        let mut cli = Cli::parse_from(["witr-rs", "--alert-silence", "db=1h", "--alert-new-proc", "miner"]);
+        cli.apply_config(&cfg);
+        assert_eq!(cli.alert_silence, vec!["db=1h"]);
+        assert_eq!(cli.alert_new_proc, vec!["miner"]);
         // nothing set anywhere stays unset
         let mut cli = Cli::parse_from(["witr-rs"]);
         cli.apply_config(&crate::config::Config::default());
         assert!(cli.alert_cpu.is_none() && cli.alert_webhook.is_none());
+        assert!(cli.alert_silence.is_empty());
+        assert!(cli.alert_new_proc.is_empty());
     }
 }

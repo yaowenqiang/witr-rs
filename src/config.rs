@@ -56,6 +56,14 @@ pub struct Config {
     pub alert_repeat: Option<u64>,
     pub alert_exec: Option<String>,
     pub alert_webhook: Option<String>,
+    /// Persistent `--alert-silence` specs ("name=30m", "!name") — same
+    /// string array shape as `watch`/`notes`.
+    pub alert_silence: Vec<String>,
+    /// Persistent `--alert-new-proc` specs ("xmrig", "!cron").
+    pub alert_new_proc: Vec<String>,
+    /// Bearer token for `--serve` (`serve_token = "..."`) — same value the
+    /// `--serve-token` flag takes.
+    pub serve_token: Option<String>,
 }
 
 impl Config {
@@ -263,6 +271,19 @@ impl Config {
                     Err(_) => warnings.push(format!("line {n}: refresh_secs {quoted:?} is not a number, skipped")),
                 },
                 "sort" => cfg.sort = Some(quoted.to_string()),
+                "serve_token" => cfg.serve_token = Some(quoted.to_string()),
+                "alert_silence" => match parse_string_array(value) {
+                    Some(list) => cfg.alert_silence = list,
+                    None => warnings.push(format!(
+                        "line {n}: alert_silence is not a string array, skipped"
+                    )),
+                },
+                "alert_new_proc" => match parse_string_array(value) {
+                    Some(list) => cfg.alert_new_proc = list,
+                    None => warnings.push(format!(
+                        "line {n}: alert_new_proc is not a string array, skipped"
+                    )),
+                },
                 "watch" => match parse_string_array(value) {
                     Some(list) => cfg.watch = list,
                     None => warnings.push(format!("line {n}: watch is not a string array, skipped")),
@@ -343,6 +364,10 @@ fn set_alert(key: &str, value: &str, cfg: &mut Config) -> Result<(), String> {
         }
         "alert_webhook" => {
             cfg.alert_webhook = Some(value.to_string());
+            Ok(())
+        }
+        "serve_token" => {
+            cfg.serve_token = Some(value.to_string());
             Ok(())
         }
         _ => Err(format!("unknown key {key:?}")),
@@ -494,6 +519,18 @@ alert_nope = 1
         assert_eq!(w.len(), 2, "{w:?}");
         assert!(w.iter().any(|x| x.contains("alert_load") && x.contains("not a number")));
         assert!(w.iter().any(|x| x.contains("unknown key") && x.contains("alert_nope")));
+        let (tok_cfg, tok_w) = Config::parse("serve_token = \"s3cr3t\"\n");
+        assert_eq!(tok_cfg.serve_token.as_deref(), Some("s3cr3t"));
+        assert!(tok_w.is_empty());
+        let (sil_cfg, sil_w) = Config::parse("alert_silence = [\"backup=30m\", \"!cron\"]\n");
+        assert_eq!(sil_cfg.alert_silence, vec!["backup=30m", "!cron"]);
+        assert!(sil_w.is_empty());
+        let (np_cfg, np_w) = Config::parse("alert_new_proc = [\"xmrig\", \"!cron\"]\n");
+        assert_eq!(np_cfg.alert_new_proc, vec!["xmrig", "!cron"]);
+        assert!(np_w.is_empty());
+        let (bad_cfg, bad_w) = Config::parse("alert_silence = backup\n");
+        assert!(bad_cfg.alert_silence.is_empty());
+        assert!(bad_w.iter().any(|x| x.contains("alert_silence")));
     }
 
     #[test]

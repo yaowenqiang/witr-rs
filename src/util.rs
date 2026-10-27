@@ -117,6 +117,70 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Minimal HTTP GET over a raw TcpStream (the webhook sender's zero-dep
+/// pattern, synchronous): http:// only, one redirect-free request, body
+/// read to EOF (`Connection: close`). Errors carry the phase — DNS,
+/// connect, HTTP status — for the caller's one-line message.
+pub fn http_get(url: &str) -> Result<String, String> {
+    use std::io::Read as _;
+    let Some(rest) = url.strip_prefix("http://") else {
+        return Err(format!("only http:// URLs are supported (no TLS): {url}"));
+    };
+    let (host_port, path) = match rest.split_once('/') {
+        Some((hp, p)) => (hp.to_string(), format!("/{p}")),
+        None => (rest.to_string(), "/".to_string()),
+    };
+    if host_port.is_empty() {
+        return Err(format!("no host in {url}"));
+    }
+    let addrs = std::net::ToSocketAddrs::to_socket_addrs(&host_port.as_str())
+        .map_err(|e| format!("{host_port}: {e}"))?
+        .collect::<Vec<_>>();
+    let mut last_err = String::new();
+    for addr in addrs {
+        let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        else {
+            last_err = format!("{addr}: connect failed");
+            continue;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        );
+        use std::io::Write as _;
+        if let Err(e) = stream.write_all(req.as_bytes()) {
+            last_err = format!("{addr}: {e}");
+            continue;
+        }
+        let mut raw = Vec::new();
+        if let Err(e) = stream.read_to_end(&mut raw) {
+            last_err = format!("{addr}: {e}");
+            continue;
+        }
+        // split headers/body on the first blank line (either line ending)
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| (i, 4))
+            .or_else(|| raw.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2)));
+        let Some((pos, skip)) = split else {
+            last_err = format!("{addr}: malformed HTTP response");
+            continue;
+        };
+        let head = String::from_utf8_lossy(&raw[..pos]).to_string();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("");
+        if status.as_bytes() != b"200" {
+            return Err(format!("{path} → HTTP {status}"));
+        }
+        return Ok(String::from_utf8_lossy(&raw[pos + skip..]).to_string());
+    }
+    Err(last_err)
+}
+
 /// uid → username resolver with a lookup cache (including negative
 /// results): macOS system users are absent from /etc/passwd, so every uid
 /// costs one `id -un` process unless cached.
@@ -395,6 +459,43 @@ mod tests {
         let (p, deleted) = strip_deleted_suffix("/usr/bin/foo");
         assert_eq!(p, "/usr/bin/foo");
         assert!(!deleted);
+    }
+
+    #[test]
+    fn http_get_body_status_and_https_rejection() {
+        // one-shot server: a canned 200 (body split across the header
+        // boundary) then a 404, both on Connection: close
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::Write as _;
+            // each exchange in its own scope: the socket must drop (FIN)
+            // before the next accept, or the client's read-to-EOF blocks
+            {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut s, &mut buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"processes\"",
+                );
+            }
+            {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut s, &mut buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let body = http_get(&format!("http://{addr}/api/ps")).unwrap();
+        assert_eq!(body, r#"{"processes""#);
+        let err = http_get(&format!("http://{addr}/nope")).unwrap_err();
+        assert!(err.contains("404"), "{err}");
+        server.join().unwrap();
+        assert!(http_get("https://example.com/x")
+            .unwrap_err()
+            .contains("http://"));
     }
 
     #[test]

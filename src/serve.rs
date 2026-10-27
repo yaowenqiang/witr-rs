@@ -6,6 +6,9 @@
 //! versioned envelopes the CLI prints. Every scrape samples the
 //! process table fresh — no background
 //! sampler, no interval to tune; scrape frequency IS the sample rate.
+//! The one exception is /api/events (Server-Sent Events): a 5s delta
+//! sampler arms lazily on the first hit and streams the process
+//! started/exited/restarted edges.
 //! Container gauges ride a background `stats --no-stream` sweep (seconds
 //! per runtime CLI) refreshed at most every 30s — scrapes never block on
 //! it.
@@ -365,6 +368,24 @@ fn render_container_metrics(
 /// Parse the /api/top query string: `metric=` and `n=` params, defaults
 /// cpu / 10, n clamped to 1..=500 (unknown params ignored, a bad n falls
 /// back to 10 — same leniency as the CLI's defaults).
+/// Pull the `Authorization: Bearer <token>` value out of a raw request
+/// text (header name matched case-insensitively, per RFC 7235). None when
+/// the header is absent or not a Bearer credential.
+fn bearer_token(req: &str) -> Option<String> {
+    for line in req.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("authorization") {
+            return value
+                .trim()
+                .strip_prefix("Bearer ")
+                .map(|t| t.trim().to_string());
+        }
+    }
+    None
+}
+
 fn parse_top_query(query: &str) -> (String, usize) {
     let mut metric = "cpu".to_string();
     let mut n: usize = 10;
@@ -394,28 +415,106 @@ fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) {
     let _ = stream.write_all(body.as_bytes());
 }
 
+/// Subscribers waiting on /api/events plus the one-shot flag for the
+/// sampler thread. A subscriber whose receiver hung up is pruned on the
+/// first failed publish.
+struct EventHub {
+    subs: Mutex<Vec<std::sync::mpsc::Sender<crate::history::TuiEvent>>>,
+    sampler_armed: std::sync::atomic::AtomicBool,
+}
+
+impl EventHub {
+    fn new() -> Self {
+        Self {
+            subs: Mutex::new(Vec::new()),
+            sampler_armed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn publish(&self, events: &[crate::history::TuiEvent]) {
+        let mut subs = self.subs.lock().unwrap_or_else(|e| e.into_inner());
+        subs.retain(|tx| events.iter().all(|e| tx.send(e.clone()).is_ok()));
+    }
+
+    /// Arm the delta sampler on the first /api/events hit — pure /metrics
+    /// deployments pay nothing. It shares the scrapes' platform instance
+    /// (process CPU% deltas need consecutive samples on one instance) but
+    /// keeps its own History, whose update deltas are exactly the
+    /// started/exited/restarted edges the TUI ring carries.
+    fn ensure_sampler(self: &std::sync::Arc<Self>) {
+        if self
+            .sampler_armed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let hub = self.clone();
+        std::thread::Builder::new()
+            .name("serve-events".into())
+            .spawn(move || {
+                let platform = crate::platform::get_shared();
+                let mut hist = crate::history::History::new();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    let procs = {
+                        let guard = platform.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.list_processes().unwrap_or_default()
+                    };
+                    let events = hist.update(&procs);
+                    if !events.is_empty() {
+                        hub.publish(&events);
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
 /// Bind and serve until the process is killed. Each connection thread
 /// builds its own platform instance (`platform::get()` — the impls carry
 /// internal caches, and the trait isn't Sync), so scrapes never contend.
 /// Per-pid fd counts cost one sweep; they're only paid for real scrapes
-/// when the platform supports them (one lsof scan on macOS, a /proc walk
-/// on Linux).
-pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
+/// when the platform supports them (a native libproc sweep on macOS, a
+/// /proc walk on Linux). `token` arms bearer auth: every request must
+/// carry `Authorization: Bearer <token>` or get a 401 — the metrics name
+/// processes, so gate them before binding past 127.0.0.1.
+pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
+    // owned so the per-connection threads can move it in ('static)
+    let token = token.map(str::to_string);
     // one platform for every request: the delta-based metrics (machine
     // CPU%) need consecutive calls on the same instance
     let platform = crate::platform::get_shared();
+    let hub = std::sync::Arc::new(EventHub::new());
     crate::write_out(&format!(
-        "serving Prometheus metrics → http://{addr}/metrics (Ctrl-C to stop)"
+        "serving Prometheus metrics → http://{addr}/metrics{} (Ctrl-C to stop)",
+        if token.is_some() { " · bearer auth on" } else { "" },
     ));
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         let platform = platform.clone();
+        let token = token.clone();
+        let hub = hub.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 2048];
             let Ok(n) = stream.read(&mut buf) else { return };
             let req = String::from_utf8_lossy(&buf[..n]);
             let path = req.split_whitespace().nth(1).unwrap_or("");
+            // bearer auth (when armed) before any routing — one check for
+            // /metrics and every /api/* endpoint alike. The raw request
+            // buffer already holds the headers for the clients that matter
+            // (Prometheus, curl, jq pipelines).
+            if let Some(expected) = &token {
+                if bearer_token(&req).as_deref() != Some(expected.as_str()) {
+                    respond(
+                        &mut stream,
+                        "401 Unauthorized",
+                        "application/json",
+                        "{\"error\":\"unauthorized\"}",
+                    );
+                    return;
+                }
+            }
             // /api/ps: the full process table as the same versioned JSON
             // envelope `--json` prints — a machine-readable sibling to the
             // Prometheus gauges
@@ -637,13 +736,53 @@ pub fn run(addr: &str, fds_enabled: bool) -> std::io::Result<()> {
                 );
                 return;
             }
+            // /api/events: Server-Sent Events — the delta sampler's
+            // started/exited/restarted edges (the same TuiEvent JSON the
+            // TUI ring and --events-log carry), one `data:` line per
+            // event and a comment ping every 15s of silence. The sampler
+            // arms on the first hit; a hung-up client is pruned by the
+            // next publish.
+            if path == "/api/events" || path.starts_with("/api/events?") {
+                hub.ensure_sampler();
+                let (tx, rx) = std::sync::mpsc::channel::<crate::history::TuiEvent>();
+                hub.subs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(tx);
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(b"retry: 5000\n\n");
+                let _ = stream.flush();
+                loop {
+                    match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                        Ok(e) => {
+                            let json = serde_json::to_string(&e).unwrap_or_default();
+                            if stream
+                                .write_all(format!("data: {json}\n\n").as_bytes())
+                                .is_err()
+                            {
+                                break; // client hung up; rx drops, publish prunes tx
+                            }
+                            let _ = stream.flush();
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if stream.write_all(b": ping\n\n").is_err() {
+                                break;
+                            }
+                            let _ = stream.flush();
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                return;
+            }
             if !path.starts_with("/metrics") {
                 match path {
                     "/" => respond(
                         &mut stream,
                         "200 OK",
                         "text/plain; charset=utf-8",
-                        "witr-rs: /metrics (Prometheus) · /api/ps (process table) · /api/ports (listeners) · /api/conns (connections) · /api/tree (forest) · /api/top?metric=cpu|mem|fd|age|io|io-rate&n=N (rankings) · /api/services (service units)\n",
+                        "witr-rs: /metrics (Prometheus) · /api/ps (process table) · /api/ports (listeners) · /api/conns (connections) · /api/tree (forest) · /api/top?metric=cpu|mem|fd|age|io|io-rate&n=N (rankings) · /api/services (service units) · /api/events (SSE process edges)\n",
                     ),
                     _ => respond(&mut stream, "404 Not Found", "text/plain", "not found\n"),
                 }
@@ -699,6 +838,48 @@ mod tests {
     #[test]
     fn label_escape_follows_prometheus_rules() {
         assert_eq!(label_escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[test]
+    fn event_hub_fans_out_and_prunes_hung_up_subs() {
+        let hub = EventHub::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel();
+        drop(gone_rx); // this subscriber already hung up
+        hub.subs.lock().unwrap().push(tx);
+        hub.subs.lock().unwrap().push(gone_tx);
+        let e = crate::history::TuiEvent {
+            at_unix: 1,
+            kind: "started".into(),
+            pid: 1,
+            name: "n".into(),
+            detail: String::new(),
+        };
+        hub.publish(std::slice::from_ref(&e));
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            e
+        );
+        // the dead subscriber's sender was pruned by that same publish
+        assert_eq!(hub.subs.lock().unwrap().len(), 1);
+        hub.publish(std::slice::from_ref(&e));
+        assert_eq!(rx.try_recv().unwrap(), e);
+        assert_eq!(hub.subs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bearer_token_reads_the_header_case_insensitively() {
+        let req = "GET /metrics HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer s3cret\r\n\r\n";
+        assert_eq!(bearer_token(req).as_deref(), Some("s3cret"));
+        let lower = "GET /metrics HTTP/1.1\r\nauthorization:Bearer  padded  \r\n\r\n";
+        assert_eq!(bearer_token(lower).as_deref(), Some("padded"));
+        // no header, wrong scheme, or a bare GET all read as unauthorized
+        assert_eq!(bearer_token("GET /metrics HTTP/1.1\r\nHost: h\r\n\r\n"), None);
+        assert_eq!(
+            bearer_token("GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n"),
+            None
+        );
+        assert_eq!(bearer_token(""), None);
     }
 
     #[test]

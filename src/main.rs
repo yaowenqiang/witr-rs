@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
+use cli::Cli;
 use model::{Pid, Process, TargetReport, TargetSpec};
 use platform::Platform;
 
@@ -247,6 +248,252 @@ fn install_sigint_flag() {
 #[cfg(not(unix))]
 fn install_sigint_flag() {}
 
+/// SIGHUP during --watch / the TUI: the classic daemon convention —
+/// `kill -HUP <pid>` re-reads the config file between ticks without
+/// losing the session (alert latches, history, recordings all stay).
+/// The handler only raises a flag; the loops poll it like SIGINT's.
+static SAW_SIGHUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn sighup_flagged(_sig: i32) {
+    SAW_SIGHUP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn install_sighup_flag() {
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGHUP: i32 = 1;
+    unsafe {
+        signal(SIGHUP, sighup_flagged as extern "C" fn(i32) as usize);
+    }
+}
+#[cfg(not(unix))]
+fn install_sighup_flag() {}
+
+/// Consume the SIGHUP flag — true exactly once per delivered signal.
+pub(crate) fn take_sighup() -> bool {
+    SAW_SIGHUP.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Re-resolve the effective settings: the pre-apply CLI snapshot plus a
+/// fresh read of the config file — CLI flags still win over the file on
+/// reload, same as at startup.
+fn reload_resolved(base: &Cli) -> Cli {
+    let mut cli = base.clone();
+    cli.apply_config(&config::Config::load());
+    cli
+}
+
+// ---- --install-service: bake the current flags into a system service ----
+
+/// The headless knobs a service definition carries: the alert set plus
+/// watch cadence and the durable outputs. Targets (bare names) ride along
+/// too — `witr-rs nginx --watch 3` is a legitimate service.
+fn service_flag_args(cli: &Cli) -> Vec<String> {
+    fn opt(a: &mut Vec<String>, flag: &str, v: Option<String>) {
+        if let Some(v) = v {
+            a.push(format!("--{flag}"));
+            a.push(v);
+        }
+    }
+    let mut a: Vec<String> = Vec::new();
+    if let Some(secs) = cli.watch {
+        a.push("--watch".into());
+        a.push(secs.max(1).to_string());
+    }
+    for n in &cli.names {
+        a.push(n.clone());
+    }
+    opt(&mut a, "alert-cpu", cli.alert_cpu.map(|v| v.to_string()));
+    opt(&mut a, "alert-mem", cli.alert_mem.map(|v| v.to_string()));
+    opt(&mut a, "alert-fd", cli.alert_fd.map(|v| v.to_string()));
+    opt(&mut a, "alert-io", cli.alert_io.map(|v| v.to_string()));
+    opt(&mut a, "alert-conn", cli.alert_conn.map(|v| v.to_string()));
+    opt(&mut a, "alert-load", cli.alert_load.map(|v| v.to_string()));
+    opt(&mut a, "alert-mem-pct", cli.alert_mem_pct.map(|v| v.to_string()));
+    opt(&mut a, "alert-count", cli.alert_count.map(|v| v.to_string()));
+    opt(&mut a, "alert-disk", cli.alert_disk.map(|v| v.to_string()));
+    opt(&mut a, "alert-net", cli.alert_net.map(|v| v.to_string()));
+    opt(&mut a, "alert-psi", cli.alert_psi.map(|v| v.to_string()));
+    opt(&mut a, "alert-repeat", cli.alert_repeat.map(|v| v.to_string()));
+    opt(&mut a, "alert-exec", cli.alert_exec.clone());
+    opt(&mut a, "alert-webhook", cli.alert_webhook.clone());
+    for s in &cli.alert_silence {
+        a.push("--alert-silence".into());
+        a.push(s.clone());
+    }
+    for s in &cli.alert_new_proc {
+        a.push("--alert-new-proc".into());
+        a.push(s.clone());
+    }
+    for p in &cli.alert_port {
+        a.push("--alert-port".into());
+        a.push(p.clone());
+    }
+    opt(&mut a, "events-log", cli.events_log.clone());
+    opt(&mut a, "record", cli.record.clone());
+    if cli.quiet {
+        a.push("--quiet".into());
+    }
+    a
+}
+
+/// Escape for XML attribute/element text (plist, schtasks).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn systemd_unit(exe: &str, args: &[String]) -> String {
+    format!(
+        "\
+[Unit]
+Description=witr-rs process watchdog
+After=network-online.target
+
+[Service]
+ExecStart={exe} {}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+",
+        args.join(" ")
+    )
+}
+
+fn launchd_plist(exe: &str, args: &[String]) -> String {
+    let mut s = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n<dict>\n\
+         \x20 <key>Label</key><string>com.witr-rs.watchdog</string>\n\
+         \x20 <key>ProgramArguments</key>\n  <array>\n",
+    );
+    for a in std::iter::once(&exe.to_string()).chain(args.iter()) {
+        s.push_str(&format!("    <string>{}</string>\n", xml_escape(a)));
+    }
+    s.push_str(
+        "  </array>\n\
+         \x20 <key>RunAtLoad</key><true/>\n\
+         \x20 <key>KeepAlive</key><true/>\n\
+         \x20 <key>StandardOutPath</key><string>/tmp/witr-rs.log</string>\n\
+         \x20 <key>StandardErrorPath</key><string>/tmp/witr-rs.err.log</string>\n\
+         </dict>\n</plist>\n",
+    );
+    s
+}
+
+fn schtasks_xml(exe: &str, args: &[String]) -> String {
+    let cmd = std::iter::once(&exe.to_string())
+        .chain(args.iter())
+        .map(|a| xml_escape(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "\
+<?xml version=\"1.0\" encoding=\"UTF-16\"?>
+<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">
+  <Triggers>
+    <BootTrigger><Enabled>true</Enabled></BootTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id=\"Author\"><LogonType>LeastPrivilege</LogonType></Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure><Interval>PT5S</Interval><Count>999</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context=\"Author\">
+    <Exec><Command>{cmd}</Command></Exec>
+  </Actions>
+</Task>
+"
+    )
+}
+
+/// Where the service definition lands when --install-service gets no path.
+fn service_default_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))?;
+    let home = std::path::PathBuf::from(home);
+    if cfg!(target_os = "macos") {
+        Some(home.join("Library/LaunchAgents/com.witr-rs.watchdog.plist"))
+    } else if cfg!(target_os = "linux") {
+        Some(home.join(".config/systemd/user/witr-rs.service"))
+    } else {
+        Some(home.join("witr-rs-task.xml"))
+    }
+}
+
+/// Best-effort registration after the definition file is written. Never
+/// fatal: the printed hint is the source of truth when the manager isn't
+/// reachable (rootless CI, no systemd session bus…).
+fn service_register(path: &std::path::Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+        let ok = std::process::Command::new("systemctl")
+            .args(["--user", "enable", "--now", "witr-rs.service"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            crate::write_out("registered: systemctl --user enable --now witr-rs.service");
+        } else {
+            service_register_hint(path);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let ok = std::process::Command::new("launchctl")
+            .arg("load")
+            .arg(path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            crate::write_out("registered: launchctl load (starts now, at every login)");
+        } else {
+            service_register_hint(path);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    service_register_hint(path);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    service_register_hint(path);
+}
+
+/// The manual registration command — printed when registration didn't
+/// run (custom --install-service path) or didn't succeed.
+fn service_register_hint(path: &std::path::Path) {
+    if cfg!(target_os = "linux") {
+        crate::write_out("register manually: systemctl --user daemon-reload && systemctl --user enable --now witr-rs.service");
+    } else if cfg!(target_os = "macos") {
+        crate::write_out(&format!(
+            "register manually: launchctl load {}",
+            path.display()
+        ));
+    } else {
+        crate::write_out(&format!(
+            "register manually (admin): schtasks /Create /TN witr-rs /XML \"{}\"",
+            path.display()
+        ));
+    }
+}
+
 /// Sleep one watch interval in 100ms slices, aborting early on Ctrl-C.
 /// Returns false when SIGINT arrived (the caller should unwind).
 fn sleep_interruptible(interval: u64) -> bool {
@@ -266,6 +513,81 @@ fn run_on_exit(cmd: &str) {
     let _ = std::process::Command::new("cmd").args(["/C", cmd]).status();
     #[cfg(not(windows))]
     let _ = std::process::Command::new("sh").args(["-c", cmd]).status();
+}
+
+/// --remote core: fetch the process table from a `witr-rs --serve` peer
+/// (`/api/ps`) and push it through the same renderers as the local
+/// listing — one host's dashboard over plain HTTP, no local sampling.
+/// `--tree` is presentation only: the flat table comes over the wire and
+/// the forest is built locally, so both sides agree on the shape.
+/// `--watch N` re-fetches on an interval until Ctrl-C.
+fn remote_mode(base: &str, cli: &cli::Cli, no_color: bool) {
+    let url = format!("{}/api/ps", base.trim_end_matches('/'));
+    let fetch = || -> Result<Vec<Process>, String> {
+        let body = util::http_get(&url)?;
+        let doc: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("response is not JSON: {e}"))?;
+        let schema = doc.get("schema_version").and_then(|v| v.as_u64());
+        let procs: Vec<Process> = serde_json::from_value(
+            doc.get("processes")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .map_err(|e| format!("response shape mismatch (schema_version {schema:?}): {e}"))?;
+        Ok(procs)
+    };
+    let render_once = |procs: &[Process]| -> String {
+        let color = !no_color && std::io::stdout().is_terminal() && !cli.json;
+        let painter = render::Painter::new(color);
+        if cli.json {
+            json_listing_output(procs, cli.tree)
+        } else if cli.csv {
+            render::render_csv(procs)
+        } else if cli.markdown {
+            render::render_markdown(procs)
+        } else if cli.tree {
+            render::render_process_forest(procs, &painter)
+        } else {
+            render::render_process_table(procs, &painter)
+        }
+    };
+    if let Some(secs) = cli.watch {
+        let interval = secs.max(1);
+        let json_stream = cli.json; // one envelope per tick, no redraw
+        let redraw = !cli.quiet && !json_stream;
+        install_sigint_flag();
+        let mut ticks = 0u64;
+        loop {
+            match fetch() {
+                Ok(procs) => {
+                    if redraw {
+                        write_out("\x1b[2J\x1b[1;1H");
+                        let now = util::fmt_time(util::now_unix());
+                        write_out(&format!(
+                            "witr-rs remote · {base} · every {interval}s · {now} · Ctrl-C to stop"
+                        ));
+                    }
+                    write_out(&render_once(&procs));
+                }
+                Err(e) => eprintln!("--remote {base}: {e}"),
+            }
+            ticks += 1;
+            if cli.times.is_some_and(|n| ticks >= n.max(1)) {
+                break;
+            }
+            if !sleep_interruptible(interval) {
+                break;
+            }
+        }
+        std::process::exit(0);
+    }
+    match fetch() {
+        Ok(procs) => write_out(&render_once(&procs)),
+        Err(e) => {
+            eprintln!("--remote {base}: {e}");
+            std::process::exit(5);
+        }
+    }
 }
 
 /// The N highest-ranked processes by one metric, best first. Clones rather
@@ -383,9 +705,10 @@ pub(crate) fn json_tree_forest(procs: &[Process]) -> String {
 
 /// One `--watch` tick of the threshold-alert machinery — the headless twin
 /// of the TUI's alert_picks: sweeps fd/socket counters when armed, advances
-/// each pid's per-metric cycle, returns the firings (one per excursion,
-/// re-armed when the metric drops back under; with --alert-repeat, re-sent
-/// about every N seconds while the excursion keeps burning).
+/// each pid's per-metric cycle, returns the edges (pid, name, detail,
+/// is_recovery) — firings one per excursion, recoveries when a firing
+/// excursion drops back under; with --alert-repeat, re-sent about every N
+/// seconds while the excursion keeps burning.
 #[allow(clippy::too_many_arguments)]
 fn watch_alert_picks(
     platform: &dyn Platform,
@@ -396,7 +719,7 @@ fn watch_alert_picks(
     state: &mut HashMap<Pid, history::AlertTrack>,
     fd_counts: &mut HashMap<Pid, u64>,
     conn_counts: &mut HashMap<Pid, u64>,
-) -> Vec<(Pid, String, String)> {
+) -> Vec<(Pid, String, String, bool)> {
     let armed = cli.alert_cpu.is_some()
         || cli.alert_mem.is_some()
         || cli.alert_fd.is_some()
@@ -422,68 +745,81 @@ fn watch_alert_picks(
         if let Some(limit) = cli.alert_cpu {
             let now = hist.cpu_now.get(&p.pid).copied();
             let over = now.is_some_and(|c| c > limit);
-            if history::alert_cycle_repeat(
+            let edge = history::alert_cycle_repeat(
                 &mut track.cpu_streak,
                 &mut track.cpu_firing,
                 over,
                 &mut track.cpu_fired_secs,
                 repeat,
                 interval,
-            ) {
+            );
+            if edge == history::AlertEdge::Fire {
                 out.push((
                     p.pid,
                     p.name.clone(),
                     format!("CPU {:.0}% above {limit:.0}% for {secs}s", now.unwrap_or(0.0)),
+                    false,
                 ));
+            } else if edge == history::AlertEdge::Recover {
+                out.push((p.pid, p.name.clone(), format!("CPU back under {limit:.0}%"), true));
             }
         }
         if let Some(limit_mb) = cli.alert_mem {
             let mb = p.mem_kb.map(|kb| kb / 1024);
             let over = mb.is_some_and(|m| m > limit_mb);
-            if history::alert_cycle_repeat(
+            let edge = history::alert_cycle_repeat(
                 &mut track.mem_streak,
                 &mut track.mem_firing,
                 over,
                 &mut track.mem_fired_secs,
                 repeat,
                 interval,
-            ) {
+            );
+            if edge == history::AlertEdge::Fire {
                 out.push((
                     p.pid,
                     p.name.clone(),
                     format!("RSS {} MB above {limit_mb} MB for {secs}s", mb.unwrap_or(0)),
+                    false,
                 ));
+            } else if edge == history::AlertEdge::Recover {
+                out.push((p.pid, p.name.clone(), format!("RSS back under {limit_mb} MB"), true));
             }
         }
         if let Some(limit) = cli.alert_fd {
             let n = fd_counts.get(&p.pid).copied();
             let over = n.is_some_and(|c| c > limit);
-            if history::alert_cycle_repeat(
+            let edge = history::alert_cycle_repeat(
                 &mut track.fd_streak,
                 &mut track.fd_firing,
                 over,
                 &mut track.fd_fired_secs,
                 repeat,
                 interval,
-            ) {
+            );
+            if edge == history::AlertEdge::Fire {
                 out.push((
                     p.pid,
                     p.name.clone(),
                     format!("{} open fds above {limit} for {secs}s", n.unwrap_or(0)),
+                    false,
                 ));
+            } else if edge == history::AlertEdge::Recover {
+                out.push((p.pid, p.name.clone(), format!("open fds back under {limit}"), true));
             }
         }
         if let Some(limit_mbps) = cli.alert_io {
             let bps = hist.io_rate_of(p.pid).map(|(r, w)| r + w);
             let over = bps.is_some_and(|b| b > limit_mbps * 1024.0 * 1024.0);
-            if history::alert_cycle_repeat(
+            let edge = history::alert_cycle_repeat(
                 &mut track.io_streak,
                 &mut track.io_firing,
                 over,
                 &mut track.io_fired_secs,
                 repeat,
                 interval,
-            ) {
+            );
+            if edge == history::AlertEdge::Fire {
                 out.push((
                     p.pid,
                     p.name.clone(),
@@ -491,20 +827,24 @@ fn watch_alert_picks(
                         "I/O {:.1} MB/s above {limit_mbps} MB/s for {secs}s",
                         bps.unwrap_or(0.0) / 1024.0 / 1024.0
                     ),
+                    false,
                 ));
+            } else if edge == history::AlertEdge::Recover {
+                out.push((p.pid, p.name.clone(), format!("I/O back under {limit_mbps} MB/s"), true));
             }
         }
         if let Some(limit) = cli.alert_conn {
             let n = conn_counts.get(&p.pid).copied();
             let over = n.is_some_and(|c| c > limit);
-            if history::alert_cycle_repeat(
+            let edge = history::alert_cycle_repeat(
                 &mut track.conn_streak,
                 &mut track.conn_firing,
                 over,
                 &mut track.conn_fired_secs,
                 repeat,
                 interval,
-            ) {
+            );
+            if edge == history::AlertEdge::Fire {
                 out.push((
                     p.pid,
                     p.name.clone(),
@@ -512,7 +852,10 @@ fn watch_alert_picks(
                         "{} established connection(s) above {limit} for {secs}s",
                         n.unwrap_or(0)
                     ),
+                    false,
                 ));
+            } else if edge == history::AlertEdge::Recover {
+                out.push((p.pid, p.name.clone(), format!("connections back under {limit}"), true));
             }
         }
     }
@@ -898,6 +1241,116 @@ fn plot_html(points: &[SysPoint]) -> String {
     )
 }
 
+/// One inline-SVG overlay chart: every series (already resolved to
+/// `(unix_time, value)` points) drawn in its own color on a shared
+/// time-based x-axis. `--plot a.csv b.csv` flavor — recordings of
+/// different lengths and cadences still line up on the clock.
+fn svg_overlay(
+    name: &str,
+    unit: &str,
+    series: &[(String, Vec<(i64, f64)>)],
+    t0: i64,
+    t1: i64,
+) -> String {
+    let all: Vec<(i64, f64)> = series.iter().flat_map(|(_, pts)| pts.iter().copied()).collect();
+    if all.is_empty() || t1 <= t0 {
+        return String::new();
+    }
+    let (w, h, pad) = (560.0, 110.0, 6.0);
+    let max = all.iter().map(|(_, v)| *v).fold(0.0f64, f64::max);
+    let max = if max <= 0.0 { 1.0 } else { max * 1.1 };
+    let x = |t: i64| pad + (t - t0) as f64 / (t1 - t0) as f64 * (w - 2.0 * pad);
+    let y = |v: f64| h - pad - v / max * (h - 2.0 * pad - 14.0);
+    let polys: String = series
+        .iter()
+        .filter(|(_, pts)| !pts.is_empty())
+        .map(|(color, pts)| {
+            let poly: String = pts
+                .iter()
+                .map(|(t, v)| format!("{:.1},{:.1}", x(*t), y(*v)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("<polyline fill=\"none\" stroke=\"{color}\" stroke-width=\"1.5\" points=\"{poly}\"/>")
+        })
+        .collect();
+    let at = |t: i64| crate::util::fmt_time(t).get(11..16).unwrap_or("").to_string();
+    format!(
+        "<div style=\"display:inline-block;margin:8px\"><svg width=\"{w}\" height=\"{h}\" xmlns=\"http://www.w3.org/2000/svg\">\
+<text x=\"{pad}\" y=\"14\" font-size=\"12\" fill=\"#8899a6\">{name}</text>\
+<text x=\"{w:.0}\" y=\"14\" font-size=\"12\" fill=\"#e1e8ed\" text-anchor=\"end\">{unit} · max {max:.1}</text>\
+{polys}\
+<text x=\"{pad}\" y=\"{h:.0}\" font-size=\"10\" fill=\"#657786\">{}</text>\
+<text x=\"{w:.0}\" y=\"{h:.0}\" font-size=\"10\" fill=\"#657786\" text-anchor=\"end\">{}</text>\
+</svg></div>",
+        at(t0),
+        at(t1),
+    )
+}
+
+/// `--plot a.csv b.csv …`: the overlay flavor — every file's five machine
+/// series drawn onto the same charts (one color per file, global legend),
+/// so a before/after pair reads as one picture.
+fn plot_html_multi(named: &[(String, Vec<SysPoint>)]) -> String {
+    const PALETTE: [&str; 6] = ["#4dc3ff", "#ff6b6b", "#51cf66", "#fcc419", "#cc5de8", "#ff922b"];
+    let color = |i: usize| PALETTE[i % PALETTE.len()];
+    let t0 = named
+        .iter()
+        .filter_map(|(_, p)| p.first().map(|p| p.at))
+        .min()
+        .unwrap_or(0);
+    let t1 = named
+        .iter()
+        .filter_map(|(_, p)| p.last().map(|p| p.at))
+        .max()
+        .unwrap_or(0);
+    let legend: String = named
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| {
+            format!(
+                "<span style=\"margin-right:16px\"><span style=\"color:{}\">■</span> {}</span>",
+                color(i),
+                name
+            )
+        })
+        .collect();
+    let metric = |p: &SysPoint, f: fn(&SysPoint) -> Option<f64>| f(p).map(|v| (p.at, v));
+    let mut charts = String::new();
+    for (name, unit, f) in [
+        ("cpu %", "%", (|p: &SysPoint| p.cpu) as fn(&SysPoint) -> Option<f64>),
+        ("memory %", "%", (|p: &SysPoint| p.mem_pct) as fn(&SysPoint) -> Option<f64>),
+        ("load 1m", "", (|p: &SysPoint| p.load1) as fn(&SysPoint) -> Option<f64>),
+        (
+            "network",
+            "MB/s",
+            (|p: &SysPoint| p.net_bps.map(|b| b / 1048576.0)) as fn(&SysPoint) -> Option<f64>,
+        ),
+        (
+            "processes",
+            "",
+            (|p: &SysPoint| Some(p.procs as f64)) as fn(&SysPoint) -> Option<f64>,
+        ),
+    ] {
+        let series: Vec<(String, Vec<(i64, f64)>)> = named
+            .iter()
+            .enumerate()
+            .map(|(i, (_, pts))| {
+                (color(i).to_string(), pts.iter().filter_map(|p| metric(p, f)).collect())
+            })
+            .collect();
+        charts.push_str(&svg_overlay(name, unit, &series, t0, t1));
+    }
+    let samples: usize = named.iter().map(|(_, p)| p.len()).sum();
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>witr-rs plot</title>\
+<style>body{{background:#15202b;font-family:ui-monospace,Menlo,monospace;color:#e1e8ed;margin:24px}}</style>\
+</head><body><h3>witr-rs · {samples} samples · {} – {}</h3>\
+<div style=\"margin-bottom:8px\">{legend}</div><div>{charts}</div></body></html>",
+        crate::util::fmt_time(t0),
+        crate::util::fmt_time(t1),
+    )
+}
+
 fn main() {
     // pre-scan argv for `--en` before building the Command, so the help text
     // (and the man page / completions generated from it) comes out in the
@@ -923,6 +1376,9 @@ fn main() {
 
     // user config (flat toml subset): defaults only — CLI flags win
     let mut cli = cli;
+    // pre-apply snapshot: SIGHUP reloads re-fold a fresh file under these
+    // exact flags, so an explicit --alert-cpu still beats the file's
+    let cli_base = cli.clone();
     let cfg = config::Config::load();
     cli.apply_config(&cfg);
 
@@ -1082,6 +1538,27 @@ fn main() {
             std::process::exit(4);
         }
     };
+    // --alert-silence specs parse up front (bad durations exit 4 here, not
+    // a silent no-op later) — windows anchor at startup, like a
+    // maintenance calendar
+    let silence_rules: Vec<history::SilenceRule> = match cli
+        .alert_silence
+        .iter()
+        .map(|raw| history::SilenceRule::parse(raw).ok_or_else(|| raw.clone()))
+        .collect::<Result<Vec<_>, String>>()
+    {
+        Ok(v) => v,
+        Err(bad) => {
+            eprintln!("--alert-silence {bad}: expected NAME[=DUR] (e.g. backup=30m or '!cron')");
+            std::process::exit(4);
+        }
+    };
+    // --alert-new-proc: the only failure mode is mixed plain/! specs —
+    // catch it here, not as a silently-unarmed watch
+    if let Err(e) = history::NewProcWatch::parse(&cli.alert_new_proc) {
+        eprintln!("--alert-new-proc: {e}");
+        std::process::exit(4);
+    }
     let any_alert_armed = cli.alert_cpu.is_some()
         || cli.alert_mem.is_some()
         || cli.alert_fd.is_some()
@@ -1575,9 +2052,10 @@ fn main() {
         std::process::exit(i32::from(failed > 0));
     }
 
-    // --plot: render a --record file into a self-contained HTML chart —
-    // a no-target operation like --snap/--diff.
-    if let Some(path) = &cli.plot {
+    // --plot: render one --record file into a self-contained HTML chart (or
+    // overlay several into one comparison) — a no-target operation like
+    // --snap/--diff.
+    if !cli.plot.is_empty() {
         if !specs.is_empty() || cli.interactive {
             eprintln!("--plot renders the machine samples from a record file; drop the targets or -i");
             std::process::exit(4);
@@ -1586,28 +2064,43 @@ fn main() {
             eprintln!("--plot writes one chart and exits; drop --watch");
             std::process::exit(4);
         }
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("--plot {path}: {e}");
-                std::process::exit(5);
-            }
+        let mut named: Vec<(String, Vec<SysPoint>)> = Vec::new();
+        for path in &cli.plot {
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("--plot {path}: {e}");
+                    std::process::exit(5);
+                }
+            };
+            let points = match parse_record_system(&text) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("--plot {path}: {e}");
+                    std::process::exit(5);
+                }
+            };
+            named.push((path.clone(), points));
+        }
+        let (out, html, total) = if named.len() == 1 {
+            let (path, points) = &named[0];
+            (format!("{path}.html"), plot_html(points), points.len())
+        } else {
+            let total: usize = named.iter().map(|(_, p)| p.len()).sum();
+            (
+                "witr-plot.html".to_string(),
+                plot_html_multi(&named),
+                total,
+            )
         };
-        let points = match parse_record_system(&text) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("--plot {path}: {e}");
-                std::process::exit(5);
-            }
-        };
-        let out = format!("{path}.html");
-        if let Err(e) = std::fs::write(&out, plot_html(&points)) {
+        if let Err(e) = std::fs::write(&out, &html) {
             eprintln!("--plot: cannot write {out}: {e}");
             std::process::exit(5);
         }
         write_out(&format!(
-            "plot: {} samples → {out}",
-            points.len()
+            "plot: {} file{}, {total} samples → {out}",
+            named.len(),
+            if named.len() == 1 { "" } else { "s" },
         ));
         return;
     }
@@ -1812,9 +2305,83 @@ fn main() {
             std::process::exit(4);
         });
         let fds_enabled = platform::get().fd_counts().is_some();
-        if let Err(e) = serve::run(&addr, fds_enabled) {
+        if let Err(e) = serve::run(&addr, fds_enabled, cli.serve_token.as_deref()) {
             eprintln!("--serve: {e}");
             std::process::exit(5);
+        }
+        std::process::exit(0);
+    }
+
+    // --remote: render another host's table instead of the local machine's —
+    // a standalone mode like --serve (the peer runs `witr-rs --serve`)
+    if let Some(base) = &cli.remote {
+        remote_mode(base, &cli, no_color);
+        std::process::exit(0);
+    }
+
+    // --install-service: write the current flags as a service definition
+    // and best-effort register it — a standalone mode (the point is to
+    // persist what you just proved out interactively)
+    if cli.install_service.is_some() {
+        let armed = cli.watch.is_some()
+            || cli.alert_cpu.is_some()
+            || cli.alert_mem.is_some()
+            || cli.alert_fd.is_some()
+            || cli.alert_io.is_some()
+            || cli.alert_conn.is_some()
+            || cli.alert_load.is_some()
+            || cli.alert_mem_pct.is_some()
+            || cli.alert_count.is_some()
+            || cli.alert_disk.is_some()
+            || cli.alert_net.is_some()
+            || cli.alert_psi.is_some()
+            || !cli.alert_port.is_empty()
+            || !cli.alert_new_proc.is_empty()
+            || !cli.names.is_empty();
+        if !armed {
+            eprintln!(
+                "--install-service needs something to run: give --watch, an --alert-* flag or a target"
+            );
+            std::process::exit(4);
+        }
+        let exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "witr-rs".into());
+        let args = service_flag_args(&cli);
+        let body = if cfg!(target_os = "macos") {
+            launchd_plist(&exe, &args)
+        } else if cfg!(target_os = "linux") {
+            systemd_unit(&exe, &args)
+        } else {
+            schtasks_xml(&exe, &args)
+        };
+        let explicit = cli.install_service.as_deref().filter(|s| !s.is_empty());
+        let path = explicit
+            .map(std::path::PathBuf::from)
+            .or_else(service_default_path)
+            .unwrap_or_else(|| {
+                eprintln!("--install-service: no home directory known; give an explicit path");
+                std::process::exit(4);
+            });
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&path, &body) {
+            Ok(()) => {
+                write_out(&format!("service definition → {}", path.display()));
+                write_out(&format!("runs: {exe} {}", args.join(" ")));
+                // a custom path means "just write the file" — auto-register
+                // only the default install so staging elsewhere stays inert
+                if explicit.is_none() {
+                    service_register(&path);
+                } else {
+                    service_register_hint(&path);
+                }
+            }
+            Err(e) => {
+                eprintln!("--install-service {}: {e}", path.display());
+                std::process::exit(5);
+            }
         }
         std::process::exit(0);
     }
@@ -1839,37 +2406,27 @@ fn main() {
             );
             std::process::exit(4);
         }
+        let cli_for_reload = cli_base.clone();
         let seed = tui::Seed {
             events_log: cli.events_log.clone(),
-            notify: cli.notify || cfg.notify.unwrap_or(false),
             replayed,
             samples,
             samples_source,
             since: since_secs,
-            refresh_secs: cfg.refresh_secs,
-            sort: cfg.sort.clone(),
-            paused: cfg.paused.unwrap_or(false),
-            alert_cpu: cli.alert_cpu,
-            alert_mem: cli.alert_mem,
-            alert_exec: cli.alert_exec.clone(),
-            alert_fd: cli.alert_fd,
-            alert_io: cli.alert_io,
-            alert_conn: cli.alert_conn,
             alert_port: alert_ports.clone(),
-            alert_load: cli.alert_load,
-            alert_mem_pct: cli.alert_mem_pct,
-            alert_count: cli.alert_count,
-            alert_disk: cli.alert_disk,
-            alert_net: cli.alert_net,
-            alert_psi: cli.alert_psi,
-            alert_webhook: cli.alert_webhook.clone(),
-            alert_repeat: cli.alert_repeat,
-            watch: cfg.watch.clone(),
-            notes: cfg.notes,
             replay_follow: cli.replay.clone().filter(|_| cli.follow),
+            // SIGHUP rebuilds the seed from the pre-apply flag snapshot +
+            // a fresh config read — with_knobs keeps startup and reload on
+            // one code path
+            reseed: Some(Box::new(move || {
+                let fresh = reload_resolved(&cli_for_reload);
+                // targets aren't carried: reseed() only reads knobs
+                tui::Seed::default().with_knobs(&fresh, &config::Config::load())
+            })),
             ..tui::Seed::from_targets(
                 &cli.names, &cli.pids, &cli.ports, &cli.files, &cli.containers,
             )
+            .with_knobs(&cli, &cfg)
         };
         if let Err(e) = tui::run(seed) {
             eprintln!("tui error: {}", e);
@@ -2332,6 +2889,22 @@ fn main() {
             let json_stream = cli.json; // one envelope per tick, no redraw
             let redraw = !cli.quiet && !json_stream;
             install_sigint_flag();
+            install_sighup_flag();
+            // brief-process capture: spawns and dies between the ticks
+            // would be invisible otherwise (not on Windows — no cheap
+            // pid sweep). The thread self-terminates when this loop's
+            // channel drops at Ctrl-C.
+            let brief_rx = if platform::quick_pids().is_some() {
+                let (rx, _stop) = history::spawn_brief_poller(250);
+                Some(rx)
+            } else {
+                None
+            };
+            // container edges from the runtime's own event stream: deaths,
+            // OOM and health flips arrive in milliseconds (None without
+            // docker/podman/nerdctl on PATH; killing the child on drop is
+            // the stream struct's job)
+            let container_stream = history::spawn_container_events();
             let mut recorder = match &cli.record {
                 Some(path) => match RecordWriter::create(path) {
                     Ok(w) => {
@@ -2371,6 +2944,10 @@ fn main() {
             let mut port_owner: HashMap<u16, String> = HashMap::new();
             // --alert-load / --alert-mem-pct: one machine-wide state
             let mut sys_alert = history::SysAlertState::default();
+            // --alert-new-proc: first-sighting tracker (armed per session)
+            let mut new_proc = history::NewProcWatch::parse(&cli.alert_new_proc)
+                .ok()
+                .flatten();
             // --diff-auto: the previous frame to diff against
             let mut last_frame: Option<(Vec<Process>, Vec<snapshot::Listener>)> = None;
             let mut last_diff = Instant::now();
@@ -2380,6 +2957,70 @@ fn main() {
             let mut ticks: u64 = 0;
             let interrupted;
             loop {
+                // kill -HUP: re-fold the config file under the startup
+                // flags — alert latches and recordings stay put
+                if take_sighup() {
+                    cli = reload_resolved(&cli_base);
+                    write_out(&format!(
+                        "SIGHUP: reloaded config from {}",
+                        config::Config::path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(no path)".into()),
+                    ));
+                }
+                // brief-process capture: drain the high-frequency poller —
+                // each spawn-and-die becomes a line + ring/log entry
+                if let Some(rx) = &brief_rx {
+                    let mut briefs = Vec::new();
+                    while let Ok(e) = rx.try_recv() {
+                        briefs.push(e);
+                    }
+                    for e in briefs {
+                        let who = if e.pid > 0 {
+                            format!("{} (pid {})", e.name, e.pid)
+                        } else {
+                            e.name.clone()
+                        };
+                        let line = format!(">> brief: {who} — {}", e.detail);
+                        if json_stream {
+                            eprintln!("{line}");
+                        } else {
+                            write_out(&line);
+                        }
+                        if let Some(f) = events_file.as_mut() {
+                            use std::io::Write as _;
+                            if let Ok(json) = serde_json::to_string(&e) {
+                                let _ = writeln!(f, "{json}");
+                                let _ = f.flush();
+                            }
+                        }
+                        hist.ingest(vec![e]);
+                    }
+                }
+                // container events: one line per death/OOM/health edge,
+                // same stdout/jsonl/ring treatment as the brief captures
+                if let Some(stream) = &container_stream {
+                    let mut edges = Vec::new();
+                    while let Ok(e) = stream.rx.try_recv() {
+                        edges.push(e);
+                    }
+                    for e in edges {
+                        let line = format!(">> container: {} — {}", e.name, e.detail);
+                        if json_stream {
+                            eprintln!("{line}");
+                        } else {
+                            write_out(&line);
+                        }
+                        if let Some(f) = events_file.as_mut() {
+                            use std::io::Write as _;
+                            if let Ok(json) = serde_json::to_string(&e) {
+                                let _ = writeln!(f, "{json}");
+                                let _ = f.flush();
+                            }
+                        }
+                        hist.ingest(vec![e]);
+                    }
+                }
                 let mut listed = match platform.list_processes() {
                     Ok(p) => p,
                     Err(e) => {
@@ -2435,7 +3076,21 @@ fn main() {
                         &procs,
                         &mut port_seen,
                         &mut port_owner,
-                    ));
+                    ).into_iter().map(|(pid, n, d)| (pid, n, d, false)));
+                }
+                // --alert-new-proc: one pick per first-seen name the mode
+                // covers (the tracker remembers, so a name never re-fires)
+                if let Some(w) = new_proc.as_mut() {
+                    for p in &procs {
+                        if w.first_sighting(&p.name) {
+                            picks.push((
+                                p.pid,
+                                p.name.clone(),
+                                "first sighting of this process name".into(),
+                                false,
+                            ));
+                        }
+                    }
                 }
                 // machine-wide alerts (--alert-load / --alert-mem-pct /
                 // --alert-count / --alert-net): sample the whole system when
@@ -2475,13 +3130,13 @@ fn main() {
                             psi_limit: cli.alert_psi,
                             repeat: cli.alert_repeat,
                         };
-                        for (name, detail) in history::system_alert_picks(
+                        for (name, detail, rec) in history::system_alert_picks(
                             &stats,
                             &mut sys_alert,
                             &limits,
                             interval,
                         ) {
-                            picks.push((0, name, detail));
+                            picks.push((0, name, detail, rec));
                         }
                     }
                 }
@@ -2541,7 +3196,24 @@ fn main() {
                         last_frame = Some((procs.clone(), listeners));
                     }
                 }
-                for (pid, name, detail) in picks {
+                for (pid, name, detail, recovery) in picks {
+                    // silence windows (--alert-silence) hold down both the
+                    // alert and its recovery — the pick still lands in the
+                    // events ring/log as "silenced" so the mute is visible,
+                    // but no line, exec, webhook or notify fires
+                    if history::silenced(&silence_rules, &name, util::now_unix() as u64) {
+                        if let Some(f) = events_file.as_mut() {
+                            use std::io::Write as _;
+                            let e = hist.push_kind("silenced", pid, &name, &detail);
+                            if let Ok(json) = serde_json::to_string(&e) {
+                                let _ = writeln!(f, "{json}");
+                                let _ = f.flush();
+                            }
+                        } else {
+                            hist.push_kind("silenced", pid, &name, &detail);
+                        }
+                        continue;
+                    }
                     // in JSON-stream mode the stdout pipe carries data only —
                     // alerts go to stderr so jq output stays parseable
                     let who = if pid > 0 {
@@ -2549,29 +3221,36 @@ fn main() {
                     } else {
                         name.clone()
                     };
-                    let alert_line = format!("⚠ alert: {who} — {detail}");
+                    let kind = if recovery { "recovered" } else { "alert" };
+                    let alert_line = format!(
+                        "{} {who} — {detail}",
+                        if recovery { "✔ recovered:" } else { "⚠ alert:" }
+                    );
                     if json_stream {
                         eprintln!("{alert_line}");
                     } else {
                         write_out(&alert_line);
                     }
-                    // same durable stream as the TUI: alerts land in
-                    // --events-log too, so --replay shows them later
+                    // same durable stream as the TUI: alerts and recoveries
+                    // land in --events-log too, so --replay shows them later
                     if let Some(f) = events_file.as_mut() {
                         use std::io::Write as _;
-                        let e = hist.push_alert(pid, &name, &detail);
+                        let e = hist.push_kind(kind, pid, &name, &detail);
                         if let Ok(json) = serde_json::to_string(&e) {
                             let _ = writeln!(f, "{json}");
                             let _ = f.flush();
                         }
                     }
                     if let Some(cmd) = &cli.alert_exec {
-                        tui::spawn_alert_exec(cmd, pid, &name, &detail);
+                        tui::spawn_alert_exec(cmd, pid, &name, &detail, kind);
                     }
                     if let Some(hook) = &cli.alert_webhook {
-                        tui::send_alert_webhook(hook, pid, &name, &detail);
+                        tui::send_alert_webhook(hook, pid, &name, &detail, kind);
                     }
-                    recent_alerts.push(format!("{who} — {detail}"));
+                    recent_alerts.push(format!(
+                        "{} {who} — {detail}",
+                        if recovery { "✔" } else { "⚠" }
+                    ));
                     let excess = recent_alerts.len().saturating_sub(5);
                     recent_alerts.drain(..excess);
                 }
@@ -2951,6 +3630,52 @@ mod tests {
     }
 
     #[test]
+    fn service_definitions_carry_the_flag_set() {
+        let cli = Cli::parse_from([
+            "witr-rs",
+            "--watch",
+            "5",
+            "nginx",
+            "--alert-cpu",
+            "90",
+            "--alert-silence",
+            "backup=30m",
+            "--alert-new-proc",
+            "xmrig",
+            "--alert-port",
+            "9090",
+            "--events-log",
+            "/tmp/ev.jsonl",
+            "--quiet",
+        ]);
+        let args = service_flag_args(&cli);
+        // the serialized flag set re-parses to the same knobs
+        assert_eq!(
+            args,
+            vec![
+                "--watch", "5", "nginx", "--alert-cpu", "90", "--alert-silence", "backup=30m",
+                "--alert-new-proc", "xmrig", "--alert-port", "9090", "--events-log",
+                "/tmp/ev.jsonl", "--quiet"
+            ]
+        );
+        let unit = systemd_unit("/usr/local/bin/witr-rs", &args);
+        assert!(unit.contains("ExecStart=/usr/local/bin/witr-rs --watch 5 nginx"));
+        assert!(unit.contains("WantedBy=default.target"));
+        let plist = launchd_plist("/usr/local/bin/witr-rs", &args);
+        assert!(plist.contains("<string>/usr/local/bin/witr-rs</string>"));
+        assert!(plist.contains("<string>--alert-cpu</string>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        let task = schtasks_xml("/usr/local/bin/witr-rs", &args);
+        assert!(task.contains("<Command>"));
+        assert!(task.contains("BootTrigger"));
+        // shell commands with XML-special chars survive the plist
+        let plist = launchd_plist("/bin/sh", &["-c".into(), "notify-send \"a<b&c\"".into()]);
+        assert!(plist.contains("notify-send"));
+        assert!(!plist.contains("a<b&c"), "raw XML metacharacters must be escaped");
+        assert!(plist.contains("a&lt;b&amp;c"));
+    }
+
+    #[test]
     fn port_alert_picks_arms_then_fires_edges() {
         let sock = |port: u16, pid: Option<Pid>| crate::model::Socket {
             proto: "tcp".into(),
@@ -3146,6 +3871,32 @@ mod tests {
         // every chart carries its last-value label
         assert!(html.contains("25.0 %"), "cpu last label");
         assert!(html.contains("max 27.5"), "max is 25 * 1.1");
+    }
+
+    #[test]
+    fn plot_html_multi_overlays_files_on_a_shared_clock() {
+        let mk = |cpu: f64, at: i64| SysPoint {
+            at,
+            cpu: Some(cpu),
+            mem_pct: Some(40.0 + cpu),
+            load1: Some(cpu / 10.0),
+            procs: 200 + cpu as usize,
+            net_bps: Some(1_000_000.0 + cpu),
+        };
+        let a = ("before.csv".to_string(), vec![mk(10.0, 1_700_000_000), mk(20.0, 1_700_000_060)]);
+        // file b starts later and runs longer — the overlay still lines both
+        // up on the global time axis (t0 = a's first, t1 = b's last)
+        let b = ("after.csv".to_string(), vec![mk(55.0, 1_700_000_030), mk(5.0, 1_700_000_120)]);
+        let html = plot_html_multi(&[a, b]);
+        assert!(html.contains("before.csv"), "legend names every file");
+        assert!(html.contains("after.csv"));
+        assert_eq!(html.matches("<svg").count(), 5, "same five charts");
+        // two polylines per chart — one per file
+        assert_eq!(html.matches("<polyline").count(), 10);
+        // the global window spans both files, and both colors appear
+        assert!(html.contains("■"), "legend swatches rendered");
+        assert!(html.contains("#ff6b6b"), "second file's palette color present");
+        assert!(html.contains("4 samples"), "sample count is the sum");
     }
 
     #[test]
