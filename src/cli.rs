@@ -66,6 +66,16 @@ pub enum TopMetric {
         "GPU SM utilization (NVIDIA, needs nvidia-smi; absent without an NVIDIA GPU)"
     ))]
     Gpu,
+    #[value(help = t(
+        "内核线程数（Linux /proc stat、Windows 线程快照；macOS 仅详情页可查）——线程泄漏的进程榜",
+        "Kernel thread count (Linux /proc stat, Windows thread snapshot; macOS detail page only) — the thread-leak ranking"
+    ))]
+    Threads,
+    #[value(help = t(
+        "ESTABLISHED 连接数（--alert-conn 的排行版——谁攥着最多的活动连接）",
+        "ESTABLISHED connection count (the ranking twin of --alert-conn — who holds the most live connections)"
+    ))]
+    Conn,
 }
 
 impl TopMetric {
@@ -78,6 +88,8 @@ impl TopMetric {
             TopMetric::IoRate => "IO/S",
             TopMetric::Age => "AGE",
             TopMetric::Gpu => "GPU%",
+            TopMetric::Threads => "THR",
+            TopMetric::Conn => "CONNS",
         }
     }
 }
@@ -125,6 +137,9 @@ const EXAMPLES_ZH: &str = "示例：
   witr-rs --watch 5 --alert-load 8 --alert-mem-pct 90   整机看门狗
   witr-rs --watch 30 --diff-auto 30   每 30 秒打印一次进程表漂移
   witr-rs --serve :9100    在 :9100 暴露 Prometheus 指标（curl :9100/api/ps 取 JSON）
+  witr-rs --sys            整机仪表盘：CPU/内存/负载/磁盘/网卡/温度/PSI（--watch 2 常驻）
+  witr-rs --top threads    线程数最多的进程（--top conn 看谁攥着最多连接）
+  witr-rs --watch 10 --alert-container   无头容器哨兵：容器退出/OOM/crash loop 即喊
   witr-rs --man witr-rs.1  写出 man 手册页";
 
 const EXAMPLES_EN: &str = "Examples:
@@ -168,6 +183,9 @@ const EXAMPLES_EN: &str = "Examples:
   witr-rs --watch 5 --alert-load 8 --alert-mem-pct 90   machine-wide watchdog
   witr-rs --watch 30 --diff-auto 30   print process-table drift every 30s
   witr-rs --serve :9100    expose Prometheus metrics on :9100 (curl :9100/api/ps for JSON)
+  witr-rs --sys            the machine dashboard: cpu/mem/load/disk/nic/temp/psi (--watch 2 to keep it live)
+  witr-rs --top threads    most-threaded processes (--top conn for who holds the most connections)
+  witr-rs --watch 10 --alert-container   headless container sentinel: exit/OOM/crash loop shouts
   witr-rs --man witr-rs.1  write the man page";
 
 fn examples() -> &'static str {
@@ -191,6 +209,8 @@ impl Cli {
         self.alert_fd = self.alert_fd.or(cfg.alert_fd);
         self.alert_io = self.alert_io.or(cfg.alert_io);
         self.alert_conn = self.alert_conn.or(cfg.alert_conn);
+        self.alert_threads = self.alert_threads.or(cfg.alert_threads);
+        self.alert_container = self.alert_container || cfg.alert_container.unwrap_or(false);
         self.alert_load = self.alert_load.or(cfg.alert_load);
         self.alert_mem_pct = self.alert_mem_pct.or(cfg.alert_mem_pct);
         self.alert_count = self.alert_count.or(cfg.alert_count);
@@ -434,6 +454,15 @@ pub struct Cli {
     pub services: bool,
 
     #[arg(
+        long = "sys",
+        help = t(
+            "整机仪表盘：CPU 占用（含每核）、内存/swap、load average、磁盘挂载点用量、网卡速率、温度与 PSI 压力（平台支持时）——系统资源页（y）的 CLI 孪生。属于无目标操作；--json / --csv / --markdown 一次性输出，--watch 常驻刷新",
+            "The machine dashboard: CPU usage (per-core included), memory/swap, load average, disk mount usage, NIC rates, temperature and PSI pressure (where the platform reports them) — the system page's (y) CLI twin. A no-target operation; --json / --csv / --markdown are one-shot, --watch keeps it refreshed"
+        )
+    )]
+    pub sys: bool,
+
+    #[arg(
         long,
         help = t(
             "列出全机的网络连接（LISTEN 之外的所有状态：ESTABLISHED / TIME_WAIT / …）——本地地址 / 对端 / 状态 / 属主进程；回环对端自动归因到本机另一端的进程。--ports 的镜像面。属于无目标操作；--csv / --markdown / --json / --watch 同样支持",
@@ -640,6 +669,25 @@ pub struct Cli {
         )
     )]
     pub alert_conn: Option<u64>,
+
+    #[arg(
+        long = "alert-threads",
+        value_name = "N",
+        help = t(
+            "进程内核线程数连续 5 次采样（约 15s）超过该值时告警——内存/fd 泄漏哨兵的线程版：线程只增不减的服务（每次请求 spawn 线程却不回收）在这里现形。TUI 和 --watch",
+            "Alert when a process exceeds this kernel thread count for 5 consecutive samples (~15s) — the thread twin of the memory/fd leak sentinels: services that spawn threads per request and never reap them surface here. TUI and --watch"
+        )
+    )]
+    pub alert_threads: Option<u64>,
+
+    #[arg(
+        long = "alert-container",
+        help = t(
+            "配合 --watch 的容器与 Pod 边缘哨兵：运行中的容器退出时取死因（OOMKilled 点名 OOM）、RestartCount 攀升提示 crash loop；集群可达时 Pod 的 CrashLoopBackOff / 回退 Pending / Failed / 重启数攀升各报一条。边缘触发、只报一次——⚠ 行、--alert-exec / --alert-webhook / --events-log 照常生效（TUI 的 Containers 页无需此旗标即已盯边缘）",
+            "Container & pod edge sentinel for a headless --watch: a running container exiting names its cause of death (OOMKilled calls out OOM), a climbing RestartCount flags a crash loop; with a reachable cluster, pod CrashLoopBackOff / back-to-Pending / Failed / restart climbs each report once. Edge-triggered, one alert per edge — the ⚠ line, --alert-exec / --alert-webhook / --events-log all apply (the TUI's Containers page watches these edges without the flag)"
+        )
+    )]
+    pub alert_container: bool,
 
     #[arg(
         long = "alert-load",
@@ -1003,7 +1051,7 @@ mod tests {
     #[test]
     fn apply_config_fills_defaults_flags_win() {
         let (cfg, _) = crate::config::Config::parse(
-            "alert_cpu = 80\nalert_webhook = \"http://cfg/hook\"\nalert_exec = cfg-cmd\nalert_silence = [\"backup=30m\"]\n",
+            "alert_cpu = 80\nalert_webhook = \"http://cfg/hook\"\nalert_exec = cfg-cmd\nalert_silence = [\"backup=30m\"]\nalert_threads = 400\nalert_container = true\n",
         );
         // flag wins over the file, file fills the rest
         let mut cli = Cli::parse_from(["witr-rs", "--alert-cpu", "95"]);
@@ -1012,6 +1060,8 @@ mod tests {
         assert_eq!(cli.alert_webhook.as_deref(), Some("http://cfg/hook"));
         assert_eq!(cli.alert_exec.as_deref(), Some("cfg-cmd"));
         assert_eq!(cli.alert_silence, vec!["backup=30m"]);
+        assert_eq!(cli.alert_threads, Some(400));
+        assert!(cli.alert_container, "file bool folds in");
         // explicit flags beat the file on every knob, silence included
         let mut cli = Cli::parse_from(["witr-rs", "--alert-silence", "db=1h", "--alert-new-proc", "miner"]);
         cli.apply_config(&cfg);
@@ -1023,5 +1073,6 @@ mod tests {
         assert!(cli.alert_cpu.is_none() && cli.alert_webhook.is_none());
         assert!(cli.alert_silence.is_empty());
         assert!(cli.alert_new_proc.is_empty());
+        assert!(!cli.alert_container);
     }
 }

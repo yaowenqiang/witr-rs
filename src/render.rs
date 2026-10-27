@@ -1028,7 +1028,7 @@ pub fn render_conns_by_peer_markdown(rows: &[PeerRow]) -> String {
 }
 
 /// Escape for HTML text content and double-quoted attributes.
-fn html_escape(s: &str) -> String {
+pub fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -1123,6 +1123,7 @@ pub fn render_top(
     count: usize,
     fds: Option<&std::collections::HashMap<crate::model::Pid, u64>>,
     rates: Option<&crate::history::History>,
+    conns: Option<&std::collections::HashMap<crate::model::Pid, u64>>,
     p: &Painter,
 ) -> String {
     let now = crate::util::now_unix();
@@ -1145,6 +1146,8 @@ pub fn render_top(
                 // age in seconds — desc order puts the oldest first
                 crate::cli::TopMetric::Age => pr.started.map(|t| (now.saturating_sub(t)) as f64),
                 crate::cli::TopMetric::Gpu => pr.gpu_sm_pct.map(|v| v as f64),
+                crate::cli::TopMetric::Threads => pr.threads.map(|n| n as f64),
+                crate::cli::TopMetric::Conn => conns.and_then(|m| m.get(&pr.pid)).map(|&n| n as f64),
             }?;
             Some((v, pr))
         })
@@ -1173,6 +1176,9 @@ pub fn render_top(
             }
             crate::cli::TopMetric::Age => fmt_age(*v as i64),
             crate::cli::TopMetric::Gpu => format!("{v:.1}"),
+            crate::cli::TopMetric::Threads | crate::cli::TopMetric::Conn => {
+                format!("{}", *v as u64)
+            }
         };
         let extra = if metric == crate::cli::TopMetric::Age {
             pr.state.clone().unwrap_or_else(|| "-".into())
@@ -1226,12 +1232,275 @@ pub fn render_top(
                 "no per-process I/O counters (a Linux /proc feature)".to_string()
             }
             crate::cli::TopMetric::Age => "no processes carry a start time".to_string(),
+            crate::cli::TopMetric::Conn => "no connection table on this platform".to_string(),
             _ => "no processes report this metric".to_string(),
         };
         let _ = writeln!(out, "({why})");
     }
     out
 }
+
+/// One `--sys` frame: the machine's own numbers, gathered by the caller
+/// (platform system_stats + mount_usage + a pair of net_counters sweeps
+/// for rates). `nics` carries per-interface rates in MB/s — empty until
+/// the second sweep arms the deltas.
+pub struct SysFrame {
+    pub stats: crate::platform::SystemStats,
+    pub mounts: Vec<crate::platform::MountUsage>,
+    /// (name, rx MB/s, tx MB/s), busiest first — the text view shows the
+    /// top 8, the flat formats total them
+    pub nics: Vec<(String, f64, f64)>,
+    pub procs: usize,
+}
+
+impl SysFrame {
+    /// Busiest mount's (used%, target) — the flat formats carry one disk
+    /// cell, the watchdog detail names the fullest mount.
+    fn worst_mount(&self) -> Option<(f64, &str)> {
+        self.mounts
+            .iter()
+            .filter(|m| m.total_mb > 0)
+            .map(|m| (m.used_mb as f64 / m.total_mb as f64 * 100.0, m.target.as_str()))
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    fn net_rx_total(&self) -> f64 {
+        self.nics.iter().map(|(_, r, _)| r).sum()
+    }
+
+    fn net_tx_total(&self) -> f64 {
+        self.nics.iter().map(|(_, _, t)| t).sum()
+    }
+}
+
+/// `--sys`: the machine dashboard as text — cpu (with the per-core grid),
+/// memory/swap, load, the fullest mounts, NIC rates, temperature and PSI.
+/// Sections the platform can't measure just don't appear.
+pub fn render_sys(frame: &SysFrame, p: &Painter) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "witr-rs sys · {}",
+        fmt_time(crate::util::now_unix())
+    );
+
+    // cpu + per-core grid (the y page draws a box per core; a flat row of
+    // percentages keeps the CLI twin one line)
+    let mut cpu = String::new();
+    match frame.stats.cpu_percent {
+        Some(c) => {
+            let styled = if c >= 90.0 {
+                p.red(&format!("{c:.1}%"))
+            } else {
+                format!("{c:.1}%")
+            };
+            cpu.push_str(&styled);
+        }
+        None => cpu.push('-'),
+    }
+    if !frame.stats.cores.is_empty() {
+        let grid = frame
+            .stats
+            .cores
+            .iter()
+            .map(|c| {
+                if *c >= 90.0 {
+                    p.red(&format!("{c:.0}"))
+                } else {
+                    format!("{c:.0}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = write!(cpu, "   cores: {grid}");
+    }
+    let _ = writeln!(out, "cpu   {cpu}");
+
+    // memory + swap
+    let mem_cell = |used: Option<u64>, total: Option<u64>| match (used, total) {
+        (Some(u), Some(t)) if t > 0 => {
+            let pct = u as f64 / t as f64 * 100.0;
+            let txt = format!(
+                "{}/{} ({pct:.0}%)",
+                crate::util::fmt_bytes(u * 1024 * 1024),
+                crate::util::fmt_bytes(t * 1024 * 1024)
+            );
+            if pct >= 90.0 {
+                p.red(&txt)
+            } else if pct >= 70.0 {
+                p.yellow(&txt)
+            } else {
+                txt
+            }
+        }
+        (Some(u), _) => crate::util::fmt_bytes(u * 1024 * 1024),
+        _ => "-".to_string(),
+    };
+    let mut mem = format!("mem   {}", mem_cell(frame.stats.mem_used_mb, frame.stats.mem_total_mb));
+    if frame.stats.swap_total_mb.is_some_and(|t| t > 0) {
+        let _ = write!(mem, "   swap {}", mem_cell(frame.stats.swap_used_mb, frame.stats.swap_total_mb));
+    }
+    let _ = writeln!(out, "{mem}");
+
+    // load + process count
+    let loads = match (frame.stats.load1, frame.stats.load5, frame.stats.load15) {
+        (Some(a), Some(b), Some(c)) => format!("{a:.2} {b:.2} {c:.2}"),
+        _ => "-".to_string(),
+    };
+    let _ = writeln!(out, "load  {}   procs {}", loads, frame.procs);
+
+    // disks: the fullest six, red past 90% like the y page
+    if !frame.mounts.is_empty() {
+        let mut ms: Vec<&crate::platform::MountUsage> = frame.mounts.iter().collect();
+        ms.sort_by(|a, b| {
+            let pa = a.total_mb.max(1) as f64;
+            let pb = b.total_mb.max(1) as f64;
+            (b.used_mb as f64 / pb)
+                .partial_cmp(&(a.used_mb as f64 / pa))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let cells: Vec<String> = ms
+            .iter()
+            .take(6)
+            .map(|m| {
+                let pct = m.used_mb as f64 / m.total_mb.max(1) as f64 * 100.0;
+                let txt = format!(
+                    "{} {}/{} {:.0}%",
+                    m.target,
+                    crate::util::fmt_bytes(m.used_mb * 1024 * 1024),
+                    crate::util::fmt_bytes(m.total_mb * 1024 * 1024),
+                    pct
+                );
+                if pct >= 90.0 {
+                    p.red(&txt)
+                } else if pct >= 70.0 {
+                    p.yellow(&txt)
+                } else {
+                    txt
+                }
+            })
+            .collect();
+        let _ = writeln!(out, "disk  {}", cells.join("  "));
+    }
+
+    // network: the busiest eight interfaces by rx+tx
+    if !frame.nics.is_empty() {
+        let cells: Vec<String> = frame
+            .nics
+            .iter()
+            .take(8)
+            .map(|(name, rx, tx)| format!("{name} ↓{} ↑{}", crate::util::fmt_rate(*rx * 1024.0 * 1024.0), crate::util::fmt_rate(*tx * 1024.0 * 1024.0)))
+            .collect();
+        let _ = writeln!(out, "net   {}", cells.join("  "));
+    }
+
+    // temperature + PSI, where the kernel reports them
+    if let Some((label, c)) = &frame.stats.temp {
+        let txt = format!("{label} {c:.0}°C");
+        let styled = if *c >= 80.0 {
+            p.red(&txt)
+        } else if *c >= 65.0 {
+            p.yellow(&txt)
+        } else {
+            txt
+        };
+        let _ = writeln!(out, "temp  {styled}");
+    }
+    if let Some(psi) = &frame.stats.psi {
+        let line = psi.line();
+        let worst = psi.worst_full();
+        let styled = if worst >= 10.0 {
+            p.red(&line)
+        } else {
+            line
+        };
+        let _ = writeln!(out, "psi   {styled}");
+    }
+    out
+}
+
+/// `--sys --csv`: the whole frame as one flat row (empty cell = the
+/// platform doesn't report it; disk/net ride their busiest/total summaries).
+pub fn render_sys_csv(frame: &SysFrame) -> String {
+    let cells = sys_flat_cells(frame);
+    let mut out = String::new();
+    // csv headers run lowercase snake (render_csv's convention); the same
+    // cells render UPPERCASE in the markdown twin
+    let _ = writeln!(
+        out,
+        "{}",
+        cells
+            .iter()
+            .map(|(h, _)| h.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let _ = writeln!(out, "{}", cells.iter().map(|(_, v)| csv_field(v)).collect::<Vec<_>>().join(","));
+    out
+}
+
+/// `--sys --markdown`: the same flat row pasted into docs.
+pub fn render_sys_markdown(frame: &SysFrame) -> String {
+    let cells = sys_flat_cells(frame);
+    let mut out = String::from("| ");
+    out.push_str(&cells.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>().join(" | "));
+    out.push_str(" |\n|");
+    out.push_str(&"|".repeat(cells.len() + 1));
+    out.push_str("\n| ");
+    out.push_str(&cells.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join(" | "));
+    out.push_str(" |\n");
+    out
+}
+
+/// The flat `--sys` row as (header, value) pairs, shared by --csv and
+/// --markdown. Empty value = the platform doesn't report that number.
+fn sys_flat_cells(frame: &SysFrame) -> Vec<(String, String)> {
+    let s = &frame.stats;
+    let f = |v: Option<f64>, prec: usize| v.map(|v| format!("{v:.prec$}")).unwrap_or_default();
+    let i = |v: Option<u64>| v.map(|v| v.to_string()).unwrap_or_default();
+    let worst = frame.worst_mount();
+    let cells: Vec<(String, String)> = vec![
+        ("CPU_PCT".into(), f(s.cpu_percent, 1)),
+        ("MEM_USED_MB".into(), i(s.mem_used_mb)),
+        ("MEM_TOTAL_MB".into(), i(s.mem_total_mb)),
+        ("SWAP_USED_MB".into(), i(s.swap_used_mb)),
+        ("SWAP_TOTAL_MB".into(), i(s.swap_total_mb)),
+        ("LOAD1".into(), f(s.load1, 2)),
+        ("LOAD5".into(), f(s.load5, 2)),
+        ("LOAD15".into(), f(s.load15, 2)),
+        ("PROCS".into(), frame.procs.to_string()),
+        (
+            "DISK_USED_PCT".into(),
+            worst.map(|(p, _)| format!("{p:.1}")).unwrap_or_default(),
+        ),
+        (
+            "DISK_MOUNT".into(),
+            worst.map(|(_, t)| t.to_string()).unwrap_or_default(),
+        ),
+        ("NET_RX_MBPS".into(), f(Some(frame.net_rx_total()), 2)),
+        ("NET_TX_MBPS".into(), f(Some(frame.net_tx_total()), 2)),
+        (
+            "TEMP_C".into(),
+            s.temp
+                .as_ref()
+                .map(|(_, c)| format!("{c:.1}"))
+                .unwrap_or_default(),
+        ),
+        (
+            "TEMP_SENSOR".into(),
+            s.temp.as_ref().map(|(l, _)| l.clone()).unwrap_or_default(),
+        ),
+        (
+            "PSI_WORST_FULL_PCT".into(),
+            s.psi
+                .as_ref()
+                .map(|p| format!("{:.1}", p.worst_full()))
+                .unwrap_or_default(),
+        ),
+    ];
+    cells
+}
+
 
 /// `--report-html FILE`: a self-contained report — no JS, no external
 /// assets. Summary + top-5 lists + the full table, with css bars for the
@@ -2418,20 +2687,20 @@ mod tests {
             proc(2, "high", Some(9.0), Some(8192)),
             proc(3, "unknown", None, None),
         ];
-        let out = render_top(&procs, TopMetric::Cpu, 10, None, None, &painter);
+        let out = render_top(&procs, TopMetric::Cpu, 10, None, None, None, &painter);
         let high = out.find("high").unwrap();
         let low = out.find("low").unwrap();
         assert!(high < low, "9.0 ranks above 0.5:\n{out}");
         assert!(!out.contains("unknown"), "unmeasured processes drop out");
         // count caps the rows
-        let out2 = render_top(&procs, TopMetric::Cpu, 1, None, None, &painter);
+        let out2 = render_top(&procs, TopMetric::Cpu, 1, None, None, None, &painter);
         assert!(out2.contains("high"));
         assert!(!out2.contains("low"), "count=1 keeps only the best");
         // fd without a counts map → nothing to rank, note explains
-        let out3 = render_top(&procs, TopMetric::Fd, 10, None, None, &painter);
+        let out3 = render_top(&procs, TopMetric::Fd, 10, None, None, None, &painter);
         assert!(out3.contains("no fd counts"));
         // io never measured → platform note
-        let out4 = render_top(&procs, TopMetric::Io, 10, None, None, &painter);
+        let out4 = render_top(&procs, TopMetric::Io, 10, None, None, None, &painter);
         assert!(out4.contains("no per-process I/O counters"));
     }
 
@@ -2444,7 +2713,7 @@ mod tests {
         let mut fds = HashMap::new();
         fds.insert(1, 4u64);
         fds.insert(2, 900u64);
-        let out = render_top(&procs, TopMetric::Fd, 10, Some(&fds), None, &painter);
+        let out = render_top(&procs, TopMetric::Fd, 10, Some(&fds), None, None, &painter);
         let b = out.find("b").unwrap();
         let a = out.find("a").unwrap();
         assert!(b < a, "900 fds ranks above 4:\n{out}");
@@ -2461,5 +2730,109 @@ mod tests {
         assert!(html.contains("width:100%"), "max-cpu row gets a full bar");
         assert!(html.contains("Top CPU"));
         assert!(html.contains("1 processes"));
+    }
+
+    #[test]
+    fn render_top_threads_and_conn() {
+        use crate::cli::TopMetric;
+        let painter = Painter::new(false);
+        let mut a = proc(1, "a", None, None);
+        a.threads = Some(4);
+        let mut b = proc(2, "b", None, None);
+        b.threads = Some(64);
+        let out = render_top(&[a, b], TopMetric::Threads, 10, None, None, None, &painter);
+        let b = out.find("b").unwrap();
+        let a = out.find("a").unwrap();
+        assert!(b < a, "64 threads ranks above 4:\n{out}");
+        assert!(out.contains("THR"));
+
+        use std::collections::HashMap;
+        let mut conns = HashMap::new();
+        conns.insert(2, 40u64);
+        let procs = vec![proc(1, "a", None, None), proc(2, "b", None, None)];
+        let out = render_top(&procs, TopMetric::Conn, 10, None, None, Some(&conns), &painter);
+        let b = out.find("b").unwrap();
+        let a = out.find("a").unwrap();
+        assert!(b < a, "40 conns ranks above unlisted:\n{out}");
+        assert!(out.contains("CONNS"));
+    }
+
+    #[test]
+    fn render_sys_text_csv_and_markdown() {
+        let painter = Painter::new(false);
+        let stats = crate::platform::SystemStats {
+            cpu_percent: Some(37.25),
+            cores: vec![10.0, 95.0],
+            mem_used_mb: Some(6000),
+            mem_total_mb: Some(16000),
+            swap_used_mb: Some(512),
+            swap_total_mb: Some(4096),
+            load1: Some(0.42),
+            load5: Some(0.35),
+            load15: Some(0.30),
+            psi: Some(crate::platform::PsiStats {
+                cpu_some: 1.2,
+                cpu_full: 0.0,
+                mem_some: 0.4,
+                mem_full: 0.0,
+                io_some: 3.1,
+                io_full: 12.5,
+            }),
+            temp: Some(("acpitz".into(), 54.0)),
+        };
+        let frame = SysFrame {
+            stats,
+            mounts: vec![crate::platform::MountUsage {
+                target: "/".into(),
+                total_mb: 51_200,
+                used_mb: 50_000,
+            }],
+            nics: vec![("eth0".into(), 12.5, 1.25), ("eth1".into(), 0.0, 0.0)],
+            procs: 214,
+        };
+        let text = render_sys(&frame, &painter);
+        assert!(text.contains("cpu   37.2%"), "{text}");
+        assert!(text.contains("cores: 10 95"));
+        assert!(text.contains("swap"));
+        assert!(text.contains("load  0.42 0.35 0.30"));
+        assert!(text.contains("procs 214"));
+        assert!(text.contains("disk  /"), "fullest mount first: {text}");
+        assert!(text.contains("net   eth0"));
+        assert!(text.contains("temp  acpitz 54°C"));
+        assert!(text.contains("psi   cpu 1.2/0.0"));
+
+        let csv = render_sys_csv(&frame);
+        let mut lines = csv.lines();
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap();
+        assert_eq!(header.split(',').count(), row.split(',').count(), "{csv}");
+        assert!(header.starts_with("cpu_pct,mem_used_mb"));
+        assert!(row.starts_with("37.2,6000,16000,512,4096,0.42,0.35,0.30,214,"));
+        assert!(row.contains("97.7"), "disk used pct: {row}");
+        assert!(row.ends_with(",54.0,acpitz,12.5"), "temp/psi tail: {row}");
+
+        let md = render_sys_markdown(&frame);
+        assert!(md.starts_with("| CPU_PCT |"));
+        assert!(md.contains("| 37.2 | 6000 |"));
+    }
+
+    #[test]
+    fn render_sys_handles_missing_sections() {
+        // a platform reporting nothing renders dashes, not panics
+        let painter = Painter::new(false);
+        let frame = SysFrame {
+            stats: crate::platform::SystemStats::default(),
+            mounts: Vec::new(),
+            nics: Vec::new(),
+            procs: 0,
+        };
+        let text = render_sys(&frame, &painter);
+        assert!(text.contains("cpu   -"));
+        assert!(text.contains("mem   -"));
+        assert!(text.contains("load  -   procs 0"));
+        assert!(!text.contains("disk"), "{text}");
+        assert!(!text.contains("net "), "{text}");
+        let csv = render_sys_csv(&frame);
+        assert!(csv.lines().nth(1).unwrap().starts_with(",,,,"));
     }
 }

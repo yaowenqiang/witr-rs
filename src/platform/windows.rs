@@ -176,6 +176,42 @@ fn toolhelp_snapshot() -> PlatResult<Vec<SnapProc>> {
     }
 }
 
+/// One thread snapshot, folded into pid → live-thread counts. Same cost
+/// class as the process snapshot itself (one kernel walk), so the listing
+/// can carry the Threads column the way Linux's /proc stat does.
+fn thread_counts() -> Option<std::collections::HashMap<Pid, u32>> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32FirstW, Thread32NextW, TH32CS_SNAPTHREAD,
+            THREADENTRY32W,
+        };
+        let mut out: std::collections::HashMap<Pid, u32> = std::collections::HashMap::new();
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).ok()?;
+            let mut entry = THREADENTRY32W::default();
+            entry.dwSize = std::mem::size_of::<THREADENTRY32W>() as u32;
+            if Thread32FirstW(snap, &mut entry).is_ok() {
+                loop {
+                    *out
+                        .entry(entry.th32OwnerProcessID as Pid)
+                        .or_insert(0) += 1;
+                    if Thread32NextW(snap, &mut entry).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = CloseHandle(snap);
+        }
+        Some(out)
+    }
+    #[cfg(not(windows))]
+    {
+        None // windows-only snapshot
+    }
+}
+
 // ---------- Restart Manager file holders ----------
 
 /// Which pids hold `path` open / locked, via the Restart Manager API
@@ -629,6 +665,7 @@ impl Platform for Windows {
             .map(|o| parse_tasklist_mem(&String::from_utf8_lossy(&o.stdout)))
             .unwrap_or_default();
         let cpu = cpu_time_map().unwrap_or_default();
+        let threads = thread_counts().unwrap_or_default();
         Ok(snap
             .into_iter()
             .map(|s| Process {
@@ -637,6 +674,7 @@ impl Platform for Windows {
                 name: basename(&s.exe),
                 mem_kb: mem.get(&s.pid).copied(),
                 cpu_time_ms: cpu.get(&s.pid).copied(),
+                threads: threads.get(&s.pid).copied().filter(|n| *n > 0),
                 ..Default::default()
             })
             .collect())

@@ -599,6 +599,7 @@ fn top_procs(
     count: usize,
     fds: Option<&std::collections::HashMap<Pid, u64>>,
     rates: Option<&history::History>,
+    conns: Option<&std::collections::HashMap<Pid, u64>>,
 ) -> Vec<Process> {
     let mut ranked: Vec<(f64, &Process)> = procs
         .iter()
@@ -621,6 +622,8 @@ fn top_procs(
                     p.started.map(|t| (util::now_unix().saturating_sub(t)) as f64)
                 }
                 cli::TopMetric::Gpu => p.gpu_sm_pct.map(|v| v as f64),
+                cli::TopMetric::Threads => p.threads.map(|n| n as f64),
+                cli::TopMetric::Conn => conns.and_then(|m| m.get(&p.pid)).map(|&n| n as f64),
             }?;
             Some((v, p))
         })
@@ -634,6 +637,46 @@ fn top_procs(
 /// `--top --json`): scripts can key off `schema_version` instead of
 /// guessing the shape. Bump [`SCHEMA_VERSION`] on breaking field changes.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// One `--sys` frame: platform stats + mounts, plus per-NIC rates diffed
+/// against the caller's previous sweep (`net_prev` — None only arms; the
+/// first frame carries no rates, like the machine page's sparkline).
+fn sys_frame(
+    platform: &dyn Platform,
+    net_prev: &mut Option<(Vec<platform::NicCounters>, Instant)>,
+    procs: usize,
+) -> render::SysFrame {
+    let stats = platform.system_stats().unwrap_or_default();
+    let mounts = platform.mount_usage();
+    let counters = platform.net_counters();
+    let mut nics: Vec<(String, f64, f64)> = Vec::new();
+    if let Some((prev, at)) = net_prev.as_ref() {
+        let elapsed = at.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            for c in &counters {
+                if let Some(p) = prev.iter().find(|p| p.name == c.name) {
+                    nics.push((
+                        c.name.clone(),
+                        c.rx_bytes.saturating_sub(p.rx_bytes) as f64 / elapsed / 1024.0 / 1024.0,
+                        c.tx_bytes.saturating_sub(p.tx_bytes) as f64 / elapsed / 1024.0 / 1024.0,
+                    ));
+                }
+            }
+            nics.sort_by(|a, b| {
+                (b.1 + b.2)
+                    .partial_cmp(&(a.1 + a.2))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+    }
+    *net_prev = Some((counters, Instant::now()));
+    render::SysFrame {
+        stats,
+        mounts,
+        nics,
+        procs,
+    }
+}
 
 pub(crate) fn json_envelope(procs: &[Process]) -> String {
     let doc = serde_json::json!({
@@ -724,7 +767,8 @@ fn watch_alert_picks(
         || cli.alert_mem.is_some()
         || cli.alert_fd.is_some()
         || cli.alert_io.is_some()
-        || cli.alert_conn.is_some();
+        || cli.alert_conn.is_some()
+        || cli.alert_threads.is_some();
     if !armed {
         return Vec::new();
     }
@@ -856,6 +900,28 @@ fn watch_alert_picks(
                 ));
             } else if edge == history::AlertEdge::Recover {
                 out.push((p.pid, p.name.clone(), format!("connections back under {limit}"), true));
+            }
+        }
+        if let Some(limit) = cli.alert_threads {
+            let n = p.threads.map(|t| t as u64);
+            let over = n.is_some_and(|c| c > limit);
+            let edge = history::alert_cycle_repeat(
+                &mut track.threads_streak,
+                &mut track.threads_firing,
+                over,
+                &mut track.threads_fired_secs,
+                repeat,
+                interval,
+            );
+            if edge == history::AlertEdge::Fire {
+                out.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!("{} thread(s) above {limit} for {secs}s", n.unwrap_or(0)),
+                    false,
+                ));
+            } else if edge == history::AlertEdge::Recover {
+                out.push((p.pid, p.name.clone(), format!("threads back under {limit}"), true));
             }
         }
     }
@@ -1512,6 +1578,10 @@ fn main() {
         eprintln!("--quiet suppresses the --watch redraw; add --watch SECONDS");
         std::process::exit(4);
     }
+    if cli.alert_container && cli.watch.is_none() {
+        eprintln!("--alert-container rides a headless --watch; add --watch SECONDS");
+        std::process::exit(4);
+    }
     if cli.on_start.is_some() && cli.watch.is_none() && !cli.follow {
         eprintln!("--on-start fires in watch/follow mode; add --watch or --follow");
         std::process::exit(4);
@@ -1564,6 +1634,8 @@ fn main() {
         || cli.alert_fd.is_some()
         || cli.alert_io.is_some()
         || cli.alert_conn.is_some()
+        || cli.alert_threads.is_some()
+        || cli.alert_container
         || cli.alert_load.is_some()
         || cli.alert_mem_pct.is_some()
         || cli.alert_count.is_some()
@@ -1681,7 +1753,8 @@ fn main() {
             || cli.conns
             || cli.locks
             || cli.zombies
-            || cli.services;
+            || cli.services
+            || cli.sys;
         if clash {
             eprintln!("--ports is a standalone listing; drop the targets and other modes (it pairs with --csv/--json/--watch)");
             std::process::exit(4);
@@ -1710,6 +1783,7 @@ fn main() {
             || cli.locks
             || cli.zombies
             || cli.services
+            || cli.sys
             || cli.by_name;
         if clash {
             eprintln!("--conns is a standalone listing; drop the targets and other modes (it pairs with --csv/--markdown/--json/--watch)");
@@ -1822,6 +1896,7 @@ fn main() {
         ("--zombies", cli.zombies),
         ("--locks", cli.locks),
         ("--services", cli.services),
+        ("--sys", cli.sys),
     ] {
         if on {
             let clash = !specs.is_empty()
@@ -1842,7 +1917,7 @@ fn main() {
                 || cli.by_name
                 || cli.pids_only
                 || cli.wait.is_some()
-                || cli.watch.is_some()
+                || (cli.watch.is_some() && flag != "--sys")
                 || cli.follow
                 || cli.audit.is_some()
                 || cli.kill
@@ -1852,6 +1927,12 @@ fn main() {
                 std::process::exit(4);
             }
         }
+    }
+    // --sys --watch redraws the human table only; machine-readable frames
+    // are one-shot (their consumers own their cadence, like --ports)
+    if cli.sys && cli.watch.is_some() && (cli.json || cli.csv || cli.markdown) {
+        eprintln!("machine-readable --sys is one-shot; drop --watch or the format flag");
+        std::process::exit(4);
     }
     if cli.record.is_some() && cli.watch.is_none() {
         eprintln!("--record samples alongside --watch; add --watch SECONDS");
@@ -2296,6 +2377,81 @@ fn main() {
         std::process::exit(0);
     }
 
+    // --sys: the machine dashboard (the system page's CLI twin). CPU% and
+    // NIC rates are delta metrics — a one-shot takes two samples a second
+    // apart (the io-rate pattern); --watch diffs across ticks.
+    if cli.sys {
+        let platform = platform::get();
+        let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+        let count = |platform: &dyn Platform| -> usize {
+            platform.list_processes().map(|p| p.len()).unwrap_or(0)
+        };
+        if let Some(secs) = cli.watch {
+            let interval = secs.max(1);
+            install_sigint_flag();
+            let mut net_prev: Option<(Vec<platform::NicCounters>, Instant)> = None;
+            let mut ticks: u64 = 0;
+            loop {
+                let frame = sys_frame(platform.as_ref(), &mut net_prev, count(platform.as_ref()));
+                write_out("\x1b[2J\x1b[1;1H");
+                write_out(&format!(
+                    "witr-rs sys · every {interval}s · Ctrl-C to stop\n{}",
+                    render::render_sys(&frame, &painter)
+                ));
+                ticks += 1;
+                if cli.times.is_some_and(|n| ticks >= n.max(1)) {
+                    std::process::exit(0);
+                }
+                if !sleep_interruptible(interval) {
+                    std::process::exit(130);
+                }
+            }
+        }
+        let mut net_prev: Option<(Vec<platform::NicCounters>, Instant)> = None;
+        let _ = sys_frame(platform.as_ref(), &mut net_prev, count(platform.as_ref()));
+        std::thread::sleep(Duration::from_secs(1));
+        let frame = sys_frame(platform.as_ref(), &mut net_prev, count(platform.as_ref()));
+        if cli.json {
+            let s = &frame.stats;
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "cpu_pct": s.cpu_percent,
+                "cores": s.cores,
+                "mem_used_mb": s.mem_used_mb,
+                "mem_total_mb": s.mem_total_mb,
+                "swap_used_mb": s.swap_used_mb,
+                "swap_total_mb": s.swap_total_mb,
+                "load1": s.load1,
+                "load5": s.load5,
+                "load15": s.load15,
+                "procs": frame.procs,
+                "mounts": frame.mounts.iter().map(|m| serde_json::json!({
+                    "target": m.target, "used_mb": m.used_mb, "total_mb": m.total_mb,
+                })).collect::<Vec<_>>(),
+                "nics": frame.nics.iter().map(|(n, r, t)| serde_json::json!({
+                    "name": n, "rx_mbps": r, "tx_mbps": t,
+                })).collect::<Vec<_>>(),
+                "temp": s.temp.as_ref().map(|(l, c)| serde_json::json!({
+                    "sensor": l, "celsius": c,
+                })),
+                "psi": s.psi.as_ref().map(|p| serde_json::json!({
+                    "cpu_some": p.cpu_some, "cpu_full": p.cpu_full,
+                    "mem_some": p.mem_some, "mem_full": p.mem_full,
+                    "io_some": p.io_some, "io_full": p.io_full,
+                })),
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if cli.csv {
+            write_out(&render::render_sys_csv(&frame));
+        } else if cli.markdown {
+            write_out(&render::render_sys_markdown(&frame));
+        } else {
+            write_out(&render::render_sys(&frame, &painter));
+        }
+        std::process::exit(0);
+    }
+
     // --serve: Prometheus endpoint — samples the table on every scrape, so
     // it needs no interval of its own; a standalone mode like --snap/--diff
     // (compat rules validated above).
@@ -2423,6 +2579,7 @@ fn main() {
                 // targets aren't carried: reseed() only reads knobs
                 tui::Seed::default().with_knobs(&fresh, &config::Config::load())
             })),
+            alert_threads: cli.alert_threads,
             ..tui::Seed::from_targets(
                 &cli.names, &cli.pids, &cli.ports, &cli.files, &cli.containers,
             )
@@ -2699,6 +2856,13 @@ fn main() {
                 } else {
                     None
                 };
+                let conns = if metric == cli::TopMetric::Conn {
+                    Some(tui::established_per_pid(
+                        &platform.list_all_sockets().unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                };
                 write_out("\x1b[2J\x1b[1;1H");
                 let now = util::fmt_time(util::now_unix());
                 write_out(&format!(
@@ -2713,6 +2877,7 @@ fn main() {
                     count,
                     fds.as_ref(),
                     Some(&hist),
+                    conns.as_ref(),
                     &painter,
                 ));
                 ticks += 1;
@@ -2739,6 +2904,15 @@ fn main() {
                     std::process::exit(4);
                 }
             }
+        } else {
+            None
+        };
+        // conn ranking needs the socket table once (attribution rides the
+        // same sweep the Ports page uses)
+        let conns = if cli.top == Some(cli::TopMetric::Conn) {
+            Some(tui::established_per_pid(
+                &platform.list_all_sockets().unwrap_or_default(),
+            ))
         } else {
             None
         };
@@ -2774,7 +2948,8 @@ fn main() {
                 None
             };
             if cli.json {
-                let ranked = top_procs(&procs, metric, count, fds.as_ref(), rates.as_ref());
+                let ranked =
+                    top_procs(&procs, metric, count, fds.as_ref(), rates.as_ref(), conns.as_ref());
                 write_out(&json_envelope(&ranked));
             } else if cli.csv {
                 write_out(&render::render_csv(&top_procs(
@@ -2783,6 +2958,7 @@ fn main() {
                     count,
                     fds.as_ref(),
                     rates.as_ref(),
+                    conns.as_ref(),
                 )));
             } else if cli.markdown {
                 write_out(&render::render_markdown(&top_procs(
@@ -2791,6 +2967,7 @@ fn main() {
                     count,
                     fds.as_ref(),
                     rates.as_ref(),
+                    conns.as_ref(),
                 )));
             } else {
                 write_out(&render::render_top(
@@ -2799,6 +2976,7 @@ fn main() {
                     count,
                     fds.as_ref(),
                     rates.as_ref(),
+                    conns.as_ref(),
                     &painter,
                 ));
             }
@@ -2859,6 +3037,7 @@ fn main() {
                 watch: cfg.watch.clone(),
                 notes: cfg.notes,
                 replay_follow: cli.replay.clone().filter(|_| cli.follow),
+                alert_threads: cli.alert_threads,
                 ..tui::Seed::default()
             };
             if let Err(e) = tui::run(seed) {
@@ -2951,6 +3130,13 @@ fn main() {
             // --diff-auto: the previous frame to diff against
             let mut last_frame: Option<(Vec<Process>, Vec<snapshot::Listener>)> = None;
             let mut last_diff = Instant::now();
+            // --alert-container: the container/pod sweep rides a background
+            // thread (runtime CLIs take seconds) on a slower cadence than
+            // the tick; the shared edge detector fires once per edge
+            let mut container_edges = history::ContainerEdges::default();
+            let mut container_rx: Option<std::sync::mpsc::Receiver<(Vec<model::Container>, Vec<crate::k8s::Pod>)>> = None;
+            let mut container_swept_at: Option<Instant> = None;
+            let container_every = Duration::from_secs(10).max(Duration::from_secs(interval.max(1)));
             // the most recent firings, repeated under the header so a redraw
             // doesn't erase them from view
             let mut recent_alerts: Vec<String> = Vec::new();
@@ -3137,6 +3323,43 @@ fn main() {
                             interval,
                         ) {
                             picks.push((0, name, detail, rec));
+                        }
+                    }
+                }
+                // --alert-container: kick a background enumeration when the
+                // last one is old enough, then fold in whatever landed —
+                // firings ride the same picks pipeline as every other alert
+                if cli.alert_container {
+                    if container_rx.is_none() {
+                        let due = match container_swept_at {
+                            Some(t) => t.elapsed() >= container_every,
+                            None => true,
+                        };
+                        if due {
+                            container_swept_at = Some(Instant::now());
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let mut cs = platform::enumerate_containers();
+                                let pods = k8s::pods().unwrap_or_default();
+                                k8s::annotate_with(&pods, &mut cs);
+                                for c in cs.iter_mut().filter(|c| c.state == "running") {
+                                    if c.restarts.is_none() {
+                                        c.restarts = platform::container_restarts(&c.runtime, &c.id);
+                                    }
+                                }
+                                let _ = tx.send((cs, pods));
+                            });
+                            container_rx = Some(rx);
+                        }
+                    }
+                    if let Some(rx) = &container_rx {
+                        if let Ok((cs, pods)) = rx.try_recv() {
+                            container_rx = None;
+                            for (name, detail) in
+                                container_edges.update(&cs, &pods, container_stream.is_some())
+                            {
+                                picks.push((0, name, detail, false));
+                            }
                         }
                     }
                 }
@@ -3735,14 +3958,14 @@ mod tests {
             proc(2, "b", Some(9.0), Some(8192)),
             proc(3, "c", Some(4.0), Some(4096)),
         ];
-        let top = top_procs(&procs, cli::TopMetric::Cpu, 2, None, None);
+        let top = top_procs(&procs, cli::TopMetric::Cpu, 2, None, None, None);
         let names: Vec<&str> = top.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["b", "c"]);
         // mem ranking uses the same rows, different key
-        let top_mem = top_procs(&procs, cli::TopMetric::Mem, 1, None, None);
+        let top_mem = top_procs(&procs, cli::TopMetric::Mem, 1, None, None, None);
         assert_eq!(top_mem[0].name, "b");
         // fd with no map → nothing
-        assert!(top_procs(&procs, cli::TopMetric::Fd, 5, None, None).is_empty());
+        assert!(top_procs(&procs, cli::TopMetric::Fd, 5, None, None, None).is_empty());
     }
 
     #[test]
@@ -3971,6 +4194,110 @@ mod tests {
 
     fn procs_of(p: Process) -> Vec<Process> {
         vec![p]
+    }
+
+    #[test]
+    fn top_procs_threads_and_conn_rank() {
+        let mut a = proc(1, "a", None, None);
+        a.threads = Some(4);
+        let mut b = proc(2, "b", None, None);
+        b.threads = Some(64);
+        let c = proc(3, "c", None, None); // no thread data → drops out
+        let top = top_procs(&[a, b, c], cli::TopMetric::Threads, 10, None, None, None);
+        assert_eq!(top.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+
+        let mut conns = HashMap::new();
+        conns.insert(1, 7u64);
+        conns.insert(2, 2u64);
+        let top = top_procs(
+            &[proc(1, "a", None, None), proc(2, "b", None, None)],
+            cli::TopMetric::Conn,
+            10,
+            None,
+            None,
+            Some(&conns),
+        );
+        assert_eq!(top.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    }
+
+    #[test]
+    fn watch_alert_threads_fires_after_streak() {
+        let cli = cli::Cli::parse_from(["witr", "--alert-threads", "100"]);
+        let platform = NoPlatform;
+        let hist = history::History::new();
+        let mut state = HashMap::new();
+        let mut fds = HashMap::new();
+        let mut conns = HashMap::new();
+        let mut leaky = proc(9, "leaky", None, None);
+        leaky.threads = Some(120);
+        let leaky = vec![leaky];
+        for _ in 0..history::ALERT_CYCLES - 1 {
+            assert!(watch_alert_picks(&platform, &cli, &leaky, &hist, 1, &mut state, &mut fds, &mut conns).is_empty());
+        }
+        let fired = watch_alert_picks(&platform, &cli, &leaky, &hist, 1, &mut state, &mut fds, &mut conns);
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert!(fired[0].2.contains("120 thread(s) above 100"), "{}", fired[0].2);
+        // latched until the count drops back under
+        assert!(watch_alert_picks(&platform, &cli, &leaky, &hist, 1, &mut state, &mut fds, &mut conns).is_empty());
+    }
+
+    #[test]
+    fn sys_frame_diffs_nic_rates_against_previous_sweep() {
+        struct NetPlatform {
+            rx: std::sync::atomic::AtomicU64,
+        }
+        impl Platform for NetPlatform {
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            fn capabilities(&self) -> platform::Capabilities {
+                platform::Capabilities { file_lookup: false, env: false }
+            }
+            fn list_processes(&self) -> platform::PlatResult<Vec<Process>> {
+                Ok(Vec::new())
+            }
+            fn detail(&self, brief: &Process, _want_env: bool) -> Process {
+                brief.clone()
+            }
+            fn port_to_sockets(&self, _port: u16) -> platform::PlatResult<Vec<model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn list_sockets(&self) -> platform::PlatResult<Vec<model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn file_to_pids(&self, _path: &str) -> platform::PlatResult<Vec<i32>> {
+                Ok(Vec::new())
+            }
+            fn container_of(&self, _pid: i32) -> Option<model::Source> {
+                None
+            }
+            fn service_source(&self, _procs: &[Process]) -> Option<model::Source> {
+                None
+            }
+            fn net_counters(&self) -> Vec<platform::NicCounters> {
+                use std::sync::atomic::Ordering::Relaxed;
+                vec![platform::NicCounters {
+                    name: "eth0".into(),
+                    rx_bytes: self.rx.load(Relaxed),
+                    tx_bytes: 0,
+                }]
+            }
+        }
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let platform = NetPlatform { rx: AtomicU64::new(0) };
+        let mut prev = None;
+        // first frame arms only — no rates yet
+        let f = sys_frame(&platform, &mut prev, 3);
+        assert!(f.nics.is_empty());
+        assert_eq!(f.procs, 3);
+        // 1 MB arriving over ~60 ms → a real rx rate on the second frame
+        platform.rx.store(1024 * 1024, Relaxed);
+        std::thread::sleep(Duration::from_millis(60));
+        let frame = sys_frame(&platform, &mut prev, 3);
+        assert_eq!(frame.nics.len(), 1);
+        assert_eq!(frame.nics[0].0, "eth0");
+        assert!(frame.nics[0].1 > 1.0, "rx MB/s: {:?}", frame.nics);
+        assert_eq!(frame.nics[0].2, 0.0);
     }
 
     struct NoPlatform;

@@ -36,6 +36,9 @@ pub struct AlertTrack {
     pub conn_streak: u32,
     pub conn_firing: bool,
     pub conn_fired_secs: u32,
+    pub threads_streak: u32,
+    pub threads_firing: bool,
+    pub threads_fired_secs: u32,
 }
 
 /// What one sample did to a metric's alert cycle: nothing, a threshold
@@ -526,6 +529,126 @@ pub fn machine_net_rate(total: (u64, u64), state: &mut SysAlertState) -> Option<
 /// `<metric> back under <limit>`.
 pub type SysPick = (String, String, bool);
 
+/// Shared container/pod edge detector. The TUI (Containers tab open) and
+/// the headless `--watch --alert-container` loop both feed it fresh
+/// enumerations; first sighting arms quietly, afterwards each edge fires
+/// exactly once: a running container dying (with the inspect'ed cause of
+/// death), a climbing runtime RestartCount, and — with a reachable
+/// cluster — pod waiting reasons (CrashLoopBackOff & co), Running →
+/// Pending, Failed phase, climbing k8s restart totals.
+#[derive(Default)]
+pub struct ContainerEdges {
+    /// "runtime/id" → (state, restarts) of the previous enumeration.
+    container_seen: std::collections::HashMap<String, (String, Option<u32>)>,
+    /// pod key → (phase, restarts, waiting reason) of the previous sweep.
+    pod_seen: std::collections::HashMap<String, (Option<String>, u32, Option<String>)>,
+}
+
+impl ContainerEdges {
+    /// Fold one enumeration in, return the (name, detail) firings. Inspect
+    /// calls (exit reason) happen only on the death edge. `stream_live`
+    /// suppresses the death edge — a live docker/podman `events` stream
+    /// owns instant death reporting, and the sweep-diff double-firing it
+    /// would be noise (the sweep still records state, so the detector's
+    /// memory stays correct for every other edge).
+    pub fn update(
+        &mut self,
+        cs: &[crate::model::Container],
+        pods: &[crate::k8s::Pod],
+        stream_live: bool,
+    ) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for c in cs {
+            let key = format!("{}/{}", c.runtime, c.id);
+            if let Some((st, rst)) = self.container_seen.get(&key) {
+                let pod_tag = match &c.pod {
+                    Some(p) => format!(" · pod {p}"),
+                    None => String::new(),
+                };
+                let was_running = st == "running";
+                let now_dead = matches!(c.state.as_str(), "exited" | "dead");
+                if was_running && now_dead && !stream_live {
+                    let reason = crate::platform::container_exit_reason(&c.runtime, &c.id)
+                        .unwrap_or_else(|| c.status.clone());
+                    out.push((
+                        format!("container {}", c.name),
+                        format!("exited — {reason}{pod_tag}"),
+                    ));
+                }
+                if let (Some(old), Some(new)) = (*rst, c.restarts) {
+                    if new > old {
+                        out.push((
+                            format!("container {}", c.name),
+                            format!("restart count {old} → {new} (crash loop?){pod_tag}"),
+                        ));
+                    }
+                }
+            }
+            self.container_seen
+                .insert(key, (c.state.clone(), c.restarts));
+        }
+        // removed containers drop out of the edge detector's memory
+        let live: std::collections::HashSet<String> = cs
+            .iter()
+            .map(|c| format!("{}/{}", c.runtime, c.id))
+            .collect();
+        self.container_seen.retain(|k, _| live.contains(k));
+
+        for p in pods {
+            if let Some((phase, restarts, waiting)) = self.pod_seen.get(&p.key) {
+                if p.waiting.is_some() && *waiting != p.waiting {
+                    out.push((
+                        format!("pod {}", p.key),
+                        format!(
+                            "containers waiting: {}{}",
+                            p.waiting.clone().unwrap_or_default(),
+                            match &p.phase {
+                                Some(ph) => format!(" (phase {ph})"),
+                                None => String::new(),
+                            }
+                        ),
+                    ));
+                }
+                if phase.as_deref() == Some("Running") && p.phase.as_deref() == Some("Pending") {
+                    out.push((format!("pod {}", p.key), "went Pending again".into()));
+                }
+                if p.phase.as_deref() == Some("Failed") && phase.as_deref() != Some("Failed") {
+                    out.push((format!("pod {}", p.key), "phase Failed".into()));
+                }
+                if p.restarts > *restarts {
+                    out.push((
+                        format!("pod {}", p.key),
+                        format!("restart count {} → {} (crash loop?)", restarts, p.restarts),
+                    ));
+                }
+            }
+            self.pod_seen
+                .insert(p.key.clone(), (p.phase.clone(), p.restarts, p.waiting.clone()));
+        }
+        let live_pods: std::collections::HashSet<&str> =
+            pods.iter().map(|p| p.key.as_str()).collect();
+        self.pod_seen
+            .retain(|k, _| live_pods.contains(k.as_str()));
+        out
+    }
+
+    // test-only peeks at the edge detector's memory
+    #[cfg(test)]
+    pub(crate) fn tracks_container(&self, key: &str) -> bool {
+        self.container_seen.contains_key(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn containers_tracked(&self) -> usize {
+        self.container_seen.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pods_tracked(&self) -> usize {
+        self.pod_seen.len()
+    }
+}
+
 /// One tick of the machine-wide alerts. `stats` comes from the platform's
 /// `system_stats()`; firings are [`SysPick`]s with no pid (the machine is
 /// not a process). Same 5-samples-and-latch cycle as the per-process
@@ -772,6 +895,11 @@ const LEAK_FRACTION: f64 = 0.7;
 const FD_LEAK_SAMPLES: usize = 60; // ~5 min at the 3s TUI refresh
 const FD_LEAK_GROWTH: f64 = 64.0;
 const FD_LEAK_FRACTION: f64 = 0.7;
+/// Thread leak suspicion: same shape on the kernel thread count. Sixteen
+/// steady new threads over ~5 min is a leak; healthy thread pools oscillate.
+const THR_LEAK_SAMPLES: usize = 60;
+const THR_LEAK_GROWTH: f64 = 16.0;
+const THR_LEAK_FRACTION: f64 = 0.7;
 
 #[derive(Default, Clone)]
 struct RestartState {
@@ -996,6 +1124,12 @@ pub struct History {
     fd_big: HashMap<Pid, VecDeque<u64>>,
     /// pid → last SAMPLES fd counts as a sparkline (peak-normalized)
     pub fd_sparks: HashMap<Pid, String>,
+    /// pid → last BIG_SAMPLES kernel thread counts (detail-page thread
+    /// chart and thread leak suspicion). Rides the listing — Linux
+    /// /proc/<pid>/stat and the Windows thread snapshot carry it for the
+    /// whole table; macOS fills it only at detail time, so its window
+    /// builds only while the detail page keeps the field populated.
+    thr_big: HashMap<Pid, VecDeque<u32>>,
     /// pid → last BIG_SAMPLES (read, write) rates in bytes/s (detail-page
     /// I/O chart). Filled from the same cumulative deltas as `io_rate`,
     /// so it covers exactly the platforms that report per-process I/O.
@@ -1063,6 +1197,15 @@ impl History {
             if let Some(kb) = p.mem_kb {
                 let dq = self.mem_big.entry(p.pid).or_default();
                 dq.push_back(kb);
+                while dq.len() > BIG_SAMPLES {
+                    dq.pop_front();
+                }
+            }
+            // thread counts ride the listing (Linux stat / Windows thread
+            // snapshot) — same window as the memory chart
+            if let Some(t) = p.threads {
+                let dq = self.thr_big.entry(p.pid).or_default();
+                dq.push_back(t);
                 while dq.len() > BIG_SAMPLES {
                     dq.pop_front();
                 }
@@ -1154,6 +1297,7 @@ impl History {
         self.io_rate.retain(|pid, _| seen.contains(pid));
         self.io_prev.retain(|pid, _| seen.contains(pid));
         self.mem_big.retain(|pid, _| seen.contains(pid));
+        self.thr_big.retain(|pid, _| seen.contains(pid));
         self.fd_big.retain(|pid, _| seen.contains(pid));
         self.fd_sparks.retain(|pid, _| seen.contains(pid));
         self.io_big.retain(|pid, _| seen.contains(pid));
@@ -1509,7 +1653,8 @@ impl History {
         }
         let start = dq.len() - tail_len;
         let tail: Vec<u64> = dq.iter().skip(start).copied().collect();
-        let grew = (*tail.last().unwrap() - tail[0]) as f64;
+        // saturating: a shrinking count is not a leak (and u64 would panic)
+        let grew = tail.last().unwrap().saturating_sub(tail[0]) as f64;
         if grew < FD_LEAK_GROWTH {
             return None;
         }
@@ -1522,6 +1667,62 @@ impl History {
         Some(format!(
             "+{grew:.0} fds over the last {mins:.0} min, steadily increasing — possible fd leak"
         ))
+    }
+
+    /// Thread leak suspicion — the fd one applied to kernel thread counts
+    /// (a service spawning threads per request without reaping them climbs
+    /// steadily). Growth is in threads, so [`THR_LEAK_GROWTH`] is far
+    /// smaller than the fd window.
+    pub fn thread_suspicion(&self, pid: Pid, sample_secs: f64) -> Option<String> {
+        let dq = self.thr_big.get(&pid)?;
+        let tail_len = dq.len().min(THR_LEAK_SAMPLES);
+        if tail_len < 8 {
+            return None;
+        }
+        let start = dq.len() - tail_len;
+        let tail: Vec<u32> = dq.iter().skip(start).copied().collect();
+        let grew = tail.last().unwrap().saturating_sub(tail[0]) as f64;
+        if grew < THR_LEAK_GROWTH {
+            return None;
+        }
+        let ups = tail.windows(2).filter(|w| w[1] > w[0]).count();
+        let pairs = tail_len - 1;
+        if (ups as f64 / pairs as f64) < THR_LEAK_FRACTION {
+            return None;
+        }
+        let mins = (pairs as f64 * sample_secs) / 60.0;
+        Some(format!(
+            "+{grew:.0} threads over the last {mins:.0} min, steadily increasing — possible thread leak"
+        ))
+    }
+
+    /// Detail-page thread chart: a peak-normalized sparkline of the
+    /// thread-count window plus the latest reading. None until two
+    /// samples exist (or the platform never reported threads).
+    pub fn thread_chart(&self, pid: Pid, width: usize) -> Option<(String, u32)> {
+        let dq = self.thr_big.get(&pid)?;
+        let vals: Vec<u32> = dq.iter().copied().collect();
+        if vals.len() < 2 {
+            return None;
+        }
+        let last = *vals.last().unwrap();
+        let thinned: Vec<u32> = if vals.len() > width {
+            let stride = vals.len() as f64 / width as f64;
+            (0..width)
+                .map(|i| vals[(i as f64 * stride) as usize])
+                .collect()
+        } else {
+            vals
+        };
+        let peak = thinned.iter().copied().fold(0u32, u32::max).max(1) as f64;
+        let bars: String = thinned
+            .iter()
+            .map(|v| {
+                let idx = ((*v as f64 / peak).clamp(0.0, 0.999) * 8.0) as usize;
+                SPARK_LEVELS[idx]
+            })
+            .collect();
+        Some((bars, last))
     }
 
     /// Detail-page disk I/O chart: (read line, write line), each a
@@ -2226,6 +2427,123 @@ mod tests {
         h.update(&[]);
         assert!(h.fd_chart(10, 80).is_none(), "vanished pid leaves no data");
         assert!(!h.fd_sparks.contains_key(&10));
+    }
+
+    #[test]
+    fn thread_chart_and_leak_suspicion() {
+        let mut h = History::new();
+        let base = proc(10, "/bin/leaky", None);
+        h.update(std::slice::from_ref(&base));
+        assert!(h.thread_chart(10, 80).is_none(), "needs 2+ samples");
+        // +1 thread per refresh: the 60-sample window sees +59 of the 70 —
+        // past the 16-thread threshold, and the fd-style sawtooth checks below
+        for i in 0..70u32 {
+            let mut p = base.clone();
+            p.threads = Some(8 + i);
+            h.update(&[p]);
+        }
+        let (bars, now) = h.thread_chart(10, 80).unwrap();
+        assert_eq!(now, 77);
+        assert_eq!(bars.chars().last().unwrap(), '█', "climb ends at the top bar");
+        let msg = h.thread_suspicion(10, 3.0).unwrap();
+        assert!(msg.contains("+59 threads"), "growth in the message: {msg}");
+        assert!(msg.contains("possible thread leak"));
+
+        // small growth stays quiet (+7 < 16)
+        let mut h2 = History::new();
+        for i in 0..10u32 {
+            let mut p = base.clone();
+            p.threads = Some(8 + i);
+            h2.update(&[p]);
+        }
+        assert!(h2.thread_suspicion(10, 3.0).is_none(), "+7 threads is not a leak");
+
+        // shrinking counts never flag (and would u64-panic without the
+        // saturating diff the fd chart shares)
+        let mut h3 = History::new();
+        for i in 0..10u32 {
+            let mut p = base.clone();
+            p.threads = Some(64 - i);
+            h3.update(&[p]);
+        }
+        assert!(h3.thread_suspicion(10, 3.0).is_none(), "shrinking is not a leak");
+
+        // a vanished pid leaves no data behind
+        h3.update(&[]);
+        assert!(h3.thread_chart(10, 80).is_none());
+    }
+
+    #[test]
+    fn container_edges_fire_once_per_edge() {
+        let mk = |id: &str, name: &str, state: &str, restarts: Option<u32>| crate::model::Container {
+            runtime: "docker".into(),
+            id: id.into(),
+            name: name.into(),
+            image: String::new(),
+            command: String::new(),
+            state: state.into(),
+            status: "Up".into(),
+            ports: String::new(),
+            pod: None,
+            restarts,
+            cpu_pct: None,
+            mem_used_mb: None,
+            mem_total_mb: None,
+        };
+        let mut edges = ContainerEdges::default();
+        // first sighting arms quietly
+        assert!(edges.update(&[mk("a1", "web", "running", Some(0))], &[], false).is_empty());
+        assert!(edges.tracks_container("docker/a1"));
+        // restart climb fires once and latches
+        let hits = edges.update(&[mk("a1", "web", "running", Some(3))], &[], false);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].1.contains("restart count 0 → 3"));
+        assert!(edges.update(&[mk("a1", "web", "running", Some(3))], &[], false).is_empty());
+        // death edge (inspect fetch hits no daemon for the fixture id)
+        let hits = edges.update(&[mk("a1", "web", "exited", Some(3))], &[], false);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].0 == "container web" && hits[0].1.starts_with("exited — "));
+        assert!(edges.update(&[mk("a1", "web", "exited", Some(3))], &[], false).is_empty());
+        // removed containers leave the memory
+        assert!(edges.update(&[], &[], false).is_empty());
+        assert_eq!(edges.containers_tracked(), 0);
+
+        // a live events stream owns death reporting: the death edge stays
+        // quiet but the state still records (the next death fires once the
+        // stream is gone)
+        let mut edges = ContainerEdges::default();
+        assert!(edges.update(&[mk("b1", "db", "running", Some(0))], &[], true).is_empty());
+        assert!(edges.update(&[mk("b1", "db", "exited", Some(0))], &[], true).is_empty(), "stream owns deaths");
+        assert!(edges.update(&[mk("b1", "db", "exited", Some(0))], &[], false).is_empty(), "already-armed stays latched");
+        let mut edges = ContainerEdges::default();
+        assert!(edges.update(&[mk("c1", "api", "running", Some(0))], &[], true).is_empty());
+        let hits = edges.update(&[mk("c1", "api", "exited", Some(0))], &[], false);
+        assert_eq!(hits.len(), 1, "fallback sweeps still report: {hits:?}");
+
+        // pod edges ride the same core
+        let mkpod = |restarts: u32, phase: &str, waiting: Option<&str>| crate::k8s::Pod {
+            key: "prod/web".into(),
+            container_ids: Vec::new(),
+            phase: Some(phase.into()),
+            restarts,
+            waiting: waiting.map(str::to_string),
+        };
+        let mut edges = ContainerEdges::default();
+        assert!(edges.update(&[], &[mkpod(0, "Running", None)], false).is_empty());
+        let hits = edges.update(&[], &[mkpod(2, "Running", Some("CrashLoopBackOff"))], false);
+        assert!(hits[0].1.contains("containers waiting: CrashLoopBackOff (phase Running)"));
+        // same reason latches; the restart climb fires independently
+        let hits = edges.update(&[], &[mkpod(5, "Running", Some("CrashLoopBackOff"))], false);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].1.contains("restart count 2 → 5"));
+        // Running → Pending, then Failed, each once
+        let hits = edges.update(&[], &[mkpod(5, "Pending", None)], false);
+        assert!(hits[0].1.contains("went Pending again"));
+        let hits = edges.update(&[], &[mkpod(5, "Failed", None)], false);
+        assert!(hits[0].1.contains("phase Failed"));
+        assert!(edges.update(&[], &[mkpod(5, "Failed", None)], false).is_empty(), "Failed latches");
+        assert!(edges.update(&[], &[], false).is_empty());
+        assert_eq!(edges.pods_tracked(), 0);
     }
 
     #[test]

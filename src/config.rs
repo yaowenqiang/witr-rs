@@ -47,6 +47,8 @@ pub struct Config {
     pub alert_fd: Option<u64>,
     pub alert_io: Option<f64>,
     pub alert_conn: Option<u64>,
+    pub alert_threads: Option<u64>,
+    pub alert_container: Option<bool>,
     pub alert_load: Option<f64>,
     pub alert_mem_pct: Option<u64>,
     pub alert_count: Option<u32>,
@@ -353,6 +355,11 @@ fn set_alert(key: &str, value: &str, cfg: &mut Config) -> Result<(), String> {
         "alert_net" => int(&mut cfg.alert_net),
         "alert_disk" => int(&mut cfg.alert_disk),
         "alert_conn" => int(&mut cfg.alert_conn),
+        "alert_threads" => int(&mut cfg.alert_threads),
+        "alert_container" => value
+            .parse::<bool>()
+            .map(|v| cfg.alert_container = Some(v))
+            .map_err(|_| format!("{key} {value:?} is not true/false")),
         "alert_repeat" => int(&mut cfg.alert_repeat),
         "alert_count" => value
             .parse::<u32>()
@@ -425,6 +432,22 @@ watch = [\"nginx|nginx|www\", \"tailspid|sleep|\"]
             }
         );
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn parse_alert_keys_thread_and_container() {
+        let (cfg, w) = Config::parse(
+            "alert_threads = 500\nalert_container = true\nalert_webhook = \"http://h/hook\"\n",
+        );
+        assert_eq!(cfg.alert_threads, Some(500));
+        assert_eq!(cfg.alert_container, Some(true));
+        assert_eq!(cfg.alert_webhook.as_deref(), Some("http://h/hook"));
+        assert!(w.is_empty(), "{w:?}");
+        // bad values are skipped with a warning, not fatal
+        let (cfg, w) = Config::parse("alert_threads = lots\nalert_container = maybe\n");
+        assert!(cfg.alert_threads.is_none() && cfg.alert_container.is_none());
+        assert_eq!(w.len(), 2);
+        assert!(w.iter().all(|m| m.contains("skipped")));
     }
 
     #[test]

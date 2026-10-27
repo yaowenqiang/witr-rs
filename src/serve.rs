@@ -21,6 +21,7 @@
 //! listening (proto, port).
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
@@ -52,6 +53,193 @@ fn label_escape(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+/// The `/` dashboard: a self-contained, zero-JS HTML view of the machine —
+/// gauges (cpu / memory / load / procs), the top-10 CPU and RSS tables and
+/// the current listeners, auto-refreshed by a meta tag. Every request
+/// samples fresh, same as /metrics; the cpu gauge is a delta between
+/// requests, so the very first view of a cold server shows "–" until the
+/// second refresh.
+fn dashboard_html(platform: &dyn Platform) -> String {
+    let esc = crate::render::html_escape;
+    let procs = platform.list_processes().unwrap_or_default();
+    let stats = platform.system_stats().unwrap_or_default();
+    let listeners = {
+        let socks = platform.list_sockets().unwrap_or_default();
+        let mut ls = crate::snapshot::to_listeners(&socks, &procs);
+        ls.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.proto.cmp(&b.proto)));
+        ls
+    };
+    let top_cpu: Vec<&Process> = {
+        let mut v: Vec<&Process> = procs.iter().filter(|p| p.cpu.is_some()).collect();
+        v.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+        v.truncate(10);
+        v
+    };
+    let top_mem: Vec<&Process> = {
+        let mut v: Vec<&Process> = procs.iter().filter(|p| p.mem_kb.is_some()).collect();
+        v.sort_by_key(|p| std::cmp::Reverse(p.mem_kb));
+        v.truncate(10);
+        v
+    };
+
+    let mut out = String::with_capacity(24 * 1024);
+    out.push_str(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\n\
+         <meta http-equiv=\"refresh\" content=\"5\">\n\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+         <title>witr-rs · dashboard</title>\n\
+         <style>\n\
+         body{font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;\
+         margin:24px;color:#1c1c1c;background:#fafafa}\n\
+         h1{font-size:19px;margin:0 0 2px}h2{font-size:13px;margin:22px 0 6px;color:#555;\
+         text-transform:uppercase;letter-spacing:.05em}\n\
+         .sub{color:#777;font-size:12px;margin-bottom:14px}.sub a{color:#0366d6}\n\
+         .tiles{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:6px}\n\
+         .tile{background:#fff;border:1px solid #e3e3e3;border-radius:8px;padding:10px 14px;min-width:130px}\n\
+         .tile .k{font-size:11px;color:#777;text-transform:uppercase;letter-spacing:.05em}\n\
+         .tile .v{font-size:22px;font-variant-numeric:tabular-nums;margin-top:2px}\n\
+         .tile .bar{height:5px;border-radius:3px;background:#e6e6e6;margin-top:7px;overflow:hidden}\n\
+         .tile .bar i{display:block;height:100%;background:#4a8f57}\n\
+         table{border-collapse:collapse;width:100%;background:#fff;border:1px solid #e3e3e3}\n\
+         th,td{padding:5px 10px;text-align:left;border-bottom:1px solid #eee;\
+         font-variant-numeric:tabular-nums;font-size:13px}\n\
+         th{background:#f4f4f4;font-weight:600;font-size:11px;text-transform:uppercase;\
+         letter-spacing:.04em;color:#555}\n\
+         td.cmd{color:#666;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n\
+         .hot{color:#b02a2a}.warm{color:#9a6b00}\n\
+         </style></head><body>\n",
+    );
+    let _ = writeln!(
+        out,
+        "<h1>witr-rs dashboard</h1>\n\
+         <div class=\"sub\">{} · {} process(es) · auto-refreshes every 5s · APIs: \
+         <a href=\"/metrics\">/metrics</a> <a href=\"/api/ps\">/api/ps</a> \
+         <a href=\"/api/ports\">/api/ports</a> <a href=\"/api/conns\">/api/conns</a> \
+         <a href=\"/api/tree\">/api/tree</a> <a href=\"/api/services\">/api/services</a> \
+         <a href=\"/api/events\">/api/events</a> \
+         <a href=\"/api/top?metric=cpu&amp;n=10\">/api/top</a></div>",
+        esc(&crate::util::fmt_time(crate::util::now_unix())),
+        procs.len(),
+    );
+
+    // gauge tiles
+    let tile = |k: &str, v: String, pct: Option<f64>| -> String {
+        let bar = pct
+            .map(|p| {
+                let w = p.clamp(0.0, 100.0);
+                let cls = if p >= 90.0 { "hot" } else { "" };
+                format!(
+                    "<div class=\"bar\"><i class=\"{cls}\" style=\"width:{w:.0}%\"></i></div>"
+                )
+            })
+            .unwrap_or_default();
+        format!("<div class=\"tile\"><div class=\"k\">{}</div><div class=\"v\">{}</div>{bar}</div>", esc(k), v)
+    };
+    let cpu_v = stats
+        .cpu_percent
+        .map(|c| format!("{c:.1}<span style=\"font-size:12px\">%</span>"))
+        .unwrap_or_else(|| "–".into());
+    let mem_v = match (stats.mem_used_mb, stats.mem_total_mb) {
+        (Some(u), Some(t)) if t > 0 => format!(
+            "{}<span style=\"font-size:12px\"> / {}</span>",
+            esc(&crate::util::fmt_bytes(u * 1024 * 1024)),
+            esc(&crate::util::fmt_bytes(t * 1024 * 1024))
+        ),
+        _ => "–".into(),
+    };
+    let load_v = stats
+        .load1
+        .map(|l| format!("{l:.2}"))
+        .unwrap_or_else(|| "–".into());
+    out.push_str("<div class=\"tiles\">");
+    out.push_str(&tile("cpu", cpu_v, stats.cpu_percent));
+    out.push_str(&tile(
+        "memory",
+        mem_v,
+        stats
+            .mem_used_mb
+            .zip(stats.mem_total_mb)
+            .and_then(|(u, t)| {
+                if t > 0 {
+                    Some(u as f64 / t as f64 * 100.0)
+                } else {
+                    None
+                }
+            }),
+    ));
+    out.push_str(&tile("load (1m)", load_v, None));
+    out.push_str(&tile("processes", procs.len().to_string(), None));
+    if let Some((label, c)) = &stats.temp {
+        out.push_str(&tile(
+            &format!("temp · {label}"),
+            format!("{c:.0}°C"),
+            None,
+        ));
+    }
+    if let Some(psi) = &stats.psi {
+        let worst = psi.worst_full();
+        out.push_str(&tile(
+            "psi full (worst)",
+            format!("{worst:.1}<span style=\"font-size:12px\">%</span>"),
+            None,
+        ));
+    }
+    out.push_str("</div>\n");
+
+    let head = "<tr><th>PID</th><th>USER</th><th>NAME</th><th>COMMAND</th><th>VALUE</th></tr>";
+    let row = |p: &Process, v: String, cls: &str| -> String {
+        format!(
+            "<tr><td>{}</td><td>{}</td><td><b>{}</b></td><td class=\"cmd\">{}</td><td class=\"{cls}\">{}</td></tr>",
+            p.pid,
+            esc(p.user.as_deref().unwrap_or("-")),
+            esc(&p.name),
+            esc(&p.command_line()),
+            v,
+        )
+    };
+    let _ = writeln!(out, "<h2>top cpu</h2><table>{head}");
+    for p in &top_cpu {
+        out.push_str(&row(
+            p,
+            format!("{:.1}%", p.cpu.unwrap_or(0.0)),
+            if p.cpu.unwrap_or(0.0) >= 80.0 { "hot" } else { "" },
+        ));
+    }
+    out.push_str("</table>\n");
+    let _ = writeln!(out, "<h2>top memory</h2><table>{head}");
+    for p in &top_mem {
+        out.push_str(&row(
+            p,
+            crate::util::fmt_bytes(p.mem_kb.unwrap_or(0) * 1024),
+            "",
+        ));
+    }
+    out.push_str("</table>\n");
+
+    let _ = writeln!(
+        out,
+        "<h2>listeners</h2><table><tr><th>PORT</th><th>PROTO</th><th>SCOPE</th><th>OWNER(S)</th></tr>"
+    );
+    for l in &listeners {
+        let scope = l.scope();
+        let scope_cls = match scope {
+            "internet" => "hot",
+            "loopback" => "",
+            _ => "warm",
+        };
+        let _ = writeln!(
+            out,
+            "<tr><td><b>{}</b></td><td>{}</td><td class=\"{scope_cls}\">{}</td><td>{}</td></tr>",
+            l.port,
+            esc(&l.proto),
+            scope,
+            esc(&l.who.join(", ")),
+        );
+    }
+    out.push_str("</table>\n</body></html>\n");
+    out
 }
 
 /// The union of the top-N cpu and top-N rss processes — the set that gets
@@ -626,13 +814,13 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                 );
                 if !matches!(
                     metric.as_str(),
-                    "cpu" | "mem" | "fd" | "age" | "io" | "io-rate"
+                    "cpu" | "mem" | "fd" | "age" | "io" | "io-rate" | "threads" | "conn"
                 ) {
                     respond(
                         &mut stream,
                         "400 Bad Request",
                         "text/plain",
-                        "metric must be one of: cpu, mem, fd, age, io, io-rate\n",
+                        "metric must be one of: cpu, mem, fd, age, io, io-rate, threads, conn\n",
                     );
                     return;
                 }
@@ -643,6 +831,15 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                 if matches!(metric.as_str(), "io" | "io-rate") {
                     platform.enrich_listing(&mut procs);
                 }
+                // conn ranks live ESTABLISHED sockets per pid — one socket
+                // sweep, same attribution the /api/conns view uses
+                let conn_map = if metric == "conn" {
+                    Some(crate::tui::established_per_pid(
+                        &platform.list_all_sockets().unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                };
                 // io-rate is a delta metric: two enriched samples one second
                 // apart turn the cumulative counters into bytes/s (the CLI's
                 // one-shot --top io-rate works the same way)
@@ -693,6 +890,11 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                             .as_ref()
                             .and_then(|h| h.io_rate_of(p.pid))
                             .map(|(r, w)| serde_json::json!(r + w)),
+                        "threads" => p.threads.map(|t| serde_json::json!(t)),
+                        "conn" => conn_map
+                            .as_ref()
+                            .and_then(|m| m.get(&p.pid))
+                            .map(|v| serde_json::json!(v)),
                         _ => p
                             .started
                             .map(|t| serde_json::json!(crate::util::now_unix() - t)),
@@ -778,12 +980,15 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
             }
             if !path.starts_with("/metrics") {
                 match path {
-                    "/" => respond(
-                        &mut stream,
-                        "200 OK",
-                        "text/plain; charset=utf-8",
-                        "witr-rs: /metrics (Prometheus) · /api/ps (process table) · /api/ports (listeners) · /api/conns (connections) · /api/tree (forest) · /api/top?metric=cpu|mem|fd|age|io|io-rate&n=N (rankings) · /api/services (service units) · /api/events (SSE process edges)\n",
-                    ),
+                    // the human view: a zero-JS dashboard (meta-refresh)
+                    // over the same live sampling the APIs do
+                    "/" => {
+                        let body = {
+                            let platform = platform.lock().unwrap_or_else(|e| e.into_inner());
+                            dashboard_html(platform.as_ref())
+                        };
+                        respond(&mut stream, "200 OK", "text/html; charset=utf-8", &body);
+                    }
                     _ => respond(&mut stream, "404 Not Found", "text/plain", "not found\n"),
                 }
                 return;
@@ -934,6 +1139,113 @@ mod tests {
                 || out.contains("witr_machine_mem_total_bytes ");
             assert!(has_mem, "memory gauges emit whenever the platform measures");
         }
+    }
+
+    /// A tiny deterministic platform for the dashboard render.
+    struct DashPlatform;
+    impl Platform for DashPlatform {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        fn capabilities(&self) -> crate::platform::Capabilities {
+            crate::platform::Capabilities { file_lookup: false, env: false }
+        }
+        fn list_processes(&self) -> crate::platform::PlatResult<Vec<Process>> {
+            Ok(vec![Process {
+                pid: 7,
+                name: "<script>".into(),
+                user: Some("bob".into()),
+                cpu: Some(90.0),
+                mem_kb: Some(2_048_000),
+                cmdline: vec!["nginx".into(), "-g".into(), "daemon off;".into()],
+                ..Default::default()
+            }])
+        }
+        fn detail(&self, brief: &Process, _want_env: bool) -> Process {
+            brief.clone()
+        }
+        fn port_to_sockets(&self, _port: u16) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+            Ok(Vec::new())
+        }
+        fn list_sockets(&self) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+            Ok(vec![crate::model::Socket {
+                proto: "tcp".into(),
+                local_addr: "0.0.0.0".into(),
+                local_port: 8080,
+                peer_addr: None,
+                peer_port: None,
+                state: "LISTEN".into(),
+                pid: Some(7),
+            }])
+        }
+        fn file_to_pids(&self, _path: &str) -> crate::platform::PlatResult<Vec<i32>> {
+            Ok(Vec::new())
+        }
+        fn container_of(&self, _pid: i32) -> Option<crate::model::Source> {
+            None
+        }
+        fn service_source(&self, _procs: &[Process]) -> Option<crate::model::Source> {
+            None
+        }
+        fn system_stats(&self) -> Option<crate::platform::SystemStats> {
+            Some(crate::platform::SystemStats {
+                cpu_percent: Some(12.5),
+                mem_used_mb: Some(1000),
+                mem_total_mb: Some(4000),
+                load1: Some(0.10),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn dashboard_is_zero_js_and_escapes() {
+        let html = dashboard_html(&DashPlatform);
+        assert!(html.contains("http-equiv=\"refresh\""), "auto-refresh meta tag");
+        assert!(!html.to_lowercase().contains("<script"), "zero JS: no script tags");
+        assert!(!html.contains("<script>"), "process name is escaped");
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("12.5"), "cpu gauge renders");
+        assert!(html.contains("top cpu"), "top table section");
+        assert!(html.contains("top memory"));
+        assert!(html.contains("listeners"));
+        assert!(html.contains(">8080<"), "listener port in its table");
+        assert!(html.contains("internet"), "wildcard bind is flagged");
+        assert!(html.contains("/api/ps"), "API index still reachable from the page");
+        // cold server: cpu is a delta between requests, dashes are fine
+        struct Cold;
+        impl Platform for Cold {
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            fn capabilities(&self) -> crate::platform::Capabilities {
+                crate::platform::Capabilities { file_lookup: false, env: false }
+            }
+            fn list_processes(&self) -> crate::platform::PlatResult<Vec<Process>> {
+                Ok(Vec::new())
+            }
+            fn detail(&self, brief: &Process, _want_env: bool) -> Process {
+                brief.clone()
+            }
+            fn port_to_sockets(&self, _port: u16) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn list_sockets(&self) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn file_to_pids(&self, _path: &str) -> crate::platform::PlatResult<Vec<i32>> {
+                Ok(Vec::new())
+            }
+            fn container_of(&self, _pid: i32) -> Option<crate::model::Source> {
+                None
+            }
+            fn service_source(&self, _procs: &[Process]) -> Option<crate::model::Source> {
+                None
+            }
+        }
+        let html = dashboard_html(&Cold);
+        assert!(html.contains("–"), "missing gauges render a dash");
+        assert!(html.contains("0 process(es)"));
     }
 
     #[test]

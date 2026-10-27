@@ -2,7 +2,7 @@
 //! tab bar, mode line, search box, process table + live details panel with
 //! the ancestry tree, footer key hints, 3s auto refresh.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Result;
 use std::time::{Duration, Instant};
 
@@ -366,6 +366,9 @@ struct TuiApp {
     /// established-connection counts from the last refresh (only sampled
     /// when alert_conn is set — one socket sweep per tick)
     conn_counts: HashMap<Pid, u64>,
+    /// --alert-threads kernel-thread threshold (None = unchecked; the count
+    /// rides the listing — Linux stat / Windows thread snapshot)
+    alert_threads: Option<u64>,
     /// --alert-port canaries: (port, negate) — negate=true means the
     /// listener must stay up; alerts fire on the appear/gone edges
     alert_port: Vec<(u16, bool)>,
@@ -392,12 +395,9 @@ struct TuiApp {
     alert_psi: Option<f64>,
     /// streak/firing state for the machine-wide alerts
     sys_alert: crate::history::SysAlertState,
-    /// last (state, restarts) per "runtime/id" — the container-alert edge
-    /// detector's memory (first sighting arms, no alerts)
-    container_seen: HashMap<String, (String, Option<u32>)>,
-    /// last (phase, restarts, waiting reason) per "ns/name" — the pod-alert
-    /// edge detector's memory (first sighting arms, no alerts)
-    pod_seen: HashMap<String, (Option<String>, u32, Option<String>)>,
+    /// shared container/pod edge detector memory (first sighting arms, no
+    /// alerts) — the same core the headless `--alert-container` loop runs
+    container_edges: crate::history::ContainerEdges,
     /// container alerts (death edge / climbing restarts) waiting for the
     /// next refresh's picks loop to dispatch them
     pending_alerts: Vec<(Pid, String, String)>,
@@ -581,6 +581,9 @@ pub struct Seed {
     /// --alert-conn: ESTABLISHED-connection-count threshold; sustained
     /// excess → alert (connection-leak detection)
     pub alert_conn: Option<u64>,
+    /// --alert-threads: kernel-thread-count threshold; sustained excess →
+    /// alert (thread-leak detection)
+    pub alert_threads: Option<u64>,
     /// --alert-port canaries: (port, negate) — alert on the LISTEN
     /// appear edge, or (negated) on the listener-gone edge
     pub alert_port: Vec<(u16, bool)>,
@@ -680,6 +683,7 @@ impl Seed {
         self.alert_fd = cli.alert_fd;
         self.alert_io = cli.alert_io;
         self.alert_conn = cli.alert_conn;
+        self.alert_threads = cli.alert_threads;
         self.alert_repeat = cli.alert_repeat;
         self.alert_load = cli.alert_load;
         self.alert_mem_pct = cli.alert_mem_pct;
@@ -810,6 +814,7 @@ impl TuiApp {
             alert_io: seed.alert_io,
             alert_conn: seed.alert_conn,
             conn_counts: HashMap::new(),
+            alert_threads: seed.alert_threads,
             alert_port: seed.alert_port.clone(),
             port_seen: HashMap::new(),
             port_owner: HashMap::new(),
@@ -821,8 +826,7 @@ impl TuiApp {
             alert_net: seed.alert_net,
             alert_psi: seed.alert_psi,
             sys_alert: crate::history::SysAlertState::default(),
-            container_seen: HashMap::new(),
-            pod_seen: HashMap::new(),
+            container_edges: crate::history::ContainerEdges::default(),
             pending_alerts: Vec::new(),
             alert_exec: seed.alert_exec.clone(),
             alert_webhook: seed.alert_webhook.clone(),
@@ -1450,102 +1454,21 @@ impl TuiApp {
     }
 
     /// Container death / crash-loop edges: the fresh enumeration vs the
-    /// previous one. First sighting arms quietly; afterwards a running →
-    /// exited/dead transition fetches the exit reason (OOMKilled wins) and
-    /// a climbing restart count reports the jump. `pods` (empty without a
-    /// cluster) feeds the pod edges the same way: CrashLoopBackOff /
-    /// ImagePullBackOff appearing, a running pod going Pending again,
-    /// Failed phase, climbing k8s restart totals. Inspect calls happen
-    /// only on the death edge — and never while the `events` stream is
-    /// live, which owns instant death reporting (this sweep-diff stays as
-    /// the fallback when the stream couldn't spawn).
+    /// previous one. Delegates to the shared [`crate::history::ContainerEdges`]
+    /// core (the headless `--watch --alert-container` sentinel runs the
+    /// same detector); firings land in `pending_alerts` like every other
+    /// alert channel. The death edge never fires while the `events` stream
+    /// is live — that channel owns instant death reporting (the sweep-diff
+    /// stays as the fallback when the stream couldn't spawn).
     fn container_alert_edges(
         &mut self,
         cs: &[crate::model::Container],
         pods: &[crate::k8s::Pod],
     ) {
         let stream_live = self.container_events.is_some();
-        for c in cs {
-            let key = format!("{}/{}", c.runtime, c.id);
-            if let Some((st, rst)) = self.container_seen.get(&key) {
-                let pod_tag = match &c.pod {
-                    Some(p) => format!(" · pod {p}"),
-                    None => String::new(),
-                };
-                let was_running = st == "running";
-                let now_dead = matches!(c.state.as_str(), "exited" | "dead");
-                if was_running && now_dead && !stream_live {
-                    let reason = crate::platform::container_exit_reason(&c.runtime, &c.id)
-                        .unwrap_or_else(|| c.status.clone());
-                    self.pending_alerts.push((
-                        0,
-                        format!("container {}", c.name),
-                        format!("exited — {reason}{pod_tag}"),
-                    ));
-                }
-                if let (Some(old), Some(new)) = (*rst, c.restarts) {
-                    if new > old {
-                        self.pending_alerts.push((
-                            0,
-                            format!("container {}", c.name),
-                            format!("restart count {old} → {new} (crash loop?){pod_tag}"),
-                        ));
-                    }
-                }
-            }
-            self.container_seen
-                .insert(key, (c.state.clone(), c.restarts));
+        for (name, detail) in self.container_edges.update(cs, pods, stream_live) {
+            self.pending_alerts.push((0, name, detail));
         }
-        // removed containers drop out of the edge detector's memory
-        let live: HashSet<String> = cs
-            .iter()
-            .map(|c| format!("{}/{}", c.runtime, c.id))
-            .collect();
-        self.container_seen.retain(|k, _| live.contains(k));
-        self.pod_alert_edges(pods);
-    }
-
-    /// Pod-level edges against `pod_seen`'s snapshot: a waiting reason
-    /// appearing (CrashLoopBackOff & co), a Running pod back to Pending,
-    /// a Failed phase, a climbing restart total. First sighting arms.
-    fn pod_alert_edges(&mut self, pods: &[crate::k8s::Pod]) {
-        for p in pods {
-            if let Some((phase, restarts, waiting)) = self.pod_seen.get(&p.key) {
-                if p.waiting.is_some() && *waiting != p.waiting {
-                    self.pending_alerts.push((
-                        0,
-                        format!("pod {}", p.key),
-                        format!(
-                            "containers waiting: {}{}",
-                            p.waiting.clone().unwrap_or_default(),
-                            match &p.phase {
-                                Some(ph) => format!(" (phase {ph})"),
-                                None => String::new(),
-                            }
-                        ),
-                    ));
-                }
-                if phase.as_deref() == Some("Running") && p.phase.as_deref() == Some("Pending") {
-                    self.pending_alerts
-                        .push((0, format!("pod {}", p.key), "went Pending again".into()));
-                }
-                if p.phase.as_deref() == Some("Failed") && phase.as_deref() != Some("Failed") {
-                    self.pending_alerts
-                        .push((0, format!("pod {}", p.key), "phase Failed".into()));
-                }
-                if p.restarts > *restarts {
-                    self.pending_alerts.push((
-                        0,
-                        format!("pod {}", p.key),
-                        format!("restart count {} → {} (crash loop?)", restarts, p.restarts),
-                    ));
-                }
-            }
-            self.pod_seen
-                .insert(p.key.clone(), (p.phase.clone(), p.restarts, p.waiting.clone()));
-        }
-        let live: HashSet<&str> = pods.iter().map(|p| p.key.as_str()).collect();
-        self.pod_seen.retain(|k, _| live.contains(k.as_str()));
     }
 
     /// Kick off a background `stats --no-stream` sweep (no-op while one is
@@ -2211,6 +2134,7 @@ impl TuiApp {
             && self.alert_fd.is_none()
             && self.alert_io.is_none()
             && self.alert_conn.is_none()
+            && self.alert_threads.is_none()
         {
             return Vec::new();
         }
@@ -2351,6 +2275,28 @@ impl TuiApp {
                         format!("connections back under {limit}"),
                         true,
                     ));
+                }
+            }
+            if let Some(limit) = self.alert_threads {
+                let n = p.threads.map(|t| t as u64);
+                let over = n.is_some_and(|c| c > limit);
+                let edge = crate::history::alert_cycle_repeat(
+                    &mut track.threads_streak,
+                    &mut track.threads_firing,
+                    over,
+                    &mut track.threads_fired_secs,
+                    self.alert_repeat,
+                    interval,
+                );
+                if edge == crate::history::AlertEdge::Fire {
+                    out.push((
+                        p.pid,
+                        p.name.clone(),
+                        format!("{} thread(s) above {limit} for {secs}s", n.unwrap_or(0)),
+                        false,
+                    ));
+                } else if edge == crate::history::AlertEdge::Recover {
+                    out.push((p.pid, p.name.clone(), format!("threads back under {limit}"), true));
                 }
             }
         }
@@ -2767,6 +2713,7 @@ impl TuiApp {
                         FilterMetric::Fd => fd_disp.get(&p.pid).copied().unwrap_or(-1.0),
                         FilterMetric::Age => p.started.map(|t| (now - t) as f64).unwrap_or(-1.0),
                         FilterMetric::Io => io_disp.get(&p.pid).copied().unwrap_or(-1.0),
+                        FilterMetric::Threads => p.threads.map(|t| t as f64).unwrap_or(-1.0),
                     };
                     if f.gt {
                         v > f.value
@@ -4215,6 +4162,25 @@ fn push_history_lines(lines: &mut Vec<Line<'static>>, hist: &crate::history::His
         )));
     }
     if let Some(w) = hist.fd_suspicion(pid, REFRESH.as_secs_f64()) {
+        lines.push(Line::from(Span::styled(
+            format!("  ⚠ {w}"),
+            Style::new().fg(Color::Yellow),
+        )));
+    }
+    // Kernel thread history (Linux / Windows listings carry it) — the
+    // thread-leak twin of the fd chart
+    if let Some((chart, now)) = hist.thread_chart(pid, 80) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("Threads ({now}):"),
+            Style::new().bold(),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {chart}"),
+            Style::new().fg(GREEN),
+        )));
+    }
+    if let Some(w) = hist.thread_suspicion(pid, REFRESH.as_secs_f64()) {
         lines.push(Line::from(Span::styled(
             format!("  ⚠ {w}"),
             Style::new().fg(Color::Yellow),
@@ -7651,6 +7617,7 @@ enum FilterMetric {
     Fd,
     Age,
     Io,
+    Threads,
 }
 
 /// `1.5g` → 1.5 × 10⁹ (k/m/g suffixes, case-insensitive; bare = plain).
@@ -7714,10 +7681,11 @@ fn parse_metric_filter(s: &str) -> Option<MetricFilter> {
         "fd" => FilterMetric::Fd,
         "age" => FilterMetric::Age,
         "io" => FilterMetric::Io,
+        "threads" | "thr" => FilterMetric::Threads,
         _ => return None,
     };
     let value = match fm {
-        FilterMetric::Cpu | FilterMetric::Fd => raw.parse::<f64>().ok()?,
+        FilterMetric::Cpu | FilterMetric::Fd | FilterMetric::Threads => raw.parse::<f64>().ok()?,
         FilterMetric::Age => parse_age_secs(raw)?,
         // bare mem is MB (stored as KiB), bare io is bytes/s
         FilterMetric::Mem => parse_scaled(raw)? * 1024.0,
@@ -9363,7 +9331,7 @@ mod tests {
         // first sighting arms quietly — no alerts
         app.container_alert_edges(&[mk("a1", "web", "running", Some(0))], &[]);
         assert!(app.pending_alerts.is_empty());
-        assert!(app.container_seen.contains_key("docker/a1"));
+        assert!(app.container_edges.tracks_container("docker/a1"));
 
         // restart count climbs: crash-loop alert, latched until the next climb
         app.container_alert_edges(&[mk("a1", "web", "running", Some(3))], &[]);
@@ -9394,7 +9362,7 @@ mod tests {
 
         // a removed container leaves the edge detector's memory
         app.container_alert_edges(&[], &[]);
-        assert!(app.container_seen.is_empty());
+        assert_eq!(app.container_edges.containers_tracked(), 0);
     }
 
     #[test]
@@ -9408,34 +9376,34 @@ mod tests {
             waiting: waiting.map(str::to_string),
         };
         // first sighting arms quietly
-        app.pod_alert_edges(&[mk(0, "Running", None)]);
+        app.container_alert_edges(&[], &[mk(0, "Running", None)]);
         assert!(app.pending_alerts.is_empty());
         // CrashLoopBackOff appears
-        app.pod_alert_edges(&[mk(2, "Running", Some("CrashLoopBackOff"))]);
+        app.container_alert_edges(&[], &[mk(2, "Running", Some("CrashLoopBackOff"))]);
         assert!(app.pending_alerts[0]
             .2
             .contains("containers waiting: CrashLoopBackOff (phase Running)"));
         app.pending_alerts.clear();
         // same waiting reason → latched; restart climb fires independently
-        app.pod_alert_edges(&[mk(5, "Running", Some("CrashLoopBackOff"))]);
+        app.container_alert_edges(&[], &[mk(5, "Running", Some("CrashLoopBackOff"))]);
         assert_eq!(app.pending_alerts.len(), 1);
         assert!(app.pending_alerts[0].2.contains("restart count 2 → 5"));
         app.pending_alerts.clear();
         // Running → Pending (rescheduled) fires; the reason gone clears the latch
-        app.pod_alert_edges(&[mk(5, "Pending", None)]);
+        app.container_alert_edges(&[], &[mk(5, "Pending", None)]);
         assert_eq!(app.pending_alerts.len(), 1);
         assert!(app.pending_alerts[0].2.contains("went Pending again"));
         app.pending_alerts.clear();
         // Pending → Failed fires once
-        app.pod_alert_edges(&[mk(5, "Failed", None)]);
+        app.container_alert_edges(&[], &[mk(5, "Failed", None)]);
         assert_eq!(app.pending_alerts.len(), 1);
         assert!(app.pending_alerts[0].2.contains("phase Failed"));
         app.pending_alerts.clear();
-        app.pod_alert_edges(&[mk(5, "Failed", None)]);
+        app.container_alert_edges(&[], &[mk(5, "Failed", None)]);
         assert!(app.pending_alerts.is_empty(), "Failed latches");
         // vanished pods leave the memory
-        app.pod_alert_edges(&[]);
-        assert!(app.pod_seen.is_empty());
+        app.container_alert_edges(&[], &[]);
+        assert_eq!(app.container_edges.pods_tracked(), 0);
     }
 
     #[test]
@@ -9731,6 +9699,7 @@ mod tests {
                 alert_fd: None,
                 alert_io: None,
                 alert_conn: None,
+                alert_threads: None,
                 alert_port: Vec::new(),
                 alert_repeat: None,
                 alert_load: None,

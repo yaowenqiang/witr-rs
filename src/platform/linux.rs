@@ -288,6 +288,8 @@ pub struct StatInfo {
     pub cpu_ticks: u64,
     /// field 24: resident set size in pages
     pub rss_pages: u64,
+    /// field 20: live thread count (nlwp)
+    pub num_threads: u32,
 }
 
 fn parse_stat(raw: &str) -> Option<StatInfo> {
@@ -296,7 +298,7 @@ fn parse_stat(raw: &str) -> Option<StatInfo> {
     let rest = raw[rparen + 2..].split_whitespace().collect::<Vec<_>>();
     // rest[i] = field i+3: rest[0]=state(3) rest[1]=ppid(4) rest[2]=pgid(5)
     // rest[3]=sid(6) rest[4]=tty_nr(7) rest[11]=utime(14) rest[12]=stime(15)
-    // rest[19]=starttime(22) rest[21]=rss(24, pages)
+    // rest[17]=num_threads(20) rest[19]=starttime(22) rest[21]=rss(24, pages)
     let state = rest.first()?.chars().next()?;
     let ppid: Pid = rest.get(1)?.parse().ok()?;
     let pgid: Pid = rest.get(2)?.parse().unwrap_or(0);
@@ -306,6 +308,7 @@ fn parse_stat(raw: &str) -> Option<StatInfo> {
     let utime: u64 = rest.get(11)?.parse().unwrap_or(0);
     let stime: u64 = rest.get(12)?.parse().unwrap_or(0);
     let rss: i64 = rest.get(21)?.parse().unwrap_or(0);
+    let num_threads: u32 = rest.get(17)?.parse().unwrap_or(0);
     Some(StatInfo {
         comm,
         ppid,
@@ -316,6 +319,7 @@ fn parse_stat(raw: &str) -> Option<StatInfo> {
         starttime,
         cpu_ticks: utime + stime,
         rss_pages: rss.max(0) as u64,
+        num_threads,
     })
 }
 
@@ -832,6 +836,7 @@ impl Platform for Linux {
                 tty: Some(tty_name(tty_nr)),
                 pgid: Some(s.pgid),
                 sid: Some(s.sid),
+                threads: (s.num_threads > 0).then_some(s.num_threads),
                 ..Default::default()
             });
         }
@@ -1587,15 +1592,21 @@ wlp3s0: 5000 50 0 0 0 0 0 0  6000 60 0 0 0 0 0 0
     #[test]
     fn stat_parse() {
         // fields after ')': state(3) ppid(4) pgid(5) sid(6) tty_nr(7) ...
-        // starttime(22)=token 19, vsize(23), rss(24)=token 21. tty_nr 0 =
-        // no controlling terminal.
-        let line = "1234 (nginx: worker) S 350 1234 1234 0 -1 4194560 ... 0 0 0 0 0 0 0 0 0 0 0 123456 789012 123";
-        let s = parse_stat(line).unwrap();
+        // num_threads(20)=token 17, starttime(22)=token 19, vsize(23),
+        // rss(24)=token 21. tty_nr 0 = no controlling terminal.
+        let filler = |n: usize| vec!["0"; n].join(" ");
+        // tokens 8..16 are filler; token 17 carries the thread count
+        let line = format!(
+            "1234 (nginx: worker) S 350 1234 1234 0 -1 4194560 ... {} 9 0 123456 789012 123",
+            filler(9)
+        );
+        let s = parse_stat(&line).unwrap();
         assert_eq!(s.comm, "nginx: worker");
         assert_eq!(s.ppid, 350);
         assert_eq!(s.pgid, 1234);
         assert_eq!(s.sid, 1234);
         assert_eq!(s.state, 'S');
+        assert_eq!(s.num_threads, 9);
         assert_eq!(s.starttime, 123456);
         assert_eq!(s.cpu_ticks, 0);
         assert_eq!(s.rss_pages, 123);
