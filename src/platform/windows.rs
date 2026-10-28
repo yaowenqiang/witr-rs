@@ -184,20 +184,20 @@ fn thread_counts() -> Option<std::collections::HashMap<Pid, u32>> {
     {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, Thread32FirstW, Thread32NextW, TH32CS_SNAPTHREAD,
-            THREADENTRY32W,
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+            THREADENTRY32,
         };
         let mut out: std::collections::HashMap<Pid, u32> = std::collections::HashMap::new();
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).ok()?;
-            let mut entry = THREADENTRY32W::default();
-            entry.dwSize = std::mem::size_of::<THREADENTRY32W>() as u32;
-            if Thread32FirstW(snap, &mut entry).is_ok() {
+            let mut entry = THREADENTRY32::default();
+            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            if Thread32First(snap, &mut entry).is_ok() {
                 loop {
                     *out
                         .entry(entry.th32OwnerProcessID as Pid)
                         .or_insert(0) += 1;
-                    if Thread32NextW(snap, &mut entry).is_err() {
+                    if Thread32Next(snap, &mut entry).is_err() {
                         break;
                     }
                 }
