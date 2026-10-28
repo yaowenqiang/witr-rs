@@ -236,6 +236,8 @@ mod tests {
                 cpu_pct: None,
                 mem_used_mb: None,
                 mem_total_mb: None,
+        throttled_usec: None,
+        oom_kills: None,
             },
             Container {
                 runtime: "docker".into(),
@@ -251,6 +253,8 @@ mod tests {
                 cpu_pct: None,
                 mem_used_mb: None,
                 mem_total_mb: None,
+        throttled_usec: None,
+        oom_kills: None,
             },
             Container {
                 runtime: "docker".into(),
@@ -266,6 +270,8 @@ mod tests {
                 cpu_pct: None,
                 mem_used_mb: None,
                 mem_total_mb: None,
+        throttled_usec: None,
+        oom_kills: None,
             },
         ];
         annotate_with(&pods, &mut cs);

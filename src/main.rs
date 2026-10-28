@@ -317,6 +317,26 @@ fn service_flag_args(cli: &Cli) -> Vec<String> {
     opt(&mut a, "alert-disk", cli.alert_disk.map(|v| v.to_string()));
     opt(&mut a, "alert-net", cli.alert_net.map(|v| v.to_string()));
     opt(&mut a, "alert-psi", cli.alert_psi.map(|v| v.to_string()));
+    opt(
+        &mut a,
+        "alert-mem-avail-mb",
+        cli.alert_mem_avail_mb.map(|v| v.to_string()),
+    );
+    opt(
+        &mut a,
+        "alert-swap-pct",
+        cli.alert_swap_pct.map(|v| v.to_string()),
+    );
+    opt(
+        &mut a,
+        "alert-retrans",
+        cli.alert_retrans.map(|v| v.to_string()),
+    );
+    opt(
+        &mut a,
+        "alert-nic-drop",
+        cli.alert_nic_drop.map(|v| v.to_string()),
+    );
     opt(&mut a, "alert-repeat", cli.alert_repeat.map(|v| v.to_string()));
     opt(&mut a, "alert-exec", cli.alert_exec.clone());
     opt(&mut a, "alert-webhook", cli.alert_webhook.clone());
@@ -2419,6 +2439,7 @@ fn main() {
                 "cpu_pct": s.cpu_percent,
                 "cores": s.cores,
                 "mem_used_mb": s.mem_used_mb,
+                "mem_avail_mb": s.mem_avail_mb,
                 "mem_total_mb": s.mem_total_mb,
                 "swap_used_mb": s.swap_used_mb,
                 "swap_total_mb": s.swap_total_mb,
@@ -2491,6 +2512,10 @@ fn main() {
             || cli.alert_disk.is_some()
             || cli.alert_net.is_some()
             || cli.alert_psi.is_some()
+            || cli.alert_mem_avail_mb.is_some()
+            || cli.alert_swap_pct.is_some()
+            || cli.alert_retrans.is_some()
+            || cli.alert_nic_drop.is_some()
             || !cli.alert_port.is_empty()
             || !cli.alert_new_proc.is_empty()
             || !cli.names.is_empty();
@@ -3032,6 +3057,10 @@ fn main() {
                 alert_disk: cli.alert_disk,
                 alert_net: cli.alert_net,
                 alert_psi: cli.alert_psi,
+                alert_mem_avail_mb: cli.alert_mem_avail_mb,
+                alert_swap_pct: cli.alert_swap_pct,
+                alert_retrans: cli.alert_retrans,
+                alert_nic_drop: cli.alert_nic_drop,
                 alert_webhook: cli.alert_webhook.clone(),
                 alert_repeat: cli.alert_repeat,
                 watch: cfg.watch.clone(),
@@ -3288,6 +3317,10 @@ fn main() {
                     || cli.alert_disk.is_some()
                     || cli.alert_net.is_some()
                     || cli.alert_psi.is_some()
+                    || cli.alert_mem_avail_mb.is_some()
+                    || cli.alert_swap_pct.is_some()
+                    || cli.alert_retrans.is_some()
+                    || cli.alert_nic_drop.is_some()
                 {
                     if let Some(stats) = platform.system_stats() {
                         let mounts = if cli.alert_disk.is_some() {
@@ -3295,12 +3328,39 @@ fn main() {
                         } else {
                             Vec::new()
                         };
-                        let net_rate = if cli.alert_net.is_some() {
+                        // one NIC sweep feeds both the throughput and the
+                        // drop sentinel (deltas live in sys_alert either way)
+                        let net_armed = cli.alert_net.is_some() || cli.alert_nic_drop.is_some();
+                        let (net_rate, drop_rate) = if net_armed {
                             let nics = platform.net_counters();
-                            let total = nics
-                                .iter()
-                                .fold((0u64, 0u64), |(rx, tx), n| (rx + n.rx_bytes, tx + n.tx_bytes));
-                            history::machine_net_rate(total, &mut sys_alert)
+                            let (rx, tx, drops) = nics.iter().fold(
+                                (0u64, 0u64, 0u64),
+                                |(rx, tx, drops), n| {
+                                    (
+                                        rx + n.rx_bytes,
+                                        tx + n.tx_bytes,
+                                        drops + n.rx_drops + n.tx_drops,
+                                    )
+                                },
+                            );
+                            (
+                                cli.alert_net
+                                    .is_some()
+                                    .then(|| history::machine_net_rate((rx, tx), &mut sys_alert))
+                                    .flatten(),
+                                cli.alert_nic_drop
+                                    .is_some()
+                                    .then(|| history::machine_drop_rate(drops, &mut sys_alert))
+                                    .flatten(),
+                            )
+                        } else {
+                            (None, None)
+                        };
+                        // retrans rate diffs SystemStats' cumulative counter
+                        let retrans_rate = if cli.alert_retrans.is_some() {
+                            stats.retrans_segs.and_then(|segs| {
+                                history::machine_retrans_rate(segs, &mut sys_alert)
+                            })
                         } else {
                             None
                         };
@@ -3314,6 +3374,12 @@ fn main() {
                             net_limit: cli.alert_net,
                             net_rate,
                             psi_limit: cli.alert_psi,
+                            mem_avail_floor: cli.alert_mem_avail_mb,
+                            swap_pct_limit: cli.alert_swap_pct,
+                            retrans_limit: cli.alert_retrans.map(|v| v as f64),
+                            retrans_rate,
+                            drop_limit: cli.alert_nic_drop.map(|v| v as f64),
+                            drop_rate,
                             repeat: cli.alert_repeat,
                         };
                         for (name, detail, rec) in history::system_alert_picks(
@@ -3345,6 +3411,16 @@ fn main() {
                                 for c in cs.iter_mut().filter(|c| c.state == "running") {
                                     if c.restarts.is_none() {
                                         c.restarts = platform::container_restarts(&c.runtime, &c.id);
+                                    }
+                                }
+                                // cgroup oom_kill totals feed the climb edge —
+                                // a restart policy hiding an OOM exit still trips
+                                let pressure = platform::container_pressure();
+                                for c in cs.iter_mut() {
+                                    let key: String = c.id.chars().take(12).collect();
+                                    if let Some(p) = pressure.get(&key) {
+                                        c.throttled_usec = Some(p.throttled_usec);
+                                        c.oom_kills = Some(p.oom_kills);
                                     }
                                 }
                                 let _ = tx.send((cs, pods));
@@ -4280,6 +4356,8 @@ mod tests {
                     name: "eth0".into(),
                     rx_bytes: self.rx.load(Relaxed),
                     tx_bytes: 0,
+                    rx_drops: 0,
+                    tx_drops: 0,
                 }]
             }
         }

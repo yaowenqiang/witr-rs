@@ -217,6 +217,10 @@ impl Cli {
         self.alert_disk = self.alert_disk.or(cfg.alert_disk);
         self.alert_net = self.alert_net.or(cfg.alert_net);
         self.alert_psi = self.alert_psi.or(cfg.alert_psi);
+        self.alert_mem_avail_mb = self.alert_mem_avail_mb.or(cfg.alert_mem_avail_mb);
+        self.alert_swap_pct = self.alert_swap_pct.or(cfg.alert_swap_pct);
+        self.alert_retrans = self.alert_retrans.or(cfg.alert_retrans);
+        self.alert_nic_drop = self.alert_nic_drop.or(cfg.alert_nic_drop);
         self.alert_repeat = self.alert_repeat.or(cfg.alert_repeat);
         if self.alert_exec.is_none() {
             self.alert_exec = cfg.alert_exec.clone();
@@ -748,6 +752,46 @@ pub struct Cli {
         )
     )]
     pub alert_psi: Option<f64>,
+
+    #[arg(
+        long = "alert-mem-avail-mb",
+        value_name = "MB",
+        help = t(
+            "整机告警：可回收内存（MemAvailable）连续 5 次采样（约 15s）低于该绝对下限（MB）时触发——OOM 前的最后一道哨兵。百分比阈值在大内存机器上失真，“还剩多少 MB”不会；平台不报告 MemAvailable 时静默不设防。TUI 和 --watch",
+            "Machine-wide alert: fire when reclaimable memory (MemAvailable) falls below this absolute floor (MB) for 5 consecutive samples (~15s) — the last sentinel before the OOM killer. Percentage thresholds lie on big-RAM machines; \"MB left\" doesn't. Silently disarmed where the platform reports no MemAvailable. TUI and --watch"
+        )
+    )]
+    pub alert_mem_avail_mb: Option<u64>,
+
+    #[arg(
+        long = "alert-swap-pct",
+        value_name = "PCT",
+        help = t(
+            "整机告警：swap 已用百分比连续 5 次采样（约 15s）超过该百分比时触发——内存压力外溢到磁盘的哨兵（无 swap 或平台不报告时静默不设防）。TUI 和 --watch",
+            "Machine-wide alert: fire when swap used percent exceeds this for 5 consecutive samples (~15s) — memory pressure spilling onto disk (silently disarmed with no swap or where the platform doesn't report it). TUI and --watch"
+        )
+    )]
+    pub alert_swap_pct: Option<u64>,
+
+    #[arg(
+        long = "alert-retrans",
+        value_name = "SEG/S",
+        help = t(
+            "整机告警：TCP 重传段速率连续 5 次采样（约 15s）超过该值（段/秒）时触发——“网络变慢”的头号元凶，load 和 PSI 都看不见它；计数器来自 /proc/net/snmp 的差分。TUI 和 --watch",
+            "Machine-wide alert: fire when the TCP retransmit rate exceeds this (segments/s) for 5 consecutive samples (~15s) — the top cause of \"the network got slow\", invisible to load and PSI; counters diffed from Linux /proc/net/snmp. TUI and --watch"
+        )
+    )]
+    pub alert_retrans: Option<u64>,
+
+    #[arg(
+        long = "alert-nic-drop",
+        value_name = "PKT/S",
+        help = t(
+            "整机告警：全部非回环网卡的收发丢包/错误合计速率连续 5 次采样（约 15s）超过该值（包/秒）时触发——吞吐量看着正常但包根本没送达的哨兵（Linux /proc/net/dev 计数器）。TUI 和 --watch",
+            "Machine-wide alert: fire when combined rx+tx drop/error counters across non-loopback NICs exceed this rate (packets/s) for 5 consecutive samples (~15s) — throughput can look fine while packets never arrive (Linux /proc/net/dev counters). TUI and --watch"
+        )
+    )]
+    pub alert_nic_drop: Option<u64>,
 
     #[arg(
         long = "alert-port",

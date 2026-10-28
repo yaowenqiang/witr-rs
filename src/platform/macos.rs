@@ -453,6 +453,11 @@ fn parse_iflist2(buf: &[u8]) -> Vec<super::NicCounters> {
             name: name.to_string(),
             rx_bytes: u64::from_ne_bytes(msg[96..104].try_into().expect("96..104")),
             tx_bytes: u64::from_ne_bytes(msg[104..112].try_into().expect("104..112")),
+            // if_data64's error/drop offsets aren't verified against
+            // ground truth yet — leave 0 rather than guess (the drop
+            // sentinel disarms on an all-zero total)
+            rx_drops: 0,
+            tx_drops: 0,
         });
     }
     out
@@ -484,6 +489,26 @@ impl MacOs {
             Err(_) => Vec::new(),
         }
     }
+}
+
+/// `ps -axo pid=,nlwp=` → pid → live thread count. Two whitespace tokens
+/// per line; kernel threads report 0 and are dropped (the table treats
+/// None as "unknown", 0 as "no threads").
+fn parse_nlwp_sweep(text: &str) -> std::collections::HashMap<Pid, u32> {
+    let mut out = std::collections::HashMap::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(pid), Some(nlwp)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(n)) = (pid.parse::<Pid>(), nlwp.parse::<u32>()) else {
+            continue;
+        };
+        if n > 0 {
+            out.insert(pid, n);
+        }
+    }
+    out
 }
 
 /// `ps -axo pid=,ppid=,uid=,state=,pgid=,sess=,etime=,time=,pcpu=,rss=,vsz=,tty=,comm=` —
@@ -911,7 +936,23 @@ impl Platform for MacOs {
             CMD_TIMEOUT,
         )
         .ok_or_else(|| PlatError::Failed("ps failed".into()))?;
-        Ok(out.lines().filter_map(|l| parse_ps_list_line(l, &self.users)).collect())
+        let mut procs: Vec<Process> = out
+            .lines()
+            .filter_map(|l| parse_ps_list_line(l, &self.users))
+            .collect();
+        // thread counts ride one extra `ps -axo pid=,nlwp=` sweep (another
+        // ~50ms spawn) — completing the Threads column / --top threads
+        // tri-parity. A failure leaves the counts unset; it never sinks
+        // the main table.
+        if let Some(t) = run_ok("ps", &["-axo", "pid=,nlwp="], CMD_TIMEOUT) {
+            let counts = parse_nlwp_sweep(&t);
+            for p in procs.iter_mut() {
+                if let Some(n) = counts.get(&p.pid) {
+                    p.threads = Some(*n);
+                }
+            }
+        }
+        Ok(procs)
     }
 
     /// Listing pass for the TUI IO column: one proc_pid_rusage call per pid
@@ -997,17 +1038,8 @@ impl Platform for MacOs {
                 }
             }
         }
-        // thread count: ps -M prints one line per thread (+ header)
-        if let Some(out) = run_ok(
-            "ps",
-            &["-M", "-p", &brief.pid.to_string()],
-            CMD_TIMEOUT,
-        ) {
-            let n = out.lines().count().saturating_sub(1);
-            if n > 0 {
-                p.threads = Some(n as u32);
-            }
-        }
+        // thread count rides the listing sweep (pid=,nlwp=) — brief
+        // carries it, no per-pid ps -M query here anymore
         // environment: ps -E appends KEY=VALUE after the command for
         // same-user processes; other users yield nothing (SIP)
         if want_env && !p.kernel_thread {
@@ -1567,6 +1599,24 @@ fn parse_cpu_time_to_ms(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn nlwp_sweep_fills_thread_counts() {
+        let text = "\
+   123 5
+  456 64
+789 0
+bad lines skipped
+  42
+";
+        let counts = parse_nlwp_sweep(text);
+        assert_eq!(counts.get(&123), Some(&5));
+        assert_eq!(counts.get(&456), Some(&64));
+        // a 0 thread count means "unknown" — dropped, not stored
+        assert!(!counts.contains_key(&789));
+        assert!(!counts.contains_key(&42));
+        assert_eq!(counts.len(), 2);
+    }
+
     /// One synthetic RTM_IFINFO2 record laid out like the kernel's: 32-byte
     /// if_msghdr2 fixed part + 128-byte if_data64 (ifi_ibytes @96,
     /// ifi_obytes @104) + sockaddr_dl at 160 (sdl_nlen @165, name @168).
@@ -1599,12 +1649,16 @@ mod tests {
                 crate::platform::NicCounters {
                     name: "en1".into(),
                     rx_bytes: 1_120_667_981,
-                    tx_bytes: 1_251_172_294
+                    tx_bytes: 1_251_172_294,
+                    rx_drops: 0,
+                    tx_drops: 0
                 },
                 crate::platform::NicCounters {
                     name: "utun3".into(),
                     rx_bytes: 400,
-                    tx_bytes: 300
+                    tx_bytes: 300,
+                    rx_drops: 0,
+                    tx_drops: 0
                 },
             ]
         );

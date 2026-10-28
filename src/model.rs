@@ -155,6 +155,18 @@ pub struct Container {
     pub mem_used_mb: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mem_total_mb: Option<u64>,
+    /// Cumulative cgroup CPU-throttle time (usec) — Linux reads
+    /// cpu.stat's throttled_usec for the container's cgroup. None off
+    /// Linux / off cgroup v2 / when no container pid was found to supply
+    /// the path. Consumers diff it against their previous sweep for a
+    /// live "this container is CPU-starved" percentage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throttled_usec: Option<u64>,
+    /// Cumulative oom_kill count from the cgroup's memory.events — the
+    /// kernel OOM-killed inside this container, even when the runtime
+    /// restarts it so fast the exit code never says OOM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oom_kills: Option<u64>,
 }
 
 /// One service-manager unit: a systemd unit (Linux), a launchd job (macOS)
@@ -434,6 +446,8 @@ mod tests {
             cpu_pct: None,
             mem_used_mb: None,
             mem_total_mb: None,
+    throttled_usec: None,
+    oom_kills: None,
         }
     }
 

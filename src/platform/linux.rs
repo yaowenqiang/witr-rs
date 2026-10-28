@@ -111,11 +111,20 @@ fn busy_between(prev: StatTicks, cur: StatTicks) -> Option<f64> {
     (d_total > 0).then(|| (1.0 - d_idle as f64 / d_total as f64).clamp(0.0, 1.0) * 100.0)
 }
 
+/// (mem_used, mem_avail, mem_total, swap_used, swap_total) in KiB.
+type MemInfoKb = (
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+);
+
 /// MemAvailable-based used (what free(1) reports) plus swap, from
-/// /proc/meminfo. Returns (mem_used, mem_total, swap_used, swap_total) KiB.
-fn parse_meminfo(
-    text: &str,
-) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+/// /proc/meminfo — the avail figure feeds the absolute-floor
+/// --alert-mem-avail-mb sentinel (a percentage threshold lies on big-RAM
+/// boxes; "MB left" doesn't).
+fn parse_meminfo(text: &str) -> MemInfoKb {
     let get_kb = |key: &str| -> Option<u64> {
         text.lines()
             .find_map(|l| l.strip_prefix(key))
@@ -127,7 +136,7 @@ fn parse_meminfo(
     let swap_total = get_kb("SwapTotal:");
     let swap_free = get_kb("SwapFree:");
     let swap_used = swap_total.zip(swap_free).map(|(t, f)| t.saturating_sub(f));
-    (mem_used, mem_total, swap_used, swap_total)
+    (mem_used, avail, mem_total, swap_used, swap_total)
 }
 
 /// `0.52 0.58 0.59 2/1234 5678` → (1, 5, 15-minute load averages).
@@ -239,7 +248,8 @@ fn thermal_sensor() -> Option<(String, f64)> {
 /// /proc/net/dev → cumulative per-interface counters. Two header lines,
 /// then `iface: rx_bytes …` with tx_bytes as the 9th whitespace field
 /// (index 8 after the iface piece). Loopback drops out — intra-machine
-/// traffic would double count a throughput alert.
+/// traffic would double count a throughput alert. The rx/tx drop+error
+/// counters (rx field 3, tx field 11) ride along for the drop sentinel.
 fn parse_net_dev(text: &str) -> Vec<super::NicCounters> {
     let mut out = Vec::new();
     for line in text.lines().skip(2) {
@@ -257,11 +267,111 @@ fn parse_net_dev(text: &str) -> Vec<super::NicCounters> {
         let (Ok(rx), Ok(tx)) = (fields[0].parse::<u64>(), fields[8].parse::<u64>()) else {
             continue;
         };
+        // the 16-counter kernel layout: rx errs/drop at 2/3, tx at 10/11.
+        // Missing fields (ancient kernels?) fall back to 0 rather than
+        // dropping the interface's byte counters.
+        let num = |i: usize| fields.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         out.push(super::NicCounters {
             name: iface.to_string(),
             rx_bytes: rx,
             tx_bytes: tx,
+            rx_drops: num(2) + num(3),
+            tx_drops: num(10) + num(11),
         });
+    }
+    out
+}
+
+/// /proc/net/snmp → cumulative TCP RetransSegs since boot. Two lines per
+/// protocol (header, then values): find the `Tcp:` header, index the
+/// `RetransSegs` column by name, read the same column from the value line.
+/// The sentinel diffs it into segments/s — the top cause of "the network
+/// got slow" that load and PSI never see.
+fn parse_snmp_retrans(text: &str) -> Option<u64> {
+    let mut cols: Option<usize> = None;
+    for line in text.lines() {
+        let Some((proto, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if proto.trim() != "Tcp" {
+            continue;
+        }
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        match cols {
+            None => {
+                cols = fields.iter().position(|f| *f == "RetransSegs");
+            }
+            Some(i) => return fields.get(i).and_then(|v| v.parse::<u64>().ok()),
+        }
+    }
+    None
+}
+
+/// cpu.stat's `throttled_usec <n>` line → n. This cgroup's tasks spent
+/// that many microseconds runnable-but-stopped by the CFS quota — the
+/// "container is slow but CPU looks idle" signature.
+fn parse_cpu_stat_throttled(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("throttled_usec"))
+        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+}
+
+/// memory.events' `oom_kill <n>` line → n. Exact-prefix match — memory
+/// events also carries a bare `oom` counter (hits without kills) that
+/// must not satisfy this.
+fn parse_memory_events_oom(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("oom_kill"))
+        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+}
+
+/// Per-container cgroup pressure (see [`super::container_pressure`]). One
+/// /proc sweep finds each container's cgroup path via its first visible
+/// pid ([`classify_cgroup`] does the id extraction), then cpu.stat and
+/// memory.events are read per unique path — a handful of file reads, no
+/// runtime CLI involved. Keys are 12-char id prefixes, matching what
+/// `stats --format {{.ID}}` hands the stats merge.
+pub fn container_pressure_cgroup() -> std::collections::HashMap<String, super::ContainerPressure>
+{
+    let mut cg_paths: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return std::collections::HashMap::new();
+    };
+    for entry in entries.flatten() {
+        let Ok(_pid) = entry.file_name().to_string_lossy().parse::<Pid>() else {
+            continue;
+        };
+        let Some(cg) = read_ok(&entry.path().join("cgroup")) else {
+            continue;
+        };
+        let Some(path) = cg.lines().find_map(|l| l.strip_prefix("0::")) else {
+            continue;
+        };
+        let Some((_, id)) = classify_cgroup(path.trim()) else {
+            continue;
+        };
+        let key: String = id.chars().take(12).collect();
+        cg_paths.entry(key).or_insert_with(|| path.trim().to_string());
+    }
+    let mut out = std::collections::HashMap::new();
+    for (id, path) in cg_paths {
+        let root = Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+        let throttled_usec = read_ok(&root.join("cpu.stat"))
+            .and_then(|t| parse_cpu_stat_throttled(&t))
+            .unwrap_or(0);
+        let oom_kills = read_ok(&root.join("memory.events"))
+            .and_then(|t| parse_memory_events_oom(&t))
+            .unwrap_or(0);
+        if throttled_usec > 0 || oom_kills > 0 {
+            out.insert(
+                id,
+                super::ContainerPressure {
+                    throttled_usec,
+                    oom_kills,
+                },
+            );
+        }
     }
     out
 }
@@ -988,8 +1098,9 @@ impl Platform for Linux {
         drop(prev);
 
         if let Some(mi) = read_ok(Path::new("/proc/meminfo")) {
-            let (mu, mt, su, st) = parse_meminfo(&mi);
+            let (mu, ma, mt, su, st) = parse_meminfo(&mi);
             out.mem_used_mb = mu.map(|kb| kb / 1024);
+            out.mem_avail_mb = ma.map(|kb| kb / 1024);
             out.mem_total_mb = mt.map(|kb| kb / 1024);
             out.swap_used_mb = su.map(|kb| kb / 1024);
             out.swap_total_mb = st.map(|kb| kb / 1024);
@@ -1004,6 +1115,9 @@ impl Platform for Linux {
         // more µs-cheap /proc reads, same cadence as the rest
         out.psi = read_psi();
         out.temp = thermal_sensor();
+        if let Some(snmp) = read_ok(Path::new("/proc/net/snmp")) {
+            out.retrans_segs = parse_snmp_retrans(&snmp);
+        }
         Some(out)
     }
 
@@ -1562,17 +1676,53 @@ wlp3s0: 5000 50 0 0 0 0 0 0  6000 60 0 0 0 0 0 0
                 crate::platform::NicCounters {
                     name: "eth0".into(),
                     rx_bytes: 1000,
-                    tx_bytes: 2000
+                    tx_bytes: 2000,
+                    rx_drops: 0,
+                    tx_drops: 0
                 },
                 crate::platform::NicCounters {
                     name: "wlp3s0".into(),
                     rx_bytes: 5000,
-                    tx_bytes: 6000
+                    tx_bytes: 6000,
+                    rx_drops: 0,
+                    tx_drops: 0
                 },
             ]
         );
         // iface with no colon (corrupt line) and short rows drop out
         assert!(parse_net_dev("garbage\n eth9: 1 2\n").is_empty());
+        // drop+error counters ride along (rx errs/drop at 2/3, tx at 10/11)
+        let drops = parse_net_dev("\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+ eth1: 100 10 3 7 0 0 0 0  200 20 5 11 0 0 0 0
+");
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].rx_drops, 10, "rx errs + drop");
+        assert_eq!(drops[0].tx_drops, 16, "tx errs + drop");
+    }
+
+    #[test]
+    fn cgroup_pressure_parsers() {
+        let cpu_stat = "\
+nr_periods 1234
+nr_throttled 12
+throttled_usec 987654321
+nr_bursts 0
+burst_usec 0
+";
+        assert_eq!(parse_cpu_stat_throttled(cpu_stat), Some(987_654_321));
+        assert_eq!(parse_cpu_stat_throttled("nr_periods 1\n"), None);
+        // memory.events: oom vs oom_kill are different counters — the
+        // bare `oom` line (hits without kills) must not match
+        let mem_events = "pgscan 100\noom 2\noom_kill 1\npgsteal 50\n";
+        assert_eq!(parse_memory_events_oom(mem_events), Some(1));
+        assert_eq!(
+            parse_memory_events_oom("oom 5\noom_kill 0\n"),
+            Some(0),
+            "a zero kill count is still a reading"
+        );
+        assert_eq!(parse_memory_events_oom("oom 5\n"), None);
     }
 
     #[test]
@@ -1836,13 +1986,16 @@ SwapTotal:       2048000 kB
 SwapFree:        1024000 kB
 HugePages_Total:       0
 ";
-        let (mu, mt, su, st) = parse_meminfo(text);
+        let (mu, ma, mt, su, st) = parse_meminfo(text);
         // the parser reports KiB; system_stats does the /1024 to MB
         assert_eq!(mt, Some(16_384_000));
         assert_eq!(mu, Some(8_192_000), "used = total - MemAvailable");
-        // no MemAvailable → MemFree fallback
+        assert_eq!(ma, Some(8_192_000), "avail rides along for the floor alert");
+        // no MemAvailable → MemFree fallback (the fixture carries
+        // MemFree: 1024000 kB — used = 16384000 − 1024000)
         let fallback = text.replace("MemAvailable:    8192000 kB\n", "");
         assert_eq!(parse_meminfo(&fallback).0, Some(15_360_000));
+        assert_eq!(parse_meminfo(&fallback).1, Some(1_024_000));
         assert_eq!((su, st), (Some(1_024_000), Some(2_048_000)));
         let (l1, l5, l15) = parse_loadavg("0.52 0.58 0.59 2/1234 5678\n");
         assert_eq!((l1, l5, l15), (Some(0.52), Some(0.58), Some(0.59)));

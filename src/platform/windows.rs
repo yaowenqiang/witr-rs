@@ -123,6 +123,11 @@ fn parse_windows_nics(text: &str) -> Vec<super::NicCounters> {
             name,
             rx_bytes: rx,
             tx_bytes: tx,
+            // Get-NetAdapterStatistics exposes Discarded/ErrorPackets but
+            // the column mapping isn't verified — leave 0 (the drop
+            // sentinel disarms on an all-zero total)
+            rx_drops: 0,
+            tx_drops: 0,
         });
     }
     out
@@ -927,12 +932,16 @@ garbage
                 crate::platform::NicCounters {
                     name: "Ethernet".into(),
                     rx_bytes: 1000,
-                    tx_bytes: 2000
+                    tx_bytes: 2000,
+                    rx_drops: 0,
+                    tx_drops: 0
                 },
                 crate::platform::NicCounters {
                     name: "Wi-Fi 2 (Intel(R) Wi-Fi 6 AX201)".into(),
                     rx_bytes: 5000,
-                    tx_bytes: 6000
+                    tx_bytes: 6000,
+                    rx_drops: 0,
+                    tx_drops: 0
                 },
             ]
         );

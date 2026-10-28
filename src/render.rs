@@ -1462,6 +1462,7 @@ fn sys_flat_cells(frame: &SysFrame) -> Vec<(String, String)> {
     let cells: Vec<(String, String)> = vec![
         ("CPU_PCT".into(), f(s.cpu_percent, 1)),
         ("MEM_USED_MB".into(), i(s.mem_used_mb)),
+        ("MEM_AVAIL_MB".into(), i(s.mem_avail_mb)),
         ("MEM_TOTAL_MB".into(), i(s.mem_total_mb)),
         ("SWAP_USED_MB".into(), i(s.swap_used_mb)),
         ("SWAP_TOTAL_MB".into(), i(s.swap_total_mb)),
@@ -2765,6 +2766,7 @@ mod tests {
             cores: vec![10.0, 95.0],
             mem_used_mb: Some(6000),
             mem_total_mb: Some(16000),
+            mem_avail_mb: Some(10_000),
             swap_used_mb: Some(512),
             swap_total_mb: Some(4096),
             load1: Some(0.42),
@@ -2779,6 +2781,7 @@ mod tests {
                 io_full: 12.5,
             }),
             temp: Some(("acpitz".into(), 54.0)),
+            retrans_segs: Some(4242),
         };
         let frame = SysFrame {
             stats,
@@ -2807,7 +2810,7 @@ mod tests {
         let row = lines.next().unwrap();
         assert_eq!(header.split(',').count(), row.split(',').count(), "{csv}");
         assert!(header.starts_with("cpu_pct,mem_used_mb"));
-        assert!(row.starts_with("37.2,6000,16000,512,4096,0.42,0.35,0.30,214,"));
+        assert!(row.starts_with("37.2,6000,10000,16000,512,4096,0.42,0.35,0.30,214,"));
         assert!(row.contains("97.7"), "disk used pct: {row}");
         assert!(row.ends_with(",54.0,acpitz,12.5"), "temp/psi tail: {row}");
 

@@ -314,6 +314,12 @@ struct TuiApp {
     container_stats_at: Option<Instant>,
     container_stats_loading: bool,
     container_stats_rx: Option<ContainerStatsRx>,
+    /// per-container throttle percent over the last sweep (12-char id →
+    /// %) — diffed from the cumulative throttled_usec each containers
+    /// sweep brings back; empty until the second sweep arms the delta
+    throttle_pct: HashMap<String, f64>,
+    /// the throttled_usec reading + sweep time the percentage diffs against
+    throttle_prev: HashMap<String, (u64, Instant)>,
     /// sampling history: instantaneous cpu, sparklines, restart detection
     hist: crate::history::History,
     /// open files fetched when the full detail page opens
@@ -393,6 +399,10 @@ struct TuiApp {
     alert_net: Option<u64>,
     /// --alert-psi: PSI "full" stall percent threshold (Linux only)
     alert_psi: Option<f64>,
+    alert_mem_avail_mb: Option<u64>,
+    alert_swap_pct: Option<u64>,
+    alert_retrans: Option<u64>,
+    alert_nic_drop: Option<u64>,
     /// streak/firing state for the machine-wide alerts
     sys_alert: crate::history::SysAlertState,
     /// shared container/pod edge detector memory (first sighting arms, no
@@ -601,6 +611,14 @@ pub struct Seed {
     pub alert_net: Option<u64>,
     /// --alert-psi: PSI "full" stall percent threshold (Linux only)
     pub alert_psi: Option<f64>,
+    /// --alert-mem-avail-mb: reclaimable-memory absolute floor (MB)
+    pub alert_mem_avail_mb: Option<u64>,
+    /// --alert-swap-pct: swap saturation threshold (percent)
+    pub alert_swap_pct: Option<u64>,
+    /// --alert-retrans: TCP retransmit rate threshold (segments/s)
+    pub alert_retrans: Option<u64>,
+    /// --alert-nic-drop: NIC drop/error rate threshold (packets/s)
+    pub alert_nic_drop: Option<u64>,
     /// --alert-exec: shell command run on every threshold-alert firing;
     /// context exported as WITR_ALERT_PID/NAME/DETAIL
     pub alert_exec: Option<String>,
@@ -691,6 +709,10 @@ impl Seed {
         self.alert_disk = cli.alert_disk;
         self.alert_net = cli.alert_net;
         self.alert_psi = cli.alert_psi;
+        self.alert_mem_avail_mb = cli.alert_mem_avail_mb;
+        self.alert_swap_pct = cli.alert_swap_pct;
+        self.alert_retrans = cli.alert_retrans;
+        self.alert_nic_drop = cli.alert_nic_drop;
         self.alert_exec = cli.alert_exec.clone();
         self.alert_webhook = cli.alert_webhook.clone();
         self.alert_silence = cli
@@ -825,6 +847,10 @@ impl TuiApp {
             alert_disk: seed.alert_disk,
             alert_net: seed.alert_net,
             alert_psi: seed.alert_psi,
+            alert_mem_avail_mb: seed.alert_mem_avail_mb,
+            alert_swap_pct: seed.alert_swap_pct,
+            alert_retrans: seed.alert_retrans,
+            alert_nic_drop: seed.alert_nic_drop,
             sys_alert: crate::history::SysAlertState::default(),
             container_edges: crate::history::ContainerEdges::default(),
             pending_alerts: Vec::new(),
@@ -884,6 +910,8 @@ impl TuiApp {
             containers_loaded: false,
             containers_rx: None,
             container_stats: HashMap::new(),
+            throttle_pct: HashMap::new(),
+            throttle_prev: HashMap::new(),
             container_stats_at: None,
             container_stats_loading: false,
             container_stats_rx: None,
@@ -1047,6 +1075,10 @@ impl TuiApp {
         self.alert_disk = seed.alert_disk;
         self.alert_net = seed.alert_net;
         self.alert_psi = seed.alert_psi;
+        self.alert_mem_avail_mb = seed.alert_mem_avail_mb;
+        self.alert_swap_pct = seed.alert_swap_pct;
+        self.alert_retrans = seed.alert_retrans;
+        self.alert_nic_drop = seed.alert_nic_drop;
         self.alert_exec = seed.alert_exec.clone();
         self.alert_webhook = seed.alert_webhook.clone();
         self.alert_silence = seed.alert_silence.clone();
@@ -1209,7 +1241,11 @@ impl TuiApp {
                     || self.alert_count.is_some()
                     || self.alert_disk.is_some()
                     || self.alert_net.is_some()
-                    || self.alert_psi.is_some())
+                    || self.alert_psi.is_some()
+                    || self.alert_mem_avail_mb.is_some()
+                    || self.alert_swap_pct.is_some()
+                    || self.alert_retrans.is_some()
+                    || self.alert_nic_drop.is_some())
             {
                 // --alert-load / --alert-mem-pct / --alert-count /
                 // --alert-disk / --alert-net: sample the whole machine when
@@ -1222,12 +1258,42 @@ impl TuiApp {
                     } else {
                         Vec::new()
                     };
-                    let net_rate = if self.alert_net.is_some() {
+                    // one NIC sweep feeds both the throughput and drop
+                    // sentinels (the deltas live in sys_alert either way)
+                    let net_armed =
+                        self.alert_net.is_some() || self.alert_nic_drop.is_some();
+                    let (net_rate, drop_rate) = if net_armed {
                         let nics = self.platform.net_counters();
-                        let total = nics
+                        let (rx, tx, drops) = nics
                             .iter()
-                            .fold((0u64, 0u64), |(rx, tx), n| (rx + n.rx_bytes, tx + n.tx_bytes));
-                        crate::history::machine_net_rate(total, &mut self.sys_alert)
+                            .fold((0u64, 0u64, 0u64), |(rx, tx, drops), n| {
+                                (
+                                    rx + n.rx_bytes,
+                                    tx + n.tx_bytes,
+                                    drops + n.rx_drops + n.tx_drops,
+                                )
+                            });
+                        (
+                            self.alert_net
+                                .is_some()
+                                .then(|| {
+                                    crate::history::machine_net_rate((rx, tx), &mut self.sys_alert)
+                                })
+                                .flatten(),
+                            self.alert_nic_drop
+                                .is_some()
+                                .then(|| {
+                                    crate::history::machine_drop_rate(drops, &mut self.sys_alert)
+                                })
+                                .flatten(),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let retrans_rate = if self.alert_retrans.is_some() {
+                        stats.retrans_segs.and_then(|segs| {
+                            crate::history::machine_retrans_rate(segs, &mut self.sys_alert)
+                        })
                     } else {
                         None
                     };
@@ -1241,6 +1307,12 @@ impl TuiApp {
                         net_limit: self.alert_net,
                         net_rate,
                         psi_limit: self.alert_psi,
+                        mem_avail_floor: self.alert_mem_avail_mb,
+                        swap_pct_limit: self.alert_swap_pct,
+                        retrans_limit: self.alert_retrans.map(|v| v as f64),
+                        retrans_rate,
+                        drop_limit: self.alert_nic_drop.map(|v| v as f64),
+                        drop_rate,
                         repeat: self.alert_repeat,
                     };
                     picks.extend(
@@ -1388,6 +1460,20 @@ impl TuiApp {
                     c.restarts = crate::platform::container_restarts(&c.runtime, &c.id);
                 }
             }
+            // cgroup pressure readings (throttle time + oom_kill totals)
+            // merge by 12-char id prefix — a Linux-only sweep of a few
+            // file reads, no runtime CLI involved
+            let pressure = crate::platform::container_pressure();
+            for c in cs.iter_mut() {
+                if c.throttled_usec.is_some() && c.oom_kills.is_some() {
+                    continue;
+                }
+                let key: String = c.id.chars().take(12).collect();
+                if let Some(p) = pressure.get(&key) {
+                    c.throttled_usec = Some(p.throttled_usec);
+                    c.oom_kills = Some(p.oom_kills);
+                }
+            }
             let _ = tx.send((cs, pods));
         });
         self.containers_rx = Some(rx);
@@ -1410,6 +1496,22 @@ impl TuiApp {
             if !self.container_events_tried {
                 self.container_events_tried = true;
                 self.container_events = crate::history::spawn_container_events();
+            }
+            // throttle percent per container: diff this sweep's cumulative
+            // throttled_usec against the previous one over the elapsed wall
+            // time (the first sweep only arms the baseline)
+            let now_instant = Instant::now();
+            for c in self.containers.iter().filter(|c| c.throttled_usec.is_some()) {
+                let key: String = c.id.chars().take(12).collect();
+                let cur = c.throttled_usec.unwrap_or(0);
+                if let Some((prev, at)) = self.throttle_prev.get(&key) {
+                    let elapsed = now_instant.duration_since(*at).as_micros() as f64;
+                    if elapsed > 0.0 {
+                        let pct = (cur.saturating_sub(*prev) as f64 / elapsed * 100.0).clamp(0.0, 100.0);
+                        self.throttle_pct.insert(key.clone(), pct);
+                    }
+                }
+                self.throttle_prev.insert(key, (cur, now_instant));
             }
             self.container_alert_edges(&self.containers.clone(), &pods);
             self.apply_container_stats();
@@ -3271,6 +3373,35 @@ impl TuiApp {
             } else {
                 kv("Restarts", "unavailable".into())
             },
+            // cgroup pressure (Linux): cumulative oom_kill total + the
+            // throttle percentage over the last sweep
+            match c.oom_kills {
+                Some(n) if n > 0 => Line::from(vec![
+                    styled(Style::new().fg(MID), format!("{:<9}", "OOM kills")),
+                    Span::raw(n.to_string()),
+                    styled(
+                        Style::new().fg(Color::Red).bold(),
+                        "  (the kernel OOM-killed inside this container)",
+                    ),
+                ]),
+                Some(_) => kv("OOM kills", "0".into()),
+                None => kv("OOM kills", "n/a (no cgroup v2)".into()),
+            },
+            match self
+                .throttle_pct
+                .get(&c.id.chars().take(12).collect::<String>())
+            {
+                Some(pct) if *pct > 0.0 => Line::from(vec![
+                    styled(Style::new().fg(MID), format!("{:<9}", "Throttled")),
+                    Span::raw(format!("{pct:.1}% of the last sweep")),
+                    if *pct >= 50.0 {
+                        styled(Style::new().fg(Color::Red).bold(), "  (CPU-starved by its quota)")
+                    } else {
+                        Span::raw("")
+                    },
+                ]),
+            _ => kv("Throttled", "0% of the last sweep".into()),
+            },
         ]
     }
 
@@ -4892,9 +5023,12 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
     // Pod column only when k8s attribution actually produced something —
     // it's dead width on plain-docker hosts. Same for the CPU%/MEM columns:
     // they appear once the first stats sweep has landed (stats cost ~2s
-    // per runtime CLI, so they arrive after the listing).
+    // per runtime CLI, so they arrive after the listing). THR%/OOM ride
+    // the same pattern — cgroup pressure readings from the first sweep.
     let has_pod = app.containers.iter().any(|c| c.pod.is_some());
     let has_stats = app.containers.iter().any(|c| c.cpu_pct.is_some());
+    let has_thr = app.throttle_pct.values().any(|v| *v > 0.0);
+    let has_oom = app.containers.iter().any(|c| c.oom_kills.is_some());
     let mut header: Vec<Cell> = vec![
         Cell::from("Runtime"),
         Cell::from("ID"),
@@ -4912,6 +5046,14 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
         header.push(Cell::from("MEM"));
         widths.push(Constraint::Length(8));
         widths.push(Constraint::Length(15));
+    }
+    if has_thr {
+        header.push(Cell::from("THR%"));
+        widths.push(Constraint::Length(7));
+    }
+    if has_oom {
+        header.push(Cell::from("OOM"));
+        widths.push(Constraint::Length(5));
     }
     if has_pod {
         header.push(Cell::from("Pod"));
@@ -4936,6 +5078,31 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
             if has_stats {
                 cells.push(Cell::from(container_cpu_disp(c)));
                 cells.push(Cell::from(container_mem_disp(c)).style(container_mem_style(c)));
+            }
+            let key: String = c.id.chars().take(12).collect();
+            if has_thr {
+                let cell = match app.throttle_pct.get(&key) {
+                    Some(pct) if *pct > 0.0 => {
+                        let style = if *pct >= 50.0 {
+                            Style::new().fg(Color::Red).bold()
+                        } else {
+                            Style::new().fg(Color::Yellow)
+                        };
+                        Cell::from(format!("{pct:.0}%")).style(style)
+                    }
+                    _ => Cell::from("-"),
+                };
+                cells.push(cell);
+            }
+            if has_oom {
+                let cell = match c.oom_kills {
+                    Some(n) if n > 0 => {
+                        Cell::from(format!("{n}")).style(Style::new().fg(Color::Red).bold())
+                    }
+                    Some(_) => Cell::from("0"),
+                    None => Cell::from("-"),
+                };
+                cells.push(cell);
             }
             if has_pod {
                 cells.push(Cell::from(c.pod.clone().unwrap_or_else(|| "-".into())));
@@ -9241,6 +9408,8 @@ mod tests {
             cpu_pct: None,
             mem_used_mb: None,
             mem_total_mb: None,
+    throttled_usec: None,
+    oom_kills: None,
         };
         assert_eq!(
             container_state_style(&mk("running", "Up 2 weeks (healthy)")).fg,
@@ -9282,6 +9451,8 @@ mod tests {
                 cpu_pct: None,
                 mem_used_mb: None,
                 mem_total_mb: None,
+        throttled_usec: None,
+        oom_kills: None,
             },
             Container {
                 runtime: "docker".into(),
@@ -9297,6 +9468,8 @@ mod tests {
                 cpu_pct: None,
                 mem_used_mb: None,
                 mem_total_mb: None,
+        throttled_usec: None,
+        oom_kills: None,
             },
         ];
         app.rebuild_container_view();
@@ -9327,6 +9500,8 @@ mod tests {
             cpu_pct: None,
             mem_used_mb: None,
             mem_total_mb: None,
+    throttled_usec: None,
+    oom_kills: None,
         };
         // first sighting arms quietly — no alerts
         app.container_alert_edges(&[mk("a1", "web", "running", Some(0))], &[]);
@@ -9708,6 +9883,10 @@ mod tests {
                 alert_disk: None,
                 alert_net: None,
                 alert_psi: None,
+                alert_mem_avail_mb: None,
+                alert_swap_pct: None,
+                alert_retrans: None,
+                alert_nic_drop: None,
                 alert_webhook: None,
                 alert_silence: Vec::new(),
                 alert_new_proc: Vec::new(),

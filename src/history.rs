@@ -475,6 +475,27 @@ pub struct SysAlertState {
     pub psi_streak: u32,
     pub psi_firing: bool,
     pub psi_fired_secs: u32,
+    pub mem_avail_streak: u32,
+    pub mem_avail_firing: bool,
+    pub mem_avail_fired_secs: u32,
+    pub swap_streak: u32,
+    pub swap_firing: bool,
+    pub swap_fired_secs: u32,
+    /// Cumulative TCP RetransSegs at `retrans_prev_at` — the previous
+    /// sample [`machine_retrans_rate`] diffs against.
+    pub retrans_prev: Option<u64>,
+    pub retrans_prev_at: Option<std::time::Instant>,
+    pub retrans_streak: u32,
+    pub retrans_firing: bool,
+    pub retrans_fired_secs: u32,
+    /// Total rx+tx drop counters across non-loopback NICs at
+    /// `drop_prev_at` — the previous sample [`machine_drop_rate`] diffs
+    /// against.
+    pub drop_prev: Option<u64>,
+    pub drop_prev_at: Option<std::time::Instant>,
+    pub drop_streak: u32,
+    pub drop_firing: bool,
+    pub drop_fired_secs: u32,
 }
 
 /// The armed machine-wide alert thresholds plus the inputs they compare
@@ -501,6 +522,24 @@ pub struct SysAlertLimits {
     /// --alert-psi threshold in percent: fire when any resource's PSI full
     /// stall (avg10) exceeds it. Disarmed when the platform reports no PSI.
     pub psi_limit: Option<f64>,
+    /// --alert-mem-avail-mb: fire when reclaimable memory (MemAvailable)
+    /// drops below this absolute floor in MB. Percentage thresholds lie on
+    /// big-RAM machines; "MB left" doesn't. Disarmed where the platform
+    /// reports no avail figure.
+    pub mem_avail_floor: Option<u64>,
+    /// --alert-swap-pct: fire when swap used percent exceeds this. Disarmed
+    /// when the platform reports no swap (or swap is 0 — nothing to
+    /// saturate).
+    pub swap_pct_limit: Option<u64>,
+    /// --alert-retrans threshold in segments/s, compared against the
+    /// caller's [`machine_retrans_rate`] output. `None` (first sample or
+    /// the platform reports no TCP counters) disarms the check.
+    pub retrans_limit: Option<f64>,
+    pub retrans_rate: Option<f64>,
+    /// --alert-nic-drop threshold in packets/s, compared against the
+    /// caller's [`machine_drop_rate`] output. `None` disarms.
+    pub drop_limit: Option<f64>,
+    pub drop_rate: Option<f64>,
     pub repeat: Option<u64>,
 }
 
@@ -524,6 +563,35 @@ pub fn machine_net_rate(total: (u64, u64), state: &mut SysAlertState) -> Option<
     rate
 }
 
+/// Diff the cumulative TCP RetransSegs counter into a segments-per-second
+/// rate. `None` on the first sample (no previous to diff against); a
+/// counter reset (the box's TCP stats restart — container namespace? net
+/// stack reload?) counts as a zero delta rather than a huge spike.
+pub fn machine_retrans_rate(total: u64, state: &mut SysAlertState) -> Option<f64> {
+    let now = std::time::Instant::now();
+    let rate = state.retrans_prev.zip(state.retrans_prev_at).and_then(|(prev, at)| {
+        let elapsed = now.duration_since(at).as_secs_f64();
+        (elapsed > 0.0).then(|| total.saturating_sub(prev) as f64 / elapsed)
+    });
+    state.retrans_prev = Some(total);
+    state.retrans_prev_at = Some(now);
+    rate
+}
+
+/// Diff summed NIC rx+tx drop/error counters into a packets-per-second
+/// rate. `None` on the first sample. Drops are the NIC or queue throwing
+/// work away — throughput can look fine while packets never arrive.
+pub fn machine_drop_rate(total: u64, state: &mut SysAlertState) -> Option<f64> {
+    let now = std::time::Instant::now();
+    let rate = state.drop_prev.zip(state.drop_prev_at).and_then(|(prev, at)| {
+        let elapsed = now.duration_since(at).as_secs_f64();
+        (elapsed > 0.0).then(|| total.saturating_sub(prev) as f64 / elapsed)
+    });
+    state.drop_prev = Some(total);
+    state.drop_prev_at = Some(now);
+    rate
+}
+
 /// One machine-wide alert edge: `(name, detail, is_recovery)` — name is
 /// always `"system"` (the machine has no pid); recoveries read
 /// `<metric> back under <limit>`.
@@ -538,8 +606,9 @@ pub type SysPick = (String, String, bool);
 /// Pending, Failed phase, climbing k8s restart totals.
 #[derive(Default)]
 pub struct ContainerEdges {
-    /// "runtime/id" → (state, restarts) of the previous enumeration.
-    container_seen: std::collections::HashMap<String, (String, Option<u32>)>,
+    /// "runtime/id" → (state, restarts, oom_kills) of the previous
+    /// enumeration.
+    container_seen: std::collections::HashMap<String, (String, Option<u32>, Option<u64>)>,
     /// pod key → (phase, restarts, waiting reason) of the previous sweep.
     pod_seen: std::collections::HashMap<String, (Option<String>, u32, Option<String>)>,
 }
@@ -560,7 +629,7 @@ impl ContainerEdges {
         let mut out = Vec::new();
         for c in cs {
             let key = format!("{}/{}", c.runtime, c.id);
-            if let Some((st, rst)) = self.container_seen.get(&key) {
+            if let Some((st, rst, oom)) = self.container_seen.get(&key) {
                 let pod_tag = match &c.pod {
                     Some(p) => format!(" · pod {p}"),
                     None => String::new(),
@@ -583,9 +652,22 @@ impl ContainerEdges {
                         ));
                     }
                 }
+                // cgroup memory.events oom_kill climb — the kernel OOM
+                // killer went to work inside this container even if a
+                // restart policy hid the exit code
+                if let (Some(old), Some(new)) = (*oom, c.oom_kills) {
+                    if new > old {
+                        out.push((
+                            format!("container {}", c.name),
+                            format!(
+                                "OOM kill count {old} → {new} — the kernel OOM-killed inside this container{pod_tag}"
+                            ),
+                        ));
+                    }
+                }
             }
             self.container_seen
-                .insert(key, (c.state.clone(), c.restarts));
+                .insert(key, (c.state.clone(), c.restarts, c.oom_kills));
         }
         // removed containers drop out of the edge detector's memory
         let live: std::collections::HashSet<String> = cs
@@ -670,6 +752,12 @@ pub fn system_alert_picks(
         net_limit: net_limit_opt,
         net_rate: net_rate_opt,
         psi_limit: psi_limit_opt,
+        mem_avail_floor,
+        swap_pct_limit,
+        retrans_limit,
+        retrans_rate: retrans_rate_opt,
+        drop_limit,
+        drop_rate: drop_rate_opt,
         repeat: repeat_secs,
     } = limits;
     let load_limit = *load_limit;
@@ -680,6 +768,12 @@ pub fn system_alert_picks(
     let net_limit = *net_limit_opt;
     let net_rate = *net_rate_opt;
     let psi_limit = *psi_limit_opt;
+    let retrans_rate = *retrans_rate_opt;
+    let drop_rate = *drop_rate_opt;
+    let mem_avail_floor = *mem_avail_floor;
+    let swap_pct_limit = *swap_pct_limit;
+    let retrans_limit = *retrans_limit;
+    let drop_limit = *drop_limit;
     let repeat_secs = *repeat_secs;
     let mut out = Vec::new();
     if let Some(limit) = load_limit {
@@ -873,6 +967,120 @@ pub fn system_alert_picks(
             ));
         } else if edge == AlertEdge::Recover {
             out.push(("system".to_string(), format!("PSI back under {limit}%"), true));
+        }
+    }
+    if let Some(floor) = mem_avail_floor {
+        let avail = stats.mem_avail_mb;
+        // the floor is a *lower* bound: over = we've fallen under it
+        let under = avail.is_some_and(|a| a < floor);
+        let edge = alert_cycle_repeat(
+            &mut state.mem_avail_streak,
+            &mut state.mem_avail_firing,
+            under,
+            &mut state.mem_avail_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            out.push((
+                "system".to_string(),
+                format!(
+                    "MemAvailable {} MB below {floor} MB floor for {}s",
+                    avail.unwrap_or(0),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("memory avail back above {floor} MB"),
+                true,
+            ));
+        }
+    }
+    if let Some(limit) = swap_pct_limit {
+        let pct = match (stats.swap_used_mb, stats.swap_total_mb) {
+            (Some(u), Some(t)) if t > 0 => Some(u * 100 / t),
+            _ => None,
+        };
+        let over = pct.is_some_and(|p| p > limit);
+        let edge = alert_cycle_repeat(
+            &mut state.swap_streak,
+            &mut state.swap_firing,
+            over,
+            &mut state.swap_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            out.push((
+                "system".to_string(),
+                format!(
+                    "swap {}% above {limit}% for {}s",
+                    pct.unwrap_or(0),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push(("system".to_string(), format!("swap back under {limit}%"), true));
+        }
+    }
+    if let Some(limit) = retrans_limit {
+        let over = retrans_rate.is_some_and(|r| r > limit);
+        let edge = alert_cycle_repeat(
+            &mut state.retrans_streak,
+            &mut state.retrans_firing,
+            over,
+            &mut state.retrans_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            out.push((
+                "system".to_string(),
+                format!(
+                    "TCP retransmits {:.0}/s above {limit:.0}/s for {}s",
+                    retrans_rate.unwrap_or(0.0),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("TCP retransmits back under {limit:.0}/s"),
+                true,
+            ));
+        }
+    }
+    if let Some(limit) = drop_limit {
+        let over = drop_rate.is_some_and(|r| r > limit);
+        let edge = alert_cycle_repeat(
+            &mut state.drop_streak,
+            &mut state.drop_firing,
+            over,
+            &mut state.drop_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            out.push((
+                "system".to_string(),
+                format!(
+                    "NIC drops {:.0}/s above {limit:.0}/s for {}s",
+                    drop_rate.unwrap_or(0.0),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("NIC drops back under {limit:.0}/s"),
+                true,
+            ));
         }
     }
     out
@@ -1982,6 +2190,12 @@ mod tests {
             net_limit: None,
             net_rate: None,
             psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
             repeat: None,
         };
         assert!(
@@ -2018,6 +2232,165 @@ mod tests {
     }
 
     #[test]
+    fn system_alerts_fire_on_memory_floor_and_swap() {
+        let stats = crate::platform::SystemStats {
+            mem_avail_mb: Some(120),
+            mem_used_mb: Some(9880),
+            mem_total_mb: Some(10_000),
+            swap_used_mb: Some(850),
+            swap_total_mb: Some(1024),
+            ..Default::default()
+        };
+        let limits = |avail: Option<u64>, swap: Option<u64>| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: avail,
+            swap_pct_limit: swap,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
+            repeat: None,
+        };
+        // 120 MB avail above the 100 MB floor → never fires
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                system_alert_picks(&stats, &mut state, &limits(Some(100), None), 3).is_empty()
+            );
+        }
+        // drop the floor to 200: quiet through the cycle, then one fire
+        // naming the reading and the window
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES - 1 {
+            assert!(
+                system_alert_picks(&stats, &mut state, &limits(Some(200), None), 3).is_empty()
+            );
+        }
+        let fires = system_alert_picks(&stats, &mut state, &limits(Some(200), None), 3);
+        assert_eq!(fires.len(), 1);
+        assert!(fires[0].1.contains("MemAvailable 120 MB below 200 MB floor"), "{}", fires[0].1);
+        assert!(!fires[0].2, "not a recovery");
+        // recovery fires once the avail climbs back above the floor
+        let ok = crate::platform::SystemStats {
+            mem_avail_mb: Some(900),
+            ..stats.clone()
+        };
+        let rec = system_alert_picks(&ok, &mut state, &limits(Some(200), None), 3);
+        assert_eq!(rec.len(), 1);
+        assert!(rec[0].2, "recovery");
+        assert!(rec[0].1.contains("back above 200 MB"));
+
+        // swap: 850/1024 = 82% over 80 → fires after the cycle
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES - 1 {
+            assert!(
+                system_alert_picks(&stats, &mut state, &limits(None, Some(80)), 3).is_empty()
+            );
+        }
+        let fires = system_alert_picks(&stats, &mut state, &limits(None, Some(80)), 3);
+        assert_eq!(fires.len(), 1);
+        assert!(fires[0].1.contains("swap 83% above 80%"), "{}", fires[0].1);
+        // no swap → disarmed even with the limit set
+        let noswap = crate::platform::SystemStats {
+            swap_used_mb: None,
+            swap_total_mb: None,
+            ..stats.clone()
+        };
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                system_alert_picks(&noswap, &mut state, &limits(None, Some(80)), 3).is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn system_alerts_fire_on_retrans_and_drop_rates() {
+        let stats = crate::platform::SystemStats {
+            retrans_segs: Some(9999),
+            ..Default::default()
+        };
+        let limits = |retrans: Option<u64>, retrans_rate: Option<f64>, drop: Option<u64>, drop_rate: Option<f64>| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: retrans.map(|v| v as f64),
+            retrans_rate,
+            drop_limit: drop.map(|v| v as f64),
+            drop_rate,
+            repeat: None,
+        };
+        // no rate yet (first sample disarms) — even over the line
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                system_alert_picks(&stats, &mut state, &limits(Some(50), None, Some(10), None), 3)
+                    .is_empty()
+            );
+        }
+        // retrans 80/s over 50: fires after the cycle
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES - 1 {
+            assert!(
+                system_alert_picks(&stats, &mut state, &limits(Some(50), Some(80.0), None, None), 3)
+                    .is_empty()
+            );
+        }
+        let fires = system_alert_picks(&stats, &mut state, &limits(Some(50), Some(80.0), None, None), 3);
+        assert_eq!(fires.len(), 1);
+        assert!(fires[0].1.contains("TCP retransmits 80/s above 50/s"), "{}", fires[0].1);
+        let rec = system_alert_picks(&stats, &mut state, &limits(Some(50), Some(5.0), None, None), 3);
+        assert_eq!(rec.len(), 1);
+        assert!(rec[0].2 && rec[0].1.contains("retransmits back under 50/s"));
+
+        // drops 4/s over 2: same machinery
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES - 1 {
+            assert!(
+                system_alert_picks(&stats, &mut state, &limits(None, None, Some(2), Some(4.0)), 3)
+                    .is_empty()
+            );
+        }
+        let fires = system_alert_picks(&stats, &mut state, &limits(None, None, Some(2), Some(4.0)), 3);
+        assert_eq!(fires.len(), 1);
+        assert!(fires[0].1.contains("NIC drops 4/s above 2/s"), "{}", fires[0].1);
+    }
+
+    #[test]
+    fn retrans_and_drop_rate_differs_accumulate_counters() {
+        // first sample arms only; a counter reset counts as zero delta
+        let mut state = SysAlertState::default();
+        assert_eq!(machine_retrans_rate(1000, &mut state), None);
+        state.retrans_prev_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        let rate = machine_retrans_rate(6000, &mut state).unwrap();
+        assert!((rate - 500.0).abs() < 1.0, "5000 segs / ~10s: {rate}");
+        state.retrans_prev_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        assert_eq!(machine_retrans_rate(400, &mut state), Some(0.0), "reset → no spike");
+
+        let mut state = SysAlertState::default();
+        assert_eq!(machine_drop_rate(10, &mut state), None);
+        state.drop_prev_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        let rate = machine_drop_rate(60, &mut state).unwrap();
+        assert!((rate - 10.0).abs() < 1.0, "50 drops / ~5s: {rate}");
+    }
+
+    #[test]
     fn system_alert_fires_on_process_count() {
         let s = crate::platform::SystemStats::default();
         let mut state = SysAlertState::default();
@@ -2031,6 +2404,12 @@ mod tests {
             net_limit: None,
             net_rate: None,
             psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
             repeat: None,
         };
         // 5 visible, limit 10 → under, never fires
@@ -2072,6 +2451,12 @@ mod tests {
                 net_limit: None,
                 net_rate: None,
                 psi_limit: None,
+                mem_avail_floor: None,
+                swap_pct_limit: None,
+                retrans_limit: None,
+                retrans_rate: None,
+                drop_limit: None,
+                drop_rate: None,
                 repeat: None,
             }
         };
@@ -2125,6 +2510,12 @@ mod tests {
             net_limit,
             net_rate,
             psi_limit,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
             repeat: None,
         };
         // first tick has no rate (None disarms) — even over the line
@@ -2174,6 +2565,12 @@ mod tests {
             net_limit: None,
             net_rate: None,
             psi_limit,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
             repeat: None,
         };
         // no PSI report at all → silent even with the limit armed
@@ -2489,6 +2886,8 @@ mod tests {
             cpu_pct: None,
             mem_used_mb: None,
             mem_total_mb: None,
+    throttled_usec: None,
+    oom_kills: None,
         };
         let mut edges = ContainerEdges::default();
         // first sighting arms quietly
@@ -2507,6 +2906,25 @@ mod tests {
         // removed containers leave the memory
         assert!(edges.update(&[], &[], false).is_empty());
         assert_eq!(edges.containers_tracked(), 0);
+
+        // cgroup oom_kill climb fires once and latches (a restart policy
+        // may hide the exit, memory.events still tells the truth)
+        let mut edges = ContainerEdges::default();
+        let oom = |n: u64| {
+            let mut c = mk("d1", "worker", "running", Some(0));
+            c.oom_kills = Some(n);
+            c
+        };
+        assert!(edges.update(&[oom(0)], &[], false).is_empty(), "first sighting arms");
+        let hits = edges.update(&[oom(2)], &[], false);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].1.contains("OOM kill count 0 → 2"));
+        assert!(edges.update(&[oom(2)], &[], false).is_empty(), "latched");
+        // a live events stream suppresses only deaths — the oom climb
+        // still reports (the stream carries no such edge)
+        let hits = edges.update(&[oom(4)], &[], true);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].1.contains("OOM kill count 2 → 4"));
 
         // a live events stream owns death reporting: the death edge stays
         // quiet but the state still records (the next death fires once the

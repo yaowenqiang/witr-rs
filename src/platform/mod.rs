@@ -94,6 +94,8 @@ pub fn parse_container_line(line: &str, runtime: &str) -> Option<Container> {
         cpu_pct: None,
         mem_used_mb: None,
         mem_total_mb: None,
+throttled_usec: None,
+oom_kills: None,
     })
 }
 
@@ -191,6 +193,34 @@ pub fn container_stats() -> std::collections::HashMap<String, (f64, u64, u64)> {
         }
     }
     out
+}
+
+/// Per-container cgroup pressure readings, keyed by container id prefix
+/// (the same key style [`container_stats`] uses). Cumulative figures —
+/// consumers diff `throttled_usec` against their previous sweep for a
+/// live throttle percentage, and climb-check `oom_kills` for the alert.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ContainerPressure {
+    /// cpu.stat throttled_usec: time this cgroup's tasks spent throttled
+    /// (runnable but stopped by the CFS quota).
+    pub throttled_usec: u64,
+    /// memory.events oom_kill: kernel OOM kills inside the cgroup since
+    /// boot — the ground truth even a fast restart policy hides.
+    pub oom_kills: u64,
+}
+
+/// Read the pressure signals for every container that has at least one
+/// visible process (the cgroup path comes from /proc/<pid>/cgroup).
+/// Empty off Linux / without cgroup v2.
+pub fn container_pressure() -> std::collections::HashMap<String, ContainerPressure> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::container_pressure_cgroup()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::collections::HashMap::new()
+    }
 }
 
 /// One tab-separated `stats --format` row: `abc123…\t12.50%\t12.5MiB /
@@ -491,6 +521,10 @@ pub struct SystemStats {
     pub cores: Vec<f64>,
     pub mem_used_mb: Option<u64>,
     pub mem_total_mb: Option<u64>,
+    /// Reclaimable headroom (Linux MemAvailable) in MB — the honest floor
+    /// number the --alert-mem-avail-mb sentinel watches. `None` where the
+    /// platform doesn't separate it from used.
+    pub mem_avail_mb: Option<u64>,
     pub swap_used_mb: Option<u64>,
     pub swap_total_mb: Option<u64>,
     pub load1: Option<f64>,
@@ -504,6 +538,10 @@ pub struct SystemStats {
     /// platform exposes none (macOS SMC and Windows thermal zones need
     /// privileges this tool doesn't take).
     pub temp: Option<(String, f64)>,
+    /// Cumulative TCP retransmitted segments since boot (Linux
+    /// /proc/net/snmp). `None` where the platform reports no TCP counters —
+    /// the --alert-retrans sentinel diffs it into segments/s.
+    pub retrans_segs: Option<u64>,
 }
 
 /// Pressure Stall Information, avg10 window (the last 10 seconds): the
@@ -555,6 +593,11 @@ pub struct NicCounters {
     pub name: String,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Cumulative rx/tx drops + errors — packets the NIC, queue or driver
+    /// threw away. 0 where the platform doesn't report per-interface
+    /// error counters (the drop sentinel disarms on an all-zero total).
+    pub rx_drops: u64,
+    pub tx_drops: u64,
 }
 
 /// The single seam between pipeline logic and OS specifics.
