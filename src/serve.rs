@@ -814,13 +814,13 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                 );
                 if !matches!(
                     metric.as_str(),
-                    "cpu" | "mem" | "fd" | "age" | "io" | "io-rate" | "threads" | "conn"
+                    "cpu" | "mem" | "fd" | "age" | "io" | "io-rate" | "threads" | "conn" | "net"
                 ) {
                     respond(
                         &mut stream,
                         "400 Bad Request",
                         "text/plain",
-                        "metric must be one of: cpu, mem, fd, age, io, io-rate, threads, conn\n",
+                        "metric must be one of: cpu, mem, fd, age, io, io-rate, threads, conn, net\n",
                     );
                     return;
                 }
@@ -850,6 +850,21 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                     let mut again = platform.list_processes().unwrap_or_default();
                     platform.enrich_listing(&mut again);
                     let _ = hist.update(&again);
+                    Some(hist)
+                } else {
+                    None
+                };
+                // net is a delta metric too, but its ss sweep is cheap enough
+                // to run twice inside one scrape — the same two-samples-1s-
+                // apart shape as the CLI's one-shot --top net
+                let net_rates = if metric == "net" {
+                    let mut hist = crate::history::History::new();
+                    if let Some(sweep) = crate::platform::net_bytes_per_pid() {
+                        hist.update_net(&sweep);
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let again = crate::platform::net_bytes_per_pid().unwrap_or_default();
+                        hist.update_net(&again);
+                    }
                     Some(hist)
                 } else {
                     None
@@ -895,6 +910,11 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                             .as_ref()
                             .and_then(|m| m.get(&p.pid))
                             .map(|v| serde_json::json!(v)),
+                        // combined sent+received bytes/s from the ss diffs
+                        "net" => net_rates
+                            .as_ref()
+                            .and_then(|h| h.net_rate_of(p.pid))
+                            .and_then(|r| (r > 0.0).then(|| serde_json::json!(r))),
                         _ => p
                             .started
                             .map(|t| serde_json::json!(crate::util::now_unix() - t)),

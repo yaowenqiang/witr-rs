@@ -39,6 +39,9 @@ pub struct AlertTrack {
     pub threads_streak: u32,
     pub threads_firing: bool,
     pub threads_fired_secs: u32,
+    pub net_streak: u32,
+    pub net_firing: bool,
+    pub net_fired_secs: u32,
 }
 
 /// What one sample did to a metric's alert cycle: nothing, a threshold
@@ -1317,6 +1320,12 @@ pub struct History {
     /// pid → (read bytes/s, write bytes/s) from cumulative io deltas
     /// (Linux /proc/<pid>/io; empty on platforms that don't report it)
     pub io_rate: HashMap<Pid, (f64, f64)>,
+    /// pid → (cumulative TCP bytes at last sweep, swept at) — fed by
+    /// [`History::update_net`] from `ss` sweeps (Linux, when ss(8) is on
+    /// PATH; empty elsewhere)
+    net_prev: HashMap<Pid, (u64, Instant)>,
+    /// pid → combined bytes/s (sent + received) from the sweep deltas
+    pub net_rate: HashMap<Pid, f64>,
     /// pid → last SAMPLES instantaneous percents as a sparkline
     pub sparks: HashMap<Pid, String>,
     samples: HashMap<Pid, VecDeque<f64>>,
@@ -1573,6 +1582,35 @@ impl History {
     /// two samples exist (first refresh has no delta to diff).
     pub fn io_rate_of(&self, pid: Pid) -> Option<(f64, f64)> {
         self.io_rate.get(&pid).copied()
+    }
+
+    /// Fold one `ss` sweep in: diff each pid's cumulative TCP bytes
+    /// against the previous sweep into a combined bytes/s figure (sent +
+    /// received — the --top net board and --alert-net-per-proc both rank
+    /// on it). Pids missing from this sweep leave the window (their
+    /// sockets closed); the first sweep only arms the baseline.
+    pub fn update_net(&mut self, per_pid: &HashMap<Pid, u64>) {
+        let now = Instant::now();
+        for (pid, cur) in per_pid {
+            if let Some((prev, at)) = self.net_prev.get(pid) {
+                let elapsed = now.duration_since(*at).as_secs_f64();
+                if elapsed > 0.0 {
+                    let rate = cur.saturating_sub(*prev) as f64 / elapsed;
+                    self.net_rate.insert(*pid, rate);
+                }
+            }
+            self.net_prev.insert(*pid, (*cur, now));
+        }
+        let seen: std::collections::HashSet<Pid> = per_pid.keys().copied().collect();
+        self.net_prev.retain(|pid, _| seen.contains(pid));
+        self.net_rate.retain(|pid, _| seen.contains(pid));
+    }
+
+    /// The pid's network throughput in bytes/s (sent + received) from the
+    /// last two `ss` sweeps. `None` before the second sweep or off the
+    /// platforms that can't measure it.
+    pub fn net_rate_of(&self, pid: Pid) -> Option<f64> {
+        self.net_rate.get(&pid).copied()
     }
 
     /// Block-char CPU chart over the long sample window, normalized to the
@@ -2370,6 +2408,33 @@ mod tests {
         let fires = system_alert_picks(&stats, &mut state, &limits(None, None, Some(2), Some(4.0)), 3);
         assert_eq!(fires.len(), 1);
         assert!(fires[0].1.contains("NIC drops 4/s above 2/s"), "{}", fires[0].1);
+    }
+
+    #[test]
+    fn net_rate_diffs_ss_sweeps() {
+        use std::collections::HashMap;
+        let mut h = History::new();
+        // first sweep arms the baseline — no rates yet
+        let mut sweep: HashMap<Pid, u64> = [(1, 10_000), (2, 5_000)].into_iter().collect();
+        h.update_net(&sweep);
+        assert!(h.net_rate_of(1).is_none());
+        // 50 KB arriving between sweeps → a real combined rate
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        sweep.insert(1, 60_000);
+        h.update_net(&sweep);
+        let rate = h.net_rate_of(1).unwrap();
+        assert!((rate - 50_000.0 / 0.06).abs() < 20_000.0, "~830KB/s: {rate}");
+        // pid 2 sent nothing → 0 B/s is still a reading
+        assert_eq!(h.net_rate_of(2), Some(0.0));
+        // a pid missing from the sweep leaves the window (sockets closed)
+        sweep.remove(&2);
+        h.update_net(&sweep);
+        assert!(h.net_rate_of(2).is_none());
+        // a counter reset (process restart reusing the pid) is not a spike
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        sweep.insert(1, 10);
+        h.update_net(&sweep);
+        assert_eq!(h.net_rate_of(1), Some(0.0), "reset → no spike");
     }
 
     #[test]

@@ -376,6 +376,116 @@ pub fn container_pressure_cgroup() -> std::collections::HashMap<String, super::C
     out
 }
 
+/// ss's humanized byte counters ("12.3M", "1.5G" — current iproute2
+/// prints raw integers, older ones suffix) → bytes.
+fn parse_ss_human_bytes(v: &str) -> Option<u64> {
+    let cut = v
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(v.len());
+    let n: f64 = v[..cut].parse().ok()?;
+    let mult = match v[cut..].trim() {
+        "K" | "Ki" | "kB" => 1024.0,
+        "M" | "Mi" | "MB" => 1_048_576.0,
+        "G" | "Gi" | "GB" => 1_073_741_824.0,
+        _ => return None,
+    };
+    Some((n * mult) as u64)
+}
+
+/// One `ss -tinp` record (the socket line plus its tab-indented tcp_info
+/// continuation) → (owning pids, inode, cumulative bytes). Attribution
+/// comes from `users:(("name",pid=N,fd=M))` — every listed pid holds a
+/// descriptor on the socket (forked servers share it, so the bytes count
+/// for each). Bytes are `bytes_sent` + `bytes_received` from tcp_info:
+/// raw integers on current iproute2, humanized ("12.3M") accepted too.
+fn parse_ss_net_record(record: &str) -> (Vec<Pid>, Option<u64>, Option<u64>) {
+    let mut pids = Vec::new();
+    for rest in record.split("pid=") {
+        // a pid= token only counts inside a users:(...) group — the token
+        // is always followed by digits then ,fd= or )}
+        let digits: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if digits.is_empty() || !rest[digits.len()..].starts_with(",fd=") {
+            continue;
+        }
+        if let Ok(pid) = digits.parse::<Pid>() {
+            if pid > 0 && !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+    }
+    let mut inode = None;
+    for tok in record.split_whitespace() {
+        if let Some(n) = tok.strip_prefix("inode:") {
+            inode = n.parse::<u64>().ok();
+            break;
+        }
+    }
+    let grab = |key: &str| -> Option<u64> {
+        for tok in record.split_whitespace() {
+            if let Some(v) = tok.strip_prefix(key) {
+                return v.parse::<u64>().ok().or_else(|| parse_ss_human_bytes(v));
+            }
+        }
+        None
+    };
+    let bytes = match (grab("bytes_sent:"), grab("bytes_received:")) {
+        (Some(s), Some(r)) => Some(s + r),
+        _ => None,
+    };
+    (pids, inode, bytes)
+}
+
+/// Per-pid cumulative TCP bytes from one `ss -Htinp` sweep (sent +
+/// received; the caller diffs two sweeps into a throughput). Sockets ss
+/// couldn't attribute (`-p` needs privileges for other users) fall back
+/// to the /proc fd inode map. `None` when ss(8) is missing — everything
+/// downstream stays unset, like nvidia-smi's absence.
+pub(crate) fn ss_net_bytes() -> Option<HashMap<Pid, u64>> {
+    let text = run_ok("ss", &["-Htinp"], CMD_TIMEOUT)?;
+    // group physical lines into records: a line not starting with
+    // whitespace begins a socket; tab-indented lines continue it
+    let mut owned: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for line in text.lines() {
+        if line.starts_with(char::is_whitespace) {
+            if !pending.is_empty() {
+                pending.push(' ');
+                pending.push_str(line.trim());
+            }
+        } else {
+            if !pending.is_empty() {
+                owned.push(std::mem::take(&mut pending));
+            }
+            pending = line.to_string();
+        }
+    }
+    if !pending.is_empty() {
+        owned.push(pending);
+    }
+    let mut out: HashMap<Pid, u64> = HashMap::new();
+    let mut inode_map: Option<HashMap<u64, Pid>> = None;
+    for record in &owned {
+        let (pids, inode, bytes) = parse_ss_net_record(record);
+        let Some(bytes) = bytes else {
+            continue; // LISTEN sockets and the like carry no byte counters
+        };
+        if !pids.is_empty() {
+            for pid in pids {
+                *out.entry(pid).or_insert(0) += bytes;
+            }
+        } else if let Some(ino) = inode {
+            let map = inode_map.get_or_insert_with(inode_owner_map);
+            if let Some(pid) = map.get(&ino).copied() {
+                *out.entry(pid).or_insert(0) += bytes;
+            }
+        }
+    }
+    Some(out)
+}
+
 /// The /proc/<pid>/stat fields witr uses. comm may contain spaces and
 /// parentheses, so the parse cuts at the LAST ')' — everything after it is
 /// field 3+ of stat(5), indexed here by the canonical field number.
@@ -1700,6 +1810,37 @@ Inter-|   Receive                                                |  Transmit
         assert_eq!(drops.len(), 1);
         assert_eq!(drops[0].rx_drops, 10, "rx errs + drop");
         assert_eq!(drops[0].tx_drops, 16, "tx errs + drop");
+    }
+
+    #[test]
+    fn ss_record_parser() {
+        // observed format: raw integers, users: attribution, continuation
+        // lines already joined by the caller
+        let rec = "ESTAB 0 0 10.3.8.14:40936 169.254.0.138:8186 users:((\"tat_agent\",pid=1575777,fd=16)) uid:0 inode:284014 sk:1001 cgroup:0::/ <-> cubic rto:204 bytes_sent:1543563 bytes_acked:1543564 bytes_received:1326261 segs_out:495493";
+        let (pids, inode, bytes) = parse_ss_net_record(rec);
+        assert_eq!(pids, vec![1_575_777]);
+        assert_eq!(inode, Some(284_014));
+        assert_eq!(bytes, Some(1_543_563 + 1_326_261));
+
+        // forked server: several pids hold the socket — all count
+        let rec = "ESTAB 0 0 10.0.0.1:8443 10.0.0.2:5000 users:((\"nginx\",pid=100,fd=6),(\"nginx\",pid=101,fd=6)) inode:99 bytes_sent:1000 bytes_received:2000";
+        let (pids, _, bytes) = parse_ss_net_record(rec);
+        assert_eq!(pids, vec![100, 101]);
+        assert_eq!(bytes, Some(3000));
+
+        // humanized counters (older iproute2) parse via the suffix table —
+        // ss suffixes are binary multiples (12.3M = 12.3 × 1024²)
+        let rec = "ESTAB 0 0 a:b c:d users:((\"x\",pid=7,fd=3)) inode:5 bytes_sent:12.3M bytes_received:1.5G";
+        let (_, _, bytes) = parse_ss_net_record(rec);
+        assert_eq!(bytes, Some(12_897_484 + 1_610_612_736));
+
+        // a bare "pid=" elsewhere must not invent attribution; listen
+        // sockets carry no byte counters → bytes None (the sweep skips)
+        let rec = "LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=9,fd=3)) inode:11";
+        let (pids, inode, bytes) = parse_ss_net_record(rec);
+        assert_eq!(pids, vec![9]);
+        assert_eq!(inode, Some(11));
+        assert_eq!(bytes, None);
     }
 
     #[test]

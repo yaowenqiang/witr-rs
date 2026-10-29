@@ -375,6 +375,9 @@ struct TuiApp {
     /// --alert-threads kernel-thread threshold (None = unchecked; the count
     /// rides the listing — Linux stat / Windows thread snapshot)
     alert_threads: Option<u64>,
+    /// --alert-net-per-proc TCP-throughput threshold (None = unchecked;
+    /// rates ride hist's ss-sweep diffs)
+    alert_net_per_proc: Option<u64>,
     /// --alert-port canaries: (port, negate) — negate=true means the
     /// listener must stay up; alerts fire on the appear/gone edges
     alert_port: Vec<(u16, bool)>,
@@ -594,6 +597,9 @@ pub struct Seed {
     /// --alert-threads: kernel-thread-count threshold; sustained excess →
     /// alert (thread-leak detection)
     pub alert_threads: Option<u64>,
+    /// --alert-net-per-proc: per-process TCP throughput threshold (MB/s);
+    /// sustained excess → alert (quiet-exfiltration detection)
+    pub alert_net_per_proc: Option<u64>,
     /// --alert-port canaries: (port, negate) — alert on the LISTEN
     /// appear edge, or (negated) on the listener-gone edge
     pub alert_port: Vec<(u16, bool)>,
@@ -702,6 +708,7 @@ impl Seed {
         self.alert_io = cli.alert_io;
         self.alert_conn = cli.alert_conn;
         self.alert_threads = cli.alert_threads;
+        self.alert_net_per_proc = cli.alert_net_per_proc;
         self.alert_repeat = cli.alert_repeat;
         self.alert_load = cli.alert_load;
         self.alert_mem_pct = cli.alert_mem_pct;
@@ -837,6 +844,7 @@ impl TuiApp {
             alert_conn: seed.alert_conn,
             conn_counts: HashMap::new(),
             alert_threads: seed.alert_threads,
+            alert_net_per_proc: seed.alert_net_per_proc,
             alert_port: seed.alert_port.clone(),
             port_seen: HashMap::new(),
             port_owner: HashMap::new(),
@@ -1198,6 +1206,13 @@ impl TuiApp {
             if self.alert_conn.is_some() {
                 let socks = self.platform.list_all_sockets().unwrap_or_default();
                 self.conn_counts = established_per_pid(&socks);
+            }
+            // --alert-net-per-proc: the ss sweep feeds the same history the
+            // --top net board reads (only sampled when armed)
+            if self.alert_net_per_proc.is_some() {
+                if let Some(sweep) = crate::platform::net_bytes_per_pid() {
+                    self.hist.update_net(&sweep);
+                }
             }
             // threshold alerts (--alert-cpu / --alert-mem): a metric over
             // its limit for ALERT_CYCLES samples fires once per excursion —
@@ -2237,6 +2252,7 @@ impl TuiApp {
             && self.alert_io.is_none()
             && self.alert_conn.is_none()
             && self.alert_threads.is_none()
+            && self.alert_net_per_proc.is_none()
         {
             return Vec::new();
         }
@@ -9875,6 +9891,7 @@ mod tests {
                 alert_io: None,
                 alert_conn: None,
                 alert_threads: None,
+                alert_net_per_proc: None,
                 alert_port: Vec::new(),
                 alert_repeat: None,
                 alert_load: None,

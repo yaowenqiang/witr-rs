@@ -337,6 +337,11 @@ fn service_flag_args(cli: &Cli) -> Vec<String> {
         "alert-nic-drop",
         cli.alert_nic_drop.map(|v| v.to_string()),
     );
+    opt(
+        &mut a,
+        "alert-net-per-proc",
+        cli.alert_net_per_proc.map(|v| v.to_string()),
+    );
     opt(&mut a, "alert-repeat", cli.alert_repeat.map(|v| v.to_string()));
     opt(&mut a, "alert-exec", cli.alert_exec.clone());
     opt(&mut a, "alert-webhook", cli.alert_webhook.clone());
@@ -644,6 +649,7 @@ fn top_procs(
                 cli::TopMetric::Gpu => p.gpu_sm_pct.map(|v| v as f64),
                 cli::TopMetric::Threads => p.threads.map(|n| n as f64),
                 cli::TopMetric::Conn => conns.and_then(|m| m.get(&p.pid)).map(|&n| n as f64),
+                cli::TopMetric::Net => rates.and_then(|h| h.net_rate_of(p.pid)),
             }?;
             Some((v, p))
         })
@@ -788,7 +794,8 @@ fn watch_alert_picks(
         || cli.alert_fd.is_some()
         || cli.alert_io.is_some()
         || cli.alert_conn.is_some()
-        || cli.alert_threads.is_some();
+        || cli.alert_threads.is_some()
+        || cli.alert_net_per_proc.is_some();
     if !armed {
         return Vec::new();
     }
@@ -942,6 +949,29 @@ fn watch_alert_picks(
                 ));
             } else if edge == history::AlertEdge::Recover {
                 out.push((p.pid, p.name.clone(), format!("threads back under {limit}"), true));
+            }
+        }
+        if let Some(limit) = cli.alert_net_per_proc {
+            let rate = hist.net_rate_of(p.pid);
+            let over = rate.is_some_and(|r| r > (limit as f64) * 1024.0 * 1024.0);
+            let edge = history::alert_cycle_repeat(
+                &mut track.net_streak,
+                &mut track.net_firing,
+                over,
+                &mut track.net_fired_secs,
+                repeat,
+                interval,
+            );
+            if edge == history::AlertEdge::Fire {
+                let mbps = rate.unwrap_or(0.0) / 1024.0 / 1024.0;
+                out.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!("{mbps:.1} MB/s above {limit} MB/s for {secs}s"),
+                    false,
+                ));
+            } else if edge == history::AlertEdge::Recover {
+                out.push((p.pid, p.name.clone(), format!("net back under {limit} MB/s"), true));
             }
         }
     }
@@ -1655,6 +1685,7 @@ fn main() {
         || cli.alert_io.is_some()
         || cli.alert_conn.is_some()
         || cli.alert_threads.is_some()
+        || cli.alert_net_per_proc.is_some()
         || cli.alert_container
         || cli.alert_load.is_some()
         || cli.alert_mem_pct.is_some()
@@ -2516,6 +2547,7 @@ fn main() {
             || cli.alert_swap_pct.is_some()
             || cli.alert_retrans.is_some()
             || cli.alert_nic_drop.is_some()
+            || cli.alert_net_per_proc.is_some()
             || !cli.alert_port.is_empty()
             || !cli.alert_new_proc.is_empty()
             || !cli.names.is_empty();
@@ -2888,6 +2920,13 @@ fn main() {
                 } else {
                     None
                 };
+                // net is a delta metric: feed each tick's ss sweep into the
+                // persistent history; rates exist from the second tick on
+                if metric == cli::TopMetric::Net {
+                    if let Some(sweep) = platform::net_bytes_per_pid() {
+                        hist.update_net(&sweep);
+                    }
+                }
                 write_out("\x1b[2J\x1b[1;1H");
                 let now = util::fmt_time(util::now_unix());
                 write_out(&format!(
@@ -2952,22 +2991,33 @@ fn main() {
         if let Some(metric) = cli.top {
             let count = cli.count.unwrap_or(15).max(1);
             let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
-            // io-rate is a delta metric: two samples one second apart turn
-            // the cumulative counters into bytes/s (a running --watch keeps
-            // its own persistent history instead)
-            let rates = if metric == cli::TopMetric::IoRate {
+            // io-rate / net are delta metrics: two samples one second apart
+            // turn the cumulative counters into bytes/s (a running --watch
+            // keeps its own persistent history instead)
+            let rates = if matches!(metric, cli::TopMetric::IoRate | cli::TopMetric::Net) {
                 let mut hist = history::History::new();
-                let _ = hist.update(&procs);
-                std::thread::sleep(Duration::from_secs(1));
-                let mut again = match platform.list_processes() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("cannot list processes: {}", e);
-                        std::process::exit(5);
+                if metric == cli::TopMetric::IoRate {
+                    let _ = hist.update(&procs);
+                    std::thread::sleep(Duration::from_secs(1));
+                    let mut again = match platform.list_processes() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("cannot list processes: {}", e);
+                            std::process::exit(5);
+                        }
+                    };
+                    platform.enrich_listing(&mut again);
+                    let _ = hist.update(&again);
+                } else {
+                    // --top net: two ss(8) sweeps diff the per-socket byte
+                    // counters; absent ss leaves the board to its note
+                    if let Some(sweep) = platform::net_bytes_per_pid() {
+                        hist.update_net(&sweep);
+                        std::thread::sleep(Duration::from_secs(1));
+                        let again = platform::net_bytes_per_pid().unwrap_or_default();
+                        hist.update_net(&again);
                     }
-                };
-                platform.enrich_listing(&mut again);
-                let _ = hist.update(&again);
+                }
                 Some(hist)
             } else {
                 None
@@ -3272,6 +3322,14 @@ fn main() {
                     let net_bps =
                         history::machine_net_rate(total, &mut sys_alert).map(|mbps| mbps * 1048576.0);
                     w.append(&procs, &hist, stats.as_ref(), net_bps);
+                }
+                // --alert-net-per-proc: feed this tick's ss sweep into the
+                // persistent history so per-pid rates exist to compare
+                // (absent ss leaves the sentinel quiet, like the board)
+                if cli.alert_net_per_proc.is_some() {
+                    if let Some(sweep) = platform::net_bytes_per_pid() {
+                        hist.update_net(&sweep);
+                    }
                 }
                 let mut picks = watch_alert_picks(
                     platform.as_ref(),
@@ -4315,6 +4373,38 @@ mod tests {
         assert!(fired[0].2.contains("120 thread(s) above 100"), "{}", fired[0].2);
         // latched until the count drops back under
         assert!(watch_alert_picks(&platform, &cli, &leaky, &hist, 1, &mut state, &mut fds, &mut conns).is_empty());
+    }
+
+    #[test]
+    fn watch_alert_net_per_proc_fires_after_streak() {
+        let cli = cli::Cli::parse_from(["witr", "--alert-net-per-proc", "1"]);
+        let platform = NoPlatform;
+        let mut hist = history::History::new();
+        let mut state = HashMap::new();
+        let mut fds = HashMap::new();
+        let mut conns = HashMap::new();
+        let leaky = vec![proc(9, "leaky", None, None)];
+        // baseline sweep, then 8 MB between sweeps ~80ms apart (~100 MB/s)
+        let mut sweep: HashMap<Pid, u64> = [(9, 0)].into_iter().collect();
+        hist.update_net(&sweep);
+        std::thread::sleep(Duration::from_millis(80));
+        sweep.insert(9, 800_000);
+        hist.update_net(&sweep);
+        for _ in 0..history::ALERT_CYCLES - 1 {
+            assert!(
+                watch_alert_picks(&platform, &cli, &leaky, &hist, 1, &mut state, &mut fds, &mut conns)
+                    .is_empty()
+            );
+        }
+        let fired =
+            watch_alert_picks(&platform, &cli, &leaky, &hist, 1, &mut state, &mut fds, &mut conns);
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert!(fired[0].2.contains("above 1 MB/s"), "{}", fired[0].2);
+        // latched while it stays over the line
+        assert!(
+            watch_alert_picks(&platform, &cli, &leaky, &hist, 1, &mut state, &mut fds, &mut conns)
+                .is_empty()
+        );
     }
 
     #[test]

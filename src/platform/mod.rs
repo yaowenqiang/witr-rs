@@ -223,6 +223,22 @@ pub fn container_pressure() -> std::collections::HashMap<String, ContainerPressu
     }
 }
 
+/// Per-pid cumulative TCP bytes (sent + received) from one `ss -Htinp`
+/// sweep. The caller diffs two sweeps into a per-pid throughput (the
+/// --top net board and the --alert-net-per-proc sentinel both feed on
+/// that). `None` off Linux or without ss(8) on PATH — every consumer
+/// stays unset, the nvidia-smi pattern.
+pub fn net_bytes_per_pid() -> Option<std::collections::HashMap<Pid, u64>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::ss_net_bytes()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// One tab-separated `stats --format` row: `abc123…\t12.50%\t12.5MiB /
 /// 1.944GiB` → (id, cpu_pct, mem_used_bytes, mem_total_bytes).
 #[allow(dead_code)] // every parse fn is unit-tested on all platforms

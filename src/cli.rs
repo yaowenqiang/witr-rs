@@ -67,8 +67,8 @@ pub enum TopMetric {
     ))]
     Gpu,
     #[value(help = t(
-        "内核线程数（Linux /proc stat、Windows 线程快照；macOS 仅详情页可查）——线程泄漏的进程榜",
-        "Kernel thread count (Linux /proc stat, Windows thread snapshot; macOS detail page only) — the thread-leak ranking"
+        "内核线程数（三平台随整表携带：Linux /proc stat、Windows 线程快照、macOS ps nlwp）——线程泄漏的进程榜",
+        "Kernel thread count (carried with the table on all three platforms: Linux /proc stat, the Windows thread snapshot, macOS ps nlwp) — the thread-leak ranking"
     ))]
     Threads,
     #[value(help = t(
@@ -76,6 +76,11 @@ pub enum TopMetric {
         "ESTABLISHED connection count (the ranking twin of --alert-conn — who holds the most live connections)"
     ))]
     Conn,
+    #[value(help = t(
+        "TCP 吞吐速率（字节/秒，发 + 收；两次 ss(8) 采样差分——或一次正在运行的 --watch；Linux 且 PATH 上有 ss 时可用）——谁在吃网卡的进程榜",
+        "TCP throughput in bytes/s (sent + received; diffed from two ss(8) sweeps — or a running --watch; Linux with ss(8) on PATH) — who is eating the NIC"
+    ))]
+    Net,
 }
 
 impl TopMetric {
@@ -90,6 +95,7 @@ impl TopMetric {
             TopMetric::Gpu => "GPU%",
             TopMetric::Threads => "THR",
             TopMetric::Conn => "CONNS",
+            TopMetric::Net => "NET",
         }
     }
 }
@@ -221,6 +227,7 @@ impl Cli {
         self.alert_swap_pct = self.alert_swap_pct.or(cfg.alert_swap_pct);
         self.alert_retrans = self.alert_retrans.or(cfg.alert_retrans);
         self.alert_nic_drop = self.alert_nic_drop.or(cfg.alert_nic_drop);
+        self.alert_net_per_proc = self.alert_net_per_proc.or(cfg.alert_net_per_proc);
         self.alert_repeat = self.alert_repeat.or(cfg.alert_repeat);
         if self.alert_exec.is_none() {
             self.alert_exec = cfg.alert_exec.clone();
@@ -792,6 +799,16 @@ pub struct Cli {
         )
     )]
     pub alert_nic_drop: Option<u64>,
+
+    #[arg(
+        long = "alert-net-per-proc",
+        value_name = "MB/S",
+        help = t(
+            "进程 TCP 吞吐阈值：每进程 发+收 速率（ss(8) 差分）连续 5 次采样（约 15s）超过该值（MB/s）时告警——--top net 的哨兵孪生：谁在偷偷外传数据、哪个服务把出口打满，点名到 pid。Linux 且 PATH 上有 ss 时可用。TUI 和 --watch",
+            "Per-process TCP throughput threshold: fire when a process's sent+received rate (diffed from ss(8) sweeps) exceeds this value (MB/s) for 5 consecutive samples (~15s) — the sentinel twin of --top net: who is quietly exfiltrating, which service saturates the uplink, named by pid. Linux with ss(8) on PATH. TUI and --watch"
+        )
+    )]
+    pub alert_net_per_proc: Option<u64>,
 
     #[arg(
         long = "alert-port",

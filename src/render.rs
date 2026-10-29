@@ -1148,6 +1148,7 @@ pub fn render_top(
                 crate::cli::TopMetric::Gpu => pr.gpu_sm_pct.map(|v| v as f64),
                 crate::cli::TopMetric::Threads => pr.threads.map(|n| n as f64),
                 crate::cli::TopMetric::Conn => conns.and_then(|m| m.get(&pr.pid)).map(|&n| n as f64),
+                crate::cli::TopMetric::Net => rates.and_then(|h| h.net_rate_of(pr.pid)),
             }?;
             Some((v, pr))
         })
@@ -1171,7 +1172,7 @@ pub fn render_top(
             crate::cli::TopMetric::Mem => crate::util::fmt_bytes(*v as u64),
             crate::cli::TopMetric::Fd => format!("{}", *v as u64),
             crate::cli::TopMetric::Io => crate::util::fmt_bytes(*v as u64),
-            crate::cli::TopMetric::IoRate => {
+            crate::cli::TopMetric::IoRate | crate::cli::TopMetric::Net => {
                 format!("{}/s", crate::util::fmt_bytes(*v as u64))
             }
             crate::cli::TopMetric::Age => fmt_age(*v as i64),
@@ -1233,6 +1234,7 @@ pub fn render_top(
             }
             crate::cli::TopMetric::Age => "no processes carry a start time".to_string(),
             crate::cli::TopMetric::Conn => "no connection table on this platform".to_string(),
+            crate::cli::TopMetric::Net => "no per-socket byte counters (needs ss(8) on PATH, Linux)".to_string(),
             _ => "no processes report this metric".to_string(),
         };
         let _ = writeln!(out, "({why})");
@@ -2817,6 +2819,33 @@ mod tests {
         let md = render_sys_markdown(&frame);
         assert!(md.starts_with("| CPU_PCT |"));
         assert!(md.contains("| 37.2 | 6000 |"));
+    }
+
+    #[test]
+    fn render_top_net_ranks_and_formats_rates() {
+        use crate::cli::TopMetric;
+        let painter = Painter::new(false);
+        let mut hist = crate::history::History::new();
+        let mut sweep = std::collections::HashMap::new();
+        sweep.insert(1, 1_000_000u64);
+        sweep.insert(2, 9_000_000u64);
+        hist.update_net(&sweep);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        sweep.insert(1, 9_000_000);
+        sweep.insert(2, 10_000_000);
+        hist.update_net(&sweep);
+        let procs = vec![proc(1, "a", None, None), proc(2, "b", None, None)];
+        let out = render_top(&procs, TopMetric::Net, 10, None, Some(&hist), None, &painter);
+        // pid 2 moved ~16MB/s, pid 1 ~133MB/s — a tops the board
+        let a = out.find("a").unwrap();
+        let b = out.find("b").unwrap();
+        assert!(a < b, "higher rate ranks first:\n{out}");
+        assert!(out.contains("NET"));
+        assert!(out.contains("/s"), "rate formatting: {out}");
+        // no sweep data at all → the explanatory note
+        let empty = crate::history::History::new();
+        let out = render_top(&procs, TopMetric::Net, 10, None, Some(&empty), None, &painter);
+        assert!(out.contains("needs ss(8) on PATH"), "{out}");
     }
 
     #[test]
