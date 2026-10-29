@@ -215,7 +215,7 @@ struct TuiApp {
     container_search: String,
     /// indices into `containers` after the filter
     container_view: Vec<usize>,
-    /// Containers-tab sort column ('i/n/r/g/s', Go witr parity); None =
+    /// Containers-tab sort column ('i/n/r/g/s/p', Go witr parity + compose); None =
     /// the runtime's natural order. Direction flips when the same key is
     /// pressed again.
     container_sort: Option<ContainerSort>,
@@ -508,7 +508,8 @@ enum PortSort {
     State,
 }
 
-/// Containers-tab sort columns — keys i/n/r/g/s, matching the Go witr.
+/// Containers-tab sort columns — keys i/n/r/g/s (+ p for compose
+/// project), matching the Go witr.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ContainerSort {
     Id,
@@ -516,6 +517,7 @@ enum ContainerSort {
     Runtime,
     Image,
     Status,
+    Project,
 }
 
 /// One full-id → (cpu_pct, mem_used_bytes, mem_total_bytes) stats sweep,
@@ -2604,6 +2606,11 @@ impl TuiApp {
                     ContainerSort::Runtime => cs[a].runtime.cmp(&cs[b].runtime),
                     ContainerSort::Image => cs[a].image.cmp(&cs[b].image),
                     ContainerSort::Status => cs[a].status.cmp(&cs[b].status),
+                    ContainerSort::Project => cs[a]
+                        .compose
+                        .as_deref()
+                        .unwrap_or("~")
+                        .cmp(cs[b].compose.as_deref().unwrap_or("~")),
                 };
                 if desc { ord.reverse() } else { ord }
             });
@@ -3405,6 +3412,7 @@ impl TuiApp {
         vec![
             kv("Name", c.name.clone()),
             kv("Runtime", c.runtime.clone()),
+            kv("Compose", c.compose.clone().unwrap_or_else(|| "-".into())),
             kv("ID", c.id.clone()),
             kv("Image", c.image.clone()),
             kv("State", c.state.clone()),
@@ -3882,7 +3890,8 @@ fn filter_locks(locks: &[LockEntry], needle: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Filter containers: substring match over name, image, id, runtime, state.
+/// Filter containers: substring match over name, image, id, runtime,
+/// state and compose project.
 fn filter_containers(containers: &[Container], needle: &str) -> Vec<usize> {
     if needle.is_empty() {
         return (0..containers.len()).collect();
@@ -3896,6 +3905,10 @@ fn filter_containers(containers: &[Container], needle: &str) -> Vec<usize> {
                 || c.id.to_lowercase().contains(needle)
                 || c.runtime.to_lowercase().contains(needle)
                 || c.state.to_lowercase().contains(needle)
+                || c
+                    .compose
+                    .as_ref()
+                    .is_some_and(|p| p.to_lowercase().contains(needle))
         })
         .map(|(i, _)| i)
         .collect()
@@ -5080,6 +5093,7 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
     let has_stats = app.containers.iter().any(|c| c.cpu_pct.is_some());
     let has_thr = app.throttle_pct.values().any(|v| *v > 0.0);
     let has_oom = app.containers.iter().any(|c| c.oom_kills.is_some());
+    let has_compose = app.containers.iter().any(|c| c.compose.is_some());
     let mut header: Vec<Cell> = vec![
         Cell::from("Runtime"),
         Cell::from("ID"),
@@ -5105,6 +5119,10 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
     if has_oom {
         header.push(Cell::from("OOM"));
         widths.push(Constraint::Length(5));
+    }
+    if has_compose {
+        header.push(Cell::from("Compose"));
+        widths.push(Constraint::Length(16));
     }
     if has_pod {
         header.push(Cell::from("Pod"));
@@ -5154,6 +5172,11 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
                     None => Cell::from("-"),
                 };
                 cells.push(cell);
+            }
+            if has_compose {
+                cells.push(Cell::from(
+                    c.compose.clone().unwrap_or_else(|| "-".into()),
+                ));
             }
             if has_pod {
                 cells.push(Cell::from(c.pod.clone().unwrap_or_else(|| "-".into())));
@@ -6348,7 +6371,7 @@ fn ui(app: &mut TuiApp, f: &mut Frame<'_>) {
             if app.ports_overview { " (on)" } else { "" }
         ),
         Tab::Containers => format!(
-            "Total: {} | Enter: Detail | i/n/r/g/s: Sort | /: Search | h-l: Tab | r: Refresh | q: Quit",
+            "Total: {} | Enter: Detail | i/n/r/g/s/p: Sort | /: Search | h-l: Tab | r: Refresh | q: Quit",
             total
         ),
         Tab::Locks => {
@@ -6605,7 +6628,7 @@ fn help_lines(tab: Tab) -> Vec<Line<'static>> {
                 ("j/k", "move selection"),
                 ("Enter", "container detail + its processes"),
                 ("l", "container logs"),
-                ("i/n/r/g/s", "sort: id/name/runtime/image/status"),
+                ("i/n/r/g/s/p", "sort: id/name/runtime/image/status/compose"),
                 ("/", "search"),
                 ("CPU%/MEM", "live stats sweep, ~10s cadence"),
             ],
@@ -7558,13 +7581,14 @@ fn on_key(app: &mut TuiApp, key: KeyCode) -> bool {
         KeyCode::Char(c)
             if app.tab == Tab::Containers
                 && app.focus == Focus::Table
-                && matches!(c.to_ascii_lowercase(), 'i' | 'n' | 'r' | 'g' | 's') =>
+                && matches!(c.to_ascii_lowercase(), 'i' | 'n' | 'r' | 'g' | 's' | 'p') =>
         {
             let col = match c.to_ascii_lowercase() {
                 'i' => ContainerSort::Id,
                 'n' => ContainerSort::Name,
                 'r' => ContainerSort::Runtime,
                 'g' => ContainerSort::Image,
+                'p' => ContainerSort::Project,
                 _ => ContainerSort::Status,
             };
             if app.container_sort == Some(col) {
@@ -9461,6 +9485,7 @@ mod tests {
             mem_total_mb: None,
     throttled_usec: None,
     oom_kills: None,
+    compose: None,
         };
         assert_eq!(
             container_state_style(&mk("running", "Up 2 weeks (healthy)")).fg,
@@ -9504,6 +9529,7 @@ mod tests {
                 mem_total_mb: None,
         throttled_usec: None,
         oom_kills: None,
+        compose: None,
             },
             Container {
                 runtime: "docker".into(),
@@ -9521,6 +9547,7 @@ mod tests {
                 mem_total_mb: None,
         throttled_usec: None,
         oom_kills: None,
+        compose: None,
             },
         ];
         app.rebuild_container_view();
@@ -9553,6 +9580,7 @@ mod tests {
             mem_total_mb: None,
     throttled_usec: None,
     oom_kills: None,
+    compose: None,
         };
         // first sighting arms quietly — no alerts
         app.container_alert_edges(&[mk("a1", "web", "running", Some(0))], &[]);

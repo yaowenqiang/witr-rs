@@ -155,6 +155,11 @@ pub struct Container {
     pub mem_used_mb: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mem_total_mb: Option<u64>,
+    /// Docker Compose project this container belongs to
+    /// (`com.docker.compose.project` label), however the runtime formats
+    /// its labels. None outside compose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose: Option<String>,
     /// Cumulative cgroup CPU-throttle time (usec) — Linux reads
     /// cpu.stat's throttled_usec for the container's cgroup. None off
     /// Linux / off cgroup v2 / when no container pid was found to supply
@@ -448,6 +453,7 @@ mod tests {
             mem_total_mb: None,
     throttled_usec: None,
     oom_kills: None,
+    compose: None,
         }
     }
 

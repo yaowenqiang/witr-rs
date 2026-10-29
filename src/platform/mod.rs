@@ -63,6 +63,27 @@ pub fn enumerate_containers() -> Vec<Container> {
     out
 }
 
+/// The compose project from a container's labels, however the runtime
+/// formats them: docker packs `Labels` into one "k=v,k2=v2" string,
+/// podman/nerdctl hand a JSON object (or null).
+fn compose_project_of(v: &serde_json::Value) -> Option<String> {
+    const KEY: &str = "com.docker.compose.project";
+    match v.get("Labels") {
+        Some(serde_json::Value::String(s)) => s.split(',').find_map(|kv| {
+            let (k, val) = kv.split_once('=')?;
+            (k.trim() == KEY)
+                .then(|| val.trim().to_string())
+                .filter(|v| !v.is_empty())
+        }),
+        Some(serde_json::Value::Object(m)) => m
+            .get(KEY)
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+            .filter(|v| !v.is_empty()),
+        _ => None,
+    }
+}
+
 /// Parse one `{{json .}}` line from docker/podman/nerdctl.
 pub fn parse_container_line(line: &str, runtime: &str) -> Option<Container> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
@@ -94,6 +115,7 @@ pub fn parse_container_line(line: &str, runtime: &str) -> Option<Container> {
         cpu_pct: None,
         mem_used_mb: None,
         mem_total_mb: None,
+        compose: compose_project_of(&v),
 throttled_usec: None,
 oom_kills: None,
     })
@@ -844,6 +866,28 @@ pub fn get_shared() -> std::sync::Arc<std::sync::Mutex<Box<dyn Platform + Send>>
 #[cfg(test)]
 mod service_tests {
     use super::*;
+
+    #[test]
+    fn compose_project_from_either_label_shape() {
+        // docker packs labels into one "k=v,k2=v2" string
+        let line = r#"{"ID":"abc123","Names":"web-1","Image":"nginx","State":"running","Labels":"com.docker.compose.project=lab,com.docker.compose.service=web"}"#;
+        let c = parse_container_line(line, "docker").unwrap();
+        assert_eq!(c.compose.as_deref(), Some("lab"));
+
+        // podman/nerdctl hand a JSON object (or null)
+        let line = r#"{"ID":"def456","Names":["api-1"],"Image":"rust","State":"running","Labels":{"com.docker.compose.project":"shop","io.containers.autoupdate":"registry"}}"#;
+        let c = parse_container_line(line, "podman").unwrap();
+        assert_eq!(c.compose.as_deref(), Some("shop"));
+
+        let line = r#"{"ID":"ghi789","Names":["plain"],"Image":"alpine","State":"running","Labels":null}"#;
+        let c = parse_container_line(line, "podman").unwrap();
+        assert_eq!(c.compose, None);
+
+        // an empty project value doesn't count
+        let line = r#"{"ID":"jkl012","Names":["x"],"Labels":"com.docker.compose.project="}"#;
+        let c = parse_container_line(line, "docker").unwrap();
+        assert_eq!(c.compose, None);
+    }
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]

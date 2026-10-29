@@ -133,7 +133,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | `Enter` | Processes 页：打开全屏进程详情页；Ports 页：端口详情页（该端口全部连接 + 归属进程）；Containers 页：容器详情页；Locks 页：跳到持锁进程的详情页；Events 页：跳到事件对应进程的详情页 |
 | `p` `n` `u` `c` `m` `i` `t` | Processes 页按 PID / 名称 / 用户 / CPU / 内存 / 磁盘 I/O 速率 / 启动时间排序，重复按切换升降序（`i` 按每秒读+写字节排序，需相隔一秒的两次采样） |
 | `p` `t` `n` `s` | Ports 页按 端口 / 协议 / 地址 / 状态 排序 |
-| `i` `n` `r` `g` `s` | Containers 页按 ID / 名称 / 运行时 / 镜像 / 状态 排序 |
+| `i` `n` `r` `g` `s` `p` | Containers 页按 ID / 名称 / 运行时 / 镜像 / 状态 / compose 项目 排序 |
 | `p` `n` `t` `m` `f` | Locks 页按 PID / 进程 / 类型 / 模式 / 路径 排序 |
 | `n` `m` `s` `p` | Services 页按 名称 / 管理器 / 状态 / 主 pid 排序 |
 | `t` `e` `p` `n` | Events 页按 时间 / 事件 / PID / 进程 排序（时间默认最新在前，重复按切换升降序） |
@@ -185,7 +185,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **样本回放页（`--samples`）**：`witr-rs --samples load.csv` 把 `--record` 产出的样本文件（.csv / .jsonl 都认）导入 TUI 的 **Samples 页**——五条整机曲线（cpu% / 内存% / 1 分钟负载 / 网络 MB/s / 进程数）以 sparkline 呈现，`←/→`（h/l）移动光标逐时刻读数（读数行列出光标处全部五个指标的值），`↑/↓`（j/k）切换图上曲线，`g/G` 跳到首尾，`Esc` 回主表，`c` 复制页面文本。实时采样照常继续——"照着昨晚录制的曲线排查现在这台机器"两个时间面叠在一屏上。
 
-**Containers 页**：通过 PATH 上的运行时 CLI（docker / podman / nerdctl）枚举容器，显示 Runtime / ID / State / Status /（Pod）/ Image / Name，状态按健康度着色；**CPU% / MEM 两列**在首次资源采样落地后出现——后台每约 10 秒跑一次 `stats --no-stream`（每运行时约 2 秒，成本高于列表本身），按容器 id 合并回表格，MEM 列按容器自身限额的占用比例着色（≥70% 黄、≥90% 红——容器撞限额是 OOM 的前奏）；**THR% / OOM 两列**来自容器 cgroup 的限流时间与 oom_kill 计数（Linux cgroup v2，每轮枚举顺路读几个文件，无运行时 CLI 开销）——THR% 是本轮枚举间隔内被 CFS 配额掐住的时间占比（≥50% 红——"容器变慢但 CPU 看着不满"的头号原因），OOM 列非零即容器内发生过内核级 OOM 杀；`/` 按 名称/镜像/ID/运行时/状态 过滤，`i/n/r/g/s` 排序。枚举在后台线程执行（运行时 CLI 挂起不会卡住界面），每 3 秒自动刷新；刷新期间保留旧表格不闪烁，首次加载才显示 loading。**`Enter` 打开容器详情页**：左侧容器属性（Name/Runtime/ID/Image/State/Status/Ports/Restarts），右侧容器内进程列表（Linux 通过 cgroup 匹配；macOS/Windows 容器进程在 VM 内不可见，显示说明）。
+**Containers 页**：通过 PATH 上的运行时 CLI（docker / podman / nerdctl）枚举容器，显示 Runtime / ID / State / Status /（Pod）/（Compose）/ Image / Name，状态按健康度着色；**CPU% / MEM 两列**在首次资源采样落地后出现——后台每约 10 秒跑一次 `stats --no-stream`（每运行时约 2 秒，成本高于列表本身），按容器 id 合并回表格，MEM 列按容器自身限额的占用比例着色（≥70% 黄、≥90% 红——容器撞限额是 OOM 的前奏）；**THR% / OOM 两列**来自容器 cgroup 的限流时间与 oom_kill 计数（Linux cgroup v2，每轮枚举顺路读几个文件，无运行时 CLI 开销）——THR% 是本轮枚举间隔内被 CFS 配额掐住的时间占比（≥50% 红——"容器变慢但 CPU 看着不满"的头号原因），OOM 列非零即容器内发生过内核级 OOM 杀；**Compose 列**取容器的 `com.docker.compose.project` 标签（兼容 docker 的 `k=v,k2=v2` 串与 podman/nerdctl 的 JSON object 两种 label 形态，非 compose 容器该列自动隐藏）——开发机上"这排容器是谁家的"一眼分明；`/` 按 名称/镜像/ID/运行时/状态/compose 项目 过滤，`i/n/r/g/s` 排序，`p` 按 compose 项目排序。枚举在后台线程执行（运行时 CLI 挂起不会卡住界面），每 3 秒自动刷新；刷新期间保留旧表格不闪烁，首次加载才显示 loading。**`Enter` 打开容器详情页**：左侧容器属性（Name/Runtime/Compose/ID/Image/State/Status/Ports/Restarts），右侧容器内进程列表（Linux 通过 cgroup 匹配；macOS/Windows 容器进程在 VM 内不可见，显示说明）。
 
 **Locks 页**：文件锁 + 打开文件视图（Linux 读 `/proc/locks`，macOS 从 `lsof` 提取锁标志并辅以锁文件名启发式）；`a` 在 锁视图 ↔ 全部打开文件 之间切换（打开文件视图空搜索时截断显示前 100 行，搜索即放开），选中行按 `Enter` 直接跳到持锁进程的详情页。
 
