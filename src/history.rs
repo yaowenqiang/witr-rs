@@ -42,6 +42,9 @@ pub struct AlertTrack {
     pub net_streak: u32,
     pub net_firing: bool,
     pub net_fired_secs: u32,
+    pub dev_streak: u32,
+    pub dev_firing: bool,
+    pub dev_fired_secs: u32,
 }
 
 /// What one sample did to a metric's alert cycle: nothing, a threshold
@@ -1090,6 +1093,13 @@ pub fn system_alert_picks(
 }
 
 const SAMPLES: usize = 8;
+/// Self-baseline deviation ([`History::deviation_of`]): the trailing
+/// window its median is computed over, the minimum history before it
+/// arms, and the absolute floor under which a reading is noise no matter
+/// how many times the baseline it clears.
+const DEV_SAMPLES: usize = 40; // ~2 min at the 3s TUI refresh
+const DEV_MIN_SAMPLES: usize = 12;
+const DEV_FLOOR_PCT: f64 = 5.0;
 /// Detail-page CPU chart window (~10 min at the 3s TUI refresh).
 const BIG_SAMPLES: usize = 120;
 const RESTART_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -1329,6 +1339,9 @@ pub struct History {
     /// pid → last SAMPLES instantaneous percents as a sparkline
     pub sparks: HashMap<Pid, String>,
     samples: HashMap<Pid, VecDeque<f64>>,
+    /// pid → last DEV_SAMPLES instantaneous percents — the trailing window
+    /// [`History::deviation_of`] takes its median baseline over
+    dev_samples: HashMap<Pid, VecDeque<f64>>,
     /// pid → last BIG_SAMPLES instantaneous percents (detail-page chart)
     big: HashMap<Pid, VecDeque<f64>>,
     /// pid → last BIG_SAMPLES RSS values in KiB (detail-page memory chart
@@ -1509,6 +1522,7 @@ impl History {
         self.cpu_now.retain(|pid, _| seen.contains(pid));
         self.sparks.retain(|pid, _| seen.contains(pid));
         self.samples.retain(|pid, _| seen.contains(pid));
+        self.dev_samples.retain(|pid, _| seen.contains(pid));
         self.big.retain(|pid, _| seen.contains(pid));
         self.cpu_prev.retain(|pid, _| seen.contains(pid));
         self.io_rate.retain(|pid, _| seen.contains(pid));
@@ -1535,6 +1549,13 @@ impl History {
         dq.push_back(v);
         while dq.len() > SAMPLES {
             dq.pop_front();
+        }
+        // the deviation baseline keeps its own, longer window — 8 samples
+        // is a sparkline, not a character reference
+        let dev = self.dev_samples.entry(pid).or_default();
+        dev.push_back(v);
+        while dev.len() > DEV_SAMPLES {
+            dev.pop_front();
         }
         let spark: String = dq
             .iter()
@@ -1611,6 +1632,36 @@ impl History {
     /// platforms that can't measure it.
     pub fn net_rate_of(&self, pid: Pid) -> Option<f64> {
         self.net_rate.get(&pid).copied()
+    }
+
+    /// Self-baseline deviation — the "--alert-deviation" check. A process
+    /// whose instantaneous CPU has left its own trailing median (over the
+    /// [`DEV_SAMPLES`] window) by `factor`, and cleared the absolute
+    /// [`DEV_FLOOR_PCT`] floor, reads as "changed character": the quiet
+    /// daemon suddenly busy, no per-process threshold having to exist.
+    /// The floor keeps 0.1%→1% noise from ever counting, and the median
+    /// can't be dragged by the burst itself until half the window turns
+    /// over. `None` while the history is still short or the reading is
+    /// unremarkable.
+    pub fn deviation_of(&self, pid: Pid, factor: f64) -> Option<String> {
+        let cur = *self.cpu_now.get(&pid)?;
+        if cur < DEV_FLOOR_PCT {
+            return None;
+        }
+        let dq = self.dev_samples.get(&pid)?;
+        if dq.len() < DEV_MIN_SAMPLES {
+            return None;
+        }
+        let mut vals: Vec<f64> = dq.iter().copied().collect();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = vals[vals.len() / 2];
+        if median <= 0.0 || cur < factor * median {
+            return None;
+        }
+        Some(format!(
+            "cpu {cur:.1}% is {:.0}× its own {median:.1}% baseline — sustained change of character",
+            cur / median
+        ))
     }
 
     /// Block-char CPU chart over the long sample window, normalized to the
@@ -2408,6 +2459,60 @@ mod tests {
         let fires = system_alert_picks(&stats, &mut state, &limits(None, None, Some(2), Some(4.0)), 3);
         assert_eq!(fires.len(), 1);
         assert!(fires[0].1.contains("NIC drops 4/s above 2/s"), "{}", fires[0].1);
+    }
+
+    #[test]
+    fn deviation_flags_a_changed_character() {
+        let mut h = History::new();
+        let base = proc(10, "/bin/quiet", None);
+        // deltas ride ~60ms-apart updates — the <50ms guard keeps
+        // back-to-back updates from inventing rates, so 1ms per tick
+        // reads as ~1.7%
+        let mut cpu = 0u64;
+        for _ in 0..14 {
+            std::thread::sleep(Duration::from_millis(60));
+            cpu += 1;
+            let mut p = base.clone();
+            p.cpu_time_ms = Some(cpu);
+            h.update(&[p]);
+        }
+        // a ~3% blip: above the baseline but under the 5% floor — noise
+        std::thread::sleep(Duration::from_millis(60));
+        cpu += 2;
+        let mut p = base.clone();
+        p.cpu_time_ms = Some(cpu);
+        h.update(&[p]);
+        assert!(
+            h.deviation_of(10, 5.0).is_none(),
+            "floor gates sub-5% readings: {:?}",
+            h.cpu_now.get(&10)
+        );
+        // ~67% sustained (40ms more over one tick): far over both the
+        // 5% floor and 5× the ~1.7% median
+        std::thread::sleep(Duration::from_millis(60));
+        cpu += 40;
+        let mut p = base.clone();
+        p.cpu_time_ms = Some(cpu);
+        h.update(&[p]);
+        let msg = h.deviation_of(10, 5.0).unwrap();
+        assert!(msg.contains("× its own"), "{msg}");
+        assert!(msg.contains("sustained change of character"));
+        // a short history hasn't earned a baseline yet
+        let mut h2 = History::new();
+        let mut cpu = 0u64;
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(60));
+            cpu += 1;
+            let mut p = base.clone();
+            p.cpu_time_ms = Some(cpu);
+            h2.update(&[p]);
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        cpu += 40;
+        let mut p = base.clone();
+        p.cpu_time_ms = Some(cpu);
+        h2.update(&[p]);
+        assert!(h2.deviation_of(10, 5.0).is_none(), "5 samples is not a baseline");
     }
 
     #[test]

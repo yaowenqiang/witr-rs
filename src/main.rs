@@ -342,6 +342,11 @@ fn service_flag_args(cli: &Cli) -> Vec<String> {
         "alert-net-per-proc",
         cli.alert_net_per_proc.map(|v| v.to_string()),
     );
+    opt(
+        &mut a,
+        "alert-deviation",
+        cli.alert_deviation.map(|v| v.to_string()),
+    );
     opt(&mut a, "alert-repeat", cli.alert_repeat.map(|v| v.to_string()));
     opt(&mut a, "alert-exec", cli.alert_exec.clone());
     opt(&mut a, "alert-webhook", cli.alert_webhook.clone());
@@ -795,7 +800,8 @@ fn watch_alert_picks(
         || cli.alert_io.is_some()
         || cli.alert_conn.is_some()
         || cli.alert_threads.is_some()
-        || cli.alert_net_per_proc.is_some();
+        || cli.alert_net_per_proc.is_some()
+        || cli.alert_deviation.is_some();
     if !armed {
         return Vec::new();
     }
@@ -972,6 +978,28 @@ fn watch_alert_picks(
                 ));
             } else if edge == history::AlertEdge::Recover {
                 out.push((p.pid, p.name.clone(), format!("net back under {limit} MB/s"), true));
+            }
+        }
+        if let Some(factor) = cli.alert_deviation {
+            let msg = hist.deviation_of(p.pid, factor);
+            let over = msg.is_some();
+            let edge = history::alert_cycle_repeat(
+                &mut track.dev_streak,
+                &mut track.dev_firing,
+                over,
+                &mut track.dev_fired_secs,
+                repeat,
+                interval,
+            );
+            if edge == history::AlertEdge::Fire {
+                out.push((
+                    p.pid,
+                    p.name.clone(),
+                    msg.unwrap_or_else(|| "deviated from its own baseline".into()),
+                    false,
+                ));
+            } else if edge == history::AlertEdge::Recover {
+                out.push((p.pid, p.name.clone(), "back near its own baseline".to_string(), true));
             }
         }
     }
@@ -1686,6 +1714,7 @@ fn main() {
         || cli.alert_conn.is_some()
         || cli.alert_threads.is_some()
         || cli.alert_net_per_proc.is_some()
+        || cli.alert_deviation.is_some()
         || cli.alert_container
         || cli.alert_load.is_some()
         || cli.alert_mem_pct.is_some()
@@ -2548,6 +2577,7 @@ fn main() {
             || cli.alert_retrans.is_some()
             || cli.alert_nic_drop.is_some()
             || cli.alert_net_per_proc.is_some()
+            || cli.alert_deviation.is_some()
             || !cli.alert_port.is_empty()
             || !cli.alert_new_proc.is_empty()
             || !cli.names.is_empty();

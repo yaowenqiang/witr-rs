@@ -146,6 +146,7 @@ const EXAMPLES_ZH: &str = "示例：
   witr-rs --sys            整机仪表盘：CPU/内存/负载/磁盘/网卡/温度/PSI（--watch 2 常驻）
   witr-rs --top threads    线程数最多的进程（--top conn 看谁攥着最多连接）
   witr-rs --watch 10 --alert-container   无头容器哨兵：容器退出/OOM/crash loop 即喊
+  witr-rs --watch 5 --alert-deviation 10   自基线哨兵：安静进程突然持续繁忙即喊
   witr-rs --man witr-rs.1  写出 man 手册页";
 
 const EXAMPLES_EN: &str = "Examples:
@@ -192,6 +193,7 @@ const EXAMPLES_EN: &str = "Examples:
   witr-rs --sys            the machine dashboard: cpu/mem/load/disk/nic/temp/psi (--watch 2 to keep it live)
   witr-rs --top threads    most-threaded processes (--top conn for who holds the most connections)
   witr-rs --watch 10 --alert-container   headless container sentinel: exit/OOM/crash loop shouts
+  witr-rs --watch 5 --alert-deviation 10   self-baseline sentinel: a quiet process suddenly staying busy shouts
   witr-rs --man witr-rs.1  write the man page";
 
 fn examples() -> &'static str {
@@ -228,6 +230,7 @@ impl Cli {
         self.alert_retrans = self.alert_retrans.or(cfg.alert_retrans);
         self.alert_nic_drop = self.alert_nic_drop.or(cfg.alert_nic_drop);
         self.alert_net_per_proc = self.alert_net_per_proc.or(cfg.alert_net_per_proc);
+        self.alert_deviation = self.alert_deviation.or(cfg.alert_deviation);
         self.alert_repeat = self.alert_repeat.or(cfg.alert_repeat);
         if self.alert_exec.is_none() {
             self.alert_exec = cfg.alert_exec.clone();
@@ -809,6 +812,16 @@ pub struct Cli {
         )
     )]
     pub alert_net_per_proc: Option<u64>,
+
+    #[arg(
+        long = "alert-deviation",
+        value_name = "X",
+        help = t(
+            "自基线偏离告警：进程瞬时 CPU 连续 5 次采样（约 15s）超过自身近 2 分钟中位数的 X 倍、且绝对值不低于 5% 时告警——“一直安静的任务突然持续繁忙”不需要预先写阈值（基线约 36s 历史后武装）。TUI 和 --watch",
+            "Self-baseline deviation alert: fire when a process's instantaneous CPU exceeds its own trailing ~2-minute median by X times (and clears the absolute 5% floor) for 5 consecutive samples (~15s) — \"the quiet daemon suddenly busy\" needs no per-process threshold to exist (the baseline arms after ~36s of history). TUI and --watch"
+        )
+    )]
+    pub alert_deviation: Option<f64>,
 
     #[arg(
         long = "alert-port",

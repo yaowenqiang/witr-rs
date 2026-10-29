@@ -378,6 +378,9 @@ struct TuiApp {
     /// --alert-net-per-proc TCP-throughput threshold (None = unchecked;
     /// rates ride hist's ss-sweep diffs)
     alert_net_per_proc: Option<u64>,
+    /// --alert-deviation self-baseline factor (None = unchecked; the
+    /// baseline lives in hist's dev_samples window)
+    alert_deviation: Option<f64>,
     /// --alert-port canaries: (port, negate) — negate=true means the
     /// listener must stay up; alerts fire on the appear/gone edges
     alert_port: Vec<(u16, bool)>,
@@ -600,6 +603,9 @@ pub struct Seed {
     /// --alert-net-per-proc: per-process TCP throughput threshold (MB/s);
     /// sustained excess → alert (quiet-exfiltration detection)
     pub alert_net_per_proc: Option<u64>,
+    /// --alert-deviation: self-baseline CPU deviation factor; sustained
+    /// excess → alert ("the quiet daemon suddenly busy")
+    pub alert_deviation: Option<f64>,
     /// --alert-port canaries: (port, negate) — alert on the LISTEN
     /// appear edge, or (negated) on the listener-gone edge
     pub alert_port: Vec<(u16, bool)>,
@@ -709,6 +715,7 @@ impl Seed {
         self.alert_conn = cli.alert_conn;
         self.alert_threads = cli.alert_threads;
         self.alert_net_per_proc = cli.alert_net_per_proc;
+        self.alert_deviation = cli.alert_deviation;
         self.alert_repeat = cli.alert_repeat;
         self.alert_load = cli.alert_load;
         self.alert_mem_pct = cli.alert_mem_pct;
@@ -845,6 +852,7 @@ impl TuiApp {
             conn_counts: HashMap::new(),
             alert_threads: seed.alert_threads,
             alert_net_per_proc: seed.alert_net_per_proc,
+            alert_deviation: seed.alert_deviation,
             alert_port: seed.alert_port.clone(),
             port_seen: HashMap::new(),
             port_owner: HashMap::new(),
@@ -2253,6 +2261,7 @@ impl TuiApp {
             && self.alert_conn.is_none()
             && self.alert_threads.is_none()
             && self.alert_net_per_proc.is_none()
+            && self.alert_deviation.is_none()
         {
             return Vec::new();
         }
@@ -2415,6 +2424,32 @@ impl TuiApp {
                     ));
                 } else if edge == crate::history::AlertEdge::Recover {
                     out.push((p.pid, p.name.clone(), format!("threads back under {limit}"), true));
+                }
+            }
+            if let Some(factor) = self.alert_deviation {
+                let msg = self.hist.deviation_of(p.pid, factor);
+                let edge = crate::history::alert_cycle_repeat(
+                    &mut track.dev_streak,
+                    &mut track.dev_firing,
+                    msg.is_some(),
+                    &mut track.dev_fired_secs,
+                    self.alert_repeat,
+                    interval,
+                );
+                if edge == crate::history::AlertEdge::Fire {
+                    out.push((
+                        p.pid,
+                        p.name.clone(),
+                        msg.unwrap_or_else(|| "deviated from its own baseline".into()),
+                        false,
+                    ));
+                } else if edge == crate::history::AlertEdge::Recover {
+                    out.push((
+                        p.pid,
+                        p.name.clone(),
+                        "back near its own baseline".to_string(),
+                        true,
+                    ));
                 }
             }
         }
@@ -9892,6 +9927,7 @@ mod tests {
                 alert_conn: None,
                 alert_threads: None,
                 alert_net_per_proc: None,
+                alert_deviation: None,
                 alert_port: Vec::new(),
                 alert_repeat: None,
                 alert_load: None,

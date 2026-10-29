@@ -60,6 +60,7 @@ pub struct Config {
     pub alert_retrans: Option<u64>,
     pub alert_nic_drop: Option<u64>,
     pub alert_net_per_proc: Option<u64>,
+    pub alert_deviation: Option<f64>,
     pub alert_repeat: Option<u64>,
     pub alert_exec: Option<String>,
     pub alert_webhook: Option<String>,
@@ -363,6 +364,7 @@ fn set_alert(key: &str, value: &str, cfg: &mut Config) -> Result<(), String> {
         "alert_retrans" => int(&mut cfg.alert_retrans),
         "alert_nic_drop" => int(&mut cfg.alert_nic_drop),
         "alert_net_per_proc" => int(&mut cfg.alert_net_per_proc),
+        "alert_deviation" => num(&mut cfg.alert_deviation),
         "alert_disk" => int(&mut cfg.alert_disk),
         "alert_conn" => int(&mut cfg.alert_conn),
         "alert_threads" => int(&mut cfg.alert_threads),
@@ -442,6 +444,16 @@ watch = [\"nginx|nginx|www\", \"tailspid|sleep|\"]
             }
         );
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn parse_alert_key_deviation() {
+        let (cfg, w) = Config::parse("alert_deviation = 5\n");
+        assert_eq!(cfg.alert_deviation, Some(5.0));
+        assert!(w.is_empty(), "{w:?}");
+        let (cfg, w) = Config::parse("alert_deviation = lots\n");
+        assert!(cfg.alert_deviation.is_none());
+        assert_eq!(w.len(), 1);
     }
 
     #[test]
