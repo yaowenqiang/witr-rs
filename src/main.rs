@@ -4266,7 +4266,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn rotation_caps_long_running_writers() {
         // RecordWriter: cap of one byte rotates on every append — the .1
         // generation holds the older rows, the fresh file carries the CSV
