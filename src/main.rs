@@ -364,6 +364,11 @@ fn service_flag_args(cli: &Cli) -> Vec<String> {
     }
     opt(&mut a, "events-log", cli.events_log.clone());
     opt(&mut a, "record", cli.record.clone());
+    opt(
+        &mut a,
+        "record-max-mb",
+        cli.record_max_mb.map(|v| v.to_string()),
+    );
     if cli.quiet {
         a.push("--quiet".into());
     }
@@ -1092,24 +1097,155 @@ pub(crate) fn port_alert_picks(
 /// (richer — ppid, state, age ride along — and jq-friendly).
 /// Every tick also carries a machine-level sample: a `_system` row in CSV
 /// (dedicated `sys_*` columns) or a `system` key in the JSONL envelope.
+/// --events-log with long-run hygiene: the same rotation cap as
+/// --record. Append-mode (an explicit `--events-log ev.jsonl` never
+/// loses prior sessions' lines), rotated to `<path>.1` once the cap
+/// passes — a months-long watchdog's disk use stays bounded.
+struct EventLog {
+    path: std::path::PathBuf,
+    file: Option<std::fs::File>,
+    cap_bytes: Option<u64>,
+    written: u64,
+}
+
+impl EventLog {
+    fn create(path: &str, cap_mb: Option<u64>) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(EventLog {
+            path: path.into(),
+            file: Some(file),
+            cap_bytes: cap_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
+            written,
+        })
+    }
+
+    /// Serialize one event to JSONL; serialization failure stays silent,
+    /// like every other events-log writer.
+    fn log_json<T: serde::Serialize>(&mut self, value: &T) {
+        let Ok(json) = serde_json::to_string(value) else {
+            return;
+        };
+        self.log_str(&json);
+    }
+
+    fn log_str(&mut self, json: &str) {
+        use std::io::Write as _;
+        if self.cap_bytes.is_some_and(|cap| self.written >= cap) {
+            self.file = None; // close before the rename (Windows can't rename open files)
+            let rotated = self.path.with_file_name(format!(
+                "{}.1",
+                self.path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("events")
+            ));
+            let _ = std::fs::remove_file(&rotated);
+            let _ = std::fs::rename(&self.path, &rotated);
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+            {
+                Ok(f) => {
+                    self.file = Some(f);
+                    self.written = 0;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "--events-log rotate {}: {e} — event logging stops here",
+                        self.path.display()
+                    );
+                }
+            }
+        }
+        let Some(f) = self.file.as_mut() else {
+            return;
+        };
+        if writeln!(f, "{json}").is_ok() {
+            self.written += json.len() as u64 + 1;
+        }
+        let _ = f.flush();
+    }
+}
+
 struct RecordWriter {
-    file: std::fs::File,
+    file: Option<std::fs::File>,
     jsonl: bool,
+    path: std::path::PathBuf,
+    cap_bytes: Option<u64>,
+    written: u64,
 }
 
 impl RecordWriter {
+    #[cfg(test)] // production goes through create_with_cap (--record-max-mb)
     fn create(path: &str) -> std::io::Result<Self> {
+        Self::create_with_cap(path, None)
+    }
+
+    /// `cap_bytes` (from --record-max-mb) rotates the file to `<path>.1`
+    /// once it passes the cap — the previous .1 is dropped, so disk stays
+    /// bounded at twice the cap however long the watchdog runs.
+    fn create_with_cap(path: &str, cap_bytes: Option<u64>) -> std::io::Result<Self> {
         let jsonl = path.ends_with(".jsonl");
-        let mut f = std::fs::File::create(path)?;
-        use std::io::Write as _;
-        if !jsonl {
-            writeln!(
-                f,
-                "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps,gpu_sm,\
-                 sys_load1,sys_mem_pct,sys_procs,sys_net_bps"
-            )?;
+        let (f, written) = Self::reopen(std::path::Path::new(path), jsonl)?;
+        Ok(RecordWriter {
+            file: Some(f),
+            jsonl,
+            path: path.into(),
+            cap_bytes,
+            written,
+        })
+    }
+
+    /// Pass the cap: close, drop the old .1, rename current → .1, reopen
+    /// fresh (the CSV header rewrites — the rotation must leave a file
+    /// --plot/--samples can read without special cases). A failed reopen
+    /// leaves `file` None and recording quietly stops (one stderr note).
+    fn rotate_if_over_cap(&mut self) {
+        if !self.cap_bytes.is_some_and(|cap| self.written >= cap) {
+            return;
         }
-        Ok(RecordWriter { file: f, jsonl })
+        self.file = None; // close before the rename (Windows can't rename open files)
+        let rotated = self.path.with_file_name(format!(
+            "{}.1",
+            self.path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("record")
+        ));
+        let _ = std::fs::remove_file(&rotated);
+        let _ = std::fs::rename(&self.path, &rotated);
+        match Self::reopen(&self.path, self.jsonl) {
+            Ok((f, written)) => {
+                self.file = Some(f);
+                self.written = written;
+            }
+            Err(e) => {
+                eprintln!(
+                    "--record rotate {}: {e} — recording stops here",
+                    self.path.display()
+                );
+            }
+        }
+    }
+
+    /// Fresh file + the CSV header when the mode needs one; the byte count
+    /// the cap diffs against.
+    fn reopen(path: &std::path::Path, jsonl: bool) -> std::io::Result<(std::fs::File, u64)> {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(path)?;
+        let mut written = 0u64;
+        if !jsonl {
+            let header = "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps,gpu_sm,\
+                 sys_load1,sys_mem_pct,sys_procs,sys_net_bps";
+            writeln!(f, "{header}")?;
+            written = header.len() as u64 + 1;
+        }
+        Ok((f, written))
     }
 
     fn append(
@@ -1119,7 +1255,10 @@ impl RecordWriter {
         stats: Option<&crate::platform::SystemStats>,
         net_bps: Option<f64>,
     ) {
-        use std::io::Write as _;
+        self.rotate_if_over_cap();
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
         if self.jsonl {
             let rows: Vec<serde_json::Value> = procs
                 .iter()
@@ -1167,7 +1306,7 @@ impl RecordWriter {
                 "system": system,
                 "processes": rows,
             });
-            let _ = writeln!(self.file, "{}", serde_json::to_string(&doc).unwrap_or_default());
+            let _ = writeln!(file, "{}", serde_json::to_string(&doc).unwrap_or_default());
             return;
         }
         let ts = util::now_unix();
@@ -1183,7 +1322,7 @@ impl RecordWriter {
                 .map(|(r, w)| (format!("{r:.0}"), format!("{w:.0}")))
                 .unwrap_or_default();
             let _ = writeln!(
-                self.file,
+                file,
                 "{},{},{},{},{},{},{},{},{},,,,",
                 ts,
                 p.pid,
@@ -1205,7 +1344,7 @@ impl RecordWriter {
                 _ => None,
             };
             let _ = writeln!(
-                self.file,
+                file,
                 "{},_system,-,system,{},{},,,,{},{},{},{}",
                 ts,
                 s.cpu_percent.map(|c| format!("{c:.1}")).unwrap_or_default(),
@@ -3194,7 +3333,10 @@ fn main() {
             // the stream struct's job)
             let container_stream = history::spawn_container_events();
             let mut recorder = match &cli.record {
-                Some(path) => match RecordWriter::create(path) {
+                Some(path) => match RecordWriter::create_with_cap(
+                    path,
+                    cli.record_max_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
+                ) {
                     Ok(w) => {
                         write_out(&format!("recording per-process samples → {path}"));
                         Some(w)
@@ -3207,11 +3349,7 @@ fn main() {
                 None => None,
             };
             let mut events_file = match &cli.events_log {
-                Some(path) => match std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                {
+                Some(path) => match EventLog::create(path, cli.record_max_mb) {
                     Ok(f) => {
                         write_out(&format!("recording events → {path}"));
                         Some(f)
@@ -3282,12 +3420,8 @@ fn main() {
                         } else {
                             write_out(&line);
                         }
-                        if let Some(f) = events_file.as_mut() {
-                            use std::io::Write as _;
-                            if let Ok(json) = serde_json::to_string(&e) {
-                                let _ = writeln!(f, "{json}");
-                                let _ = f.flush();
-                            }
+                        if let Some(log) = events_file.as_mut() {
+                            log.log_json(&e);
                         }
                         hist.ingest(vec![e]);
                     }
@@ -3306,12 +3440,8 @@ fn main() {
                         } else {
                             write_out(&line);
                         }
-                        if let Some(f) = events_file.as_mut() {
-                            use std::io::Write as _;
-                            if let Ok(json) = serde_json::to_string(&e) {
-                                let _ = writeln!(f, "{json}");
-                                let _ = f.flush();
-                            }
+                        if let Some(log) = events_file.as_mut() {
+                            log.log_json(&e);
                         }
                         hist.ingest(vec![e]);
                     }
@@ -3329,14 +3459,10 @@ fn main() {
                 gpu::enrich(&mut listed);
                 let procs = recent_only(listed);
                 let fresh = hist.update(&procs);
-                if let Some(f) = events_file.as_mut() {
-                    use std::io::Write as _;
+                if let Some(log) = events_file.as_mut() {
                     for e in &fresh {
-                        if let Ok(json) = serde_json::to_string(e) {
-                            let _ = writeln!(f, "{json}");
-                        }
+                        log.log_json(e);
                     }
-                    let _ = f.flush();
                 }
                 if let Some(w) = recorder.as_mut() {
                     // --record samples the machine alongside the processes —
@@ -3589,12 +3715,10 @@ fn main() {
                     // events ring/log as "silenced" so the mute is visible,
                     // but no line, exec, webhook or notify fires
                     if history::silenced(&silence_rules, &name, util::now_unix() as u64) {
-                        if let Some(f) = events_file.as_mut() {
-                            use std::io::Write as _;
+                        if events_file.is_some() {
                             let e = hist.push_kind("silenced", pid, &name, &detail);
-                            if let Ok(json) = serde_json::to_string(&e) {
-                                let _ = writeln!(f, "{json}");
-                                let _ = f.flush();
+                            if let Some(log) = events_file.as_mut() {
+                                log.log_json(&e);
                             }
                         } else {
                             hist.push_kind("silenced", pid, &name, &detail);
@@ -3620,12 +3744,10 @@ fn main() {
                     }
                     // same durable stream as the TUI: alerts and recoveries
                     // land in --events-log too, so --replay shows them later
-                    if let Some(f) = events_file.as_mut() {
-                        use std::io::Write as _;
+                    if events_file.is_some() {
                         let e = hist.push_kind(kind, pid, &name, &detail);
-                        if let Ok(json) = serde_json::to_string(&e) {
-                            let _ = writeln!(f, "{json}");
-                            let _ = f.flush();
+                        if let Some(log) = events_file.as_mut() {
+                            log.log_json(&e);
                         }
                     }
                     if let Some(cmd) = &cli.alert_exec {
@@ -4141,6 +4263,65 @@ mod tests {
         assert_eq!(v["process_count"], 1);
         assert_eq!(v["processes"][0]["pid"], 7);
         assert!(v["generated_at"].is_number());
+    }
+
+    #[test]
+    #[test]
+    fn rotation_caps_long_running_writers() {
+        // RecordWriter: cap of one byte rotates on every append — the .1
+        // generation holds the older rows, the fresh file carries the CSV
+        // header so --plot/--samples keep reading it without special cases
+        let path = std::env::temp_dir().join(format!("witr-rot-{}.csv", std::process::id()));
+        let mut w = RecordWriter::create_with_cap(path.to_str().unwrap(), Some(1)).unwrap();
+        let hist = history::History::new();
+        let procs = vec![proc(3, "worker", None, None)];
+        w.append(&procs, &hist, None, None);
+        w.append(&procs, &hist, None, None);
+        let rotated = path.with_file_name(format!(
+            "{}.1",
+            path.file_name().unwrap().to_str().unwrap()
+        ));
+        assert!(rotated.exists(), "first generation rolled aside");
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap().lines().count(),
+            2,
+            "header + row (no stats → no _system row)"
+        );
+        let cur = std::fs::read_to_string(&path).unwrap();
+        assert!(cur.starts_with("timestamp,"), "fresh file re-carries the header");
+        assert_eq!(cur.lines().count(), 2, "header + the second append's row");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+
+        // EventLog: append-mode, cap zero rotates before every write —
+        // each generation holds exactly one line
+        let epath = std::env::temp_dir().join(format!("witr-evlog-{}.jsonl", std::process::id()));
+        let mut log = EventLog::create(epath.to_str().unwrap(), Some(0)).unwrap();
+        log.log_json(&serde_json::json!({"n": 1}));
+        log.log_json(&serde_json::json!({"n": 2}));
+        let erotated = epath.with_file_name(format!(
+            "{}.1",
+            epath.file_name().unwrap().to_str().unwrap()
+        ));
+        let first = std::fs::read_to_string(&erotated).unwrap();
+        assert!(first.contains("\"n\":1"), "{first}");
+        let cur = std::fs::read_to_string(&epath).unwrap();
+        assert!(cur.contains("\"n\":2"), "{cur}");
+        let _ = std::fs::remove_file(&epath);
+        let _ = std::fs::remove_file(&erotated);
+
+        // no cap → nothing ever rotates
+        let epath = std::env::temp_dir().join(format!("witr-evlog2-{}.jsonl", std::process::id()));
+        let mut log = EventLog::create(epath.to_str().unwrap(), None).unwrap();
+        log.log_json(&serde_json::json!({"n": 1}));
+        log.log_json(&serde_json::json!({"n": 2}));
+        assert!(
+            !epath
+                .with_file_name(format!("{}.1", epath.file_name().unwrap().to_str().unwrap()))
+                .exists()
+        );
+        assert_eq!(std::fs::read_to_string(&epath).unwrap().lines().count(), 2);
+        let _ = std::fs::remove_file(&epath);
     }
 
     #[test]

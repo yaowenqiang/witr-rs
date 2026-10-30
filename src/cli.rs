@@ -231,6 +231,7 @@ impl Cli {
         self.alert_nic_drop = self.alert_nic_drop.or(cfg.alert_nic_drop);
         self.alert_net_per_proc = self.alert_net_per_proc.or(cfg.alert_net_per_proc);
         self.alert_deviation = self.alert_deviation.or(cfg.alert_deviation);
+        self.record_max_mb = self.record_max_mb.or(cfg.record_max_mb);
         self.alert_repeat = self.alert_repeat.or(cfg.alert_repeat);
         if self.alert_exec.is_none() {
             self.alert_exec = cfg.alert_exec.clone();
@@ -522,6 +523,16 @@ pub struct Cli {
         )
     )]
     pub record: Option<String>,
+
+    #[arg(
+        long = "record-max-mb",
+        value_name = "MB",
+        help = t(
+            "录制与事件日志的长跑卫生：--record / --events-log 的文件超过该大小（MB）时滚动为 <文件>.1（上一代 .1 丢弃）并重新开始——watchdog 跑几个月磁盘占用也有上界（2×上限）。默认不限",
+            "Long-run hygiene for recordings and event logs: when the --record / --events-log file passes this size (MB) it rotates to <file>.1 (the previous .1 is dropped) and starts fresh — a months-long watchdog's disk use stays bounded (2× the cap). Unlimited by default"
+        )
+    )]
+    pub record_max_mb: Option<u64>,
 
     #[arg(
         long = "watch",

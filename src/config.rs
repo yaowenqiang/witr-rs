@@ -61,6 +61,8 @@ pub struct Config {
     pub alert_nic_drop: Option<u64>,
     pub alert_net_per_proc: Option<u64>,
     pub alert_deviation: Option<f64>,
+    /// --record-max-mb: rotate --record / --events-log files past this size
+    pub record_max_mb: Option<u64>,
     pub alert_repeat: Option<u64>,
     pub alert_exec: Option<String>,
     pub alert_webhook: Option<String>,
@@ -280,6 +282,12 @@ impl Config {
                 },
                 "sort" => cfg.sort = Some(quoted.to_string()),
                 "serve_token" => cfg.serve_token = Some(quoted.to_string()),
+                "record_max_mb" => match quoted.parse::<u64>() {
+                    Ok(v) => cfg.record_max_mb = Some(v),
+                    Err(_) => warnings.push(format!(
+                        "line {n}: record_max_mb {quoted:?} is not a number, skipped"
+                    )),
+                },
                 "alert_silence" => match parse_string_array(value) {
                     Some(list) => cfg.alert_silence = list,
                     None => warnings.push(format!(

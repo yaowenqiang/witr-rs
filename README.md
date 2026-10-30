@@ -32,7 +32,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **表格输出（`--csv` / `--markdown`）**：进程表的机器可读形式——`--csv` 按 RFC-4180 转义（命令行里的逗号、引号、换行都安全），`--markdown` 直接贴 issue / 文档；两列都含 NAME 与完整命令行，脚本与报表一等公民。
 
-**CSV 时间序列（`--watch` + `--record`）**：`witr-rs --watch 5 --record load.csv` 每 5 秒把整张进程表按进程追加进 CSV——timestamp / pid / user / name / cpu_pct / rss_mb / io 读写速率 / gpu_sm（平台没有的指标留空列），外加整机四列 `sys_load1` / `sys_mem_pct` / `sys_procs` / `sys_net_bps`（记录在一条 `pid=_system` 的汇总行上——load、内存占用百分比、进程数与全网卡收发合计字节/秒，与进程行同文件同节奏）。收工后用 Excel / pandas / SQLite 回放负载走势，控制台输出不受影响。存成 `.jsonl` 后缀则切换为 **NDJSON 模式**：每个 tick 追加一行版本化 JSON 信封（`{schema_version, generated_at, process_count, processes}`），每进程额外带 ppid / state / age_secs，`jq '.processes[] | select(.rss_mb > 500)'` 直接取数；整机快照在同信封的 `system` 键（`load1` / `cpu_pct` / `mem_used_mb` / `mem_pct` / `proc_count` / `net_bps`，平台测不到时为 null）。
+**CSV 时间序列（`--watch` + `--record`）**：`witr-rs --watch 5 --record load.csv` 每 5 秒把整张进程表按进程追加进 CSV——timestamp / pid / user / name / cpu_pct / rss_mb / io 读写速率 / gpu_sm（平台没有的指标留空列），外加整机四列 `sys_load1` / `sys_mem_pct` / `sys_procs` / `sys_net_bps`（记录在一条 `pid=_system` 的汇总行上——load、内存占用百分比、进程数与全网卡收发合计字节/秒，与进程行同文件同节奏）。收工后用 Excel / pandas / SQLite 回放负载走势，控制台输出不受影响。存成 `.jsonl` 后缀则切换为 **NDJSON 模式**：每个 tick 追加一行版本化 JSON 信封（`{schema_version, generated_at, process_count, processes}`），每进程额外带 ppid / state / age_secs，`jq '.processes[] | select(.rss_mb > 500)'` 直接取数；整机快照在同信封的 `system` 键（`load1` / `cpu_pct` / `mem_used_mb` / `mem_pct` / `proc_count` / `net_bps`，平台测不到时为 null）。**长跑卫生（`--record-max-mb MB`）**：`--record` 与 `--events-log` 的文件超过该大小时滚动为 `<文件>.1`（上一代 .1 丢弃）并重新开始——CSV 模式重转后自动补写表头，`--plot` / `--samples` 无需特殊处理；磁盘占用从此有上界（2×上限），watchdog 跑几个月不再写满盘。该键也可写进配置文件（`record_max_mb = 200`）。
 
 **时序图（`--plot`）**：`witr-rs --plot load.csv` 把 `--record` 产出的样本文件（.csv / .jsonl 都认）画成自包含 HTML 时序图，写入 `load.csv.html` 后退出——内联 SVG 五张图（整机 cpu% / 内存% / 1 分钟负载 / 网络速率 MB/s / 进程数），零 JS 零外部资源，离线双击可看。给**多个文件**则曲线叠加对比——`--plot before.jsonl after.jsonl` 发布前后各录一份，一图看清差异（输出 `witr-plot.html`）。"录制回来看看负载曲线"不用再开 Excel。
 
@@ -286,6 +286,7 @@ witr-rs --top threads -n 10   # 线程数最多的进程（--top conn 看谁攥�
 witr-rs --top cpu --watch 5   # 每 5s 重采样重排的常驻 CPU 榜（Ctrl-C 退出）
 witr-rs --csv                 # 全表 CSV（RFC-4180 转义；--markdown 贴文档用）
 witr-rs --watch 5 --record load.csv # 每 5s 把整张进程表追加进 CSV 时间序列
+witr-rs --watch 5 --record load.csv --record-max-mb 200 # 同上，超 200MB 滚动为 load.csv.1（长跑 watchdog 磁盘有上界）
 witr-rs --watch 5 --record load.jsonl # 同款时间序列，NDJSON 信封（ppid/state/age 顺路带上）
 witr-rs --plot load.csv        # 录制文件画成自包含 HTML 时序图（离线可看的五张 SVG 曲线）
 witr-rs --samples load.csv     # 录制文件导入 TUI Samples 页（sparkline + ←→ 光标逐时刻读数）
