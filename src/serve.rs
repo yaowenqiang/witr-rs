@@ -9,9 +9,10 @@
 //! The one exception is /api/events (Server-Sent Events): a 5s delta
 //! sampler arms lazily on the first hit and streams the process
 //! started/exited/restarted edges.
-//! Container gauges ride a background `stats --no-stream` sweep (seconds
-//! per runtime CLI) refreshed at most every 30s — scrapes never block on
-//! it.
+//! Container series and the /api/containers + dashboard container table
+//! ride a background snapshot (enumerate + cgroup pressure + the
+//! `stats --no-stream` sweep, merged into full rows, refreshed at most
+//! every 30s) — scrapes never block on a runtime CLI.
 //!
 //! Hand-rolled on std::net (one thread per connection, sequential reads)
 //! so the binary keeps zero extra dependencies. Cardinality stays bounded:
@@ -56,12 +57,12 @@ fn label_escape(s: &str) -> String {
 }
 
 /// The `/` dashboard: a self-contained, zero-JS HTML view of the machine —
-/// gauges (cpu / memory / load / procs), the top-10 CPU and RSS tables and
-/// the current listeners, auto-refreshed by a meta tag. Every request
-/// samples fresh, same as /metrics; the cpu gauge is a delta between
-/// requests, so the very first view of a cold server shows "–" until the
-/// second refresh.
-fn dashboard_html(platform: &dyn Platform) -> String {
+/// gauges (cpu / memory / load / procs), the top-10 CPU and RSS tables,
+/// the container table (from the background snapshot) and the current
+/// listeners, auto-refreshed by a meta tag. Every request samples fresh,
+/// same as /metrics; the cpu gauge is a delta between requests, so the
+/// very first view of a cold server shows "–" until the second refresh.
+fn dashboard_html(platform: &dyn Platform, containers: &[crate::model::Container]) -> String {
     let esc = crate::render::html_escape;
     let procs = platform.list_processes().unwrap_or_default();
     let stats = platform.system_stats().unwrap_or_default();
@@ -218,6 +219,36 @@ fn dashboard_html(platform: &dyn Platform) -> String {
     }
     out.push_str("</table>\n");
 
+    if !containers.is_empty() {
+        let _ = writeln!(
+            out,
+            "<h2>containers</h2><table><tr><th>NAME</th><th>STATE</th><th>CPU%</th><th>MEM</th><th>LIMIT</th><th>OOM</th></tr>"
+        );
+        for c in containers {
+            let oom = match c.oom_kills {
+                Some(n) if n > 0 => format!("<span class=\"hot\">{n}</span>"),
+                Some(_) => "0".into(),
+                None => "-".into(),
+            };
+            let _ = writeln!(
+                out,
+                "<tr><td><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&c.name),
+                esc(&c.state),
+                c.cpu_pct
+                    .map(|v| format!("{v:.1}"))
+                    .unwrap_or_else(|| "–".into()),
+                c.mem_used_mb
+                    .map(|m| esc(&crate::util::fmt_bytes(m * 1024 * 1024)))
+                    .unwrap_or_else(|| "–".into()),
+                c.mem_total_mb
+                    .map(|m| esc(&crate::util::fmt_bytes(m * 1024 * 1024)))
+                    .unwrap_or_else(|| "–".into()),
+                oom,
+            );
+        }
+        out.push_str("</table>\n");
+    }
     let _ = writeln!(
         out,
         "<h2>listeners</h2><table><tr><th>PORT</th><th>PROTO</th><th>SCOPE</th><th>OWNER(S)</th></tr>"
@@ -417,13 +448,12 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
     }
     // container gauges: one info series per container from the runtime
     // listing (a cheap `ps --all`), cpu/mem from the cached background
-    // `stats --no-stream` sweep (seconds per runtime — it rides a thread
-    // so a scrape never blocks on the runtime CLI; the first scrapes
-    // report only the info series)
-    let containers = crate::platform::enumerate_containers();
+    // container series ride the background snapshot (enumerate + cgroup
+    // pressure + stats merged off the scrape path — the first scrapes
+    // report no container series until the first sweep lands)
+    let containers = refresh_container_snapshot();
     if !containers.is_empty() {
-        let stats = refresh_container_stats();
-        render_container_metrics(&mut out, &containers, &stats);
+        render_container_metrics(&mut out, &containers);
     }
     // self-monitoring: total scrapes served and how long the last one took
     out.push_str("# HELP witr_scrapes_total Scrapes served since startup\n");
@@ -447,101 +477,142 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
     out
 }
 
-/// The cached `stats --no-stream` sweep: one in flight at a time, results
-/// older than 30s trigger a refresh on the next scrape. Scrapes read the
-/// last completed sweep and never wait on the runtime CLI.
-fn refresh_container_stats() -> HashMap<String, (f64, u64, u64)> {
-    let mut g = stats_cache().lock().unwrap();
+/// The cached container snapshot: enumerate + cgroup pressure + the
+/// runtime `stats` sweep, merged into full [`Container`] rows by one
+/// background sweep — at most one in flight, results older than 30s
+/// trigger a refresh on the next scrape. Scrapes read the last completed
+/// snapshot and never wait on a runtime CLI (enumerate alone can take
+/// seconds per runtime; stats several more).
+fn refresh_container_snapshot() -> Vec<crate::model::Container> {
+    let mut g = snapshot_cache().lock().unwrap();
     let stale = g
         .at
         .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(30));
     if stale && !g.in_flight {
         g.in_flight = true;
         std::thread::spawn(|| {
-            let fresh = crate::platform::container_stats();
-            let mut g = stats_cache().lock().unwrap();
-            g.stats = fresh;
+            let mut cs = crate::platform::enumerate_containers();
+            let pressure = crate::platform::container_pressure();
+            let stats = crate::platform::container_stats();
+            for c in cs.iter_mut() {
+                let key: String = c.id.chars().take(12).collect();
+                if let Some(p) = pressure.get(&key) {
+                    c.throttled_usec = Some(p.throttled_usec);
+                    c.oom_kills = Some(p.oom_kills);
+                    c.io_read_bytes = Some(p.io_read);
+                    c.io_write_bytes = Some(p.io_write);
+                }
+                if let Some(&(cpu, used, total)) = stats
+                    .get(&c.id)
+                    .or_else(|| stats.iter().find(|(k, _)| k.starts_with(&key)).map(|(_, v)| v))
+                {
+                    c.cpu_pct = Some(cpu);
+                    c.mem_used_mb = Some(used / 1024 / 1024);
+                    c.mem_total_mb = Some(total / 1024 / 1024);
+                }
+            }
+            cs.sort_by(|a, b| {
+                (a.state != "running")
+                    .cmp(&(b.state != "running"))
+                    .then(a.name.cmp(&b.name))
+            });
+            let mut g = snapshot_cache().lock().unwrap();
+            g.containers = cs;
             g.at = Some(std::time::Instant::now());
             g.in_flight = false;
         });
     }
-    g.stats.clone()
+    g.containers.clone()
 }
 
-struct ContainerStatsCache {
+struct ContainerSnapshotCache {
     at: Option<std::time::Instant>,
     in_flight: bool,
-    stats: HashMap<String, (f64, u64, u64)>,
+    containers: Vec<crate::model::Container>,
 }
 
 /// The shared cache cell — module-level so both the scrape path and the
 /// spawned sweep thread see the same state.
-fn stats_cache() -> &'static Mutex<ContainerStatsCache> {
-    static CACHE: std::sync::OnceLock<Mutex<ContainerStatsCache>> = std::sync::OnceLock::new();
+fn snapshot_cache() -> &'static Mutex<ContainerSnapshotCache> {
+    static CACHE: std::sync::OnceLock<Mutex<ContainerSnapshotCache>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| {
-        Mutex::new(ContainerStatsCache {
+        Mutex::new(ContainerSnapshotCache {
             at: None,
             in_flight: false,
-            stats: HashMap::new(),
+            containers: Vec::new(),
         })
     })
 }
 
-/// Container series: `witr_container_info` one per container, plus
-/// cpu/mem gauges where the sweep has a sample. Pure so tests can feed
-/// fixtures; id matching is exact then 12-char prefix (runtimes
-/// abbreviate either side).
-fn render_container_metrics(
+/// One container series family's HELP/TYPE block, emitted once — the
+/// `said` set tracks which families have had their header already.
+fn container_family_meta(
     out: &mut String,
-    containers: &[crate::model::Container],
-    stats: &HashMap<String, (f64, u64, u64)>,
+    said: &mut std::collections::HashSet<&'static str>,
+    family: &'static str,
 ) {
-    out.push_str("# HELP witr_container_info Container metadata, one series per container\n");
-    out.push_str("# TYPE witr_container_info gauge\n");
-    let mut emitted = false;
-    for c in containers {
-        let id = &c.id;
-        let sample = stats
-            .get(id)
-            .or_else(|| {
-                let prefix: String = id.chars().take(12).collect();
-                stats
-                    .iter()
-                    .find(|(k, _)| k.starts_with(&prefix))
-                    .map(|(_, v)| v)
-            })
-            .copied();
-        if let Some((cpu, used, total)) = sample {
-            if !emitted {
-                out.push_str("# HELP witr_container_cpu_percent Live CPU percent from the runtime's stats sweep\n");
-                out.push_str("# TYPE witr_container_cpu_percent gauge\n");
-                out.push_str("# HELP witr_container_mem_used_bytes Resident memory in use, from the runtime's stats sweep\n");
-                out.push_str("# TYPE witr_container_mem_used_bytes gauge\n");
-                out.push_str("# HELP witr_container_mem_total_bytes Memory limit visible to the container\n");
-                out.push_str("# TYPE witr_container_mem_total_bytes gauge\n");
-                emitted = true;
-            }
-            out.push_str(&format!(
-                "witr_container_cpu_percent{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {cpu:.2}\n",
-                label_escape(&c.runtime),
-                label_escape(id),
-                label_escape(&c.name),
-            ));
-            out.push_str(&format!(
-                "witr_container_mem_used_bytes{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {used}\n",
-                label_escape(&c.runtime),
-                label_escape(id),
-                label_escape(&c.name),
-            ));
-            out.push_str(&format!(
-                "witr_container_mem_total_bytes{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {total}\n",
-                label_escape(&c.runtime),
-                label_escape(id),
-                label_escape(&c.name),
-            ));
-        }
+    const META: &[(&str, &str, &str)] = &[
+        (
+            "info",
+            "Container metadata, one series per container",
+            "gauge",
+        ),
+        (
+            "cpu_percent",
+            "Live CPU percent from the runtime's stats sweep",
+            "gauge",
+        ),
+        (
+            "mem_used_bytes",
+            "Resident memory in use, from the runtime's stats sweep",
+            "gauge",
+        ),
+        (
+            "mem_total_bytes",
+            "Memory limit visible to the container",
+            "gauge",
+        ),
+        (
+            "throttled_seconds_total",
+            "CFS throttle time accumulated by the container's cgroup",
+            "counter",
+        ),
+        (
+            "oom_kills_total",
+            "Kernel OOM kills inside the container's cgroup since boot",
+            "counter",
+        ),
+        (
+            "io_read_bytes_total",
+            "Disk read bytes of the container's cgroup, summed across devices",
+            "counter",
+        ),
+        (
+            "io_write_bytes_total",
+            "Disk write bytes of the container's cgroup, summed across devices",
+            "counter",
+        ),
+    ];
+    if !said.insert(family) {
+        return;
     }
+    let Some((_, help, kind)) = META.iter().find(|(k, _, _)| k == &family) else {
+        return;
+    };
+    out.push_str(&format!(
+        "# HELP witr_container_{family} {help}\n# TYPE witr_container_{family} {kind}\n"
+    ));
+}
+
+/// Container series: `witr_container_info` one per container, plus
+/// cpu/mem gauges where the sweep has a sample and the cgroup pressure
+/// counters (throttle time, oom kills, disk I/O — `rate()` them for
+/// throughput) where the platform reads them. Pure so tests can feed
+/// fixtures; every value rides the Container row itself.
+fn render_container_metrics(out: &mut String, containers: &[crate::model::Container]) {
+    let mut said: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
     for c in containers {
+        container_family_meta(out, &mut said, "info");
         out.push_str(&format!(
             "witr_container_info{{runtime=\"{}\",id=\"{}\",name=\"{}\",image=\"{}\",state=\"{}\"}} 1\n",
             label_escape(&c.runtime),
@@ -550,6 +621,72 @@ fn render_container_metrics(
             label_escape(&c.image),
             label_escape(&c.state),
         ));
+        if let Some(cpu) = c.cpu_pct {
+            container_family_meta(out, &mut said, "cpu_percent");
+            out.push_str(&format!(
+                "witr_container_cpu_percent{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {cpu:.2}\n",
+                label_escape(&c.runtime),
+                label_escape(&c.id),
+                label_escape(&c.name),
+            ));
+        }
+        if let Some(used) = c.mem_used_mb {
+            container_family_meta(out, &mut said, "mem_used_bytes");
+            out.push_str(&format!(
+                "witr_container_mem_used_bytes{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {}\n",
+                label_escape(&c.runtime),
+                label_escape(&c.id),
+                label_escape(&c.name),
+                used * 1024 * 1024,
+            ));
+        }
+        if let Some(total) = c.mem_total_mb {
+            container_family_meta(out, &mut said, "mem_total_bytes");
+            out.push_str(&format!(
+                "witr_container_mem_total_bytes{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {}\n",
+                label_escape(&c.runtime),
+                label_escape(&c.id),
+                label_escape(&c.name),
+                total * 1024 * 1024,
+            ));
+        }
+        if let Some(usec) = c.throttled_usec {
+            container_family_meta(out, &mut said, "throttled_seconds_total");
+            out.push_str(&format!(
+                "witr_container_throttled_seconds_total{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {:.6}\n",
+                label_escape(&c.runtime),
+                label_escape(&c.id),
+                label_escape(&c.name),
+                usec as f64 / 1_000_000.0,
+            ));
+        }
+        if let Some(kills) = c.oom_kills {
+            container_family_meta(out, &mut said, "oom_kills_total");
+            out.push_str(&format!(
+                "witr_container_oom_kills_total{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {kills}\n",
+                label_escape(&c.runtime),
+                label_escape(&c.id),
+                label_escape(&c.name),
+            ));
+        }
+        if let Some(r) = c.io_read_bytes {
+            container_family_meta(out, &mut said, "io_read_bytes_total");
+            out.push_str(&format!(
+                "witr_container_io_read_bytes_total{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {r}\n",
+                label_escape(&c.runtime),
+                label_escape(&c.id),
+                label_escape(&c.name),
+            ));
+        }
+        if let Some(w) = c.io_write_bytes {
+            container_family_meta(out, &mut said, "io_write_bytes_total");
+            out.push_str(&format!(
+                "witr_container_io_write_bytes_total{{runtime=\"{}\",id=\"{}\",name=\"{}\"}} {w}\n",
+                label_escape(&c.runtime),
+                label_escape(&c.id),
+                label_escape(&c.name),
+            ));
+        }
     }
 }
 
@@ -718,6 +855,26 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                     "200 OK",
                     "application/json",
                     &crate::json_envelope(&procs),
+                );
+                return;
+            }
+            // /api/containers: the runtime container table with the
+            // cgroup pressure fields, from the same background snapshot
+            // the /metrics container series ride (never blocks a scrape —
+            // or this route — on a runtime CLI)
+            if path == "/api/containers" || path.starts_with("/api/containers?") {
+                let containers = refresh_container_snapshot();
+                let doc = serde_json::json!({
+                    "schema_version": crate::SCHEMA_VERSION,
+                    "generated_at": crate::util::now_unix(),
+                    "container_count": containers.len(),
+                    "containers": containers,
+                });
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    &serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()),
                 );
                 return;
             }
@@ -1003,9 +1160,10 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                     // the human view: a zero-JS dashboard (meta-refresh)
                     // over the same live sampling the APIs do
                     "/" => {
+                        let containers = refresh_container_snapshot();
                         let body = {
                             let platform = platform.lock().unwrap_or_else(|e| e.into_inner());
-                            dashboard_html(platform.as_ref())
+                            dashboard_html(platform.as_ref(), &containers)
                         };
                         respond(&mut stream, "200 OK", "text/html; charset=utf-8", &body);
                     }
@@ -1220,7 +1378,27 @@ mod tests {
 
     #[test]
     fn dashboard_is_zero_js_and_escapes() {
-        let html = dashboard_html(&DashPlatform);
+        let mut web = crate::model::Container {
+            runtime: "docker".into(),
+            id: "abc".into(),
+            name: "web".into(),
+            image: "nginx".into(),
+            command: String::new(),
+            state: "running".into(),
+            status: "Up".into(),
+            ports: String::new(),
+            pod: None,
+            restarts: None,
+            cpu_pct: Some(4.2),
+            mem_used_mb: Some(64),
+            mem_total_mb: Some(512),
+            compose: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            throttled_usec: None,
+            oom_kills: Some(1),
+        };
+        let html = dashboard_html(&DashPlatform, &[web.clone()]);
         assert!(html.contains("http-equiv=\"refresh\""), "auto-refresh meta tag");
         assert!(!html.to_lowercase().contains("<script"), "zero JS: no script tags");
         assert!(!html.contains("<script>"), "process name is escaped");
@@ -1232,6 +1410,15 @@ mod tests {
         assert!(html.contains(">8080<"), "listener port in its table");
         assert!(html.contains("internet"), "wildcard bind is flagged");
         assert!(html.contains("/api/ps"), "API index still reachable from the page");
+        // the container table: name, live cpu/mem and a red non-zero OOM
+        assert!(html.contains("containers"), "container section present");
+        assert!(html.contains(">web<"), "container name in its table");
+        assert!(html.contains(">4.2<"), "container cpu renders");
+        assert!(!html.to_lowercase().contains("warning"), "no stray warnings");
+        // a container that never OOMed shows a plain 0
+        web.oom_kills = Some(0);
+        let html = dashboard_html(&DashPlatform, &[web]);
+        assert!(html.contains("<td>0</td>"), "zero oom stays plain: {html}");
         // cold server: cpu is a delta between requests, dashes are fine
         struct Cold;
         impl Platform for Cold {
@@ -1263,13 +1450,13 @@ mod tests {
                 None
             }
         }
-        let html = dashboard_html(&Cold);
+        let html = dashboard_html(&Cold, &[]);
         assert!(html.contains("–"), "missing gauges render a dash");
         assert!(html.contains("0 process(es)"));
     }
 
-    #[test]
-    fn container_metrics_match_ids_and_skip_missing_samples() {
+#[test]
+    fn container_metrics_match_ids_and_carry_pressure() {
         let c = |id: &str, name: &str| crate::model::Container {
             runtime: "docker".into(),
             id: id.into(),
@@ -1284,25 +1471,24 @@ mod tests {
             cpu_pct: None,
             mem_used_mb: None,
             mem_total_mb: None,
-    throttled_usec: None,
-    oom_kills: None,
-    compose: None,
-    io_read_bytes: None,
-    io_write_bytes: None,
+            compose: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            throttled_usec: None,
+            oom_kills: None,
         };
-        let containers = vec![
-            c("abc123def456fullid", "web"),
-            c("ffffffffffffnostat", "idle"),
-        ];
-        // the sweep keyed the 12-char prefix; the full id in the listing
-        // must still match
-        let stats: HashMap<String, (f64, u64, u64)> = [(
-            "abc123def456".to_string(),
-            (12.5, 1024 * 1024, 100 * 1024 * 1024),
-        )]
-        .into();
+        let mut web = c("abc123def456fullid", "web");
+        // everything the sweeps merged in: stats + cgroup pressure
+        web.cpu_pct = Some(12.5);
+        web.mem_used_mb = Some(1);
+        web.mem_total_mb = Some(100);
+        web.throttled_usec = Some(2_500_000);
+        web.oom_kills = Some(2);
+        web.io_read_bytes = Some(4096);
+        web.io_write_bytes = Some(8192);
+        let containers = vec![web, c("ffffffffffffnostat", "idle")];
         let mut out = String::new();
-        render_container_metrics(&mut out, &containers, &stats);
+        render_container_metrics(&mut out, &containers);
         assert!(
             out.contains("witr_container_cpu_percent{runtime=\"docker\",id=\"abc123def456fullid\",name=\"web\"} 12.50"),
             "{out}"
@@ -1311,16 +1497,27 @@ mod tests {
             out.contains("witr_container_mem_used_bytes{runtime=\"docker\",id=\"abc123def456fullid\",name=\"web\"} 1048576"),
             "{out}"
         );
+        // the pressure counters ride the same labels; throttle time lands
+        // in seconds (rate()-able like any counter)
+        assert!(out
+            .contains("witr_container_throttled_seconds_total{runtime=\"docker\",id=\"abc123def456fullid\",name=\"web\"} 2.500000"), "{out}");
+        assert!(out.contains("witr_container_oom_kills_total{runtime=\"docker\",id=\"abc123def456fullid\",name=\"web\"} 2"));
+        assert!(out.contains("witr_container_io_read_bytes_total{runtime=\"docker\",id=\"abc123def456fullid\",name=\"web\"} 4096"));
+        assert!(out.contains("witr_container_io_write_bytes_total{runtime=\"docker\",id=\"abc123def456fullid\",name=\"web\"} 8192"));
+        // one HELP/TYPE block per family despite many series
+        assert_eq!(out.matches("# TYPE witr_container_cpu_percent").count(), 1);
+        assert_eq!(out.matches("# TYPE witr_container_throttled_seconds_total").count(), 1);
         // info series: every container, one each
         assert_eq!(out.matches("witr_container_info{").count(), 2);
         assert!(out.contains("name=\"idle\",image=\"alpine\",state=\"running\"} 1"), "{out}");
         // no sample → no cpu/mem series for that container
         assert!(!out.contains("name=\"idle\"} 12"), "{out}");
-        // empty sweep → only info series, no cpu HELP/TYPE block
+        // pressure fields absent → their series and HELP blocks stay absent
         let mut out = String::new();
-        render_container_metrics(&mut out, &containers, &HashMap::new());
-        assert_eq!(out.matches("witr_container_info{").count(), 2);
+        render_container_metrics(&mut out, &[c("ffffffffffffnostat", "idle")]);
+        assert_eq!(out.matches("witr_container_info{").count(), 1);
         assert!(!out.contains("witr_container_cpu_percent"), "{out}");
+        assert!(!out.contains("witr_container_throttled_seconds_total"), "{out}");
+        assert!(!out.contains("witr_container_oom_kills_total"), "{out}");
     }
 }
-
