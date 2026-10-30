@@ -385,6 +385,23 @@ fn xml_escape(s: &str) -> String {
 }
 
 fn systemd_unit(exe: &str, args: &[String]) -> String {
+    // the watchdog only makes sense for a watching service, and its
+    // deadline must outlive the ping cadence: the loop pings every tick,
+    // so 3× the interval (60s floor) leaves ~2 missed ticks of headroom
+    // before systemd pulls the plug
+    let interval = args
+        .iter()
+        .position(|a| a == "--watch")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|secs| secs.max(1) * 3)
+        .unwrap_or(0)
+        .max(60);
+    let watchdog = if args.contains(&"--watch".to_string()) {
+        format!("WatchdogSec={interval}\n")
+    } else {
+        String::new()
+    };
     format!(
         "\
 [Unit]
@@ -395,7 +412,7 @@ After=network-online.target
 ExecStart={exe} {}
 Restart=on-failure
 RestartSec=5
-
+{watchdog}
 [Install]
 WantedBy=default.target
 ",
@@ -3362,6 +3379,10 @@ fn main() {
                 None => None,
             };
             let mut hist = history::History::new();
+            // supervised by systemd (--install-service sets WatchdogSec)?
+            // announce readiness, then prove the loop stays alive every
+            // tick — a hung watchdog gets restarted instead of going deaf
+            util::sd_notify("READY=1");
             let mut alert_state: HashMap<Pid, history::AlertTrack> = HashMap::new();
             let mut fd_counts: HashMap<Pid, u64> = HashMap::new();
             let mut conn_counts: HashMap<Pid, u64> = HashMap::new();
@@ -3446,6 +3467,7 @@ fn main() {
                         hist.ingest(vec![e]);
                     }
                 }
+                util::sd_notify("WATCHDOG=1");
                 let mut listed = match platform.list_processes() {
                     Ok(p) => p,
                     Err(e) => {
@@ -4170,6 +4192,17 @@ mod tests {
         let unit = systemd_unit("/usr/local/bin/witr-rs", &args);
         assert!(unit.contains("ExecStart=/usr/local/bin/witr-rs --watch 5 nginx"));
         assert!(unit.contains("WantedBy=default.target"));
+        // the baked --watch 5 pings every 5s → WatchdogSec with headroom
+        assert!(unit.contains("WatchdogSec=60"), "interval*3, 60s floor:\n{unit}");
+        // no --watch in the args → no watchdog line (nothing pings)
+        let bare = systemd_unit("/usr/local/bin/witr-rs", &["nginx".to_string()]);
+        assert!(!bare.contains("WatchdogSec"));
+        // a long interval scales the deadline past its ping cadence
+        let slow = systemd_unit(
+            "/usr/local/bin/witr-rs",
+            &["--watch".to_string(), "90".to_string()],
+        );
+        assert!(slow.contains("WatchdogSec=270"), "90s interval → 270s deadline:\n{slow}");
         let plist = launchd_plist("/usr/local/bin/witr-rs", &args);
         assert!(plist.contains("<string>/usr/local/bin/witr-rs</string>"));
         assert!(plist.contains("<string>--alert-cpu</string>"));

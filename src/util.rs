@@ -106,6 +106,46 @@ pub fn run(cmd: &str, args: &[&str], timeout: Duration) -> std::io::Result<Strin
 
 /// Like [`run`], but any failure (missing binary, non-zero exit, timeout)
 /// becomes None — for best-effort lookups.
+/// systemd watchdog plumbing (Linux): the service unit carries
+/// `WatchdogSec=` and systemd hands the process a `NOTIFY_SOCKET`; a
+/// WATCHDOG=1 datagram inside the deadline proves the loop is alive, so a
+/// hung witr-rs (blocked IO, deadlock) gets killed and restarted instead
+/// of silently going deaf. Returns false off Linux, without the variable,
+/// or when the datagram doesn't land — all "not supervised" cases the
+/// caller simply ignores.
+pub fn sd_notify(msg: &str) -> bool {
+    match std::env::var_os("NOTIFY_SOCKET") {
+        Some(s) if !s.is_empty() => notify_to(&s.to_string_lossy(), msg),
+        _ => false,
+    }
+}
+
+/// One sd_notify datagram. `@` prefixes the abstract namespace (the name
+/// travels with a leading NUL byte, which std's unix-socket paths carry
+/// through to the syscall verbatim).
+pub fn notify_to(socket: &str, msg: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::net::UnixDatagram;
+        let addr: std::path::PathBuf = if let Some(name) = socket.strip_prefix('@') {
+            let mut bytes = vec![0u8];
+            bytes.extend_from_slice(name.as_bytes());
+            std::ffi::OsString::from_vec(bytes).into()
+        } else {
+            socket.into()
+        };
+        UnixDatagram::unbound()
+            .and_then(|s| s.send_to(msg.as_bytes(), &addr).map(|_| ()))
+            .is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (socket, msg);
+        false
+    }
+}
+
 pub fn run_ok(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
     run(cmd, args, timeout).ok()
 }
@@ -427,6 +467,24 @@ pub fn split_host_port(s: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn notify_to_delivers_a_datagram() {
+        let dir = std::env::temp_dir().join(format!("witr-sd-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock_path = dir.join("notify.sock");
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = std::os::unix::net::UnixDatagram::bind(&sock_path).unwrap();
+        assert!(notify_to(sock_path.to_str().unwrap(), "WATCHDOG=1"));
+        let mut buf = [0u8; 64];
+        let (n, _) = listener.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"WATCHDOG=1");
+        // a socket that isn't there → false, never a panic
+        assert!(!notify_to(dir.join("missing.sock").to_str().unwrap(), "READY=1"));
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
 
     #[test]
     fn etime_formats() {
