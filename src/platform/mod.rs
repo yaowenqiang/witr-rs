@@ -116,6 +116,8 @@ pub fn parse_container_line(line: &str, runtime: &str) -> Option<Container> {
         mem_used_mb: None,
         mem_total_mb: None,
         compose: compose_project_of(&v),
+        io_read_bytes: None,
+        io_write_bytes: None,
 throttled_usec: None,
 oom_kills: None,
     })
@@ -229,6 +231,10 @@ pub struct ContainerPressure {
     /// memory.events oom_kill: kernel OOM kills inside the cgroup since
     /// boot — the ground truth even a fast restart policy hides.
     pub oom_kills: u64,
+    /// io.stat rbytes/wbytes summed across devices — cumulative disk I/O
+    /// of the whole cgroup (the container's own numbers, not the host's).
+    pub io_read: u64,
+    pub io_write: u64,
 }
 
 /// Read the pressure signals for every container that has at least one

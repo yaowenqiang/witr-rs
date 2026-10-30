@@ -3059,6 +3059,8 @@ mod tests {
     throttled_usec: None,
     oom_kills: None,
     compose: None,
+    io_read_bytes: None,
+    io_write_bytes: None,
         };
         let mut edges = ContainerEdges::default();
         // first sighting arms quietly

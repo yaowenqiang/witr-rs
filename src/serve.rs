@@ -1287,6 +1287,8 @@ mod tests {
     throttled_usec: None,
     oom_kills: None,
     compose: None,
+    io_read_bytes: None,
+    io_write_bytes: None,
         };
         let containers = vec![
             c("abc123def456fullid", "web"),

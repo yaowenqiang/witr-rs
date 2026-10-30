@@ -81,6 +81,11 @@ pub enum TopMetric {
         "TCP throughput in bytes/s (sent + received; diffed from two ss(8) sweeps — or a running --watch; Linux with ss(8) on PATH) — who is eating the NIC"
     ))]
     Net,
+    #[value(help = t(
+        "GPU 显存占用（NVIDIA，需要 nvidia-smi）——显存吃最多的进程榜",
+        "GPU dedicated memory (NVIDIA, needs nvidia-smi) — the VRAM ranking"
+    ))]
+    GpuMem,
 }
 
 impl TopMetric {
@@ -96,6 +101,7 @@ impl TopMetric {
             TopMetric::Threads => "THR",
             TopMetric::Conn => "CONNS",
             TopMetric::Net => "NET",
+            TopMetric::GpuMem => "VRAM",
         }
     }
 }
@@ -935,6 +941,15 @@ pub struct Cli {
         )
     )]
     pub kill_tree: bool,
+
+    #[arg(
+        long = "dry-run",
+        help = t(
+            "配合 --kill / --kill-tree：只打印将要击杀的进程清单（含 --kill-tree 的后代收集），不发任何信号、退出码照常——脚本里先看后杀。无匹配仍退出码 2",
+            "With --kill / --kill-tree: print the kill plan (including --kill-tree's collected descendants) without signaling anything; exit codes unchanged — inspect first, kill second in scripts. No match still exits 2"
+        )
+    )]
+    pub dry_run: bool,
 
     #[arg(
         long = "signal",

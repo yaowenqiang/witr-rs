@@ -26,7 +26,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **快照 diff（`--snap` / `--diff`）**：`witr-rs --snap before.json` 把整张进程表落成 JSON；之后 `witr-rs --diff before.json` 报告变化——**new**（新出现）、**gone**（消失）、**restarted**（同一程序身份换了新 pid 回来，与 TUI 崩溃重启检测同一套身份判定；含"重启后恰好复用原 pid"——同 pid 同身份但启动时间变了也识别为 restarted）、**changed**（同 pid 同身份但命令行变了）。pid 被无关进程复用时不再误报为 changed：旧进程报 gone（标注 pid taken over）、新进程报 new（标注 pid reused）。快照加 **`--sockets`** 还会记录当前 LISTEN 端口，`--diff` 据此报告 **listen-new / listen-gone**——"快照之后有新进程开始监听 ：8080"这类意外服务的第一道金丝雀（已有端口只是换属主不算变化）。有变化时退出码 1，无变化 0，适合脚本。不带路径的 `witr-rs --snap` 走**自动轮转**：快照存到配置目录旁的 `snapshots/`，默认保留 10 份（`--keep N` 可调）；`--diff last` 直接对比最近一份自动快照，`--diff 30m` 对比"半小时前"那一份——"这半小时机器上多了什么、少了什么"一条命令。`--diff` 配 `--json` 输出带版本信封的机器可读结果（`summary: {new, gone, restarted, changed, listen_new, listen_gone, total}` + `entries`，jq 直接取数）；TUI 里按 `D` 看同一份对比——最新自动快照 vs 实时表，着色分组行（listen 变化青/品红色），`j/k` 选中、`Enter` 跳进该进程详情页、`r` 重算。
 
-**排行榜（`--top`）**：`witr-rs --top cpu -n 30` 不进 TUI，直接打印按 CPU / 内存 / fd 数 / 磁盘 I/O / 存活时长 / **磁盘 I/O 速率** / **GPU SM 占用**（`--top gpu`，装有 NVIDIA 驱动时）/ **内核线程数**（`--top threads`——线程泄漏榜，三平台随整表携带：Linux `/proc stat`、Windows 线程快照、macOS `ps nlwp`）/ **ESTABLISHED 连接数**（`--top conn`——`--alert-conn` 的排行孪生，谁攥着最多的活动连接）/ **TCP 吞吐速率**（`--top net`——`--alert-net-per-proc` 的排行孪生，发+收字节/秒，两次 `ss(8)` 采样差分，谁在吃网卡一目了然）排名的前 N 个进程（`--top fd` 在 Linux 直读 `/proc/<pid>/fd`、macOS 用 libproc 原生全表扫描（每 pid 一次 `proc_pidinfo` 查询，无子进程）、Windows 用 PowerShell `Get-Process` 句柄数；`--top io` 与 `--top io-rate` 三平台可用——io-rate 按读+写 MB/s 排行，一次性模式隔 1 秒采两帧差分，`--watch` 下用持续采样历史；`--top age` 最老优先——pid 1 永远榜首，末列改显进程状态）。配 `--watch N` 常驻刷新：`--top cpu --watch 5` 每 5 秒重新采样、重排、重绘，Ctrl-C 退出。回答"现在最忙的是谁"不用开界面。榜单本身也吃表格输出：`--top cpu --csv` / `--top cpu --markdown` 把榜单直接交给脚本与文档（`--json` 本就支持；`--top` 与 `--report-html` 组合仍被拒绝）。
+**排行榜（`--top`）**：`witr-rs --top cpu -n 30` 不进 TUI，直接打印按 CPU / 内存 / fd 数 / 磁盘 I/O / 存活时长 / **磁盘 I/O 速率** / **GPU SM 占用**（`--top gpu`，装有 NVIDIA 驱动时）/ **内核线程数**（`--top threads`——线程泄漏榜，三平台随整表携带：Linux `/proc stat`、Windows 线程快照、macOS `ps nlwp`）/ **GPU 显存**（`--top gpu-mem`——`nvidia-smi` 已采的 VRAM 数据直接出榜）/ **ESTABLISHED 连接数**（`--top conn`——`--alert-conn` 的排行孪生，谁攥着最多的活动连接）/ **TCP 吞吐速率**（`--top net`——`--alert-net-per-proc` 的排行孪生，发+收字节/秒，两次 `ss(8)` 采样差分，谁在吃网卡一目了然）排名的前 N 个进程（`--top fd` 在 Linux 直读 `/proc/<pid>/fd`、macOS 用 libproc 原生全表扫描（每 pid 一次 `proc_pidinfo` 查询，无子进程）、Windows 用 PowerShell `Get-Process` 句柄数；`--top io` 与 `--top io-rate` 三平台可用——io-rate 按读+写 MB/s 排行，一次性模式隔 1 秒采两帧差分，`--watch` 下用持续采样历史；`--top age` 最老优先——pid 1 永远榜首，末列改显进程状态）。配 `--watch N` 常驻刷新：`--top cpu --watch 5` 每 5 秒重新采样、重排、重绘，Ctrl-C 退出。回答"现在最忙的是谁"不用开界面。榜单本身也吃表格输出：`--top cpu --csv` / `--top cpu --markdown` 把榜单直接交给脚本与文档（`--json` 本就支持；`--top` 与 `--report-html` 组合仍被拒绝）。
 
 **按名聚合（`--by-name`）**：`witr-rs --by-name` 把整张进程表按 (名字, 用户) 折叠——列 NAME / USER / N（实例数）/ ΣCPU% / ΣRSS MB / ΣCPUTIME / AGE(OLDEST)，默认按 ΣRSS 降序。"几百个进程里那 34 个渲染进程加起来到底吃了多少"一屏答完。配 `--csv` / `--markdown` / `--json`（版本化信封：`group_count` + `groups`）交给脚本与文档；`--watch N` 常驻刷新。ΣCPU% 是平台给的生命周期均值之和（与表格列同口径），ΣCPUTIME 是累计 CPU 时间——更诚实的"它总共跑了多少"。
 
@@ -40,7 +40,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **树杀（`K`）**：操作栏新增 `K`——沿 ppid 做 BFS 收集选中进程的全部后代（含孙辈，父进程中途被收割也不漏），提示 `kill pid N + M descendant(s)? y 确认`，确认后对整棵树发 SIGTERM。杀 worker 池、清用户会话树不用再逐个查 pid。
 
-**无头击杀（`--kill` / `--kill-tree`）**：`witr-rs runaway --kill` 按常规目标匹配找到进程直接发信号，不进界面——`--signal KILL`（`SIGKILL` 同义，默认 `TERM`）换信号，`--kill-tree` 沿 ppid BFS 先杀全部后代再杀匹配进程（与 TUI 的 `K` 同一套收集逻辑）。与 `-i`/`--watch`/`--follow` 互斥；无匹配退出码 2，有目标击杀失败退出码 1，脚本里可直接判断结果。逐行打印 `killed 名字 (pid N) [SIGKILL]`。
+**无头击杀（`--kill` / `--kill-tree`）**：`witr-rs runaway --kill` 按常规目标匹配找到进程直接发信号，不进界面——`--signal KILL`（`SIGKILL` 同义，默认 `TERM`）换信号，`--kill-tree` 沿 ppid BFS 先杀全部后代再杀匹配进程（与 TUI 的 `K` 同一套收集逻辑）。与 `-i`/`--watch`/`--follow` 互斥；无匹配退出码 2，有目标击杀失败退出码 1，脚本里可直接判断结果。逐行打印 `killed 名字 (pid N) [SIGKILL]`。**`--dry-run`** 只打印击杀计划（`would kill …`，含 `--kill-tree` 收集的后代，顺序与真实执行一致）不发任何信号、退出码照常——脚本里先看后杀。
 
 **脚本原语（`--pids-only` / `--wait`）**：`witr-rs nginx --pids-only` 只打印空格分隔的匹配 pid（无匹配退出码 2）——`witr-rs nginx --pids-only | xargs kill` 一行完成击杀。`witr-rs --port 8080 --wait` 阻塞等目标出现（`--wait gone` 反过来等消失），每秒轮询一次，条件满足即打印结果并退出 0；**`--timeout N`** 给等待一个上界，超时退出码 124（GNU timeout 惯例），SIGINT 打断为 130——`--pid 1234 --wait gone --timeout 60` 就是"等部署脚本把旧进程退干净"的原语。
 
@@ -66,7 +66,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **cgroup 资源面板（Linux 详情页）**：Linux 上打开进程详情时，从 `/proc/<pid>/cgroup` 的 `0::` 行取 cgroup v2 路径，回读 `/sys/fs/cgroup` 下该组的 `memory.current` 与 `cpu.stat` 的 `usage_usec`——CLI 详情块、`--export` 与 TUI 详情页都显示 `cgroup <路径> · mem <用量> · cpu <累计秒>`。这是容器/服务的组级视图：RSS 只回答"这个进程吃了多少"，cgroup 回答"它所在的容器/服务整体吃了多少"。根 cgroup（整台机器）不显示。路径同时做**归属分类**：docker / containerd / podman / kubepods / lxc / colima 识别为容器（标注容器 id，k8s 场景再经 kubectl 反查所属 Pod——`kubernetes pod ns/name · container <id12>`），`*.service` / `*.socket` / `*.timer` 等 `.slice` 下的叶子识别为 systemd 单元（系统级或 `user@` 用户级）——Started by 归因从"进程的父进程是谁"上探到"它是被哪个服务单元/容器运行时拉起来的"。
 
-**Ports 总览页（`o`，Ports 页）**：把逐 socket 的明细表切换成按 (端口, 属主进程) 聚合的总览——列 Port / Proto(s) / Process / PID / User / Addrs（该端口绑定的地址数，tcp+tcp6 合并显示为一行），默认按端口排序，`/` 搜索照常生效，`Enter` 直接跳到属主进程的详情页。"这台机器上谁在对外服务"一屏可见。
+**Ports 总览页（`o`，Ports 页）**：把逐 socket 的明细表切换成按 (端口, 属主进程) 聚合的总览——列 Port / Proto(s) / Process / PID / User / Addrs（该端口绑定的地址数，tcp+tcp6 合并显示为一行），默认按端口排序，`/` 搜索照常生效，`Enter` 直接跳到属主进程的详情页。表格下方是**监听历史环**（暗色行）：Ports 页打开期间的 LISTEN 边缘——`▲ new` 新监听、`▼ gone` 消失的监听（带时刻与"曾属主"）——"五分钟前谁占过 :8080"答案就在下面；首轮扫描静默建基线（打开页面时就已在监听的不算事件，与 `--alert-port` 金丝雀同一规则），环内最近 30 条，选中光标永不落在历史行上。"这台机器上谁在对外服务"一屏可见。
 
 **退出即取证（crash forensics）**：进程退出事件发生的瞬间自动后台抓取它最后的日志行（macOS 统一日志按进程名 / Linux journald 按 `_PID=`，最多 25 行，缓存最近 50 个），Events 页选中 exited/restarted 事件按 `l` **立即**显示"最后的话"——不用再和日志轮转赛跑，crash 现场定格在退出那一刻。
 
@@ -185,7 +185,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **样本回放页（`--samples`）**：`witr-rs --samples load.csv` 把 `--record` 产出的样本文件（.csv / .jsonl 都认）导入 TUI 的 **Samples 页**——五条整机曲线（cpu% / 内存% / 1 分钟负载 / 网络 MB/s / 进程数）以 sparkline 呈现，`←/→`（h/l）移动光标逐时刻读数（读数行列出光标处全部五个指标的值），`↑/↓`（j/k）切换图上曲线，`g/G` 跳到首尾，`Esc` 回主表，`c` 复制页面文本。实时采样照常继续——"照着昨晚录制的曲线排查现在这台机器"两个时间面叠在一屏上。
 
-**Containers 页**：通过 PATH 上的运行时 CLI（docker / podman / nerdctl）枚举容器，显示 Runtime / ID / State / Status /（Pod）/（Compose）/ Image / Name，状态按健康度着色；**CPU% / MEM 两列**在首次资源采样落地后出现——后台每约 10 秒跑一次 `stats --no-stream`（每运行时约 2 秒，成本高于列表本身），按容器 id 合并回表格，MEM 列按容器自身限额的占用比例着色（≥70% 黄、≥90% 红——容器撞限额是 OOM 的前奏）；**THR% / OOM 两列**来自容器 cgroup 的限流时间与 oom_kill 计数（Linux cgroup v2，每轮枚举顺路读几个文件，无运行时 CLI 开销）——THR% 是本轮枚举间隔内被 CFS 配额掐住的时间占比（≥50% 红——"容器变慢但 CPU 看着不满"的头号原因），OOM 列非零即容器内发生过内核级 OOM 杀；**Compose 列**取容器的 `com.docker.compose.project` 标签（兼容 docker 的 `k=v,k2=v2` 串与 podman/nerdctl 的 JSON object 两种 label 形态，非 compose 容器该列自动隐藏）——开发机上"这排容器是谁家的"一眼分明；`/` 按 名称/镜像/ID/运行时/状态/compose 项目 过滤，`i/n/r/g/s` 排序，`p` 按 compose 项目排序。枚举在后台线程执行（运行时 CLI 挂起不会卡住界面），每 3 秒自动刷新；刷新期间保留旧表格不闪烁，首次加载才显示 loading。**`Enter` 打开容器详情页**：左侧容器属性（Name/Runtime/Compose/ID/Image/State/Status/Ports/Restarts），右侧容器内进程列表（Linux 通过 cgroup 匹配；macOS/Windows 容器进程在 VM 内不可见，显示说明）。
+**Containers 页**：通过 PATH 上的运行时 CLI（docker / podman / nerdctl）枚举容器，显示 Runtime / ID / State / Status /（Pod）/（Compose）/ Image / Name，状态按健康度着色；**CPU% / MEM 两列**在首次资源采样落地后出现——后台每约 10 秒跑一次 `stats --no-stream`（每运行时约 2 秒，成本高于列表本身），按容器 id 合并回表格，MEM 列按容器自身限额的占用比例着色（≥70% 黄、≥90% 红——容器撞限额是 OOM 的前奏）；**THR% / OOM 两列**来自容器 cgroup 的限流时间与 oom_kill 计数（Linux cgroup v2，每轮枚举顺路读几个文件，无运行时 CLI 开销）——THR% 是本轮枚举间隔内被 CFS 配额掐住的时间占比（≥50% 红——"容器变慢但 CPU 看着不满"的头号原因），OOM 列非零即容器内发生过内核级 OOM 杀；**I/O 列**读同一 cgroup 的 `io.stat`（各设备 rbytes/wbytes 差分出本轮读写速率，详情页附累计值）——容器的磁盘画像与 THR%/OOM 同一轮扫描顺路拿到；**Compose 列**取容器的 `com.docker.compose.project` 标签（兼容 docker 的 `k=v,k2=v2` 串与 podman/nerdctl 的 JSON object 两种 label 形态，非 compose 容器该列自动隐藏）——开发机上"这排容器是谁家的"一眼分明；`/` 按 名称/镜像/ID/运行时/状态/compose 项目 过滤，`i/n/r/g/s` 排序，`p` 按 compose 项目排序。枚举在后台线程执行（运行时 CLI 挂起不会卡住界面），每 3 秒自动刷新；刷新期间保留旧表格不闪烁，首次加载才显示 loading。**`Enter` 打开容器详情页**：左侧容器属性（Name/Runtime/Compose/ID/Image/State/Status/Ports/Restarts），右侧容器内进程列表（Linux 通过 cgroup 匹配；macOS/Windows 容器进程在 VM 内不可见，显示说明）。
 
 **Locks 页**：文件锁 + 打开文件视图（Linux 读 `/proc/locks`，macOS 从 `lsof` 提取锁标志并辅以锁文件名启发式）；`a` 在 锁视图 ↔ 全部打开文件 之间切换（打开文件视图空搜索时截断显示前 100 行，搜索即放开），选中行按 `Enter` 直接跳到持锁进程的详情页。
 
@@ -283,6 +283,8 @@ witr-rs --top cpu -n 30       # CPU 前排 30（--top mem|fd|io|io-rate|age 同�
 witr-rs --top io-rate -n 10   # 磁盘 I/O 速率榜（读+写 MB/s；--watch 下持续采样）
 witr-rs --top age -n 10       # 最老进程前 10（存活时长排行，pid 1 永远榜首）
 witr-rs --top threads -n 10   # 线程数最多的进程（--top conn 看谁攥着最多 ESTABLISHED 连接，--top net 看谁在吃网卡）
+witr-rs --top gpu-mem -n 10    # 显存吃最多的进程（NVIDIA）
+witr-rs --pid 1234 --kill --dry-run # 先看后杀：打印击杀计划不发信号
 witr-rs --top cpu --watch 5   # 每 5s 重采样重排的常驻 CPU 榜（Ctrl-C 退出）
 witr-rs --csv                 # 全表 CSV（RFC-4180 转义；--markdown 贴文档用）
 witr-rs --watch 5 --record load.csv # 每 5s 把整张进程表追加进 CSV 时间序列

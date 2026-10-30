@@ -209,6 +209,11 @@ struct TuiApp {
     /// Ports-tab 'o' toggle: aggregate view — one row per (port, owner)
     /// instead of one row per socket
     ports_overview: bool,
+    /// session LISTEN history (newest first, capped): edges seen while the
+    /// Ports tab has been open — "who held :8080 five minutes ago"
+    port_history: Vec<PortEdge>,
+    /// (proto, port) → owner summary at the last Ports sweep
+    listen_seen: HashMap<(String, u16), String>,
     /// overview rows rebuilt from the filtered socket view every refresh
     port_overview_view: Vec<PortOverviewRow>,
     containers: Vec<Container>,
@@ -318,8 +323,12 @@ struct TuiApp {
     /// %) — diffed from the cumulative throttled_usec each containers
     /// sweep brings back; empty until the second sweep arms the delta
     throttle_pct: HashMap<String, f64>,
-    /// the throttled_usec reading + sweep time the percentage diffs against
-    throttle_prev: HashMap<String, (u64, Instant)>,
+    /// per-container disk I/O rate (12-char id → read/write bytes/s) from
+    /// the same sweep's cumulative io.stat deltas
+    container_io_rate: HashMap<String, (f64, f64)>,
+    /// the cumulative readings (throttled usec, io read, io write) + sweep
+    /// time the percentages and rates diff against
+    throttle_prev: HashMap<String, (u64, u64, u64, Instant)>,
     /// sampling history: instantaneous cpu, sparklines, restart detection
     hist: crate::history::History,
     /// open files fetched when the full detail page opens
@@ -836,6 +845,8 @@ impl TuiApp {
             port_sort: PortSort::Port,
             port_sort_desc: false,
             ports_overview: false,
+            port_history: Vec::new(),
+            listen_seen: HashMap::new(),
             port_overview_view: Vec::new(),
             containers: Vec::new(),
             container_search: String::new(),
@@ -929,6 +940,7 @@ impl TuiApp {
             containers_rx: None,
             container_stats: HashMap::new(),
             throttle_pct: HashMap::new(),
+            container_io_rate: HashMap::new(),
             throttle_prev: HashMap::new(),
             container_stats_at: None,
             container_stats_loading: false,
@@ -1063,9 +1075,65 @@ impl TuiApp {
     }
 
     /// Sockets for the Ports tab: the full table so the 'a' toggle can
-    /// widen the view without a refetch.
+    /// widen the view without a refetch — and the LISTEN diff that feeds
+    /// the session history ring (new listeners / vanished listeners, with
+    /// who held them last).
     fn load_sockets(&mut self) {
         self.sockets = self.platform.list_all_sockets().unwrap_or_default();
+        let name_by_pid: HashMap<Pid, String> =
+            self.procs.iter().map(|p| (p.pid, p.name.clone())).collect();
+        let mut now: HashMap<(String, u16), String> = HashMap::new();
+        for s in &self.sockets {
+            if !s.state.eq_ignore_ascii_case("LISTEN") || s.local_port == 0 {
+                continue;
+            }
+            let who = match s.pid {
+                Some(pid) => format!(
+                    "{} (pid {pid})",
+                    name_by_pid.get(&pid).map(String::as_str).unwrap_or("?")
+                ),
+                None => "unknown owner".into(),
+            };
+            let entry = now
+                .entry((s.proto.clone(), s.local_port))
+                .or_insert_with(|| who.clone());
+            if !entry.contains(&who) {
+                entry.push_str(", ");
+                entry.push_str(&who);
+            }
+        }
+        // the very first sweep baselines silently — listeners already up
+        // when the tab opens are the status quo, not events (the same
+        // rule the --alert-port canary applies)
+        let first = self.listen_seen.is_empty();
+        if !first {
+            for ((proto, port), who) in &now {
+                if !self.listen_seen.contains_key(&(proto.clone(), *port)) {
+                    self.port_history.push(PortEdge {
+                        at: crate::util::now_unix(),
+                        kind: true,
+                        port: *port,
+                        proto: proto.clone(),
+                        who: who.clone(),
+                    });
+                }
+            }
+            for ((proto, port), who) in &self.listen_seen {
+                if !now.contains_key(&(proto.clone(), *port)) {
+                    self.port_history.push(PortEdge {
+                        at: crate::util::now_unix(),
+                        kind: false,
+                        port: *port,
+                        proto: proto.clone(),
+                        who: format!("was {who}"),
+                    });
+                }
+            }
+        }
+        self.listen_seen = now;
+        if self.port_history.len() > 30 {
+            self.port_history.truncate(30);
+        }
     }
 
     /// SIGHUP: fold a freshly built Seed's knobs onto the live app —
@@ -1497,6 +1565,8 @@ impl TuiApp {
                 if let Some(p) = pressure.get(&key) {
                     c.throttled_usec = Some(p.throttled_usec);
                     c.oom_kills = Some(p.oom_kills);
+                    c.io_read_bytes = Some(p.io_read);
+                    c.io_write_bytes = Some(p.io_write);
                 }
             }
             let _ = tx.send((cs, pods));
@@ -1522,21 +1592,31 @@ impl TuiApp {
                 self.container_events_tried = true;
                 self.container_events = crate::history::spawn_container_events();
             }
-            // throttle percent per container: diff this sweep's cumulative
-            // throttled_usec against the previous one over the elapsed wall
-            // time (the first sweep only arms the baseline)
+            // per-container rates: diff this sweep's cumulative
+            // throttled_usec / io.stat counters against the previous one
+            // over the elapsed wall time (the first sweep only arms the
+            // baseline)
             let now_instant = Instant::now();
             for c in self.containers.iter().filter(|c| c.throttled_usec.is_some()) {
                 let key: String = c.id.chars().take(12).collect();
-                let cur = c.throttled_usec.unwrap_or(0);
-                if let Some((prev, at)) = self.throttle_prev.get(&key) {
-                    let elapsed = now_instant.duration_since(*at).as_micros() as f64;
+                let cur_t = c.throttled_usec.unwrap_or(0);
+                let cur_r = c.io_read_bytes.unwrap_or(0);
+                let cur_w = c.io_write_bytes.unwrap_or(0);
+                if let Some((prev_t, prev_r, prev_w, at)) = self.throttle_prev.get(&key) {
+                    let elapsed = now_instant.duration_since(*at).as_secs_f64();
                     if elapsed > 0.0 {
-                        let pct = (cur.saturating_sub(*prev) as f64 / elapsed * 100.0).clamp(0.0, 100.0);
+                        let pct =
+                            (cur_t.saturating_sub(*prev_t) as f64 / (elapsed * 1_000_000.0) * 100.0)
+                                .clamp(0.0, 100.0);
                         self.throttle_pct.insert(key.clone(), pct);
+                        let rate = |cur: u64, prev: u64| {
+                            cur.saturating_sub(prev) as f64 / elapsed
+                        };
+                        self.container_io_rate
+                            .insert(key.clone(), (rate(cur_r, *prev_r), rate(cur_w, *prev_w)));
                     }
                 }
-                self.throttle_prev.insert(key, (cur, now_instant));
+                self.throttle_prev.insert(key, (cur_t, cur_r, cur_w, now_instant));
             }
             self.container_alert_edges(&self.containers.clone(), &pods);
             self.apply_container_stats();
@@ -3461,6 +3541,33 @@ impl TuiApp {
                 ]),
             _ => kv("Throttled", "0% of the last sweep".into()),
             },
+            // cgroup io.stat: last sweep's rate + cumulative totals
+            {
+                let key = c.id.chars().take(12).collect::<String>();
+                match (
+                    self.container_io_rate.get(&key),
+                    c.io_read_bytes,
+                    c.io_write_bytes,
+                ) {
+                    (Some((r, w)), cr, cw) if *r > 0.0 || *w > 0.0 => Line::from(vec![
+                        styled(Style::new().fg(MID), format!("{:<9}", "I/O")),
+                        Span::raw(format!(
+                            "{} read/s {} write/s",
+                            crate::util::fmt_bytes(*r as u64),
+                            crate::util::fmt_bytes(*w as u64)
+                        )),
+                        styled(
+                            Style::new().fg(MID),
+                            format!(
+                                "  (cumulative {} / {})",
+                                crate::util::fmt_bytes(cr.unwrap_or(0)),
+                                crate::util::fmt_bytes(cw.unwrap_or(0))
+                            ),
+                        ),
+                    ]),
+                    _ => kv("I/O", "0 B/s".into()),
+                }
+            },
         ]
     }
 
@@ -3687,6 +3794,16 @@ fn filter_sockets(
 /// owning process, its user, the protocols bound there and how many
 /// distinct addresses that port is reachable on.
 #[derive(Debug, Clone, PartialEq)]
+/// One Ports-tab session edge: a listener appearing or vanishing while
+/// the tab has been open. `kind` = true for appeared.
+struct PortEdge {
+    at: i64,
+    kind: bool,
+    port: u16,
+    proto: String,
+    who: String,
+}
+
 struct PortOverviewRow {
     port: u16,
     pid: Option<Pid>,
@@ -5019,6 +5136,21 @@ fn ports_overview_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut 
                 Cell::from(r.addrs.to_string()),
             ])
         })
+        .chain(app.port_history.iter().map(|e| {
+            // the session history ring: dim rows under the live table —
+            // selection never reaches them (it indexes the view rows only)
+            let mark = if e.kind { "▲ new" } else { "▼ gone" };
+            Row::new([
+                Cell::from(e.port.to_string()),
+                Cell::from(e.proto.clone()),
+                Cell::from(format!("{mark} {}", crate::util::fmt_time(e.at))),
+                Cell::from("-"),
+                Cell::from("-"),
+                Cell::from("history").style(Style::new().fg(MID)),
+                Cell::from(e.who.clone()),
+            ])
+            .style(Style::new().fg(MID))
+        }))
         .collect();
     let widths = [
         Constraint::Length(8),
@@ -5094,6 +5226,10 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
     let has_thr = app.throttle_pct.values().any(|v| *v > 0.0);
     let has_oom = app.containers.iter().any(|c| c.oom_kills.is_some());
     let has_compose = app.containers.iter().any(|c| c.compose.is_some());
+    let has_io = app
+        .container_io_rate
+        .values()
+        .any(|(r, w)| *r > 0.0 || *w > 0.0);
     let mut header: Vec<Cell> = vec![
         Cell::from("Runtime"),
         Cell::from("ID"),
@@ -5115,6 +5251,10 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
     if has_thr {
         header.push(Cell::from("THR%"));
         widths.push(Constraint::Length(7));
+    }
+    if has_io {
+        header.push(Cell::from("IO"));
+        widths.push(Constraint::Length(14));
     }
     if has_oom {
         header.push(Cell::from("OOM"));
@@ -5170,6 +5310,17 @@ fn containers_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Fram
                     }
                     Some(_) => Cell::from("0"),
                     None => Cell::from("-"),
+                };
+                cells.push(cell);
+            }
+            if has_io {
+                let cell = match app.container_io_rate.get(&key) {
+                    Some((r, w)) if *r > 0.0 || *w > 0.0 => Cell::from(format!(
+                        "{} {}",
+                        crate::util::fmt_bytes(*r as u64),
+                        crate::util::fmt_bytes(*w as u64)
+                    )),
+                    _ => Cell::from("-"),
                 };
                 cells.push(cell);
             }
@@ -9486,6 +9637,8 @@ mod tests {
     throttled_usec: None,
     oom_kills: None,
     compose: None,
+    io_read_bytes: None,
+    io_write_bytes: None,
         };
         assert_eq!(
             container_state_style(&mk("running", "Up 2 weeks (healthy)")).fg,
@@ -9530,6 +9683,8 @@ mod tests {
         throttled_usec: None,
         oom_kills: None,
         compose: None,
+        io_read_bytes: None,
+        io_write_bytes: None,
             },
             Container {
                 runtime: "docker".into(),
@@ -9548,6 +9703,8 @@ mod tests {
         throttled_usec: None,
         oom_kills: None,
         compose: None,
+        io_read_bytes: None,
+        io_write_bytes: None,
             },
         ];
         app.rebuild_container_view();
@@ -9559,6 +9716,93 @@ mod tests {
         app.container_search.clear();
         app.rebuild_container_view();
         assert_eq!(app.container_view.len(), 2);
+    }
+
+    /// A platform whose socket table changes between fetches, for the
+    /// listen-history ring.
+    struct FlappySockets {
+        sweeps: std::sync::Mutex<Vec<Vec<crate::model::Socket>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::platform::Platform for FlappySockets {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        fn capabilities(&self) -> crate::platform::Capabilities {
+            crate::platform::Capabilities { file_lookup: false, env: false }
+        }
+        fn list_processes(&self) -> crate::platform::PlatResult<Vec<Process>> {
+            Ok(vec![Process {
+                pid: 7,
+                name: "nginx".into(),
+                ..Default::default()
+            }])
+        }
+        fn detail(&self, brief: &Process, _want_env: bool) -> Process {
+            brief.clone()
+        }
+        fn port_to_sockets(&self, _port: u16) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+            Ok(Vec::new())
+        }
+        fn list_sockets(&self) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+            Ok(Vec::new())
+        }
+        fn list_all_sockets(&self) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+            let sweeps = self.sweeps.lock().unwrap_or_else(|e| e.into_inner());
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let i = call.min(sweeps.len().saturating_sub(1));
+            Ok(sweeps[i].clone())
+        }
+        fn file_to_pids(&self, _path: &str) -> crate::platform::PlatResult<Vec<i32>> {
+            Ok(Vec::new())
+        }
+        fn container_of(&self, _pid: i32) -> Option<crate::model::Source> {
+            None
+        }
+        fn service_source(&self, _procs: &[Process]) -> Option<crate::model::Source> {
+            None
+        }
+        fn system_stats(&self) -> Option<crate::platform::SystemStats> {
+            None
+        }
+    }
+
+    fn listen_sock(port: u16, pid: Option<i32>) -> crate::model::Socket {
+        crate::model::Socket {
+            proto: "tcp".into(),
+            local_addr: "0.0.0.0".into(),
+            local_port: port,
+            peer_addr: None,
+            peer_port: None,
+            state: "LISTEN".into(),
+            pid,
+        }
+    }
+
+    #[test]
+    fn ports_history_rings_the_edges() {
+        let platform = FlappySockets {
+            sweeps: std::sync::Mutex::new(vec![
+                vec![listen_sock(8080, Some(7))],
+                vec![listen_sock(9090, None)],
+            ]),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut app = TuiApp::new(Box::new(platform), Seed { ..Seed::default() });
+        // the first Ports sweep baselines silently — startup listeners are
+        // the status quo, not events
+        app.switch_tab(Tab::Ports);
+        assert!(app.port_history.is_empty(), "baseline is quiet");
+        assert_eq!(app.listen_seen.len(), 1);
+        // the listener vanishes, a different one appears: gone + new
+        app.switch_tab(Tab::Events);
+        app.switch_tab(Tab::Ports);
+        let kinds: Vec<(bool, u16)> =
+            app.port_history.iter().map(|e| (e.kind, e.port)).collect();
+        assert_eq!(kinds, vec![(true, 9090), (false, 8080)], "newest first");
+        assert!(app.port_history[1].who.contains("was nginx (pid 7)"));
     }
 
     #[test]
@@ -9581,6 +9825,8 @@ mod tests {
     throttled_usec: None,
     oom_kills: None,
     compose: None,
+    io_read_bytes: None,
+    io_write_bytes: None,
         };
         // first sighting arms quietly — no alerts
         app.container_alert_edges(&[mk("a1", "web", "running", Some(0))], &[]);

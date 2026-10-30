@@ -172,6 +172,13 @@ pub struct Container {
     /// restarts it so fast the exit code never says OOM.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oom_kills: Option<u64>,
+    /// Cumulative cgroup disk I/O (io.stat rbytes/wbytes summed across
+    /// devices) — Linux reads it on the same sweep as the throttle/OOM
+    /// signals; consumers diff for a live rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_read_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_write_bytes: Option<u64>,
 }
 
 /// One service-manager unit: a systemd unit (Linux), a launchd job (macOS)
@@ -454,6 +461,8 @@ mod tests {
     throttled_usec: None,
     oom_kills: None,
     compose: None,
+    io_read_bytes: None,
+    io_write_bytes: None,
         }
     }
 

@@ -677,6 +677,7 @@ fn top_procs(
                 cli::TopMetric::Threads => p.threads.map(|n| n as f64),
                 cli::TopMetric::Conn => conns.and_then(|m| m.get(&p.pid)).map(|&n| n as f64),
                 cli::TopMetric::Net => rates.and_then(|h| h.net_rate_of(p.pid)),
+                cli::TopMetric::GpuMem => p.gpu_mem_mb.map(|mb| mb as f64),
             }?;
             Some((v, p))
         })
@@ -2356,6 +2357,20 @@ fn main() {
             order.extend(extra);
         }
         order.extend(matches);
+        // --dry-run: the plan, no signals — same ordering (--kill-tree's
+        // descendants first) and same exit codes, so a script can preview
+        // exactly what the real run would do
+        if cli.dry_run {
+            for p in &order {
+                write_out(&format!("would kill {} (pid {}) [SIG{}]", p.name, p.pid, sig));
+            }
+            write_out(&format!(
+                "{} process(es) would receive SIG{} (--dry-run: nothing signaled)",
+                order.len(),
+                sig
+            ));
+            std::process::exit(0);
+        }
         let mut failed = 0usize;
         for p in &order {
             match tui::send_signal(p.pid, &sig) {
@@ -3657,6 +3672,8 @@ fn main() {
                                     if let Some(p) = pressure.get(&key) {
                                         c.throttled_usec = Some(p.throttled_usec);
                                         c.oom_kills = Some(p.oom_kills);
+                                        c.io_read_bytes = Some(p.io_read);
+                                        c.io_write_bytes = Some(p.io_write);
                                     }
                                 }
                                 let _ = tx.send((cs, pods));

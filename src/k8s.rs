@@ -239,6 +239,8 @@ mod tests {
         throttled_usec: None,
         oom_kills: None,
         compose: None,
+        io_read_bytes: None,
+        io_write_bytes: None,
             },
             Container {
                 runtime: "docker".into(),
@@ -257,6 +259,8 @@ mod tests {
         throttled_usec: None,
         oom_kills: None,
         compose: None,
+        io_read_bytes: None,
+        io_write_bytes: None,
             },
             Container {
                 runtime: "docker".into(),
@@ -275,6 +279,8 @@ mod tests {
         throttled_usec: None,
         oom_kills: None,
         compose: None,
+        io_read_bytes: None,
+        io_write_bytes: None,
             },
         ];
         annotate_with(&pods, &mut cs);

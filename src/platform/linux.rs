@@ -316,6 +316,26 @@ fn parse_cpu_stat_throttled(text: &str) -> Option<u64> {
         .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
 }
 
+/// cgroup io.stat → (cumulative rbytes, wbytes) summed across every
+/// device line. Lines are `<major:minor> rbytes=N wbytes=N rios=N wios=N`;
+/// the root group sometimes prints bare "(unknown)" rows with no counters
+/// — skipped like any line without the tokens.
+fn parse_io_stat(text: &str) -> (u64, u64) {
+    let grab = |line: &str, key: &str| -> u64 {
+        line.split_whitespace()
+            .find_map(|tok| tok.strip_prefix(key))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let mut read = 0u64;
+    let mut write = 0u64;
+    for line in text.lines() {
+        read += grab(line, "rbytes=");
+        write += grab(line, "wbytes=");
+    }
+    (read, write)
+}
+
 /// memory.events' `oom_kill <n>` line → n. Exact-prefix match — memory
 /// events also carries a bare `oom` counter (hits without kills) that
 /// must not satisfy this.
@@ -363,12 +383,17 @@ pub fn container_pressure_cgroup() -> std::collections::HashMap<String, super::C
         let oom_kills = read_ok(&root.join("memory.events"))
             .and_then(|t| parse_memory_events_oom(&t))
             .unwrap_or(0);
-        if throttled_usec > 0 || oom_kills > 0 {
+        let (io_read, io_write) = read_ok(&root.join("io.stat"))
+            .map(|t| parse_io_stat(&t))
+            .unwrap_or((0, 0));
+        if throttled_usec > 0 || oom_kills > 0 || io_read > 0 || io_write > 0 {
             out.insert(
                 id,
                 super::ContainerPressure {
                     throttled_usec,
                     oom_kills,
+                    io_read,
+                    io_write,
                 },
             );
         }
@@ -1841,6 +1866,16 @@ Inter-|   Receive                                                |  Transmit
         assert_eq!(pids, vec![9]);
         assert_eq!(inode, Some(11));
         assert_eq!(bytes, None);
+    }
+
+    #[test]
+    fn io_stat_sums_across_devices_and_skips_unknown_rows() {
+        let text = "253:0 rbytes=12210176 wbytes=2715648 rios=234 wios=663 dbytes=0 dios=0\n259:4 rbytes=4096 wbytes=8192 rios=2 wios=4\n(unknown)\n";
+        let (r, w) = parse_io_stat(text);
+        assert_eq!(r, 12_210_176 + 4096);
+        assert_eq!(w, 2_715_648 + 8192);
+        // a cgroup with no I/O at all parses to zeros
+        assert_eq!(parse_io_stat("(unknown)\n"), (0, 0));
     }
 
     #[test]
