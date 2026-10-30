@@ -1120,10 +1120,10 @@ pub struct Cli {
         value_name = "URL",
         help = t(
             "查询远端 witr-rs --serve 端点而不是本机：给定 http://host:port（不带 TLS），拉取 /api/ps（--tree 时拉 /api/tree）并按本地同样的表格/JSON/CSV 渲染；配合 --watch 周期重拉。属于无目标操作",
-            "Query a remote witr-rs --serve endpoint instead of this machine: give http://host:port (no TLS); /api/ps is fetched (or /api/tree under --tree) and rendered with the same table/JSON/CSV as local; --watch re-fetches on an interval. A no-target operation"
+            "Query remote witr-rs --serve endpoints instead of this machine: give http://host:port (no TLS), repeatable for a fleet — each host renders its own section (unreachable hosts report a ⚠ line and don't sink the rest; every host down exits 5). /api/ps is fetched (or /api/tree under --tree) and rendered with the same table/JSON/CSV as local; --watch re-fetches on an interval. A no-target operation"
         )
     )]
-    pub remote: Option<String>,
+    pub remote: Vec<String>,
 
     #[arg(
         long = "en",

@@ -567,15 +567,18 @@ fn run_on_exit(cmd: &str) {
     let _ = std::process::Command::new("sh").args(["-c", cmd]).status();
 }
 
-/// --remote core: fetch the process table from a `witr-rs --serve` peer
-/// (`/api/ps`) and push it through the same renderers as the local
-/// listing — one host's dashboard over plain HTTP, no local sampling.
-/// `--tree` is presentation only: the flat table comes over the wire and
-/// the forest is built locally, so both sides agree on the shape.
-/// `--watch N` re-fetches on an interval until Ctrl-C.
-fn remote_mode(base: &str, cli: &cli::Cli, no_color: bool) {
-    let url = format!("{}/api/ps", base.trim_end_matches('/'));
-    let fetch = || -> Result<Vec<Process>, String> {
+/// --remote core: fetch the process tables from one or more `witr-rs
+/// --serve` peers (`/api/ps`) and push them through the same renderers as
+/// the local listing — a fleet's dashboards over plain HTTP, no local
+/// sampling. One host renders exactly as before; several hosts render
+/// one divider-labeled section each (unreachable hosts report a ⚠ line
+/// and never sink the rest — every host down exits 5). `--tree` is
+/// presentation only: the flat table comes over the wire and the forest
+/// is built locally, so both sides agree on the shape. `--watch N`
+/// re-fetches on an interval until Ctrl-C.
+fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
+    let fetch = |base: &str| -> Result<Vec<Process>, String> {
+        let url = format!("{}/api/ps", base.trim_end_matches('/'));
         let body = util::http_get(&url)?;
         let doc: serde_json::Value =
             serde_json::from_str(&body).map_err(|e| format!("response is not JSON: {e}"))?;
@@ -588,12 +591,16 @@ fn remote_mode(base: &str, cli: &cli::Cli, no_color: bool) {
         .map_err(|e| format!("response shape mismatch (schema_version {schema:?}): {e}"))?;
         Ok(procs)
     };
-    let render_once = |procs: &[Process]| -> String {
+    let fetch_all = || -> Vec<(String, Result<Vec<Process>, String>)> {
+        bases
+            .iter()
+            .map(|b| (b.clone(), fetch(b)))
+            .collect()
+    };
+    let render_host = |procs: &[Process]| -> String {
         let color = !no_color && std::io::stdout().is_terminal() && !cli.json;
         let painter = render::Painter::new(color);
-        if cli.json {
-            json_listing_output(procs, cli.tree)
-        } else if cli.csv {
+        if cli.csv {
             render::render_csv(procs)
         } else if cli.markdown {
             render::render_markdown(procs)
@@ -608,20 +615,32 @@ fn remote_mode(base: &str, cli: &cli::Cli, no_color: bool) {
         let json_stream = cli.json; // one envelope per tick, no redraw
         let redraw = !cli.quiet && !json_stream;
         install_sigint_flag();
+        let label = bases.join(" · ");
         let mut ticks = 0u64;
         loop {
-            match fetch() {
-                Ok(procs) => {
-                    if redraw {
-                        write_out("\x1b[2J\x1b[1;1H");
-                        let now = util::fmt_time(util::now_unix());
-                        write_out(&format!(
-                            "witr-rs remote · {base} · every {interval}s · {now} · Ctrl-C to stop"
-                        ));
+            let results = fetch_all();
+            if redraw {
+                write_out("\x1b[2J\x1b[1;1H");
+                let now = util::fmt_time(util::now_unix());
+                write_out(&format!(
+                    "witr-rs remote · {} host(s) · {label} · every {interval}s · {now} · Ctrl-C to stop",
+                    bases.len()
+                ));
+            }
+            for (base, result) in &results {
+                match result {
+                    Ok(procs) => {
+                        if bases.len() > 1 {
+                            write_out(&format!("----- [{base}] -----"));
+                        }
+                        if json_stream {
+                            write_out(&json_listing_output(procs, cli.tree));
+                        } else {
+                            write_out(&render_host(procs));
+                        }
                     }
-                    write_out(&render_once(&procs));
+                    Err(e) => eprintln!("⚠ --remote {base}: {e}"),
                 }
-                Err(e) => eprintln!("--remote {base}: {e}"),
             }
             ticks += 1;
             if cli.times.is_some_and(|n| ticks >= n.max(1)) {
@@ -633,12 +652,44 @@ fn remote_mode(base: &str, cli: &cli::Cli, no_color: bool) {
         }
         std::process::exit(0);
     }
-    match fetch() {
-        Ok(procs) => write_out(&render_once(&procs)),
-        Err(e) => {
-            eprintln!("--remote {base}: {e}");
-            std::process::exit(5);
+    let results = fetch_all();
+    let failed = results.iter().filter(|(_, r)| r.is_err()).count();
+    if cli.json && bases.len() > 1 {
+        // the fleet envelope, once: per-host entries in the order the
+        // flags came, errors preserved as entries
+        let doc = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": util::now_unix(),
+            "host_count": bases.len(),
+            "hosts": results.iter().map(|(b, r)| match r {
+                Ok(procs) => serde_json::json!({
+                    "host": b,
+                    "process_count": procs.len(),
+                    "processes": procs,
+                }),
+                Err(e) => serde_json::json!({"host": b, "error": e}),
+            }).collect::<Vec<_>>(),
+        });
+        write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+    } else {
+        for (base, result) in &results {
+            match result {
+                Ok(procs) => {
+                    if bases.len() > 1 {
+                        write_out(&format!("----- [{base}] -----"));
+                    }
+                    if cli.json {
+                        write_out(&json_listing_output(procs, cli.tree));
+                    } else {
+                        write_out(&render_host(procs));
+                    }
+                }
+                Err(e) => eprintln!("⚠ --remote {base}: {e}"),
+            }
         }
+    }
+    if failed == bases.len() {
+        std::process::exit(5);
     }
 }
 
@@ -2720,10 +2771,10 @@ fn main() {
         std::process::exit(0);
     }
 
-    // --remote: render another host's table instead of the local machine's —
-    // a standalone mode like --serve (the peer runs `witr-rs --serve`)
-    if let Some(base) = &cli.remote {
-        remote_mode(base, &cli, no_color);
+    // --remote: render other hosts' tables instead of the local machine's —
+    // a standalone mode like --serve (the peers run `witr-rs --serve`)
+    if !cli.remote.is_empty() {
+        remote_mode(&cli.remote.clone(), &cli, no_color);
         std::process::exit(0);
     }
 

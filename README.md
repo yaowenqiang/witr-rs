@@ -90,7 +90,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **时光回放（`<` / `>`）**：TUI 在后台持续保留最近 30 帧进程表快照——Processes 页按 `<` 逐帧回看历史（进程表回到那一刻：谁当时在、CPU 当时多少；标签栏亮黄色 REPLAY 徽章），`>` 逐帧前进，走到头自动回到实时。回放期间告警机制暂停（回放帧不产生告警/通知），但环形缓冲**照常录制**——看完历史 `>` 走回实时，什么都没漏。"十分钟前机器还是正常的，到底哪一步开始变的"——不用快照不用录像，`<` 按住往回翻。
 
-**远程模式（`--remote URL`）**：`witr-rs --remote http://10.0.0.7:9100` 不看本机——从远端 `witr-rs --serve` 端点拉 `/api/ps`（`--tree` 时同样拉平表、本地重建森林），用与本地完全相同的渲染器输出表格 / `--json` / `--csv` / `--markdown`；配 `--watch N` 周期重拉（清屏重绘，`--times N` 上界）。跳板机上只装 witr-rs 一个二进制、SSH 只通一条隧道，"看隔壁机器的进程表"不用 Prometheus 也不用网页——远端一台 `--serve`，本机随时 `--remote`。零新增依赖（std::net 手写 HTTP GET，仅 http://，TLS 走前置反代）。
+**远程模式（`--remote URL`，可重复）**：`witr-rs --remote http://10.0.0.7:9100` 不看本机——从远端 `witr-rs --serve` 端点拉 `/api/ps`（`--tree` 时同样拉平表、本地重建森林），用与本地完全相同的渲染器输出表格 / `--json` / `--csv` / `--markdown`；配 `--watch N` 周期重拉（清屏重绘，`--times N` 上界）。**`--remote` 可重复**——一次看一排机器：每台一个分隔段落（`----- [host] -----`），连不上的主机报一行 ⚠ 不拖垮其余（全部不可达才退出码 5）；多机 `--json` 出舰队信封（`host_count` + `hosts[]`，每台 `host` / `process_count` / `processes`，失败主机记 `error`）。跳板机上只装 witr-rs 一个二进制、SSH 只通几条隧道，"看隔壁几台机器的进程表"不用 Prometheus 也不用网页——远端各一台 `--serve`，本机随时 `--remote`。零新增依赖（std::net 手写 HTTP GET，仅 http://，TLS 走前置反代）。
 
 **配置热重载（SIGHUP）**：`kill -HUP $(pidof witr-rs)` 无需重启即重读配置——TUI 立即重折算全部旋钮（采样间隔、排序、告警阈值、静默/首见名单、通知开关；**关注列表与告警状态保留**——调整阈值不丢已触发的告警闩锁），无头 `--watch` 同效（下一个 tick 生效）。语义与启动一致：命令行旗标始终压过配置文件，重载只动文件里改的值。改 config.toml 不用再杀进程。
 
@@ -325,6 +325,7 @@ witr-rs --watch 5 --alert-cpu 90 --install-service # 一条命令固化成 syste
 kill -HUP $(pgrep -f 'witr-rs --watch') # 配置热重载：不重启改阈值/静默名单（告警状态保留）
 witr-rs --plot before.jsonl after.jsonl # 两条录制的整机曲线叠加对比（输出 witr-plot.html）
 witr-rs --remote http://10.0.0.7:9100    # 渲染远端 --serve 的进程表（--watch N 周期重拉；--tree/--csv/--json 同本地）
+witr-rs --remote http://a:9100 --remote http://b:9100 # 一排机器各一段落（--json 出舰队信封；坏主机 ⚠ 不拖垮其余）
 witr-rs --remote http://10.0.0.7:9100 --watch 2 # 远端表格常驻刷新
 witr-rs --watch 10 --alert-container # 无头容器哨兵：容器退出/OOM、Pod CrashLoopBackOff 即喊（边缘触发只报一次）
 witr-rs --sys                 # 整机仪表盘：CPU/内存/load/磁盘/网卡/温度/PSI（--watch 2 常驻；--csv/--markdown/--json 同源）
