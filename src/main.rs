@@ -2436,6 +2436,41 @@ fn main() {
         std::process::exit(i32::from(failed > 0));
     }
 
+    // --export-grafana: write the ready-made Grafana dashboard JSON — a
+    // no-target standalone like --snap/--diff.
+    if let Some(path) = &cli.export_grafana {
+        if !specs.is_empty() || cli.interactive {
+            eprintln!("--export-grafana writes a dashboard file; drop the targets or -i");
+            std::process::exit(4);
+        }
+        if cli.watch.is_some() {
+            eprintln!("--export-grafana writes one file and exits; drop --watch");
+            std::process::exit(4);
+        }
+        let doc = render::grafana_dashboard();
+        let body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
+        if let Err(e) = std::fs::write(path, &body) {
+            // the report writers create missing parent dirs — same courtesy
+            let p = std::path::Path::new(path);
+            if e.kind() == std::io::ErrorKind::NotFound {
+                if let Some(dir) = p.parent() {
+                    if std::fs::create_dir_all(dir).is_ok() {
+                        let _ = std::fs::write(path, &body);
+                    }
+                }
+            }
+            if !std::path::Path::new(path).exists() {
+                eprintln!("--export-grafana {path}: {e}");
+                std::process::exit(5);
+            }
+        }
+        let panels = doc["panels"].as_array().map(|a| a.len()).unwrap_or(0);
+        write_out(&format!(
+            "Grafana dashboard written → {path} ({panels} panels — import it in Grafana and pick the Prometheus datasource)"
+        ));
+        std::process::exit(0);
+    }
+
     // --plot: render one --record file into a self-contained HTML chart (or
     // overlay several into one comparison) — a no-target operation like
     // --snap/--diff.

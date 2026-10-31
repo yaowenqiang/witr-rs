@@ -547,6 +547,16 @@ pub struct Cli {
     pub record_max_mb: Option<u64>,
 
     #[arg(
+        long = "export-grafana",
+        value_name = "FILE",
+        help = t(
+            "写出一份现成的 Grafana 仪表盘 JSON（witr-rs overview：整机 cpu/内存/swap/load/PSI/网络/重传/丢包 + 容器 cpu/内存/限流/OOM/磁盘 + top 进程板）——/metrics 的全部语汇一条命令变成面板；Grafana Import 选好 Prometheus 数据源即可。无目标独立操作",
+            "Write a ready-made Grafana dashboard JSON (witr-rs overview: machine cpu/memory/swap/load/PSI/network/retransmit/drops + container cpu/memory/throttle/OOM/disk + top-process boards) — the whole /metrics vocabulary becomes panels with one command; pick the Prometheus datasource on import. A no-target operation"
+        )
+    )]
+    pub export_grafana: Option<String>,
+
+    #[arg(
         long = "watch",
         value_name = "SECONDS",
         num_args = 0..=1,

@@ -1513,6 +1513,212 @@ fn sys_flat_cells(frame: &SysFrame) -> Vec<(String, String)> {
 }
 
 
+/// One Grafana panel: a timeseries box on the 24-column grid with plain
+/// PromQL targets (legend, expr). The datasource rides the `${datasource}`
+/// template variable so the dashboard works against any Prometheus input.
+fn grafana_panel(
+    id: u32,
+    title: &str,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    unit: &str,
+    max: Option<f64>,
+    targets: &[(&str, &str)],
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "type": "timeseries",
+        "title": title,
+        "gridPos": {"x": x, "y": y, "w": w, "h": h},
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "targets": targets.iter().enumerate().map(|(i, (legend, expr))| serde_json::json!({
+            "refId": char::from(b'A' + i as u8).to_string(),
+            "expr": expr,
+            "legendFormat": legend,
+        })).collect::<Vec<_>>(),
+        "fieldConfig": {
+            "defaults": {
+                "unit": unit,
+                "custom": max.map(|m| serde_json::json!({"max": m})).unwrap_or(serde_json::json!({})),
+            },
+            "overrides": [],
+        },
+        "options": {
+            "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+            "tooltip": {"mode": "multi", "sort": "desc"},
+        },
+    })
+}
+
+/// `--export-grafana FILE`: a ready-made Grafana dashboard over the
+/// /metrics vocabulary — machine gauges, the sentinel data (PSI, retrans
+/// rate, NIC drops, swap), container pressure counters and the top
+/// process boards, laid out on one screen. Building the panels is the
+/// only toil left after the exporter; this writes it as JSON for
+/// Grafana's Import (pick the Prometheus datasource on the way in).
+pub fn grafana_dashboard() -> serde_json::Value {
+    let mut panels = Vec::new();
+    let mut id = 1u32;
+    let mut add = |title: &str, x: i32, y: i32, w: i32, h: i32, unit: &str, max: Option<f64>, targets: &[(&str, &str)]| {
+        let p = grafana_panel(id, title, x, y, w, h, unit, max, targets);
+        id += 1;
+        panels.push(p);
+    };
+
+    add("CPU", 0, 0, 12, 8, "percent", Some(100.0), &[(
+        "total",
+        "witr_machine_cpu_percent",
+    )]);
+    add(
+        "Memory",
+        12, 0, 12, 8,
+        "percent",
+        Some(100.0),
+        &[
+            ("used", "witr_machine_mem_used_bytes / witr_machine_mem_total_bytes * 100"),
+            ("available", "witr_machine_mem_available_bytes / witr_machine_mem_total_bytes * 100"),
+        ],
+    );
+    add(
+        "Swap",
+        0, 8, 8, 7,
+        "percent",
+        Some(100.0),
+        &[(
+            "used",
+            "witr_machine_swap_used_bytes / witr_machine_swap_total_bytes * 100",
+        )],
+    );
+    add("Load (1m)", 8, 8, 8, 7, "short", None, &[("load1", "witr_machine_load1")]);
+    add(
+        "Process count",
+        16, 8, 8, 7,
+        "short",
+        None,
+        &[("processes", "witr_process_count")],
+    );
+    add(
+        "PSI stalls",
+        0, 15, 12, 8,
+        "percent",
+        Some(100.0),
+        &[
+            ("cpu some", "witr_machine_psi_stall_percent{resource=\"cpu\",kind=\"some\"}"),
+            ("mem some", "witr_machine_psi_stall_percent{resource=\"mem\",kind=\"some\"}"),
+            ("mem full", "witr_machine_psi_stall_percent{resource=\"mem\",kind=\"full\"}"),
+            ("io some", "witr_machine_psi_stall_percent{resource=\"io\",kind=\"some\"}"),
+            ("io full", "witr_machine_psi_stall_percent{resource=\"io\",kind=\"full\"}"),
+        ],
+    );
+    add(
+        "Network",
+        12, 15, 12, 8,
+        "Bps",
+        None,
+        &[
+            ("rx {{nic}}", "rate(witr_machine_net_rx_bytes_total[5m])"),
+            ("tx {{nic}}", "rate(witr_machine_net_tx_bytes_total[5m])"),
+        ],
+    );
+    add(
+        "TCP retransmits",
+        0, 23, 8, 7,
+        "ops",
+        None,
+        &[("retrans/s", "rate(witr_machine_tcp_retransmissions_total[5m])")],
+    );
+    add(
+        "NIC drops",
+        8, 23, 8, 7,
+        "ops",
+        None,
+        &[(
+            "{{nic}} {{direction}}",
+            "rate(witr_machine_nic_drop_total[5m]) > 0",
+        )],
+    );
+    add(
+        "Container CPU",
+        0, 30, 12, 8,
+        "percent",
+        Some(100.0),
+        &[("{{name}}", "witr_container_cpu_percent")],
+    );
+    add(
+        "Container memory",
+        12, 30, 12, 8,
+        "percent",
+        Some(100.0),
+        &[(
+            "{{name}}",
+            "witr_container_mem_used_bytes / witr_container_mem_total_bytes * 100",
+        )],
+    );
+    add(
+        "Container throttle",
+        0, 38, 8, 7,
+        "percent",
+        None,
+        &[("{{name}}", "rate(witr_container_throttled_seconds_total[5m]) * 100")],
+    );
+    add(
+        "Container OOM kills",
+        8, 38, 8, 7,
+        "short",
+        None,
+        &[("{{name}}", "increase(witr_container_oom_kills_total[5m])")],
+    );
+    add(
+        "Container I/O",
+        16, 38, 8, 7,
+        "Bps",
+        None,
+        &[
+            ("{{name}} read", "rate(witr_container_io_read_bytes_total[5m])"),
+            ("{{name}} write", "rate(witr_container_io_write_bytes_total[5m])"),
+        ],
+    );
+    add(
+        "Top CPU processes",
+        0, 45, 12, 8,
+        "percent",
+        Some(100.0),
+        &[("{{name}} (pid {{pid}})", "topk(5, witr_process_cpu_percent)")],
+    );
+    add(
+        "Top RSS processes",
+        12, 45, 12, 8,
+        "bytes",
+        None,
+        &[("{{name}} (pid {{pid}})", "topk(5, witr_process_rss_bytes)")],
+    );
+
+    serde_json::json!({
+        "id": null,
+        "uid": "witr-rs-overview",
+        "title": "witr-rs overview",
+        "tags": ["witr-rs"],
+        "timezone": "browser",
+        "schemaVersion": 39,
+        "version": 1,
+        "refresh": "30s",
+        "time": {"from": "now-6h", "to": "now"},
+        "templating": {
+            "list": [{
+                "name": "datasource",
+                "label": "Prometheus",
+                "type": "datasource",
+                "query": "prometheus",
+                "current": {},
+                "hide": 0,
+            }]
+        },
+        "panels": panels,
+    })
+}
+
 /// `--report-html FILE`: a self-contained report — no JS, no external
 /// assets. Summary + top-5 lists + the full table, with css bars for the
 /// cpu/mem columns so outliers read at a glance.
@@ -2874,5 +3080,49 @@ mod tests {
         assert!(!text.contains("net "), "{text}");
         let csv = render_sys_csv(&frame);
         assert!(csv.lines().nth(1).unwrap().starts_with(",,,,"));
+    }
+    #[test]
+    fn grafana_dashboard_is_import_ready() {
+        let doc = grafana_dashboard();
+        assert_eq!(doc["title"], "witr-rs overview");
+        assert_eq!(doc["schemaVersion"], 39);
+        assert_eq!(doc["templating"]["list"][0]["name"], "datasource");
+        let panels = doc["panels"].as_array().unwrap();
+        assert!(panels.len() >= 15, "{} panels", panels.len());
+        let ids: std::collections::HashSet<u32> = panels
+            .iter()
+            .filter_map(|p| p["id"].as_u64().map(|i| i as u32))
+            .collect();
+        assert_eq!(ids.len(), panels.len(), "panel ids unique");
+        let mut exprs: Vec<&str> = Vec::new();
+        for p in panels {
+            assert!(p["title"].is_string());
+            assert!(
+                p["datasource"]["uid"] == "${datasource}",
+                "every panel rides the template variable"
+            );
+            let targets = p["targets"].as_array().unwrap();
+            assert!(!targets.is_empty(), "panel has targets");
+            for t in targets {
+                assert!(t["expr"].is_string());
+                exprs.push(t["expr"].as_str().unwrap());
+            }
+        }
+        // the whole /metrics vocabulary the sentinels watch is representable
+        for probe in [
+            "witr_machine_cpu_percent",
+            "witr_machine_swap_used_bytes",
+            "witr_machine_psi_stall_percent",
+            "witr_machine_tcp_retransmissions_total",
+            "witr_machine_nic_drop_total",
+            "witr_container_throttled_seconds_total",
+            "witr_container_oom_kills_total",
+            "witr_process_cpu_percent",
+        ] {
+            assert!(
+                exprs.iter().any(|e| e.contains(probe)),
+                "{probe} has a panel: {exprs:?}"
+            );
+        }
     }
 }

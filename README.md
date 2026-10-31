@@ -36,6 +36,8 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **时序图（`--plot`）**：`witr-rs --plot load.csv` 把 `--record` 产出的样本文件（.csv / .jsonl 都认）画成自包含 HTML 时序图，写入 `load.csv.html` 后退出——内联 SVG 五张图（整机 cpu% / 内存% / 1 分钟负载 / 网络速率 MB/s / 进程数），零 JS 零外部资源，离线双击可看。给**多个文件**则曲线叠加对比——`--plot before.jsonl after.jsonl` 发布前后各录一份，一图看清差异（输出 `witr-plot.html`）。"录制回来看看负载曲线"不用再开 Excel。
 
+**Grafana 仪表盘导出（`--export-grafana FILE`）**：写出一份现成的 Grafana 仪表盘 JSON——16 块面板把 `/metrics` 的全部语汇铺成一屏：整机 cpu / 内存 / swap / load / 进程数、PSI 停顿、网卡吞吐与丢包、TCP 重传速率、容器 cpu / 内存 / 限流速率 / OOM 计数 / 磁盘、top CPU / top RSS 进程板（`topk(5, …)`）；PromQL 全部预填，导入 Grafana 选好数据源即用——建面板是导出之后剩下的唯一苦活，一条命令清零。
+
 **HTML 报告（`--report-html`）**：`witr-rs --report-html status.html` 生成自包含的单文件报告（零 JS 零依赖）：每进程 CPU / 内存占用条、Top CPU / Top 内存榜单、全进程九列明细表，HTML 转义齐全——贴工单、存档、发同事都行。
 
 **树杀（`K`）**：操作栏新增 `K`——沿 ppid 做 BFS 收集选中进程的全部后代（含孙辈，父进程中途被收割也不漏），提示 `kill pid N + M descendant(s)? y 确认`，确认后对整棵树发 SIGTERM。杀 worker 池、清用户会话树不用再逐个查 pid。
@@ -294,6 +296,7 @@ witr-rs --plot load.csv        # 录制文件画成自包含 HTML 时序图（�
 witr-rs --samples load.csv     # 录制文件导入 TUI Samples 页（sparkline + ←→ 光标逐时刻读数）
 witr-rs --tree --json         # 全表嵌套 JSON（子进程挂 children，孤儿/ppid 环升级为根）
 witr-rs --report-html status.html   # 自包含单文件 HTML 报告（CPU/内存条 + Top 榜 + 全表）
+witr-rs --export-grafana dash.json  # 16 面板 Grafana 仪表盘：/metrics 全语汇预填 PromQL，导入即用
 witr-rs --alert-fd 4096 --alert-io 100 # fd 数 / 磁盘 IO 速率阈值告警（同 CPU 告警机制）
 witr-rs --alert-conn 200      # 每进程 ESTABLISHED 连接数阈值告警（TUI 与 --watch 同效）
 witr-rs --alert-threads 400   # 每进程内核线程数阈值告警（线程泄漏哨兵，TUI 与 --watch 同效）
