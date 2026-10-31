@@ -38,6 +38,8 @@ A Rust implementation of [pranshuparmar/witr](https://github.com/pranshuparmar/w
 
 **Time-series chart (`--plot`)**: `witr-rs --plot load.csv` renders a `--record` sample file (both .csv and .jsonl are accepted) into a self-contained HTML time-series chart, written to `load.csv.html`, then exits — five inline-SVG charts (machine cpu% / memory% / 1-minute load / network rate MB/s / process count), no JS, no external assets, double-clickable offline. **Multiple files** overlay their curves — `--plot before.jsonl after.jsonl` records once before and once after a release, and one chart shows the difference (output `witr-plot.html`). "Record now, look at the load curve later" without opening Excel.
 
+**Grafana dashboard export (`--export-grafana FILE`)**: writes a ready-made Grafana dashboard JSON — 16 panels spreading the whole `/metrics` vocabulary across one screen: machine cpu / memory / swap / load / process count, PSI stalls, NIC throughput and drops, TCP retransmit rate, container cpu / memory / throttle rate / OOM kills / disk I/O, and top-CPU / top-RSS process boards (`topk(5, …)`); every PromQL expression is pre-filled — import into Grafana, pick the Prometheus datasource, done. Building panels was the only toil left after the exporter; one command retires it.
+
 **HTML report (`--report-html`)**: `witr-rs --report-html status.html` writes a self-contained single-file report (no JS, no dependencies): per-process CPU / memory bars, Top-CPU / Top-memory boards, and a nine-column table of every process, fully HTML-escaped — attach it, archive it, send it.
 
 **Tree kill (`K`)**: the actions bar gains `K` — a BFS over ppid links collects every descendant of the selected process (grandchildren included, even if a parent is reaped mid-walk), prompts `kill pid N + M descendant(s)? y to confirm`, and SIGTERMs the whole tree on `y`. Killing a worker pool or a user session tree no longer means hunting pids one by one.
@@ -293,6 +295,7 @@ witr-rs --watch 5 --record load.jsonl # same time series, NDJSON envelopes (ppid
 witr-rs --plot load.csv        # render the recording into a self-contained HTML time-series chart (five offline SVG curves)
 witr-rs --samples load.csv     # import the recording into the TUI Samples page (sparklines + ←→ cursor readout)
 witr-rs --tree --json         # whole table as nested JSON (children under parents)
+witr-rs --export-grafana dash.json  # 16-panel Grafana dashboard: the /metrics vocabulary as pre-filled PromQL, import and go
 witr-rs --report-html status.html   # self-contained HTML report (bars + top boards + full table)
 witr-rs --alert-fd 4096 --alert-io 100 # fd-count / disk-IO-rate threshold alerts (same mechanism as CPU)
 witr-rs --alert-conn 200      # per-process ESTABLISHED connection-count alerts (TUI and --watch)
