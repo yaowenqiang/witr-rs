@@ -330,6 +330,44 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
             out.push_str("# TYPE witr_machine_load1 gauge\n");
             out.push_str(&format!("witr_machine_load1 {l:.2}\n"));
         }
+        // the machine sentinels' raw data: what the built-in --alert-*
+        // thresholds watch is what a Prometheus rule can watch too
+        if let Some(mb) = s.mem_avail_mb {
+            out.push_str("# HELP witr_machine_mem_available_bytes Reclaimable memory (MemAvailable) in bytes\n");
+            out.push_str("# TYPE witr_machine_mem_available_bytes gauge\n");
+            out.push_str(&format!("witr_machine_mem_available_bytes {}\n", mb * 1024 * 1024));
+        }
+        if let Some(mb) = s.swap_used_mb {
+            out.push_str("# HELP witr_machine_swap_used_bytes Swap in use in bytes\n");
+            out.push_str("# TYPE witr_machine_swap_used_bytes gauge\n");
+            out.push_str(&format!("witr_machine_swap_used_bytes {}\n", mb * 1024 * 1024));
+        }
+        if let Some(mb) = s.swap_total_mb {
+            out.push_str("# HELP witr_machine_swap_total_bytes Total swap in bytes\n");
+            out.push_str("# TYPE witr_machine_swap_total_bytes gauge\n");
+            out.push_str(&format!("witr_machine_swap_total_bytes {}\n", mb * 1024 * 1024));
+        }
+        if let Some(segs) = s.retrans_segs {
+            out.push_str("# HELP witr_machine_tcp_retransmissions_total Cumulative TCP retransmitted segments\n");
+            out.push_str("# TYPE witr_machine_tcp_retransmissions_total counter\n");
+            out.push_str(&format!("witr_machine_tcp_retransmissions_total {segs}\n"));
+        }
+        if let Some(psi) = &s.psi {
+            out.push_str("# HELP witr_machine_psi_stall_percent Pressure Stall Information, 10-second window share\n");
+            out.push_str("# TYPE witr_machine_psi_stall_percent gauge\n");
+            for (resource, some, full) in [
+                ("cpu", psi.cpu_some, psi.cpu_full),
+                ("mem", psi.mem_some, psi.mem_full),
+                ("io", psi.io_some, psi.io_full),
+            ] {
+                out.push_str(&format!(
+                    "witr_machine_psi_stall_percent{{resource=\"{resource}\",kind=\"some\"}} {some:.2}\n"
+                ));
+                out.push_str(&format!(
+                    "witr_machine_psi_stall_percent{{resource=\"{resource}\",kind=\"full\"}} {full:.2}\n"
+                ));
+            }
+        }
     }
     // cumulative NIC bytes as counters (loopback excluded) — rate() gives
     // per-interface throughput
@@ -351,6 +389,23 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
                 "witr_machine_net_tx_bytes_total{{nic=\"{}\"}} {}\n",
                 label_escape(&n.name),
                 n.tx_bytes,
+            ));
+        }
+        // drop/error counters ride the same sweep — throughput can look
+        // fine while packets never arrive (0 where the platform doesn't
+        // report them, so the series exists but rates flatline)
+        out.push_str("# HELP witr_machine_nic_drop_total Cumulative rx/tx drops and errors per non-loopback interface\n");
+        out.push_str("# TYPE witr_machine_nic_drop_total counter\n");
+        for n in &nics {
+            out.push_str(&format!(
+                "witr_machine_nic_drop_total{{nic=\"{}\",direction=\"rx\"}} {}\n",
+                label_escape(&n.name),
+                n.rx_drops,
+            ));
+            out.push_str(&format!(
+                "witr_machine_nic_drop_total{{nic=\"{}\",direction=\"tx\"}} {}\n",
+                label_escape(&n.name),
+                n.tx_drops,
             ));
         }
     }

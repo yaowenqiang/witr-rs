@@ -86,6 +86,11 @@ pub enum TopMetric {
         "GPU dedicated memory (NVIDIA, needs nvidia-smi) — the VRAM ranking"
     ))]
     GpuMem,
+    #[value(help = t(
+        "进程被换出到 swap 的内存（Linux VmSwap）——内存吃紧时“谁蹲在 swap 里”的进程榜",
+        "Memory swapped out per process (Linux VmSwap) — who is sitting in swap when the machine runs tight"
+    ))]
+    Swap,
 }
 
 impl TopMetric {
@@ -102,6 +107,7 @@ impl TopMetric {
             TopMetric::Conn => "CONNS",
             TopMetric::Net => "NET",
             TopMetric::GpuMem => "VRAM",
+            TopMetric::Swap => "SWAP",
         }
     }
 }

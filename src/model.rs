@@ -32,6 +32,11 @@ pub struct Process {
     pub private_kb: Option<u64>,
     /// OS thread count, when the platform exposes it.
     pub threads: Option<u32>,
+    /// Swap currently charged to this process (KiB, Linux VmSwap) — the
+    /// "who is sitting in swap" answer when the machine saturates. None
+    /// off Linux.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_kb: Option<u64>,
     /// Cumulative disk I/O: bytes + syscall ops (Linux /proc/<pid>/io).
     pub io_read_bytes: Option<u64>,
     pub io_read_ops: Option<u64>,

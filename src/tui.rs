@@ -2135,6 +2135,25 @@ impl TuiApp {
                 }
                 lines.push(Line::from(spans));
             }
+            // per-core history: one sparkline per core (0–100 scale) — a
+            // single core pegged while the rest idle is the classic
+            // single-thread bottleneck, invisible in the total
+            let charts = self.hist.sys_core_charts(50);
+            if !charts.is_empty() {
+                lines.push(Line::from(Span::styled("per core", Style::new().bold())));
+                for (i, (bars, peak)) in charts.iter().enumerate() {
+                    let style = if *peak >= 90.0 {
+                        Style::new().fg(Color::Red)
+                    } else {
+                        Style::new()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {:>2} │", i), Style::new().fg(MID)),
+                        Span::styled(bars.clone(), style),
+                        Span::raw(format!("│ peak {peak:.0}%")),
+                    ]));
+                }
+            }
         }
         // disk: one bar per device-backed mount; ≥90% full renders red
         if !self.sys_mounts.is_empty() {
@@ -4662,6 +4681,16 @@ fn detail_lines(
     if let Some(g) = gpu_line(m) {
         push_kv(&mut v, "GPU", g);
     }
+    if let Some(kb) = m.swap_kb {
+        push_kv(
+            &mut v,
+            "In swap",
+            format!(
+                "{} — paged out; the resident set is only part of the story",
+                crate::util::fmt_bytes(kb)
+            ),
+        );
+    }
     if !sockets.is_empty() {
         v.push(Line::from(""));
         v.push(Line::from(Span::styled("Sockets:", Style::new().bold())));
@@ -4917,6 +4946,9 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
     // the cumulative counters; macOS/Windows never do).
     let has_gpu = app.procs.iter().any(crate::gpu::has_gpu_data);
     let has_io = app.procs.iter().any(|p| p.io_read_bytes.is_some() || p.io_write_bytes.is_some());
+    // the swap column appears only when someone is actually sitting in
+    // swap — dead width on machines that never swap
+    let has_swap = app.procs.iter().any(|p| p.swap_kb.is_some());
     let mut header: Vec<Cell> = vec![
         Cell::from(format!("PID{}", arrow(k, SortKey::Pid, d))),
         Cell::from(format!("User{}", arrow(k, SortKey::User, d))),
@@ -4939,6 +4971,10 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
     }
     if has_gpu {
         header.push(Cell::from("GPU"));
+        widths.push(Constraint::Length(9));
+    }
+    if has_swap {
+        header.push(Cell::from("SWAP"));
         widths.push(Constraint::Length(9));
     }
     header.push(Cell::from("Rst"));
@@ -5014,6 +5050,13 @@ fn processes_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame
             }
             if has_gpu {
                 cells.push(Cell::from(crate::gpu::cell(p)));
+            }
+            if has_swap {
+                cells.push(Cell::from(
+                    p.swap_kb
+                        .map(crate::util::fmt_bytes)
+                        .unwrap_or_else(|| "-".into()),
+                ));
             }
             cells.push(Cell::from(if rst > 0 { rst.to_string() } else { String::new() }));
             cells.push(Cell::from(fmt_age_short(p.started)));

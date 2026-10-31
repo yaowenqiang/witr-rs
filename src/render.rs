@@ -1150,6 +1150,7 @@ pub fn render_top(
                 crate::cli::TopMetric::Conn => conns.and_then(|m| m.get(&pr.pid)).map(|&n| n as f64),
                 crate::cli::TopMetric::Net => rates.and_then(|h| h.net_rate_of(pr.pid)),
                 crate::cli::TopMetric::GpuMem => pr.gpu_mem_mb.map(|mb| mb as f64),
+                crate::cli::TopMetric::Swap => pr.swap_kb.map(|kb| kb as f64),
             }?;
             Some((v, pr))
         })
@@ -1183,6 +1184,9 @@ pub fn render_top(
             }
             crate::cli::TopMetric::GpuMem => {
                 format!("{}M", *v as u64)
+            }
+            crate::cli::TopMetric::Swap => {
+                crate::util::fmt_bytes(*v as u64)
             }
         };
         let extra = if metric == crate::cli::TopMetric::Age {

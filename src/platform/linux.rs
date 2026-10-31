@@ -537,6 +537,15 @@ pub struct StatInfo {
     pub num_threads: u32,
 }
 
+/// /proc/<pid>/status's `VmSwap: <n> kB` line → KiB. One extra read per
+/// pid on the listing: the price of answering "who is actually sitting in
+/// swap" — the machine-level swap percent never names a culprit.
+fn parse_status_vmswap(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("VmSwap:"))
+        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+}
+
 fn parse_stat(raw: &str) -> Option<StatInfo> {
     let rparen = raw.rfind(')')?;
     let comm = raw[raw.find('(')? + 1..rparen].to_string();
@@ -1066,6 +1075,9 @@ impl Platform for Linux {
             let cpu_time_ms = (!kernel_thread && cpu_ticks > 0)
                 .then_some((cpu_ticks as f64 * 1000.0 / CLK_TCK) as u64);
             let mem_kb = (rss_pages > 0).then_some(rss_pages * 4); // 4 KiB pages
+            let swap_kb = read_ok(&Path::new("/proc").join(pid.to_string()).join("status"))
+                .and_then(|st| parse_status_vmswap(&st))
+                .filter(|kb| *kb > 0);
             procs.push(Process {
                 pid,
                 ppid: Some(ppid),
@@ -1082,6 +1094,7 @@ impl Platform for Linux {
                 pgid: Some(s.pgid),
                 sid: Some(s.sid),
                 threads: (s.num_threads > 0).then_some(s.num_threads),
+                swap_kb,
                 ..Default::default()
             });
         }
@@ -1866,6 +1879,17 @@ Inter-|   Receive                                                |  Transmit
         assert_eq!(pids, vec![9]);
         assert_eq!(inode, Some(11));
         assert_eq!(bytes, None);
+    }
+
+    #[test]
+    fn status_vmswap_parse() {
+        let status = "Name:\tbash\nVmRSS:\t  1234 kB\nVmSwap:\t\t 5678 kB\nThreads:\t1\n";
+        assert_eq!(parse_status_vmswap(status), Some(5678));
+        // no swap line → None (field absent on kernels without swap)
+        assert_eq!(parse_status_vmswap("Name:\tinit\nVmRSS:\t100 kB\n"), None);
+        // a zero reading stays a reading (Some(0)) — the column filter
+        // decides visibility, not the parser
+        assert_eq!(parse_status_vmswap("VmSwap:\t0 kB\n"), Some(0));
     }
 
     #[test]

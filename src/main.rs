@@ -729,6 +729,7 @@ fn top_procs(
                 cli::TopMetric::Conn => conns.and_then(|m| m.get(&p.pid)).map(|&n| n as f64),
                 cli::TopMetric::Net => rates.and_then(|h| h.net_rate_of(p.pid)),
                 cli::TopMetric::GpuMem => p.gpu_mem_mb.map(|mb| mb as f64),
+                cli::TopMetric::Swap => p.swap_kb.map(|kb| kb as f64),
             }?;
             Some((v, p))
         })

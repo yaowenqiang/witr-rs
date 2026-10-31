@@ -1317,6 +1317,9 @@ pub struct SystemSample {
     pub mem_used_mb: Option<u64>,
     pub swap_used_mb: Option<u64>,
     pub load1: Option<f64>,
+    /// per-core busy percents at this sample (empty when the platform has
+    /// no per-core source) — the system page's per-core history rows
+    pub cores: Vec<f64>,
 }
 
 #[derive(Default)]
@@ -1780,6 +1783,7 @@ impl History {
             mem_used_mb: s.mem_used_mb,
             swap_used_mb: s.swap_used_mb,
             load1: s.load1,
+            cores: s.cores.clone(),
         });
         while self.sys.len() > BIG_SAMPLES {
             self.sys.pop_front();
@@ -1789,6 +1793,51 @@ impl History {
     /// The freshest system sample (page header's "now" values).
     pub fn sys_latest(&self) -> Option<&SystemSample> {
         self.sys.back()
+    }
+
+    /// Per-core history: the ring transposed into one percent series per
+    /// core (thinned to `width`), plus that core's window peak. `None`
+    /// until two samples carry cores — one sparkline row per core.
+    pub fn sys_core_charts(&self, width: usize) -> Vec<(String, f64)> {
+        let Some(ncores) = self.sys.iter().map(|s| s.cores.len()).max() else {
+            return Vec::new();
+        };
+        if ncores == 0 {
+            return Vec::new();
+        }
+        let samples: usize = self
+            .sys
+            .iter()
+            .filter(|s| s.cores.len() == ncores)
+            .count();
+        if samples < 2 {
+            return Vec::new();
+        }
+        (0..ncores)
+            .map(|core| {
+                let mut vals: Vec<f64> = self
+                    .sys
+                    .iter()
+                    .filter(|s| s.cores.len() == ncores)
+                    .map(|s| s.cores[core])
+                    .collect();
+                if vals.len() > width {
+                    let stride = vals.len() as f64 / width as f64;
+                    vals = (0..width)
+                        .map(|i| vals[(i as f64 * stride) as usize])
+                        .collect();
+                }
+                let peak = vals.iter().copied().fold(0.0f64, f64::max);
+                let bars: String = vals
+                    .iter()
+                    .map(|v| {
+                        let idx = ((v / 100.0).clamp(0.0, 0.999) * 8.0) as usize;
+                        SPARK_LEVELS[idx]
+                    })
+                    .collect();
+                (bars, peak)
+            })
+            .collect()
     }
 
     /// System CPU chart on a fixed 0–100 scale (the max is known, unlike
@@ -2513,6 +2562,32 @@ mod tests {
         p.cpu_time_ms = Some(cpu);
         h2.update(&[p]);
         assert!(h2.deviation_of(10, 5.0).is_none(), "5 samples is not a baseline");
+    }
+
+    #[test]
+    fn sys_core_charts_transpose_the_ring() {
+        let mut h = History::new();
+        let stats = |cores: Vec<f64>| crate::platform::SystemStats {
+            cpu_percent: Some(cores.iter().sum::<f64>() / cores.len() as f64),
+            cores,
+            ..Default::default()
+        };
+        h.update_system(stats(vec![10.0, 90.0]));
+        assert!(h.sys_core_charts(50).is_empty(), "one sample is not history");
+        for i in 1..6u32 {
+            h.update_system(stats(vec![10.0 + i as f64, 90.0 - i as f64]));
+        }
+        let charts = h.sys_core_charts(50);
+        assert_eq!(charts.len(), 2, "one series per core");
+        // core 0 climbed 10→15 (peak 15), core 1 fell 90→86 (peak 90)
+        assert!((charts[0].1 - 15.0).abs() < 0.001, "{:?}", charts[0]);
+        assert!((charts[1].1 - 90.0).abs() < 0.001, "{:?}", charts[1]);
+        assert!(charts.iter().all(|(bars, _)| !bars.is_empty()));
+        // a platform with no per-core data → no rows
+        let mut h2 = History::new();
+        h2.update_system(crate::platform::SystemStats::default());
+        h2.update_system(crate::platform::SystemStats::default());
+        assert!(h2.sys_core_charts(50).is_empty());
     }
 
     #[test]
