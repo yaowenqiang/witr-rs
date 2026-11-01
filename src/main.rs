@@ -576,22 +576,222 @@ fn run_on_exit(cmd: &str) {
 /// presentation only: the flat table comes over the wire and the forest
 /// is built locally, so both sides agree on the shape. `--watch N`
 /// re-fetches on an interval until Ctrl-C.
-fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
-    let fetch = |base: &str| -> Result<Vec<Process>, String> {
-        let url = format!("{}/api/ps", base.trim_end_matches('/'));
-        let body = util::http_get(&url)?;
-        let doc: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| format!("response is not JSON: {e}"))?;
-        let schema = doc.get("schema_version").and_then(|v| v.as_u64());
-        let procs: Vec<Process> = serde_json::from_value(
-            doc.get("processes")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        )
-        .map_err(|e| format!("response shape mismatch (schema_version {schema:?}): {e}"))?;
-        Ok(procs)
+/// The /api/ps envelope's machine snapshot, parsed back into the same
+/// shapes the local sentinels judge — stats for [`system_alert_picks`],
+/// cumulative NIC totals for the rate diffs, the mount sweep for the
+/// disk/disk-eta sentinels. `None` when the server predates the `system`
+/// key (older witr-rs --serve) — machine sentinels disarm for that host,
+/// the table still renders.
+struct FleetSample {
+    stats: crate::platform::SystemStats,
+    net: Option<(u64, u64, u64)>,
+    mounts: Vec<crate::platform::MountUsage>,
+}
+
+fn parse_system_snapshot(doc: &serde_json::Value) -> Option<FleetSample> {
+    let s = doc.get("system")?;
+    if s.is_null() {
+        return None;
+    }
+    let f = |k: &str| s.get(k).and_then(|v| v.as_f64());
+    let u = |k: &str| s.get(k).and_then(|v| v.as_u64());
+    let psi = s.get("psi").and_then(|p| p.as_object()).map(|p| {
+        let g = |k: &str| p.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        crate::platform::PsiStats {
+            cpu_some: g("cpu_some"),
+            cpu_full: g("cpu_full"),
+            mem_some: g("mem_some"),
+            mem_full: g("mem_full"),
+            io_some: g("io_some"),
+            io_full: g("io_full"),
+        }
+    });
+    let net = s.get("net").and_then(|n| n.as_object()).map(|n| {
+        let g = |k: &str| n.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        (g("rx_bytes"), g("tx_bytes"), g("drop_total"))
+    });
+    let mounts = s
+        .get("mounts")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    Some(crate::platform::MountUsage {
+                        target: m.get("target")?.as_str()?.to_string(),
+                        total_mb: m.get("total_mb")?.as_u64()?,
+                        used_mb: m.get("used_mb")?.as_u64()?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(FleetSample {
+        stats: crate::platform::SystemStats {
+            load1: f("load1"),
+            load5: f("load5"),
+            load15: f("load15"),
+            cpu_percent: f("cpu_pct"),
+            mem_used_mb: u("mem_used_mb"),
+            mem_total_mb: u("mem_total_mb"),
+            mem_avail_mb: u("mem_avail_mb"),
+            swap_used_mb: u("swap_used_mb"),
+            swap_total_mb: u("swap_total_mb"),
+            psi,
+            temp: s.get("temp_c").and_then(|t| t.as_f64()).map(|c| ("remote".into(), c)),
+            retrans_segs: u("retrans_segs"),
+            oom_kills: u("oom_kills"),
+            ..Default::default()
+        },
+        net,
+        mounts,
+    })
+}
+
+/// One fleet host's /api/ps: the process table plus the machine snapshot.
+fn fetch_fleet(base: &str) -> Result<(Vec<Process>, Option<FleetSample>), String> {
+    let url = format!("{}/api/ps", base.trim_end_matches('/'));
+    let body = util::http_get(&url)?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("response is not JSON: {e}"))?;
+    let schema = doc.get("schema_version").and_then(|v| v.as_u64());
+    let procs: Vec<Process> = serde_json::from_value(
+        doc.get("processes")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .map_err(|e| format!("response shape mismatch (schema_version {schema:?}): {e}"))?;
+    Ok((procs, parse_system_snapshot(&doc)))
+}
+
+/// The machine-wide sentinel flags, as the fleet watch judges them —
+/// per-host state keeps the streaks/latches independent. The per-process
+/// family can't work remotely (fd/conn/io/deviation probe the local
+/// machine), so the entry points reject it instead of half-working.
+fn fleet_machine_armed(cli: &cli::Cli) -> bool {
+    cli.alert_load.is_some()
+        || cli.alert_mem_pct.is_some()
+        || cli.alert_count.is_some()
+        || cli.alert_disk.is_some()
+        || cli.alert_disk_eta.is_some()
+        || cli.alert_net.is_some()
+        || cli.alert_psi.is_some()
+        || cli.alert_mem_avail_mb.is_some()
+        || cli.alert_swap_pct.is_some()
+        || cli.alert_retrans.is_some()
+        || cli.alert_nic_drop.is_some()
+        || cli.alert_oom.is_some()
+}
+
+fn reject_fleet_per_process_alerts(cli: &cli::Cli) {
+    let per_process = cli.alert_cpu.is_some()
+        || cli.alert_mem.is_some()
+        || cli.alert_fd.is_some()
+        || cli.alert_io.is_some()
+        || cli.alert_conn.is_some()
+        || cli.alert_threads.is_some()
+        || cli.alert_net_per_proc.is_some()
+        || cli.alert_deviation.is_some()
+        || !cli.alert_new_proc.is_empty()
+        || !cli.alert_port.is_empty()
+        || cli.alert_container;
+    if per_process {
+        eprintln!(
+            "fleet mode runs the machine-wide sentinels (--alert-load/--alert-mem-pct/--alert-psi/...); per-process thresholds probe the local machine and are local-only"
+        );
+        std::process::exit(4);
+    }
+}
+
+/// A fleet host's machine-sentinel verdicts: fold one snapshot into the
+/// host's alert state and return the picks. Reuses the local machinery
+/// wholesale — [`history::system_alert_picks`] over a per-host
+/// [`history::SysAlertState`] (streaks, latches and the disk-eta history
+/// all live in there, keyed by host at the caller).
+/// Diff one fleet snapshot's cumulative counters into the per-host rate
+/// values (net throughput, NIC drops, TCP retransmits, OOM window) —
+/// the first call seeds, the second reads. Shared by the fleet watch
+/// and the fleet check.
+fn fleet_rates(
+    cli: &cli::Cli,
+    sample: &FleetSample,
+    st: &mut history::SysAlertState,
+) -> (
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<u64>,
+) {
+    let net_rate = if cli.alert_net.is_some() {
+        sample
+            .net
+            .and_then(|(rx, tx, _)| history::machine_net_rate((rx, tx), st))
+    } else {
+        None
     };
-    let fetch_all = || -> Vec<(String, Result<Vec<Process>, String>)> {
+    let drop_rate = if cli.alert_nic_drop.is_some() {
+        sample
+            .net
+            .and_then(|(_, _, drops)| history::machine_drop_rate(drops, st))
+    } else {
+        None
+    };
+    let retrans_rate = if cli.alert_retrans.is_some() {
+        sample
+            .stats
+            .retrans_segs
+            .and_then(|segs| history::machine_retrans_rate(segs, st))
+    } else {
+        None
+    };
+    let oom_window = if cli.alert_oom.is_some() {
+        sample
+            .stats
+            .oom_kills
+            .map(|k| history::machine_oom_window(k, st, 1))
+    } else {
+        None
+    };
+    (net_rate, drop_rate, retrans_rate, oom_window)
+}
+
+fn fleet_alert_picks(
+    cli: &cli::Cli,
+    sample: &FleetSample,
+    proc_count: usize,
+    st: &mut history::SysAlertState,
+    interval: u64,
+) -> Vec<history::SysPick> {
+    let (net_rate, drop_rate, retrans_rate, _oom_window) = fleet_rates(cli, sample, st);
+    let limits = history::SysAlertLimits {
+        load: cli.alert_load,
+        mem_pct: cli.alert_mem_pct,
+        count: cli.alert_count,
+        proc_count,
+        mounts: sample.mounts.clone(),
+        disk_pct: cli.alert_disk,
+        net_limit: cli.alert_net,
+        net_rate,
+        psi_limit: cli.alert_psi,
+        mem_avail_floor: cli.alert_mem_avail_mb,
+        swap_pct_limit: cli.alert_swap_pct,
+        retrans_limit: cli.alert_retrans.map(|v| v as f64),
+        retrans_rate,
+        drop_limit: cli.alert_nic_drop.map(|v| v as f64),
+        drop_rate,
+        oom_limit: cli.alert_oom,
+        oom_kills: sample.stats.oom_kills,
+        disk_eta_hours: cli.alert_disk_eta,
+        repeat: cli.alert_repeat,
+    };
+    history::system_alert_picks(&sample.stats, st, &limits, interval)
+}
+
+fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
+    reject_fleet_per_process_alerts(cli);
+    let fetch = |base: &str| -> Result<(Vec<Process>, Option<FleetSample>), String> {
+        fetch_fleet(base)
+    };
+    let fetch_all = || -> Vec<(String, Result<(Vec<Process>, Option<FleetSample>), String>)> {
         bases
             .iter()
             .map(|b| (b.clone(), fetch(b)))
@@ -614,6 +814,20 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
         let interval = secs.max(1);
         let json_stream = cli.json; // one envelope per tick, no redraw
         let redraw = !cli.quiet && !json_stream;
+        let mut events_file = match &cli.events_log {
+            Some(path) => match EventLog::create(path, cli.record_max_mb) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    eprintln!("--events-log {path}: {e}");
+                    std::process::exit(5);
+                }
+            },
+            None => None,
+        };
+        // one alert state per host — streaks, latches and the disk-eta
+        // trend windows stay independent per machine
+        let mut states: HashMap<String, history::SysAlertState> = HashMap::new();
+        let mut last_err: HashMap<String, String> = HashMap::new();
         install_sigint_flag();
         let label = bases.join(" · ");
         let mut ticks = 0u64;
@@ -629,7 +843,7 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
             }
             for (base, result) in &results {
                 match result {
-                    Ok(procs) => {
+                    Ok((procs, sample)) => {
                         if bases.len() > 1 {
                             write_out(&format!("----- [{base}] -----"));
                         }
@@ -638,8 +852,36 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
                         } else {
                             write_out(&render_host(procs));
                         }
+                        // the fleet sentinels: same machinery as the local
+                        // --watch loop, one state per host, alerts name it
+                        if fleet_machine_armed(cli) {
+                            let Some(sample) = sample else {
+                                continue; // server predates the system key
+                            };
+                            let st = states.entry(base.clone()).or_default();
+                            for (name, detail, rec) in
+                                fleet_alert_picks(cli, &sample, procs.len(), st, interval)
+                            {
+                                emit_fleet_pick(
+                                    cli,
+                                    base,
+                                    &name,
+                                    &detail,
+                                    rec,
+                                    json_stream,
+                                    events_file.as_mut(),
+                                );
+                            }
+                        }
                     }
-                    Err(e) => eprintln!("⚠ --remote {base}: {e}"),
+                    Err(e) => {
+                        // a flapping fetch error prints once per change,
+                        // not once per tick
+                        if last_err.get(base).map(|p| p != e).unwrap_or(true) {
+                            eprintln!("⚠ --remote {base}: {e}");
+                            last_err.insert(base.clone(), e.clone());
+                        }
+                    }
                 }
             }
             ticks += 1;
@@ -662,7 +904,7 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
             "generated_at": util::now_unix(),
             "host_count": bases.len(),
             "hosts": results.iter().map(|(b, r)| match r {
-                Ok(procs) => serde_json::json!({
+                Ok((procs, _sample)) => serde_json::json!({
                     "host": b,
                     "process_count": procs.len(),
                     "processes": procs,
@@ -674,7 +916,7 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
     } else {
         for (base, result) in &results {
             match result {
-                Ok(procs) => {
+                Ok((procs, _sample)) => {
                     if bases.len() > 1 {
                         write_out(&format!("----- [{base}] -----"));
                     }
@@ -690,6 +932,57 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
     }
     if failed == bases.len() {
         std::process::exit(5);
+    }
+}
+
+/// One fleet sentinel pick, through the same side-effect pipeline as the
+/// local --watch loop: stdout line (stderr under --json so jq stays
+/// parseable), --events-log (the host rides as its own field), then
+/// --alert-exec / --alert-webhook with the host prefixed to the detail.
+fn emit_fleet_pick(
+    cli: &cli::Cli,
+    host: &str,
+    name: &str,
+    detail: &str,
+    recovery: bool,
+    json_stream: bool,
+    mut events_file: Option<&mut EventLog>,
+) {
+    let kind = if recovery { "recovered" } else { "alert" };
+    let e = history::TuiEvent {
+        at_unix: util::now_unix(),
+        kind: kind.to_string(),
+        pid: 0,
+        name: name.to_string(),
+        detail: detail.to_string(),
+    };
+    if let Some(log) = events_file.as_mut() {
+        log.log_json(&serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "at_unix": e.at_unix,
+            "kind": e.kind,
+            "pid": e.pid,
+            "name": e.name,
+            "detail": e.detail,
+            "host": host,
+        }));
+    }
+    let who = format!("[{host}] {name}");
+    let line = format!(
+        "{} {who} — {detail}",
+        if recovery { "✔ recovered:" } else { "⚠ alert:" }
+    );
+    if json_stream {
+        eprintln!("{line}");
+    } else {
+        write_out(&line);
+    }
+    let effect_detail = format!("[{host}] {detail}");
+    if let Some(cmd) = &cli.alert_exec {
+        tui::spawn_alert_exec(cmd, 0, name, &effect_detail, kind);
+    }
+    if let Some(hook) = &cli.alert_webhook {
+        tui::send_alert_webhook(hook, 0, name, &effect_detail, kind);
     }
 }
 
@@ -1061,133 +1354,22 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
     }
 
     // ---- machine-wide thresholds over the fresh snapshot ----
-    if let Some(limit) = cli.alert_load {
-        if let Some(l) = stats.load1 {
-            if l > limit {
-                violations.push((0, "system".into(), format!("load average {l:.2} above {limit}")));
-            }
-        }
-    }
-    if let Some(limit) = cli.alert_mem_pct {
-        if let (Some(u), Some(t)) = (stats.mem_used_mb, stats.mem_total_mb) {
-            if t > 0 {
-                let pct = (u * 100) / t;
-                if pct > limit {
-                    violations.push((0, "system".into(), format!("RAM {pct}% above {limit}%")));
-                }
-            }
-        }
-    }
-    if let Some(limit) = cli.alert_count {
-        if procs.len() > limit as usize {
-            violations.push((
-                0,
-                "system".into(),
-                format!("{} visible processes above {limit}", procs.len()),
-            ));
-        }
-    }
-    if cli.alert_disk.is_some() {
-        let mut over_mounts: Vec<(u64, String)> = platform
-            .mount_usage()
-            .iter()
-            .filter(|m| m.total_mb > 0)
-            .map(|m| ((m.used_mb * 100) / m.total_mb, m.target.clone()))
-            .filter(|(pct, _)| Some(*pct) > cli.alert_disk)
-            .collect();
-        over_mounts.sort_by(|a, b| b.0.cmp(&a.0));
-        if !over_mounts.is_empty() {
-            let named: Vec<String> = over_mounts
-                .iter()
-                .take(3)
-                .map(|(pct, t)| format!("{t} {pct}%"))
-                .collect();
-            violations.push((
-                0,
-                "system".into(),
-                format!("disk {} above {}%", named.join(", "), cli.alert_disk.unwrap_or(0)),
-            ));
-        }
-    }
-    if let (Some(limit), Some(rate)) = (cli.alert_net, net_rate) {
-        if rate > limit as f64 {
-            violations.push((
-                0,
-                "system".into(),
-                format!("net {rate:.1} MB/s above {limit} MB/s"),
-            ));
-        }
-    }
-    if let Some(limit) = cli.alert_psi {
-        if let Some(psi) = &stats.psi {
-            let over: Vec<String> = [
-                ("cpu", psi.cpu_full),
-                ("mem", psi.mem_full),
-                ("io", psi.io_full),
-            ]
-            .into_iter()
-            .filter(|(_, v)| *v > limit as f64)
-            .map(|(r, v)| format!("{r} {v:.1}%"))
-            .collect();
-            if !over.is_empty() {
-                violations.push((
-                    0,
-                    "system".into(),
-                    format!("PSI full {} above {limit}%", over.join(", ")),
-                ));
-            }
-        }
-    }
-    if let Some(floor) = cli.alert_mem_avail_mb {
-        if let Some(a) = stats.mem_avail_mb {
-            if a < floor {
-                violations.push((
-                    0,
-                    "system".into(),
-                    format!("MemAvailable {a} MB below {floor} MB floor"),
-                ));
-            }
-        }
-    }
-    if let Some(limit) = cli.alert_swap_pct {
-        if let (Some(u), Some(t)) = (stats.swap_used_mb, stats.swap_total_mb) {
-            if t > 0 {
-                let pct = (u * 100) / t;
-                if pct > limit {
-                    violations.push((0, "system".into(), format!("swap {pct}% above {limit}%")));
-                }
-            }
-        }
-    }
-    if let (Some(limit), Some(rate)) = (cli.alert_retrans.map(|v| v as f64), retrans_rate) {
-        if rate > limit {
-            violations.push((
-                0,
-                "system".into(),
-                format!("TCP retransmits {rate:.0}/s above {limit:.0}/s"),
-            ));
-        }
-    }
-    if let (Some(limit), Some(rate)) = (cli.alert_nic_drop.map(|v| v as f64), drop_rate) {
-        if rate > limit {
-            violations.push((
-                0,
-                "system".into(),
-                format!("NIC drops {rate:.0}/s above {limit:.0}/s"),
-            ));
-        }
-    }
-    if let Some(limit) = cli.alert_oom {
-        if oom_in_window.is_some_and(|w| w >= limit) {
-            violations.push((
-                0,
-                "system".into(),
-                format!(
-                    "OOM killer {} kill(s) within the sample gap",
-                    oom_in_window.unwrap_or(0)
-                ),
-            ));
-        }
+    let mounts = if cli.alert_disk.is_some() {
+        platform.mount_usage()
+    } else {
+        Vec::new()
+    };
+    for detail in machine_check_lines(
+        cli,
+        &stats,
+        &mounts,
+        procs.len(),
+        net_rate,
+        drop_rate,
+        retrans_rate,
+        oom_in_window,
+    ) {
+        violations.push((0, "system".into(), detail));
     }
 
     if cli.json {
@@ -1216,6 +1398,217 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
             write_out(&format!("⚠ {who} — {detail}"));
         }
         write_out(&format!("{} violation(s)", violations.len()));
+    }
+    i32::from(!violations.is_empty())
+}
+
+/// The machine-wide half of `--check`, shared by the local run and the
+/// fleet run: every armed level/rate threshold judged against one
+/// snapshot, violation detail lines back (no host/pid wrapping — the
+/// caller wraps). Levels are single comparisons; the rates arrive
+/// pre-diffed by the caller (two samples, or two fetches, a second
+/// apart).
+fn machine_check_lines(
+    cli: &cli::Cli,
+    stats: &crate::platform::SystemStats,
+    mounts: &[crate::platform::MountUsage],
+    proc_count: usize,
+    net_rate: Option<f64>,
+    drop_rate: Option<f64>,
+    retrans_rate: Option<f64>,
+    oom_in_window: Option<u64>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(limit) = cli.alert_load {
+        if let Some(l) = stats.load1 {
+            if l > limit {
+                out.push(format!("load average {l:.2} above {limit}"));
+            }
+        }
+    }
+    if let Some(limit) = cli.alert_mem_pct {
+        if let (Some(u), Some(t)) = (stats.mem_used_mb, stats.mem_total_mb) {
+            if t > 0 {
+                let pct = (u * 100) / t;
+                if pct > limit {
+                    out.push(format!("RAM {pct}% above {limit}%"));
+                }
+            }
+        }
+    }
+    if let Some(limit) = cli.alert_count {
+        if proc_count > limit as usize {
+            out.push(format!("{proc_count} visible processes above {limit}"));
+        }
+    }
+    if cli.alert_disk.is_some() {
+        let mut over_mounts: Vec<(u64, &crate::platform::MountUsage)> = mounts
+            .iter()
+            .filter(|m| m.total_mb > 0)
+            .map(|m| ((m.used_mb * 100) / m.total_mb, m))
+            .filter(|(pct, _)| Some(*pct) > cli.alert_disk)
+            .collect();
+        over_mounts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.target.cmp(&b.1.target)));
+        if !over_mounts.is_empty() {
+            let named: Vec<String> = over_mounts
+                .iter()
+                .take(3)
+                .map(|(pct, m)| format!("{} {pct}%", m.target))
+                .collect();
+            out.push(format!(
+                "disk {} above {}%",
+                named.join(", "),
+                cli.alert_disk.unwrap_or(0)
+            ));
+        }
+    }
+    if let (Some(limit), Some(rate)) = (cli.alert_net, net_rate) {
+        if rate > limit as f64 {
+            out.push(format!("net {rate:.1} MB/s above {limit} MB/s"));
+        }
+    }
+    if let Some(limit) = cli.alert_psi {
+        if let Some(psi) = &stats.psi {
+            let over: Vec<String> = [
+                ("cpu", psi.cpu_full),
+                ("mem", psi.mem_full),
+                ("io", psi.io_full),
+            ]
+            .into_iter()
+            .filter(|(_, v)| *v > limit as f64)
+            .map(|(r, v)| format!("{r} {v:.1}%"))
+            .collect();
+            if !over.is_empty() {
+                out.push(format!("PSI full {} above {limit}%", over.join(", ")));
+            }
+        }
+    }
+    if let Some(floor) = cli.alert_mem_avail_mb {
+        if let Some(a) = stats.mem_avail_mb {
+            if a < floor {
+                out.push(format!("MemAvailable {a} MB below {floor} MB floor"));
+            }
+        }
+    }
+    if let Some(limit) = cli.alert_swap_pct {
+        if let (Some(u), Some(t)) = (stats.swap_used_mb, stats.swap_total_mb) {
+            if t > 0 {
+                let pct = (u * 100) / t;
+                if pct > limit {
+                    out.push(format!("swap {pct}% above {limit}%"));
+                }
+            }
+        }
+    }
+    if let (Some(limit), Some(rate)) = (cli.alert_retrans.map(|v| v as f64), retrans_rate) {
+        if rate > limit {
+            out.push(format!("TCP retransmits {rate:.0}/s above {limit:.0}/s"));
+        }
+    }
+    if let (Some(limit), Some(rate)) = (cli.alert_nic_drop.map(|v| v as f64), drop_rate) {
+        if rate > limit {
+            out.push(format!("NIC drops {rate:.0}/s above {limit:.0}/s"));
+        }
+    }
+    if let Some(limit) = cli.alert_oom {
+        if oom_in_window.is_some_and(|w| w >= limit) {
+            out.push(format!(
+                "OOM killer {} kill(s) within the sample gap",
+                oom_in_window.unwrap_or(0)
+            ));
+        }
+    }
+    out
+}
+
+/// The fleet one-shot: `--check --remote a,b,c` — two fetches a second
+/// apart per host (the same trick the local run uses), machine sentinels
+/// evaluated per host, every violation prefixed with its host. Exit 1
+/// when any host sits over a line.
+fn run_check_fleet(bases: &[String], cli: &cli::Cli) -> i32 {
+    if !fleet_machine_armed(cli) {
+        eprintln!(
+            "--check --remote evaluates the machine-wide --alert-* thresholds; arm at least one (e.g. --check --remote ... --alert-load 4)"
+        );
+        std::process::exit(4);
+    }
+    let sweep = || -> Vec<(String, Result<(Vec<Process>, Option<FleetSample>), String>)> {
+        bases
+            .iter()
+            .map(|b| (b.clone(), fetch_fleet(b)))
+            .collect()
+    };
+    let mut states: HashMap<String, history::SysAlertState> = HashMap::new();
+    // sweep 1 seeds every per-host cumulative counter — into the same
+    // per-host states sweep 2 diffs against
+    for (base, r) in sweep() {
+        if let Ok((_, Some(sample))) = r {
+            let st = states.entry(base).or_default();
+            let _ = fleet_rates(cli, &sample, st);
+        }
+    }
+    std::thread::sleep(Duration::from_secs(1));
+
+    let mut violations: Vec<(String, String)> = Vec::new(); // (host, detail)
+    let mut unreachable: Vec<String> = Vec::new();
+    for (base, r) in sweep() {
+        match r {
+            Ok((procs, Some(sample))) => {
+                let st = states.entry(base.clone()).or_default();
+                let (net_rate, drop_rate, retrans_rate, oom_window) =
+                    fleet_rates(cli, &sample, st);
+                for detail in machine_check_lines(
+                    cli,
+                    &sample.stats,
+                    &sample.mounts,
+                    procs.len(),
+                    net_rate,
+                    drop_rate,
+                    retrans_rate,
+                    oom_window,
+                ) {
+                    violations.push((base.clone(), detail));
+                }
+            }
+            Ok((_, None)) => unreachable.push(base.clone()),
+            Err(e) => {
+                violations.push((base.clone(), format!("fetch failed: {e}")));
+            }
+        }
+    }
+
+    if cli.json {
+        let doc = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": util::now_unix(),
+            "violations": violations
+                .iter()
+                .map(|(host, detail)| serde_json::json!({
+                    "host": host,
+                    "pid": 0,
+                    "name": "system",
+                    "detail": detail,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+    } else if violations.is_empty() {
+        write_out(&format!(
+            "✔ all armed checks clean across {} host(s)",
+            bases.len()
+        ));
+    } else {
+        for (host, detail) in &violations {
+            write_out(&format!("⚠ [{host}] system — {detail}"));
+        }
+        write_out(&format!("{} violation(s)", violations.len()));
+    }
+    if !unreachable.is_empty() {
+        eprintln!(
+            "⚠ {} host(s) predate the machine snapshot (old witr-rs --serve): {}",
+            unreachable.len(),
+            unreachable.join(", ")
+        );
     }
     i32::from(!violations.is_empty())
 }
@@ -1880,6 +2273,204 @@ pub(crate) fn parse_record_system(text: &str) -> Result<Vec<SysPoint>, String> {
     Ok(out)
 }
 
+/// One per-process sample from a record file: who, when, how much CPU —
+/// the heatmap feed (the machine-only `_system` rows carry none of this).
+pub(crate) struct ProcSample {
+    pub(crate) at: i64,
+    pub(crate) pid: Pid,
+    pub(crate) name: String,
+    pub(crate) cpu: Option<f64>,
+}
+
+/// The per-process rows of a record file (either format). Empty when the
+/// recording carried no process rows — the caller notes the heatmap as
+/// skipped instead of failing the whole plot.
+pub(crate) fn parse_record_processes(text: &str) -> Vec<ProcSample> {
+    let mut out = Vec::new();
+    let mut lines = text.lines().peekable();
+    if let Some(first) = lines.peek() {
+        if first.starts_with("timestamp,") {
+            let header: Vec<&str> = first.split(',').collect();
+            let col = |name: &str| header.iter().position(|c| *c == name);
+            if let (Some(t), Some(pid)) = (col("timestamp"), col("pid")) {
+                let (name, cpu) = (col("name"), col("cpu_pct"));
+                for line in lines {
+                    let f: Vec<&str> = line.split(',').collect();
+                    if f.len() <= t.max(pid) || f[pid] == "_system" {
+                        continue;
+                    }
+                    let Ok(at) = f[t].trim().parse::<i64>() else {
+                        continue;
+                    };
+                    let Ok(id) = f[pid].trim().parse::<i64>() else {
+                        continue;
+                    };
+                    if id < 0 {
+                        continue;
+                    }
+                    out.push(ProcSample {
+                        at,
+                        pid: id as Pid,
+                        name: name
+                            .and_then(|i| f.get(i))
+                            .map(|s| s.to_string())
+                            .unwrap_or_default(),
+                        cpu: cpu
+                            .and_then(|i| f.get(i))
+                            .and_then(|v| v.trim().parse().ok()),
+                    });
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        // JSONL: the processes array rides every envelope
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(ps) = v.get("processes").and_then(|p| p.as_array()) else {
+                continue;
+            };
+            let Some(at) = v.get("generated_at").and_then(|x| x.as_i64()) else {
+                continue;
+            };
+            for p in ps {
+                let pid = p.get("pid").and_then(|x| x.as_i64()).unwrap_or(-1);
+                if pid < 0 {
+                    continue;
+                }
+                out.push(ProcSample {
+                    at,
+                    pid: pid as Pid,
+                    name: p
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    cpu: p.get("cpu_pct").and_then(|x| x.as_f64()),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The cpu% heat color: dark at zero, blue as it wakes up, yellow when
+/// it's working, red at saturation — one scale, no legend gymnastics.
+fn heat_color(v: f64) -> String {
+    let stops: [(f64, (u8, u8, u8)); 4] = [
+        (0.0, (26, 39, 51)),
+        (20.0, (77, 195, 255)),
+        (60.0, (252, 196, 25)),
+        (100.0, (255, 107, 107)),
+    ];
+    let v = v.clamp(0.0, 100.0);
+    let mut lo = stops[0];
+    let mut hi = stops[stops.len() - 1];
+    for pair in stops.windows(2) {
+        if v >= pair[0].0 && v <= pair[1].0 {
+            lo = pair[0];
+            hi = pair[1];
+            break;
+        }
+    }
+    let f = if hi.0 > lo.0 {
+        (v - lo.0) / (hi.0 - lo.0)
+    } else {
+        0.0
+    };
+    let mix = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * f).round() as u8;
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        mix(lo.1 .0, hi.1 .0),
+        mix(lo.1 .1, hi.1 .1),
+        mix(lo.1 .2, hi.1 .2)
+    )
+}
+
+/// The top-identities × time CPU% heatmap: rows ranked by total CPU over
+/// the file, one cell per sample. Bursts get a face — which process was
+/// the spike — that the machine-level curves can't name.
+fn proc_heatmap_svg(samples: &[ProcSample]) -> String {
+    // rank identities by total cpu across the file, keep the top 12
+    let mut totals: std::collections::HashMap<Pid, (String, f64)> =
+        std::collections::HashMap::new();
+    for s in samples.iter().filter(|s| s.cpu.is_some()) {
+        totals
+            .entry(s.pid)
+            .and_modify(|(n, t)| {
+                *t += s.cpu.unwrap_or(0.0);
+                if n.is_empty() {
+                    *n = s.name.clone();
+                }
+            })
+            .or_insert((s.name.clone(), s.cpu.unwrap_or(0.0)));
+    }
+    let mut top: Vec<(Pid, String, f64)> = totals
+        .into_iter()
+        .map(|(pid, (name, t))| (pid, name, t))
+        .collect();
+    top.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    top.truncate(12);
+    if top.is_empty() {
+        return String::new();
+    }
+    let t0 = samples.iter().map(|s| s.at).min().unwrap_or(0);
+    let t1 = samples.iter().map(|s| s.at).max().unwrap_or(t0).max(t0 + 1);
+    let peak = samples.iter().filter_map(|s| s.cpu).fold(0.0f64, f64::max);
+    let (w, label_w, cell_h, top_h) = (900.0, 170.0, 20.0, 30.0);
+    let rows = top.len() as f64;
+    let h = top_h + cell_h * rows + 24.0;
+    let span = (t1 - t0).max(1) as f64;
+    let x = |t: i64| label_w + (t - t0) as f64 / span * (w - label_w - 12.0);
+    let at = |t: i64| crate::util::fmt_time(t).get(11..16).unwrap_or("").to_string();
+    let rank = |pid: Pid| top.iter().position(|(p, _, _)| *p == pid);
+
+    let mut svg = format!(
+        "<div style=\"display:inline-block;margin:8px\"><svg width=\"{w}\" height=\"{h:.0}\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"ui-monospace,Menlo,monospace\">\
+<text x=\"6\" y=\"14\" font-size=\"12\" fill=\"#8899a6\">top {} processes · cpu % · peak {peak:.1}%</text>",
+        top.len()
+    );
+    for (i, (_, name, total)) in top.iter().enumerate() {
+        let y = top_h + cell_h * i as f64;
+        svg.push_str(&format!(
+            "<text x=\"4\" y=\"{:.1}\" font-size=\"11\" fill=\"#e1e8ed\">{} ({total:.0}%)</text>",
+            y + 14.0,
+            crate::render::html_escape(name)
+        ));
+    }
+    for s in samples {
+        let Some(ri) = rank(s.pid) else {
+            continue;
+        };
+        let Some(v) = s.cpu else {
+            continue;
+        };
+        // half-cell-wide tiles with a 1px gutter — reads as a grid, keeps
+        // the SVG from doubling as a wall of fill
+        let cw = ((w - label_w - 12.0) / span * 1000.0).max(2.0) / 1000.0;
+        let x1 = x(s.at);
+        let y = top_h + cell_h * ri as f64;
+        svg.push_str(&format!(
+            "<rect x=\"{x1:.1}\" y=\"{y:.1}\" width=\"{cw:.1}\" height=\"{:.1}\" fill=\"{}\"><title>{} (pid {}) · {} · {v:.1}%</title></rect>",
+            cell_h - 2.0,
+            heat_color(v),
+            crate::render::html_escape(&s.name),
+            s.pid,
+            at(s.at),
+        ));
+    }
+    svg.push_str(&format!(
+        "<text x=\"{label_w}\" y=\"{h:.0}\" font-size=\"10\" fill=\"#657786\">{}</text>\
+<text x=\"{w:.0}\" y=\"{h:.0}\" font-size=\"10\" fill=\"#657786\" text-anchor=\"end\">{}</text>\
+</svg></div>",
+        at(t0),
+        at(t1),
+    ));
+    svg
+}
+
 /// One inline-SVG line chart of `values` (None gaps skipped), w×h, with a
 /// last-value label. Self-contained: polyline + text only.
 fn svg_series(name: &str, unit: &str, values: &[Option<f64>], t0: i64, t1: i64) -> String {
@@ -1922,8 +2513,9 @@ fn svg_series(name: &str, unit: &str, values: &[Option<f64>], t0: i64, t1: i64) 
 }
 
 /// `--plot`: the self-contained HTML — a dark page with one chart per
-/// series the record actually carried.
-fn plot_html(points: &[SysPoint]) -> String {
+/// series the record actually carried, plus the per-process heatmap when
+/// the file has process rows.
+fn plot_html(points: &[SysPoint], proc_samples: &[ProcSample]) -> String {
     let t0 = points.first().map(|p| p.at).unwrap_or(0);
     let t1 = points.last().map(|p| p.at).unwrap_or(0);
     let col = |f: fn(&SysPoint) -> Option<f64>| -> Vec<Option<f64>> {
@@ -1945,10 +2537,18 @@ fn plot_html(points: &[SysPoint]) -> String {
     // process count is a plain usize series — same chart shape
     let procs: Vec<Option<f64>> = points.iter().map(|p| Some(p.procs as f64)).collect();
     charts.push_str(&svg_series("processes", "", &procs, t0, t1));
+    // the per-process heatmap — the burst's face. Absent rows note the
+    // skip rather than failing the machine charts.
+    let heatmap_note = if proc_samples.is_empty() {
+        "<p style=\"color:#657786\">no per-process rows in this recording — the heatmap is skipped (record with --watch 5 --record file.csv to feed it)</p>"
+    } else {
+        ""
+    };
+    let heatmap = proc_heatmap_svg(proc_samples);
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>witr-rs plot</title>\
 <style>body{{background:#15202b;font-family:ui-monospace,Menlo,monospace;color:#e1e8ed;margin:24px}}</style>\
-</head><body><h3>witr-rs · {} samples · {} – {}</h3><div>{charts}</div></body></html>",
+</head><body><h3>witr-rs · {} samples · {} – {}</h3><div>{charts}</div>{heatmap}{heatmap_note}</body></html>",
         points.len(),
         crate::util::fmt_time(t0),
         crate::util::fmt_time(t1),
@@ -2062,6 +2662,293 @@ fn plot_html_multi(named: &[(String, Vec<SysPoint>)]) -> String {
 <div style=\"margin-bottom:8px\">{legend}</div><div>{charts}</div></body></html>",
         crate::util::fmt_time(t0),
         crate::util::fmt_time(t1),
+    )
+}
+
+/// `--plot-events`: parse a `--events-log` JSONL file — one TuiEvent per
+/// line, append order. Fleet lines carry an extra `host` field (serde
+/// ignores unknown fields) and broken lines skip — it's a log, not a
+/// contract.
+fn parse_events_jsonl(text: &str) -> Vec<history::TuiEvent> {
+    text.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// One process's life as the log saw it: a pid from its start (or the
+/// log's first moment, if it was already running) to its exit, a restart
+/// (the identity came back under a new pid), or the log's end (still
+/// running when recording stopped).
+struct LifeSeg {
+    name: String,
+    pid: Pid,
+    from: i64,
+    to: i64,
+    /// "started" (alive at log end) | "exited" | "restarted"
+    end: &'static str,
+}
+
+/// Rebuild the lifecycles from the log's lifecycle events. The log is
+/// append-ordered but sort defensively; restarted events close every
+/// open bar of the same identity (the detail names the old pid, but
+/// matching by name is what survives a lost birth), and deaths with no
+/// observed birth draw from the log's start — alive when the log began.
+fn lifecycle_segments(events: &[history::TuiEvent], t_start: i64, t_end: i64) -> Vec<LifeSeg> {
+    let mut evs: Vec<&history::TuiEvent> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind.as_str(),
+                "started" | "exited" | "restarted"
+            )
+        })
+        .collect();
+    evs.sort_by_key(|e| e.at_unix);
+    let mut open: std::collections::HashMap<Pid, (String, i64)> = std::collections::HashMap::new();
+    let mut segs = Vec::new();
+    for e in evs {
+        match e.kind.as_str() {
+            "started" => {
+                open.insert(e.pid, (e.name.clone(), e.at_unix));
+            }
+            "restarted" => {
+                let same: Vec<Pid> = open
+                    .iter()
+                    .filter(|(_, (n, _))| *n == e.name)
+                    .map(|(p, _)| *p)
+                    .collect();
+                for p in same {
+                    if let Some((name, from)) = open.remove(&p) {
+                        segs.push(LifeSeg {
+                            name,
+                            pid: p,
+                            from,
+                            to: e.at_unix.max(from),
+                            end: "restarted",
+                        });
+                    }
+                }
+                open.insert(e.pid, (e.name.clone(), e.at_unix));
+            }
+            _ => {
+                // exited — with or without an observed birth
+                let (name, from) = open
+                    .remove(&e.pid)
+                    .unwrap_or((e.name.clone(), t_start));
+                segs.push(LifeSeg {
+                    name,
+                    pid: e.pid,
+                    from,
+                    to: e.at_unix.max(from),
+                    end: "exited",
+                });
+            }
+        }
+    }
+    for (pid, (name, from)) in open {
+        segs.push(LifeSeg {
+            name,
+            pid,
+            from,
+            to: t_end,
+            end: "started",
+        });
+    }
+    segs.sort_by(|a, b| a.from.cmp(&b.from).then_with(|| a.pid.cmp(&b.pid)));
+    segs
+}
+
+/// `--plot-events`: the self-contained HTML — a gantt of every identity's
+/// lifecycle bars (restart deaths get a red tick, alerts a yellow one),
+/// a system lane for the machine/container events, HH:MM axis. Zero JS,
+/// zero external assets, double-clickable offline.
+fn plot_events_html(events: &[history::TuiEvent], sources: &[String]) -> String {
+    let t0 = events.iter().map(|e| e.at_unix).min().unwrap_or(0);
+    let t1 = events
+        .iter()
+        .map(|e| e.at_unix)
+        .max()
+        .unwrap_or(t0)
+        .max(t0 + 1);
+    let segs = lifecycle_segments(events, t0, t1);
+
+    // rows: one identity per row, first-seen order (already sorted by
+    // from via the segments), capped — a fork storm shouldn't own the page
+    const MAX_ROWS: usize = 30;
+    let mut row_names: Vec<String> = Vec::new();
+    for s in &segs {
+        if !row_names.contains(&s.name) {
+            row_names.push(s.name.clone());
+        }
+    }
+    let hidden = row_names.len().saturating_sub(MAX_ROWS);
+    row_names.truncate(MAX_ROWS);
+
+    // alerts and container edges: pin to their identity's row when the
+    // name matches, otherwise the system lane at the top
+    let is_marker_kind = |k: &str| {
+        matches!(
+            k,
+            "alert" | "recovered" | "container-death" | "container-health" | "container-events"
+        )
+    };
+    let mut markers: Vec<(String, i64, &'static str)> = Vec::new(); // (name, at, color-key)
+    let mut system_markers: Vec<(i64, &'static str, String)> = Vec::new(); // (at, key, name)
+    for e in events.iter().filter(|e| is_marker_kind(&e.kind)) {
+        if row_names.contains(&e.name) {
+            let key = match e.kind.as_str() {
+                "alert" => "alert",
+                "recovered" => "recovered",
+                _ => "container",
+            };
+            markers.push((e.name.clone(), e.at_unix, key));
+        } else {
+            let key = match e.kind.as_str() {
+                "alert" => "alert",
+                "recovered" => "recovered",
+                _ => "container",
+            };
+            system_markers.push((e.at_unix, key, e.name.clone()));
+        }
+    }
+
+    // geometry: label column + timeline, one row per identity, the
+    // system lane on top
+    let (w, label_w, row_h, top) = (1280.0, 200.0, 22.0, 46.0);
+    let span = (t1 - t0).max(1) as f64;
+    let x = |t: i64| label_w + (t - t0) as f64 / span * (w - label_w - 20.0);
+    let at = |t: i64| crate::util::fmt_time(t).get(11..16).unwrap_or("").to_string();
+
+    let mut svg = String::new();
+    svg.push_str(&format!(
+        "<svg width=\"{w}\" height=\"{}\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"ui-monospace,Menlo,monospace\">",
+        (top + row_h * (row_names.len() + 1) as f64 + 30.0) as i32
+    ));
+    // time axis: ~6 HH:MM ticks
+    for i in 0..=6 {
+        let t = t0 + (span as i64) * i as i64 / 6;
+        let px = x(t);
+        svg.push_str(&format!(
+            "<line x1=\"{px:.1}\" y1=\"{top}\" x2=\"{px:.1}\" y2=\"{}\" stroke=\"#22303c\"/>\
+<text x=\"{px:.1}\" y=\"{}\" font-size=\"10\" fill=\"#657786\" text-anchor=\"middle\">{}</text>",
+            top + row_h * (row_names.len() + 1) as f64,
+            top - 6.0,
+            at(t),
+        ));
+    }
+    // the system lane (machine alerts + container edges that name no row)
+    let sys_y = top + 6.0;
+    svg.push_str(&format!(
+        "<text x=\"4\" y=\"{}\" font-size=\"11\" fill=\"#8899a6\">system / containers</text>",
+        sys_y + 12.0
+    ));
+    for (t, key, name) in &system_markers {
+        let (color, shape) = match *key {
+            "alert" => ("#fcc419", "M0,-6 L5,4 L-5,4 Z"),
+            "recovered" => ("#51cf66", "M0,-5 L4,0 L0,5 L-4,0 Z"),
+            _ => ("#cc5de8", "M-4,-4 L4,-4 L4,4 L-4,4 Z"),
+        };
+        let px = x(*t);
+        svg.push_str(&format!(
+            "<path d=\"{shape}\" transform=\"translate({px:.1},{:.1})\" fill=\"{color}\"><title>{} {}</title></path>",
+            sys_y + 9.0,
+            crate::util::fmt_time(*t),
+            name
+        ));
+    }
+    // identity rows
+    let mut body = String::new();
+    for (ri, name) in row_names.iter().enumerate() {
+        let y = top + row_h * (ri + 1) as f64;
+        // greedy sub-lanes so overlapping instances of one identity don't
+        // overdraw (an nginx master + its workers share the name)
+        let mut lanes: Vec<i64> = Vec::new(); // lane → free-from time
+        let row_segs: Vec<&LifeSeg> = segs.iter().filter(|s| &s.name == name).collect();
+        let mut placed: Vec<(usize, &LifeSeg)> = Vec::new();
+        for s in &row_segs {
+            let lane = lanes
+                .iter()
+                .position(|free| s.from >= *free)
+                .unwrap_or(lanes.len());
+            if lane == lanes.len() {
+                lanes.push(0);
+            }
+            lanes[lane] = s.to;
+            placed.push((lane, s));
+        }
+        body.push_str(&format!(
+            "<text x=\"4\" y=\"{:.1}\" font-size=\"11\" fill=\"#e1e8ed\">{}</text>",
+            y + 13.0,
+            crate::render::html_escape(name)
+        ));
+        for (lane, s) in &placed {
+            let (color, tag) = match s.end {
+                "started" => ("#51cf66", "alive"),
+                "exited" => ("#657786", "exited"),
+                _ => ("#ff922b", "restarted"),
+            };
+            let x1 = x(s.from);
+            let x2 = x(s.to).max(x1 + 2.0);
+            let by = y + 4.0 + *lane as f64 * 14.0;
+            body.push_str(&format!(
+                "<rect x=\"{x1:.1}\" y=\"{by:.1}\" width=\"{:.1}\" height=\"10\" rx=\"2\" fill=\"{color}\" fill-opacity=\"0.75\"><title>{} (pid {}) · {} – {} · {tag}</title></rect>",
+                x2 - x1,
+                crate::render::html_escape(&s.name),
+                s.pid,
+                at(s.from),
+                at(s.to),
+            ));
+        }
+        // alert/recovery markers on this row
+        for (mname, t, key) in markers.iter().filter(|(n, _, _)| n == name) {
+            let (color, shape) = match *key {
+                "alert" => ("#fcc419", "M0,-6 L5,4 L-5,4 Z"),
+                _ => ("#51cf66", "M0,-5 L4,0 L0,5 L-4,0 Z"),
+            };
+            let px = x(*t);
+            body.push_str(&format!(
+                "<path d=\"{shape}\" transform=\"translate({px:.1},{:.1})\" fill=\"{color}\"><title>{} {mname}</title></path>",
+                y + 12.0,
+                at(*t),
+            ));
+        }
+    }
+    svg.push_str(&body);
+    svg.push_str("</svg>");
+
+    let counts = |k: &str| events.iter().filter(|e| e.kind == k).count();
+    let legend = "\
+<span style=\"margin-right:16px\"><span style=\"color:#51cf66\">■</span> alive at log end</span>\
+<span style=\"margin-right:16px\"><span style=\"color:#657786\">■</span> exited</span>\
+<span style=\"margin-right:16px\"><span style=\"color:#ff922b\">■</span> restarted</span>\
+<span style=\"margin-right:16px\"><span style=\"color:#fcc419\">▲</span> alert</span>\
+<span style=\"margin-right:16px\"><span style=\"color:#51cf66\">◆</span> recovered</span>\
+<span style=\"margin-right:16px\"><span style=\"color:#cc5de8\">■</span> container</span>";
+    let counts_line = format!(
+        "{} started · {} exited · {} restarted · {} alerts · {} container edges",
+        counts("started"),
+        counts("exited"),
+        counts("restarted"),
+        counts("alert"),
+        counts("container-death") + counts("container-health") + counts("container-events"),
+    );
+    let more_line = if hidden > 0 {
+        format!("<p style=\"color:#657786\">+{hidden} more identities beyond the first {MAX_ROWS} rows</p>")
+    } else {
+        String::new()
+    };
+    let srcs = sources.join(" · ");
+    let t0_s = crate::util::fmt_time(t0);
+    let t1_s = crate::util::fmt_time(t1);
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>witr-rs events</title>\
+<style>body{{background:#15202b;font-family:ui-monospace,Menlo,monospace;color:#e1e8ed;margin:24px}}</style>\
+</head><body><h3>witr-rs events · {srcs} · {t0_s} – {t1_s}</h3>\
+<div style=\"margin-bottom:8px\">{counts_line}</div>\
+<div style=\"margin-bottom:8px\">{legend}</div>\
+<div>{svg}</div>\
+{more_line}\
+</body></html>"
     )
 }
 
@@ -2871,12 +3758,22 @@ fn main() {
     // cron+mail health checks and pre-deploy gates run the same
     // thresholds the --watch loop patrols.
     if cli.check {
-        if !specs.is_empty() || cli.interactive {
-            eprintln!("--check sweeps the whole machine; drop the targets or -i");
+        if cli.interactive {
+            eprintln!("--check sweeps the whole machine; drop -i");
             std::process::exit(4);
         }
         if cli.watch.is_some() {
             eprintln!("--check is one pass; plain --watch already patrols continuously");
+            std::process::exit(4);
+        }
+        if !cli.remote.is_empty() {
+            // the fleet one-shot: machine sentinels judged per host
+            reject_fleet_per_process_alerts(&cli);
+            let bases = cli.remote.clone();
+            std::process::exit(run_check_fleet(&bases, &cli));
+        }
+        if !specs.is_empty() {
+            eprintln!("--check sweeps the whole machine; drop the targets");
             std::process::exit(4);
         }
         let platform = platform::get();
@@ -2895,7 +3792,7 @@ fn main() {
             eprintln!("--plot writes one chart and exits; drop --watch");
             std::process::exit(4);
         }
-        let mut named: Vec<(String, Vec<SysPoint>)> = Vec::new();
+        let mut named: Vec<(String, String, Vec<SysPoint>)> = Vec::new(); // (path, text, points)
         for path in &cli.plot {
             let text = match std::fs::read_to_string(path) {
                 Ok(t) => t,
@@ -2911,18 +3808,19 @@ fn main() {
                     std::process::exit(5);
                 }
             };
-            named.push((path.clone(), points));
+            named.push((path.clone(), text, points));
         }
         let (out, html, total) = if named.len() == 1 {
-            let (path, points) = &named[0];
-            (format!("{path}.html"), plot_html(points), points.len())
+            let (path, text, points) = &named[0];
+            let samples = parse_record_processes(text);
+            (format!("{path}.html"), plot_html(points, &samples), points.len())
         } else {
-            let total: usize = named.iter().map(|(_, p)| p.len()).sum();
-            (
-                "witr-plot.html".to_string(),
-                plot_html_multi(&named),
-                total,
-            )
+            let total: usize = named.iter().map(|(_, _, p)| p.len()).sum();
+            let pairs: Vec<(String, Vec<SysPoint>)> = named
+                .iter()
+                .map(|(p, _, pts)| (p.clone(), pts.clone()))
+                .collect();
+            ("witr-plot.html".to_string(), plot_html_multi(&pairs), total)
         };
         if let Err(e) = std::fs::write(&out, &html) {
             eprintln!("--plot: cannot write {out}: {e}");
@@ -2932,6 +3830,56 @@ fn main() {
             "plot: {} file{}, {total} samples → {out}",
             named.len(),
             if named.len() == 1 { "" } else { "s" },
+        ));
+        return;
+    }
+
+    // --plot-events: render --events-log files into a self-contained HTML
+    // lifecycle timeline (gantt) — a no-target operation like --plot.
+    if !cli.plot_events.is_empty() {
+        if !specs.is_empty() || cli.interactive {
+            eprintln!("--plot-events renders event logs; drop the targets or -i");
+            std::process::exit(4);
+        }
+        if cli.watch.is_some() {
+            eprintln!("--plot-events writes one chart and exits; drop --watch");
+            std::process::exit(4);
+        }
+        let mut events = Vec::new();
+        for path in &cli.plot_events {
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("--plot-events {path}: {e}");
+                    std::process::exit(5);
+                }
+            };
+            events.extend(parse_events_jsonl(&text));
+        }
+        if events.is_empty() {
+            eprintln!(
+                "--plot-events: no events parsed — is this a --events-log JSONL file?"
+            );
+            std::process::exit(5);
+        }
+        let (out, html) = if cli.plot_events.len() == 1 {
+            let path = &cli.plot_events[0];
+            (format!("{path}.html"), plot_events_html(&events, &cli.plot_events))
+        } else {
+            (
+                "witr-events.html".to_string(),
+                plot_events_html(&events, &cli.plot_events),
+            )
+        };
+        if let Err(e) = std::fs::write(&out, &html) {
+            eprintln!("--plot-events: cannot write {out}: {e}");
+            std::process::exit(5);
+        }
+        write_out(&format!(
+            "events: {} file{}, {} events → {out}",
+            cli.plot_events.len(),
+            if cli.plot_events.len() == 1 { "" } else { "s" },
+            events.len(),
         ));
         return;
     }
@@ -4652,6 +5600,126 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn record_processes_parse_from_both_formats_for_the_heatmap() {
+        // CSV: per-process rows feed it, _system rows don't
+        let csv = "\
+timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_pct,sys_procs,sys_net_bps
+1700000000,_system,,,.0,.0,,,,0.5,10,2,0.0
+1700000000,3,root,worker,42.5,100,,,,,,,,
+1700000000,4,root,other,0.0,50,,,,,,,,
+";
+        let s = parse_record_processes(csv);
+        assert_eq!(s.len(), 2, "the _system row carries no process");
+        assert_eq!((s[0].pid, s[0].name.as_str()), (3, "worker"));
+        assert_eq!(s[0].cpu, Some(42.5));
+        // JSONL: the processes array rides each envelope
+        let jsonl = "\
+{\"schema_version\":1,\"generated_at\":1700000000,\"process_count\":1,\"system\":{\"load1\":0.1},\"processes\":[{\"pid\":9,\"name\":\"beacon\",\"cpu_pct\":12.5}]}
+{\"schema_version\":1,\"generated_at\":1700000005,\"process_count\":1,\"system\":null,\"processes\":[]}
+";
+        let s = parse_record_processes(jsonl);
+        assert_eq!(s.len(), 1, "empty process arrays contribute nothing");
+        assert_eq!((s[0].pid, s[0].name.as_str(), s[0].cpu), (9, "beacon", Some(12.5)));
+    }
+
+    #[test]
+    fn heat_color_climbs_from_dark_to_red() {
+        assert_eq!(heat_color(0.0), "#1a2733");
+        assert_eq!(heat_color(100.0), "#ff6b6b");
+        // and the walk is monotonic in redness: a hotter cell is never
+        // less red than a cooler one (sampled across the stops)
+        let redness = |v: f64| u8::from_str_radix(&heat_color(v)[1..3], 16).unwrap();
+        let vs = [5.0, 30.0, 70.0, 95.0];
+        for w in vs.windows(2) {
+            assert!(redness(w[0]) < redness(w[1]), "{} → {}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn proc_heatmap_names_the_burst_process() {
+        let sample = |at: i64, pid: i32, name: &str, cpu: f64| ProcSample {
+            at,
+            pid,
+            name: name.into(),
+            cpu: Some(cpu),
+        };
+        let samples = vec![
+            sample(100, 1, "idle", 1.0),
+            sample(100, 2, "hog", 90.0),
+            sample(200, 2, "hog", 95.0),
+            sample(200, 1, "idle", 2.0),
+        ];
+        let svg = proc_heatmap_svg(&samples);
+        assert!(svg.contains("hog (185%)"), "the top row names the hog: {svg}");
+        assert!(svg.contains("peak 95.0%"), "{svg}");
+        assert!(svg.contains("idle (3%)"), "the low row still exists: {svg}");
+        assert!(
+            svg.contains("fill=\"#ff7") || svg.contains("fill=\"#fe"),
+            "hot cells sit in the red family: {svg}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_segments_rebuild_lives_from_the_log() {
+        let ev = |at: i64, kind: &str, pid: i32, name: &str| crate::history::TuiEvent {
+            at_unix: at,
+            kind: kind.into(),
+            pid,
+            name: name.into(),
+            detail: String::new(),
+        };
+        let events = vec![
+            // a daemon that restarts once and lives on, a worker that was
+            // already running when the log began and dies mid-log, and a
+            // short-lived process that exits after its birth
+            ev(100, "started", 10, "nginx"),
+            ev(100, "started", 20, "worker"),
+            ev(150, "exited", 20, "worker"),
+            ev(200, "restarted", 30, "nginx"),
+            ev(300, "started", 40, "init"),
+        ];
+        let segs = lifecycle_segments(&events, 100, 300);
+        let find = |pid: i32| segs.iter().find(|s| s.pid == pid).unwrap();
+        // the restart closes the old bar (end=restarted) and opens the new
+        let old = find(10);
+        assert_eq!((old.from, old.to), (100, 200));
+        assert_eq!(old.end, "restarted");
+        let new = find(30);
+        assert_eq!((new.from, new.to), (200, 300));
+        assert_eq!(new.end, "started"); // alive at log end
+        // a death with no observed birth draws from the log's start
+        let orphan = find(20);
+        assert_eq!((orphan.from, orphan.to), (100, 150));
+        assert_eq!(orphan.end, "exited");
+    }
+
+    #[test]
+    fn plot_events_html_renders_rows_markers_and_the_system_lane() {
+        let ev = |at: i64, kind: &str, pid: i32, name: &str| crate::history::TuiEvent {
+            at_unix: at,
+            kind: kind.into(),
+            pid,
+            name: name.into(),
+            detail: String::new(),
+        };
+        let events = vec![
+            ev(100, "started", 10, "nginx"),
+            ev(120, "alert", 10, "nginx"),
+            ev(140, "recovered", 10, "nginx"),
+            ev(160, "restarted", 11, "nginx"),
+            ev(180, "container-death", 0, "container web"),
+            ev(200, "alert", 0, "system"), // no matching row → system lane
+        ];
+        let html = plot_events_html(&events, &["/tmp/e.jsonl".to_string()]);
+        assert!(html.contains("nginx"), "identity row label");
+        assert!(html.contains("system / containers"), "system lane");
+        assert!(html.contains("alive at log end"), "legend");
+        assert!(html.contains("1 restarted"), "counts line");
+        assert!(html.contains("fcc419"), "alert marker color");
+        assert!(html.contains("#ff922b"), "restart bar color");
+        assert!(!html.contains("<script"), "zero JS");
+    }
     use super::*;
 
     #[test]
@@ -4979,7 +6047,7 @@ mod tests {
             SysPoint { at: 1_700_000_100, cpu: Some(12.5), mem_pct: Some(40.0), load1: Some(0.5), procs: 210, net_bps: Some(1_048_576.0) },
             SysPoint { at: 1_700_000_160, cpu: Some(25.0), mem_pct: Some(50.0), load1: Some(1.0), procs: 220, net_bps: None },
         ];
-        let html = plot_html(&pts);
+        let html = plot_html(&pts, &[]);
         assert!(html.starts_with("<!doctype html>"));
         assert!(
             html.contains("2 samples"),
@@ -5222,6 +6290,89 @@ mod tests {
         let cli = cli::Cli::parse_from(["witr", "--check", "--alert-mem", "999999", "--alert-load", "40"]);
         let code = run_check_once(&CheckPlatform, &cli);
         assert_eq!(code, 0, "everything under its line");
+    }
+
+    #[test]
+    fn fleet_snapshot_round_trips_into_the_local_sentinels() {
+        let stats = crate::platform::SystemStats {
+            load1: Some(7.25),
+            cpu_percent: Some(42.0),
+            mem_used_mb: Some(8000),
+            mem_total_mb: Some(16000),
+            mem_avail_mb: Some(4000),
+            swap_used_mb: Some(512),
+            swap_total_mb: Some(4096),
+            psi: Some(crate::platform::PsiStats {
+                cpu_some: 1.0,
+                cpu_full: 0.0,
+                mem_some: 2.0,
+                mem_full: 3.0,
+                io_some: 4.0,
+                io_full: 5.0,
+            }),
+            retrans_segs: Some(12345),
+            oom_kills: Some(2),
+            ..Default::default()
+        };
+        let nics = vec![crate::platform::NicCounters {
+            name: "eth0".into(),
+            rx_bytes: 100,
+            tx_bytes: 200,
+            rx_drops: 3,
+            tx_drops: 4,
+            ..Default::default()
+        }];
+        let mounts = vec![crate::platform::MountUsage {
+            target: "/data".into(),
+            total_mb: 10_000,
+            used_mb: 6_000,
+        }];
+        let doc = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "system": crate::serve::system_snapshot(&stats, &nics, &mounts, 42),
+            "processes": [],
+        });
+        let sample = parse_system_snapshot(&doc).expect("the system key parses");
+        let s = &sample.stats;
+        assert_eq!(s.load1, Some(7.25));
+        assert_eq!(s.mem_used_mb, Some(8000));
+        assert_eq!(s.psi.as_ref().map(|p| p.io_full), Some(5.0));
+        assert_eq!(s.retrans_segs, Some(12345));
+        assert_eq!(s.oom_kills, Some(2));
+        assert_eq!(sample.net, Some((100, 200, 7))); // (rx, tx, drops folded)
+        assert_eq!(sample.mounts[0].target, "/data");
+        // a server without the snapshot (or a null one) disarms cleanly
+        assert!(parse_system_snapshot(&serde_json::json!({"processes": []})).is_none());
+        assert!(parse_system_snapshot(&serde_json::json!({"system": null})).is_none());
+    }
+
+    #[test]
+    fn fleet_sentinels_fire_per_host_with_local_machinery() {
+        let cli = cli::Cli::parse_from([
+            "witr", "--remote", "http://h1:9100", "--watch", "3", "--alert-load", "4",
+        ]);
+        let sample = FleetSample {
+            stats: crate::platform::SystemStats {
+                load1: Some(9.0),
+                ..Default::default()
+            },
+            net: None,
+            mounts: Vec::new(),
+        };
+        let mut st = history::SysAlertState::default();
+        for _ in 0..history::ALERT_CYCLES - 1 {
+            assert!(
+                fleet_alert_picks(&cli, &sample, 10, &mut st, 3).is_empty(),
+                "no fire before the window completes"
+            );
+        }
+        let picks = fleet_alert_picks(&cli, &sample, 10, &mut st, 3);
+        assert_eq!(picks.len(), 1, "{picks:?}");
+        assert!(
+            picks[0].1.contains("load average 9.00 above 4"),
+            "{}",
+            picks[0].1
+        );
     }
 
     #[test]

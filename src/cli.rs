@@ -571,8 +571,8 @@ pub struct Cli {
     #[arg(
         long = "check",
         help = t(
-            "一次性体检：单次采样评估全部已武装的 --alert-* 阈值（速率类采样两次、间隔 1s），逐行打印违规，有违规退出码 1、干净退出 0——cron+邮件体检、发布前置检查用得上整个告警语汇，不用常驻；趋势/基线类哨兵（--alert-disk-eta、--alert-deviation 等）需要历史，仍是 --watch 的领地。无目标独立操作",
-            "One-shot health check: sample once (rates take two samples 1s apart) and evaluate every armed --alert-* threshold, print each violation, exit 1 when anything is over its line and 0 when clean — cron+mail checks and pre-deploy gates get the whole alert vocabulary with no resident watcher; trend/baseline sentinels (--alert-disk-eta, --alert-deviation, …) need history and stay --watch's territory. A no-target operation"
+            "一次性体检：单次采样评估全部已武装的 --alert-* 阈值（速率类采样两次、间隔 1s），逐行打印违规，有违规退出码 1、干净退出 0——cron+邮件体检、发布前置检查用得上整个告警语汇，不用常驻；配 --remote 变舰队体检（每台主机独立判定，违规点名主机）；趋势/基线类哨兵（--alert-disk-eta、--alert-deviation 等）需要历史，仍是 --watch 的领地。无目标独立操作",
+            "One-shot health check: sample once (rates take two samples 1s apart) and evaluate every armed --alert-* threshold, print each violation, exit 1 when anything is over its line and 0 when clean — cron+mail checks and pre-deploy gates get the whole alert vocabulary with no resident watcher; --remote turns it into a fleet check (each host judged independently, violations name the host); trend/baseline sentinels (--alert-disk-eta, --alert-deviation, …) need history and stay --watch's territory. A no-target operation"
         )
     )]
     pub check: bool,
@@ -1040,6 +1040,17 @@ pub struct Cli {
     pub plot: Vec<String>,
 
     #[arg(
+        long = "plot-events",
+        value_name = "FILE",
+        num_args = 1..,
+        help = t(
+            "把 --events-log 的事件落盘（JSONL）画成自包含 HTML 时间线（甘特图）：每个进程身份一条生命周期条（started→exited，日志结束时还活着的是绿色），重启死亡标橙、结束带红tick，告警黄三角、恢复绿菱形，机器/容器事件落到顶部 system 泳道——\"服务什么时候重启的、前后谁在跑\"一张图；零 JS 零外部资源离线可看。给多个文件则叠加到同一条时间轴，输出 witr-events.html。属于无目标操作：不能与目标同时使用",
+            "Render a --events-log JSONL file into a self-contained HTML timeline (a gantt): one lifecycle bar per process identity (started→exited, green when still alive at the log's end), restart deaths orange with a red tick, alerts yellow triangles, recoveries green diamonds, machine/container events on the top system lane — \"when did the service restart and who else was running\" in one chart; no JS, no external assets, viewable offline. Multiple files overlay onto one axis (output witr-events.html). A no-target operation: cannot be combined with targets"
+        )
+    )]
+    pub plot_events: Vec<String>,
+
+    #[arg(
         long = "samples",
         value_name = "FILE",
         help = t(
@@ -1177,7 +1188,7 @@ pub struct Cli {
         value_name = "URL",
         help = t(
             "查询远端 witr-rs --serve 端点而不是本机：给定 http://host:port（不带 TLS），拉取 /api/ps（--tree 时拉 /api/tree）并按本地同样的表格/JSON/CSV 渲染；配合 --watch 周期重拉。属于无目标操作",
-            "Query remote witr-rs --serve endpoints instead of this machine: give http://host:port (no TLS), repeatable for a fleet — each host renders its own section (unreachable hosts report a ⚠ line and don't sink the rest; every host down exits 5). /api/ps is fetched (or /api/tree under --tree) and rendered with the same table/JSON/CSV as local; --watch re-fetches on an interval. A no-target operation"
+            "Query remote witr-rs --serve endpoints instead of this machine: give http://host:port (no TLS), repeatable for a fleet — each host renders its own section (unreachable hosts report a ⚠ line and don't sink the rest; every host down exits 5). /api/ps is fetched (or /api/tree under --tree) and rendered with the same table/JSON/CSV as local; --watch re-fetches on an interval — and pairs with the machine-wide --alert-* into a fleet watchdog: every tick judges the sentinels per host (each host keeps its own streak/latch state), alerts name the host (⚠ [host] system — …) and ride --events-log/--alert-exec/--alert-webhook as usual; per-process thresholds probe the local machine and stay local-only. --check --remote is the one-shot fleet health check. A no-target operation"
         )
     )]
     pub remote: Vec<String>,

@@ -34,7 +34,9 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **CSV 时间序列（`--watch` + `--record`）**：`witr-rs --watch 5 --record load.csv` 每 5 秒把整张进程表按进程追加进 CSV——timestamp / pid / user / name / cpu_pct / rss_mb / io 读写速率 / gpu_sm（平台没有的指标留空列），外加整机四列 `sys_load1` / `sys_mem_pct` / `sys_procs` / `sys_net_bps`（记录在一条 `pid=_system` 的汇总行上——load、内存占用百分比、进程数与全网卡收发合计字节/秒，与进程行同文件同节奏）。收工后用 Excel / pandas / SQLite 回放负载走势，控制台输出不受影响。存成 `.jsonl` 后缀则切换为 **NDJSON 模式**：每个 tick 追加一行版本化 JSON 信封（`{schema_version, generated_at, process_count, processes}`），每进程额外带 ppid / state / age_secs，`jq '.processes[] | select(.rss_mb > 500)'` 直接取数；整机快照在同信封的 `system` 键（`load1` / `cpu_pct` / `mem_used_mb` / `mem_pct` / `proc_count` / `net_bps`，平台测不到时为 null）。**长跑卫生（`--record-max-mb MB`）**：`--record` 与 `--events-log` 的文件超过该大小时滚动为 `<文件>.1`（上一代 .1 丢弃）并重新开始——CSV 模式重转后自动补写表头，`--plot` / `--samples` 无需特殊处理；磁盘占用从此有上界（2×上限），watchdog 跑几个月不再写满盘。该键也可写进配置文件（`record_max_mb = 200`）。
 
-**时序图（`--plot`）**：`witr-rs --plot load.csv` 把 `--record` 产出的样本文件（.csv / .jsonl 都认）画成自包含 HTML 时序图，写入 `load.csv.html` 后退出——内联 SVG 五张图（整机 cpu% / 内存% / 1 分钟负载 / 网络速率 MB/s / 进程数），零 JS 零外部资源，离线双击可看。给**多个文件**则曲线叠加对比——`--plot before.jsonl after.jsonl` 发布前后各录一份，一图看清差异（输出 `witr-plot.html`）。"录制回来看看负载曲线"不用再开 Excel。
+**时序图（`--plot`）**：`witr-rs --plot load.csv` 把 `--record` 产出的样本文件（.csv / .jsonl 都认）画成自包含 HTML 时序图，写入 `load.csv.html` 后退出——内联 SVG 五张图（整机 cpu% / 内存% / 1 分钟负载 / 网络速率 MB/s / 进程数），零 JS 零外部资源，离线双击可看。**进程热力图**：文件里有进程行时追加第六张——top-12 进程（按文件内 CPU 总量排序）× 时间的 cpu% 色块阵，暗→蓝→黄→红一套色标，burst 的发源进程一眼可见（机器曲线只喊"什么时候尖了"，热力图喊"是谁"）。给**多个文件**则曲线叠加对比——`--plot before.jsonl after.jsonl` 发布前后各录一份，一图看清差异（输出 `witr-plot.html`）。"录制回来看看负载曲线"不用再开 Excel。
+
+**事件时间线（`--plot-events`）**：`witr-rs --plot-events events.jsonl` 把 `--events-log` 的事件落盘画成自包含 HTML 甘特图，写入 `events.jsonl.html` 后退出——每个进程身份一条生命周期条（started→exited，日志结束时还活着的是绿色），重启死亡标橙、结束带红 tick，告警黄三角、恢复绿菱形，机器/容器事件落到顶部 system 泳道，贪婪子泳道让同名多实例（master + workers）不互相覆盖——"服务什么时候重启的、前后谁在跑、重启前后有没有告警"一张图；零 JS 零外部资源，离线双击可看。给多个文件则叠加到同一条时间轴（输出 `witr-events.html`）。
 
 **Grafana 仪表盘导出（`--export-grafana FILE`）**：写出一份现成的 Grafana 仪表盘 JSON——16 块面板把 `/metrics` 的全部语汇铺成一屏：整机 cpu / 内存 / swap / load / 进程数、PSI 停顿、网卡吞吐与丢包、TCP 重传速率、容器 cpu / 内存 / 限流速率 / OOM 计数 / 磁盘、top CPU / top RSS 进程板（`topk(5, …)`）；PromQL 全部预填，导入 Grafana 选好数据源即用——建面板是导出之后剩下的唯一苦活，一条命令清零。
 
@@ -96,7 +98,9 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **时光回放（`<` / `>`）**：TUI 在后台持续保留最近 30 帧进程表快照——Processes 页按 `<` 逐帧回看历史（进程表回到那一刻：谁当时在、CPU 当时多少；标签栏亮黄色 REPLAY 徽章），`>` 逐帧前进，走到头自动回到实时。回放期间告警机制暂停（回放帧不产生告警/通知），但环形缓冲**照常录制**——看完历史 `>` 走回实时，什么都没漏。"十分钟前机器还是正常的，到底哪一步开始变的"——不用快照不用录像，`<` 按住往回翻。
 
-**远程模式（`--remote URL`，可重复）**：`witr-rs --remote http://10.0.0.7:9100` 不看本机——从远端 `witr-rs --serve` 端点拉 `/api/ps`（`--tree` 时同样拉平表、本地重建森林），用与本地完全相同的渲染器输出表格 / `--json` / `--csv` / `--markdown`；配 `--watch N` 周期重拉（清屏重绘，`--times N` 上界）。**`--remote` 可重复**——一次看一排机器：每台一个分隔段落（`----- [host] -----`），连不上的主机报一行 ⚠ 不拖垮其余（全部不可达才退出码 5）；多机 `--json` 出舰队信封（`host_count` + `hosts[]`，每台 `host` / `process_count` / `processes`，失败主机记 `error`）。跳板机上只装 witr-rs 一个二进制、SSH 只通几条隧道，"看隔壁几台机器的进程表"不用 Prometheus 也不用网页——远端各一台 `--serve`，本机随时 `--remote`。零新增依赖（std::net 手写 HTTP GET，仅 http://，TLS 走前置反代）。
+**远程模式（`--remote URL`，可重复）**：`witr-rs --remote http://10.0.0.7:9100` 不看本机——从远端 `witr-rs --serve` 端点拉 `/api/ps`（`--tree` 时同样拉平表、本地重建森林），用与本地完全相同的渲染器输出表格 / `--json` / `--csv` / `--markdown`；配 `--watch N` 周期重拉（清屏重绘，`--times N` 上界）。**`--remote` 可重复**——一次看一排机器：每台一个分隔段落（`----- [host] -----`），连不上的主机报一行 ⚠ 不拖垮其余（全部不可达才退出码 5；fleet watch 里拉取错误只在**变化时**打印一次，不刷屏）；多机 `--json` 出舰队信封（`host_count` + `hosts[]`，每台 `host` / `process_count` / `processes`，失败主机记 `error`）。跳板机上只装 witr-rs 一个二进制、SSH 只通几条隧道，"看隔壁几台机器的进程表"不用 Prometheus 也不用网页——远端各一台 `--serve`，本机随时 `--remote`。零新增依赖（std::net 手写 HTTP GET，仅 http://，TLS 走前置反代）。
+
+**舰队哨兵（`--remote` × `--watch` × `--alert-*`）**：告警语汇的最后一站——跨机器。`/api/ps` 信封带上**机器快照**（`system` 键：load / cpu / 内存 / swap / PSI / retrans / oom 计数 / 进程数 + NIC 累计计数 + 挂载点扫描——整机哨兵要判的全部字段），`--remote ... --watch 5 --alert-load 4 --alert-psi 20` 每个 tick 拉全 fleet 后**逐主机**判定机器级哨兵（每主机独立 streak/闩锁/disk-eta 趋势窗口），告警点名主机：`⚠ [host2] system — load average 5.20 above 4`；`--events-log` 条目多带 `host` 字段（本地事件没有该字段，回放兼容），`--alert-exec` / `--alert-webhook` 照常触发（detail 带 `[host]` 前缀）。旧版 `--serve` 没有快照键的主机自动解除哨兵（表格照常渲染）。`--check --remote a,b,c --alert-load 4` 是舰队一次性体检（每台两次拉取隔 1s 出速率，违规逐行点名主机，任一违规退出码 1）——cron 舰队巡检一条命令。进程级阈值要探测本机（fd/conn/io），舰队模式明确拒绝而不是半工作。
 
 **配置热重载（SIGHUP）**：`kill -HUP $(pidof witr-rs)` 无需重启即重读配置——TUI 立即重折算全部旋钮（采样间隔、排序、告警阈值、静默/首见名单、通知开关；**关注列表与告警状态保留**——调整阈值不丢已触发的告警闩锁），无头 `--watch` 同效（下一个 tick 生效）。语义与启动一致：命令行旗标始终压过配置文件，重载只动文件里改的值。改 config.toml 不用再杀进程。
 
@@ -339,6 +343,9 @@ witr-rs --plot before.jsonl after.jsonl # 两条录制的整机曲线叠加对�
 witr-rs --remote http://10.0.0.7:9100    # 渲染远端 --serve 的进程表（--watch N 周期重拉；--tree/--csv/--json 同本地）
 witr-rs --remote http://a:9100 --remote http://b:9100 # 一排机器各一段落（--json 出舰队信封；坏主机 ⚠ 不拖垮其余）
 witr-rs --remote http://10.0.0.7:9100 --watch 2 # 远端表格常驻刷新
+witr-rs --remote http://a:9100 --remote http://b:9100 --watch 5 --alert-load 4 --alert-psi 20 # 舰队哨兵：逐主机判定，告警点名主机
+witr-rs --check --remote http://a:9100 --remote http://b:9100 --alert-load 4 # 舰队一次性体检：任一违规退出码 1
+witr-rs --plot-events events.jsonl  # 事件落盘画成自包含 HTML 甘特图（生命周期条 + 告警标记 + system 泳道）
 witr-rs --watch 10 --alert-container # 无头容器哨兵：容器退出/OOM、Pod CrashLoopBackOff 即喊（边缘触发只报一次）
 witr-rs --sys                 # 整机仪表盘：CPU/内存/load/磁盘/网卡/温度/PSI（--watch 2 常驻；--csv/--markdown/--json 同源）
 witr-rs --conns --by-peer      # 连接按对端聚合：谁连得最多、哪条链路最忙（--json/--csv/--markdown 同源）

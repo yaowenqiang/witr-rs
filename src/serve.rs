@@ -290,6 +290,70 @@ fn export_set(procs: &[Process], n: usize) -> Vec<&Process> {
     out
 }
 
+/// The machine snapshot riding the /api/ps envelope's `system` key —
+/// every field the machine-wide sentinels judge (the fleet-watch feed),
+/// sampled fresh with the table. Cumulative NIC counters (not rates —
+/// the watcher diffs them across ticks) and the mount sweep ride along
+/// so net/drop/disk/disk-eta work remotely too.
+pub(crate) fn system_snapshot(
+    stats: &crate::platform::SystemStats,
+    nics: &[crate::platform::NicCounters],
+    mounts: &[crate::platform::MountUsage],
+    proc_count: usize,
+) -> serde_json::Value {
+    let pct = |u: Option<u64>, t: Option<u64>| match (u, t) {
+        (Some(u), Some(t)) if t > 0 => Some((u * 100) / t),
+        _ => None,
+    };
+    let net = (!nics.is_empty()).then(|| {
+        let (rx, tx, drops) = nics.iter().fold(
+            (0u64, 0u64, 0u64),
+            |(rx, tx, drops), n| {
+                (
+                    rx + n.rx_bytes,
+                    tx + n.tx_bytes,
+                    drops + n.rx_drops + n.tx_drops,
+                )
+            },
+        );
+        serde_json::json!({"rx_bytes": rx, "tx_bytes": tx, "drop_total": drops})
+    });
+    serde_json::json!({
+        "load1": stats.load1,
+        "load5": stats.load5,
+        "load15": stats.load15,
+        "cpu_pct": stats.cpu_percent,
+        "mem_used_mb": stats.mem_used_mb,
+        "mem_total_mb": stats.mem_total_mb,
+        "mem_avail_mb": stats.mem_avail_mb,
+        "mem_pct": pct(stats.mem_used_mb, stats.mem_total_mb),
+        "swap_used_mb": stats.swap_used_mb,
+        "swap_total_mb": stats.swap_total_mb,
+        "swap_pct": pct(stats.swap_used_mb, stats.swap_total_mb),
+        "psi": stats.psi.as_ref().map(|p| serde_json::json!({
+            "cpu_some": p.cpu_some,
+            "cpu_full": p.cpu_full,
+            "mem_some": p.mem_some,
+            "mem_full": p.mem_full,
+            "io_some": p.io_some,
+            "io_full": p.io_full,
+        })),
+        "temp_c": stats.temp.as_ref().map(|(_, c)| c),
+        "retrans_segs": stats.retrans_segs,
+        "oom_kills": stats.oom_kills,
+        "proc_count": proc_count,
+        "net": net,
+        "mounts": mounts
+            .iter()
+            .map(|m| serde_json::json!({
+                "target": m.target,
+                "total_mb": m.total_mb,
+                "used_mb": m.used_mb,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// One scrape: sample the platform and render the Prometheus exposition.
 fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
     let mut out = String::with_capacity(16 * 1024);
@@ -897,19 +961,34 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
             }
             // /api/ps: the full process table as the same versioned JSON
             // envelope `--json` prints — a machine-readable sibling to the
-            // Prometheus gauges
+            // Prometheus gauges. The envelope carries the machine snapshot
+            // in its `system` key (the fleet-watch feed: every field the
+            // machine-wide sentinels judge, sampled fresh with the table —
+            // the --record file's `system` key is the compact subset).
             if path == "/api/ps" || path.starts_with("/api/ps?") {
-                let procs = {
+                let (procs, system) = {
                     let platform = platform.lock().unwrap_or_else(|e| e.into_inner());
                     let mut procs = platform.list_processes().unwrap_or_default();
                     platform.enrich_listing(&mut procs);
-                    procs
+                    let stats = platform.system_stats();
+                    let nics = platform.net_counters();
+                    let mounts = platform.mount_usage();
+                    let system = stats
+                        .map(|s| system_snapshot(&s, &nics, &mounts, procs.len()));
+                    (procs, system)
                 };
+                let doc = serde_json::json!({
+                    "schema_version": crate::SCHEMA_VERSION,
+                    "generated_at": crate::util::now_unix(),
+                    "process_count": procs.len(),
+                    "system": system,
+                    "processes": procs,
+                });
                 respond(
                     &mut stream,
                     "200 OK",
                     "application/json",
-                    &crate::json_envelope(&procs),
+                    &serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()),
                 );
                 return;
             }
