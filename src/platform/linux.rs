@@ -307,6 +307,17 @@ fn parse_snmp_retrans(text: &str) -> Option<u64> {
     None
 }
 
+/// /proc/vmstat's `oom_kill N` line — the host-wide kernel OOM kill total
+/// since boot, cgroup kills included (the counter lives in the same
+/// per-NUMA accounting as the alloc stalls that caused it). The
+/// --alert-oom sentinel diffs it into a trailing-window kill count.
+fn parse_vmstat_oom(text: &str) -> Option<u64> {
+    text.lines().find_map(|l| {
+        l.strip_prefix("oom_kill ")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
 /// cpu.stat's `throttled_usec <n>` line → n. This cgroup's tasks spent
 /// that many microseconds runnable-but-stopped by the CFS quota — the
 /// "container is slow but CPU looks idle" signature.
@@ -1266,6 +1277,9 @@ impl Platform for Linux {
         if let Some(snmp) = read_ok(Path::new("/proc/net/snmp")) {
             out.retrans_segs = parse_snmp_retrans(&snmp);
         }
+        if let Some(vm) = read_ok(Path::new("/proc/vmstat")) {
+            out.oom_kills = parse_vmstat_oom(&vm);
+        }
         Some(out)
     }
 
@@ -1807,6 +1821,19 @@ fn classify_cgroup(path: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_vmstat_oom_finds_the_kill_line() {
+        let vm = "\
+nr_free_pages 21345
+pgfault 1234567
+oom_kill 3
+pgmajfault 99
+";
+        assert_eq!(parse_vmstat_oom(vm), Some(3));
+        // kernels without the counter (or a truncated read) report none
+        assert_eq!(parse_vmstat_oom("nr_free_pages 1\npgfault 2\n"), None);
+    }
 
     #[test]
     fn net_dev_parse_skips_headers_and_loopback() {

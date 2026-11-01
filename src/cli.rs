@@ -235,12 +235,14 @@ impl Cli {
         self.alert_mem_pct = self.alert_mem_pct.or(cfg.alert_mem_pct);
         self.alert_count = self.alert_count.or(cfg.alert_count);
         self.alert_disk = self.alert_disk.or(cfg.alert_disk);
+        self.alert_disk_eta = self.alert_disk_eta.or(cfg.alert_disk_eta);
         self.alert_net = self.alert_net.or(cfg.alert_net);
         self.alert_psi = self.alert_psi.or(cfg.alert_psi);
         self.alert_mem_avail_mb = self.alert_mem_avail_mb.or(cfg.alert_mem_avail_mb);
         self.alert_swap_pct = self.alert_swap_pct.or(cfg.alert_swap_pct);
         self.alert_retrans = self.alert_retrans.or(cfg.alert_retrans);
         self.alert_nic_drop = self.alert_nic_drop.or(cfg.alert_nic_drop);
+        self.alert_oom = self.alert_oom.or(cfg.alert_oom);
         self.alert_net_per_proc = self.alert_net_per_proc.or(cfg.alert_net_per_proc);
         self.alert_deviation = self.alert_deviation.or(cfg.alert_deviation);
         self.record_max_mb = self.record_max_mb.or(cfg.record_max_mb);
@@ -557,6 +559,25 @@ pub struct Cli {
     pub export_grafana: Option<String>,
 
     #[arg(
+        long = "export-alert-rules",
+        value_name = "FILE",
+        help = t(
+            "写出一份现成的 Prometheus 告警规则 YAML（witr-rs /metrics 语汇：CPU/负载/内存/可用内存下限/swap/PSI 停顿/TCP 重传/网卡丢包/进程数 + 容器限流/OOM 击杀 + 进程重启信号）——--export-grafana 的姊妹篇：面板管\"看见\"，规则管\"喊人\"，Prometheus 侧的配置同样一条命令清零；阈值是取整默认值，按部署自己调。无目标独立操作",
+            "Write a ready-made Prometheus alerting-rules YAML over the witr-rs /metrics vocabulary (machine cpu/load/memory/memory-floor/swap/PSI stalls/TCP retransmit/NIC drops/process count + container throttle/OOM kills + process restarts) — the --export-grafana sibling: panels handle \"seeing\", rules handle \"shouting\"; the Prometheus side of the setup retires in one command too. Thresholds are round defaults; tune per deployment. A no-target operation"
+        )
+    )]
+    pub export_alert_rules: Option<String>,
+
+    #[arg(
+        long = "check",
+        help = t(
+            "一次性体检：单次采样评估全部已武装的 --alert-* 阈值（速率类采样两次、间隔 1s），逐行打印违规，有违规退出码 1、干净退出 0——cron+邮件体检、发布前置检查用得上整个告警语汇，不用常驻；趋势/基线类哨兵（--alert-disk-eta、--alert-deviation 等）需要历史，仍是 --watch 的领地。无目标独立操作",
+            "One-shot health check: sample once (rates take two samples 1s apart) and evaluate every armed --alert-* threshold, print each violation, exit 1 when anything is over its line and 0 when clean — cron+mail checks and pre-deploy gates get the whole alert vocabulary with no resident watcher; trend/baseline sentinels (--alert-disk-eta, --alert-deviation, …) need history and stay --watch's territory. A no-target operation"
+        )
+    )]
+    pub check: bool,
+
+    #[arg(
         long = "watch",
         value_name = "SECONDS",
         num_args = 0..=1,
@@ -777,6 +798,16 @@ pub struct Cli {
     pub alert_disk: Option<u64>,
 
     #[arg(
+        long = "alert-disk-eta",
+        value_name = "HOURS",
+        help = t(
+            "磁盘填满倒计时：按每个挂载点最近 1 小时可用空间的趋势（最小二乘斜率，趋势需统计显著）外推，预计填满时间短于该小时数时触发——百分比阈值只会喊\"已经 90%\"，趋势哨兵喊的是\"按当前速率 4 小时后满\"；至少要有 ~10 分钟的采样才开始外推。TUI 和 --watch",
+            "Disk time-to-full countdown: extrapolate each mount's trailing 1h available-space trend (least-squares slope, statistically significant only) and fire when its predicted time-to-full drops under this many hours — percentage thresholds shout \"already 90%\"; a trend shouts \"full in 4 hours at the rate you're actually filling\". Needs ~10 minutes of samples before it predicts. TUI and --watch"
+        )
+    )]
+    pub alert_disk_eta: Option<f64>,
+
+    #[arg(
         long = "alert-net",
         value_name = "MB/S",
         help = t(
@@ -835,6 +866,16 @@ pub struct Cli {
         )
     )]
     pub alert_nic_drop: Option<u64>,
+
+    #[arg(
+        long = "alert-oom",
+        value_name = "N",
+        help = t(
+            "整机告警：宿主机内核 OOM killer 的击杀计数（Linux /proc/vmstat 的 oom_kill，含各 cgroup）在 5 次采样的滑动窗口（约 15s）内新增 ≥N 次即触发——容器级 oom_kills 早有监视，裸机/宿主上的击杀此前完全不可见；一次击杀就值得喊，N 填 1。触发约滞后一个窗口，窗口排空后报恢复。TUI 和 --watch",
+            "Machine-wide alert: fire when the host kernel's OOM kill counter (Linux /proc/vmstat oom_kill, cgroup kills folded in) gains ≥N kills inside the 5-sample sliding window (~15s) — container oom_kills were watched all along, but kills on the bare host were invisible; one kill is worth shouting about, pass 1. Fires ~one window after the kill, recovers when the window drains. TUI and --watch"
+        )
+    )]
+    pub alert_oom: Option<u64>,
 
     #[arg(
         long = "alert-net-per-proc",

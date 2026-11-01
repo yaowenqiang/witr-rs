@@ -410,6 +410,8 @@ struct TuiApp {
     alert_count: Option<u32>,
     /// --alert-disk: machine-wide fullest-mount used-percent threshold
     alert_disk: Option<u64>,
+    /// --alert-disk-eta: predicted time-to-full horizon (hours)
+    alert_disk_eta: Option<f64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
     alert_net: Option<u64>,
     /// --alert-psi: PSI "full" stall percent threshold (Linux only)
@@ -418,6 +420,7 @@ struct TuiApp {
     alert_swap_pct: Option<u64>,
     alert_retrans: Option<u64>,
     alert_nic_drop: Option<u64>,
+    alert_oom: Option<u64>,
     /// streak/firing state for the machine-wide alerts
     sys_alert: crate::history::SysAlertState,
     /// shared container/pod edge detector memory (first sighting arms, no
@@ -630,6 +633,8 @@ pub struct Seed {
     pub alert_count: Option<u32>,
     /// --alert-disk: machine-wide used-percent threshold over local mounts
     pub alert_disk: Option<u64>,
+    /// --alert-disk-eta: predicted time-to-full horizon (hours)
+    pub alert_disk_eta: Option<f64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
     pub alert_net: Option<u64>,
     /// --alert-psi: PSI "full" stall percent threshold (Linux only)
@@ -642,6 +647,8 @@ pub struct Seed {
     pub alert_retrans: Option<u64>,
     /// --alert-nic-drop: NIC drop/error rate threshold (packets/s)
     pub alert_nic_drop: Option<u64>,
+    /// --alert-oom: host OOM kills inside the trailing window (kills)
+    pub alert_oom: Option<u64>,
     /// --alert-exec: shell command run on every threshold-alert firing;
     /// context exported as WITR_ALERT_PID/NAME/DETAIL
     pub alert_exec: Option<String>,
@@ -732,12 +739,14 @@ impl Seed {
         self.alert_mem_pct = cli.alert_mem_pct;
         self.alert_count = cli.alert_count;
         self.alert_disk = cli.alert_disk;
+        self.alert_disk_eta = cli.alert_disk_eta;
         self.alert_net = cli.alert_net;
         self.alert_psi = cli.alert_psi;
         self.alert_mem_avail_mb = cli.alert_mem_avail_mb;
         self.alert_swap_pct = cli.alert_swap_pct;
         self.alert_retrans = cli.alert_retrans;
         self.alert_nic_drop = cli.alert_nic_drop;
+        self.alert_oom = cli.alert_oom;
         self.alert_exec = cli.alert_exec.clone();
         self.alert_webhook = cli.alert_webhook.clone();
         self.alert_silence = cli
@@ -874,12 +883,14 @@ impl TuiApp {
             alert_mem_pct: seed.alert_mem_pct,
             alert_count: seed.alert_count,
             alert_disk: seed.alert_disk,
+            alert_disk_eta: seed.alert_disk_eta,
             alert_net: seed.alert_net,
             alert_psi: seed.alert_psi,
             alert_mem_avail_mb: seed.alert_mem_avail_mb,
             alert_swap_pct: seed.alert_swap_pct,
             alert_retrans: seed.alert_retrans,
             alert_nic_drop: seed.alert_nic_drop,
+            alert_oom: seed.alert_oom,
             sys_alert: crate::history::SysAlertState::default(),
             container_edges: crate::history::ContainerEdges::default(),
             pending_alerts: Vec::new(),
@@ -1159,12 +1170,14 @@ impl TuiApp {
         self.alert_mem_pct = seed.alert_mem_pct;
         self.alert_count = seed.alert_count;
         self.alert_disk = seed.alert_disk;
+        self.alert_disk_eta = seed.alert_disk_eta;
         self.alert_net = seed.alert_net;
         self.alert_psi = seed.alert_psi;
         self.alert_mem_avail_mb = seed.alert_mem_avail_mb;
         self.alert_swap_pct = seed.alert_swap_pct;
         self.alert_retrans = seed.alert_retrans;
         self.alert_nic_drop = seed.alert_nic_drop;
+        self.alert_oom = seed.alert_oom;
         self.alert_exec = seed.alert_exec.clone();
         self.alert_webhook = seed.alert_webhook.clone();
         self.alert_silence = seed.alert_silence.clone();
@@ -1333,12 +1346,14 @@ impl TuiApp {
                     || self.alert_mem_pct.is_some()
                     || self.alert_count.is_some()
                     || self.alert_disk.is_some()
+                    || self.alert_disk_eta.is_some()
                     || self.alert_net.is_some()
                     || self.alert_psi.is_some()
                     || self.alert_mem_avail_mb.is_some()
                     || self.alert_swap_pct.is_some()
                     || self.alert_retrans.is_some()
-                    || self.alert_nic_drop.is_some())
+                    || self.alert_nic_drop.is_some()
+                    || self.alert_oom.is_some())
             {
                 // --alert-load / --alert-mem-pct / --alert-count /
                 // --alert-disk / --alert-net: sample the whole machine when
@@ -1346,7 +1361,7 @@ impl TuiApp {
                 // watched)
                 if let Some(stats) = self.platform.system_stats() {
                     let interval = self.refresh.max(Duration::from_secs(1)).as_secs();
-                    let mounts = if self.alert_disk.is_some() {
+                    let mounts = if self.alert_disk.is_some() || self.alert_disk_eta.is_some() {
                         self.platform.mount_usage()
                     } else {
                         Vec::new()
@@ -1406,6 +1421,9 @@ impl TuiApp {
                         retrans_rate,
                         drop_limit: self.alert_nic_drop.map(|v| v as f64),
                         drop_rate,
+                        oom_limit: self.alert_oom,
+                        oom_kills: stats.oom_kills,
+                        disk_eta_hours: self.alert_disk_eta,
                         repeat: self.alert_repeat,
                     };
                     picks.extend(
@@ -10251,12 +10269,14 @@ mod tests {
                 alert_mem_pct: None,
                 alert_count: None,
                 alert_disk: None,
+                alert_disk_eta: None,
                 alert_net: None,
                 alert_psi: None,
                 alert_mem_avail_mb: None,
                 alert_swap_pct: None,
                 alert_retrans: None,
                 alert_nic_drop: None,
+                alert_oom: None,
                 alert_webhook: None,
                 alert_silence: Vec::new(),
                 alert_new_proc: Vec::new(),

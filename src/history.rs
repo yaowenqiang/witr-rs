@@ -502,6 +502,25 @@ pub struct SysAlertState {
     pub drop_streak: u32,
     pub drop_firing: bool,
     pub drop_fired_secs: u32,
+    /// Cumulative host OOM kill counter at the previous sample —
+    /// [`machine_oom_window`] diffs each new reading against it.
+    pub oom_prev: Option<u64>,
+    /// (arrival, kills) deltas still inside the --alert-oom window. A kill
+    /// keeps the sentinel "over" until it ages out, which is exactly the
+    /// streak the 5-sample latch needs — one burst fires once.
+    pub oom_window: std::collections::VecDeque<(std::time::Instant, u64)>,
+    pub oom_streak: u32,
+    pub oom_firing: bool,
+    pub oom_fired_secs: u32,
+    /// --alert-disk-eta trailing per-mount available-space history —
+    /// "target" → (unix secs, avail MB) samples, one window long. The
+    /// prediction is a least-squares slope over it, so it needs real
+    /// elapsed time; unix seconds (not `Instant`) keeps the math
+    /// injectable from tests.
+    pub disk_eta_hist: std::collections::HashMap<String, std::collections::VecDeque<(f64, u64)>>,
+    pub disk_eta_streak: u32,
+    pub disk_eta_firing: bool,
+    pub disk_eta_fired_secs: u32,
 }
 
 /// The armed machine-wide alert thresholds plus the inputs they compare
@@ -546,6 +565,20 @@ pub struct SysAlertLimits {
     /// caller's [`machine_drop_rate`] output. `None` disarms.
     pub drop_limit: Option<f64>,
     pub drop_rate: Option<f64>,
+    /// --alert-oom: fire when at least this many host OOM kills landed
+    /// inside the trailing window (ALERT_CYCLES samples — one kill stays
+    /// "over" exactly that long). `None` disarms; a platform without an
+    /// oom_kill counter disarms it too.
+    pub oom_limit: Option<u64>,
+    /// This sample's cumulative host OOM kill counter (stats.oom_kills).
+    pub oom_kills: Option<u64>,
+    /// --alert-disk-eta: fire when a mount's predicted time-to-full (a
+    /// least-squares trend over its trailing available-space history)
+    /// drops under this many hours. Percentage thresholds shout "already
+    /// 90%"; a trend shouts "full in 4 hours, at the rate you're actually
+    /// filling". Disarmed when None; needs the `mounts` sweep like
+    /// `disk_pct` does.
+    pub disk_eta_hours: Option<f64>,
     pub repeat: Option<u64>,
 }
 
@@ -596,6 +629,149 @@ pub fn machine_drop_rate(total: u64, state: &mut SysAlertState) -> Option<f64> {
     state.drop_prev = Some(total);
     state.drop_prev_at = Some(now);
     rate
+}
+
+/// Fold this sample's cumulative host OOM kill counter into the trailing
+/// window and return the kills still inside it. The window is
+/// ALERT_CYCLES samples wide, so one kill keeps `over` true for exactly
+/// the streak the 5-sample latch counts — a burst fires once, ~one window
+/// after it landed, then ages out and (because the alert had fired)
+/// writes a recovery. Deltas ride in `state.oom_window`.
+pub fn machine_oom_window(total: u64, state: &mut SysAlertState, interval_secs: u64) -> u64 {
+    let now = std::time::Instant::now();
+    if let Some(prev) = state.oom_prev {
+        let d = total.saturating_sub(prev);
+        if d > 0 {
+            state.oom_window.push_back((now, d));
+        }
+    }
+    state.oom_prev = Some(total);
+    let window = std::time::Duration::from_secs(ALERT_CYCLES as u64 * interval_secs.max(1));
+    while state
+        .oom_window
+        .front()
+        .is_some_and(|(at, _)| now.duration_since(*at) > window)
+    {
+        state.oom_window.pop_front();
+    }
+    state.oom_window.iter().map(|(_, d)| d).sum()
+}
+
+/// --alert-disk-eta tunables: how much trailing history a prediction
+/// needs before it's trusted, and how much it may span. A trend from a
+/// couple of minutes of samples is noise; an hour is a habit.
+const DISK_ETA_MIN_SAMPLES: usize = 12;
+const DISK_ETA_MIN_SPAN_SECS: u64 = 600;
+const DISK_ETA_WINDOW_SECS: u64 = 3600;
+/// Hard cap on stored samples per mount (a 1s scrape cadence would still
+/// only hold ~an hour).
+const DISK_ETA_MAX_SAMPLES: usize = 1440;
+
+/// The --alert-disk-eta decision for one mount, given its trailing
+/// `(unix_secs, avail_mb)` samples: least-squares slope on available
+/// space vs time. A shrinking trend predicts time-to-full
+/// `(eta_hours, mb_per_hour)`; the trend must be statistically real
+/// (t-statistic ≤ −2 — noise on a static disk produces tiny negative
+/// slopes that would otherwise fire on a nearly-full but quiet mount)
+/// before the prediction is trusted. `None` = no trustworthy trend.
+pub fn disk_eta_of(samples: &[(f64, u64)]) -> Option<(f64, f64)> {
+    let n = samples.len();
+    if n < DISK_ETA_MIN_SAMPLES {
+        return None;
+    }
+    let t0 = samples[0].0;
+    let span = samples[n - 1].0 - t0;
+    if span < DISK_ETA_MIN_SPAN_SECS as f64 {
+        return None;
+    }
+    // x = seconds since the first sample, y = available MB
+    let xs: Vec<f64> = samples.iter().map(|(t, _)| t - t0).collect();
+    let ys: Vec<f64> = samples.iter().map(|(_, a)| *a as f64).collect();
+    let n = n as f64;
+    let mx = xs.iter().sum::<f64>() / n;
+    let my = ys.iter().sum::<f64>() / n;
+    let mut sxx = 0.0;
+    let mut sxy = 0.0;
+    for (x, y) in xs.iter().zip(&ys) {
+        sxx += (x - mx) * (x - mx);
+        sxy += (x - mx) * (y - my);
+    }
+    if sxx <= 0.0 {
+        return None;
+    }
+    let slope = sxy / sxx; // MB per second, negative while filling
+    let mut sse = 0.0;
+    for (x, y) in xs.iter().zip(&ys) {
+        let fit = my + slope * (x - mx);
+        sse += (y - fit) * (y - fit);
+    }
+    // the t-test needs residuals; a perfectly linear history has none —
+    // that's the most significant trend there is, not an undecidable one
+    let significant = if sse <= 0.0 {
+        true
+    } else {
+        let var_slope = sse / ((n - 2.0) * sxx);
+        var_slope > 0.0 && slope / var_slope.sqrt() <= -2.0
+    };
+    if !significant {
+        return None;
+    }
+    let avail_now = *ys.last().unwrap();
+    if avail_now <= 0.0 {
+        // already full: predict zero (the alert should be firing now)
+        return Some((0.0, slope * 3600.0));
+    }
+    let eta_secs = avail_now / -slope;
+    Some((eta_secs / 3600.0, slope * 3600.0))
+}
+
+/// Fold this tick's mount sweep into the per-mount trailing histories and
+/// return the mounts whose predicted time-to-full is under `eta_limit` —
+/// `(eta_hours, mb_per_hour, mount)`, soonest first, capped at three (the
+/// detail line is a pointer, not a report). Histories for mounts that
+/// vanished (unmounted) are dropped; their trend is meaningless.
+pub fn disk_eta_picks(
+    state: &mut SysAlertState,
+    mounts: &[crate::platform::MountUsage],
+    eta_limit: f64,
+) -> Vec<(f64, f64, crate::platform::MountUsage)> {
+    let now = crate::util::now_unix() as f64;
+    for m in mounts.iter().filter(|m| m.total_mb > 0) {
+        let hist = state.disk_eta_hist.entry(m.target.clone()).or_default();
+        hist.push_back((now, m.total_mb.saturating_sub(m.used_mb)));
+        while hist
+            .front()
+            .is_some_and(|(t, _)| now - *t > DISK_ETA_WINDOW_SECS as f64)
+        {
+            hist.pop_front();
+        }
+        while hist.len() > DISK_ETA_MAX_SAMPLES {
+            hist.pop_front();
+        }
+    }
+    let live: std::collections::HashSet<&str> = mounts
+        .iter()
+        .filter(|m| m.total_mb > 0)
+        .map(|m| m.target.as_str())
+        .collect();
+    state.disk_eta_hist.retain(|k, _| live.contains(k.as_str()));
+    let mut out: Vec<(f64, f64, crate::platform::MountUsage)> = mounts
+        .iter()
+        .filter(|m| m.total_mb > 0)
+        .filter_map(|m| {
+            let hist: std::vec::Vec<(f64, u64)> = state
+                .disk_eta_hist
+                .get(&m.target)
+                .map(|h| h.iter().copied().collect())
+                .unwrap_or_default();
+            disk_eta_of(&hist)
+                .filter(|(eta, _)| *eta < eta_limit)
+                .map(|(eta, mbh)| (eta, mbh, m.clone()))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(3);
+    out
 }
 
 /// One machine-wide alert edge: `(name, detail, is_recovery)` — name is
@@ -764,6 +940,9 @@ pub fn system_alert_picks(
         retrans_rate: retrans_rate_opt,
         drop_limit,
         drop_rate: drop_rate_opt,
+        oom_limit,
+        oom_kills: oom_kills_opt,
+        disk_eta_hours,
         repeat: repeat_secs,
     } = limits;
     let load_limit = *load_limit;
@@ -780,6 +959,9 @@ pub fn system_alert_picks(
     let swap_pct_limit = *swap_pct_limit;
     let retrans_limit = *retrans_limit;
     let drop_limit = *drop_limit;
+    let oom_limit = *oom_limit;
+    let oom_kills = *oom_kills_opt;
+    let disk_eta_limit = *disk_eta_hours;
     let repeat_secs = *repeat_secs;
     let mut out = Vec::new();
     if let Some(limit) = load_limit {
@@ -900,6 +1082,53 @@ pub fn system_alert_picks(
             out.push((
                 "system".to_string(),
                 format!("disk back under {limit}%"),
+                true,
+            ));
+        }
+    }
+    if let Some(eta_limit) = disk_eta_limit {
+        let picks = disk_eta_picks(state, mounts, eta_limit);
+        let over = !picks.is_empty();
+        let edge = alert_cycle_repeat(
+            &mut state.disk_eta_streak,
+            &mut state.disk_eta_firing,
+            over,
+            &mut state.disk_eta_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            let named: Vec<String> = picks
+                .iter()
+                .map(|(eta, mbh, m)| {
+                    let pct = (m.used_mb * 100) / m.total_mb.max(1);
+                    // a full drive in under an hour reads in minutes
+                    let eta_s = if *eta < 1.0 {
+                        format!("~{}m", ((*eta * 60.0).round() as u64).max(1))
+                    } else {
+                        format!("~{eta:.1}h")
+                    };
+                    let rate_s = if mbh.abs() >= 1024.0 {
+                        format!("{:.1} GB/h", mbh.abs() / 1024.0)
+                    } else {
+                        format!("{:.0} MB/h", mbh.abs())
+                    };
+                    format!("{} {pct}% — {rate_s} → full in {eta_s}", m.target)
+                })
+                .collect();
+            out.push((
+                "system".to_string(),
+                format!(
+                    "disk filling fast: {} (under the {eta_limit}h line) for {}s",
+                    named.join(", "),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("no disk filling fast enough to hit {eta_limit:.1}h"),
                 true,
             ));
         }
@@ -1085,6 +1314,36 @@ pub fn system_alert_picks(
             out.push((
                 "system".to_string(),
                 format!("NIC drops back under {limit:.0}/s"),
+                true,
+            ));
+        }
+    }
+    if let Some(limit) = oom_limit {
+        let in_window = oom_kills
+            .map(|total| machine_oom_window(total, state, interval_secs))
+            .unwrap_or(0);
+        let over = oom_kills.is_some() && in_window >= limit;
+        let edge = alert_cycle_repeat(
+            &mut state.oom_streak,
+            &mut state.oom_firing,
+            over,
+            &mut state.oom_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            out.push((
+                "system".to_string(),
+                format!(
+                    "OOM killer {in_window} kill(s) in the last {}s — the kernel ran out of memory and shot something",
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                "OOM killer quiet again".to_string(),
                 true,
             ));
         }
@@ -2335,6 +2594,9 @@ mod tests {
             drop_limit: None,
             drop_rate: None,
             repeat: None,
+            disk_eta_hours: None,
+            oom_limit: None,
+            oom_kills: None,
         };
         assert!(
             system_alert_picks(&s, &mut state, &limits(None, None, None, 0), 3).is_empty()
@@ -2396,6 +2658,9 @@ mod tests {
             drop_limit: None,
             drop_rate: None,
             repeat: None,
+            disk_eta_hours: None,
+            oom_limit: None,
+            oom_kills: None,
         };
         // 120 MB avail above the 100 MB floor → never fires
         let mut state = SysAlertState::default();
@@ -2473,6 +2738,9 @@ mod tests {
             drop_limit: drop.map(|v| v as f64),
             drop_rate,
             repeat: None,
+            disk_eta_hours: None,
+            oom_limit: None,
+            oom_kills: None,
         };
         // no rate yet (first sample disarms) — even over the line
         let mut state = SysAlertState::default();
@@ -2656,6 +2924,9 @@ mod tests {
             drop_limit: None,
             drop_rate: None,
             repeat: None,
+            disk_eta_hours: None,
+            oom_limit: None,
+            oom_kills: None,
         };
         // 5 visible, limit 10 → under, never fires
         for _ in 0..ALERT_CYCLES + 2 {
@@ -2703,6 +2974,9 @@ mod tests {
                 drop_limit: None,
                 drop_rate: None,
                 repeat: None,
+            disk_eta_hours: None,
+            oom_limit: None,
+            oom_kills: None,
             }
         };
         // no mount sweeps in (never fetched) → nothing to compare, no fire
@@ -2762,6 +3036,9 @@ mod tests {
             drop_limit: None,
             drop_rate: None,
             repeat: None,
+            disk_eta_hours: None,
+            oom_limit: None,
+            oom_kills: None,
         };
         // first tick has no rate (None disarms) — even over the line
         let mut state = SysAlertState::default();
@@ -2791,6 +3068,197 @@ mod tests {
     }
 
     #[test]
+    fn system_alert_fires_on_host_oom_kills() {
+        let stats_of = |k: u64| crate::platform::SystemStats {
+            oom_kills: Some(k),
+            ..Default::default()
+        };
+        let limits = |oom: Option<u64>, kills: u64| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
+            oom_limit: oom,
+            oom_kills: Some(kills),
+            repeat: None,
+            disk_eta_hours: None,
+        };
+        // one kill lands (counter 5 → 6): the first tick only arms the
+        // previous counter, then the kill sits in the window long enough
+        // for the 5-sample latch — fire names the total and the window
+        let mut state = SysAlertState::default();
+        assert!(system_alert_picks(&stats_of(5), &mut state, &limits(Some(1), 5), 3).is_empty());
+        for _ in 0..ALERT_CYCLES - 1 {
+            assert!(
+                system_alert_picks(&stats_of(6), &mut state, &limits(Some(1), 6), 3).is_empty(),
+                "no fire before the window completes"
+            );
+        }
+        let fires = system_alert_picks(&stats_of(6), &mut state, &limits(Some(1), 6), 3);
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert!(
+            fires[0].1.contains("OOM killer 1 kill(s) in the last 15s"),
+            "{}",
+            fires[0].1
+        );
+        // window drains → the fired alert writes its recovery
+        state.oom_window.clear();
+        let rec = system_alert_picks(&stats_of(6), &mut state, &limits(Some(1), 6), 3);
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert!(rec[0].2 && rec[0].1.contains("quiet again"), "{}", rec[0].1);
+
+        // threshold 2 with a single kill in the window: never fires
+        let mut state = SysAlertState::default();
+        let _ = system_alert_picks(&stats_of(5), &mut state, &limits(Some(2), 5), 3);
+        for _ in 0..ALERT_CYCLES + 1 {
+            assert!(system_alert_picks(&stats_of(6), &mut state, &limits(Some(2), 6), 3).is_empty());
+        }
+        // three kills at once over a threshold of 2: fires, naming the total
+        let mut state = SysAlertState::default();
+        let _ = system_alert_picks(&stats_of(6), &mut state, &limits(Some(2), 6), 3);
+        for _ in 0..ALERT_CYCLES - 1 {
+            let _ = system_alert_picks(&stats_of(9), &mut state, &limits(Some(2), 9), 3);
+        }
+        let fires = system_alert_picks(&stats_of(9), &mut state, &limits(Some(2), 9), 3);
+        assert!(
+            fires[0].1.contains("OOM killer 3 kill(s)"),
+            "{}",
+            fires[0].1
+        );
+
+        // a platform without the counter (no vmstat) disarms the sentinel
+        let mut state = SysAlertState::default();
+        let mut no_counter = limits(Some(1), 6);
+        no_counter.oom_kills = None;
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(system_alert_picks(&stats_of(6), &mut state, &no_counter, 3).is_empty());
+        }
+    }
+
+    #[test]
+    fn disk_eta_predicts_from_a_filling_trend_and_ignores_noise() {
+        let now = crate::util::now_unix() as f64;
+        // 20 minutes of samples, 30s apart: avail drains 6 GB over the
+        // span (5 MB/s = 18000 MB/h), ending at 4000 MB → ~0.22h to full
+        let filling: Vec<(f64, u64)> = (0..41)
+            .map(|i| {
+                let t = now - (40 - i) as f64 * 30.0;
+                let avail = 10_000.0 - (i as f64 / 40.0) * 6_000.0;
+                (t, avail as u64)
+            })
+            .collect();
+        let (eta, mbh) = disk_eta_of(&filling).expect("a clean trend predicts");
+        assert!(
+            (0.15..0.3).contains(&eta),
+            "eta {eta}h ≈ 4000MB / 5MB/s = 0.22h"
+        );
+        assert!((17_000.0..19_000.0).contains(&mbh.abs()), "{mbh} MB/h");
+
+        // a static disk with alternating ±1MB jitter: tiny negative slope,
+        // statistically indistinguishable from zero → no prediction
+        let noisy: Vec<(f64, u64)> = (0..41)
+            .map(|i| {
+                let t = now - (40 - i) as f64 * 30.0;
+                (t, 10_000 - (i % 2))
+            })
+            .collect();
+        assert!(disk_eta_of(&noisy).is_none(), "noise is not a trend");
+
+        // too little history: a real trend over a couple of minutes is
+        // still not trusted
+        let short: Vec<(f64, u64)> = filling[..10].to_vec();
+        assert!(disk_eta_of(&short).is_none(), "needs ~10 min of span");
+    }
+
+    #[test]
+    fn system_alert_fires_when_disk_fill_is_imminent() {
+        let mount = crate::platform::MountUsage {
+            target: "/data".into(),
+            total_mb: 10_000,
+            used_mb: 6_000,
+        };
+        let limits = |eta: Option<f64>| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: vec![mount.clone()],
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
+            oom_limit: None,
+            oom_kills: None,
+            disk_eta_hours: eta,
+            repeat: None,
+        };
+        // seed the mount's trailing history directly (the real history
+        // accrues one sample per tick — same shape, shorter wait)
+        let now = crate::util::now_unix() as f64;
+        let seed_hist: std::collections::VecDeque<(f64, u64)> = (0..41)
+            .map(|i| {
+                let t = now - (41 - i) as f64 * 30.0;
+                let avail = 6_000.0 - (i as f64 / 40.0) * 2_000.0;
+                (t, avail as u64)
+            })
+            .collect();
+        let mut state = SysAlertState::default();
+        state.disk_eta_hist.insert("/data".into(), seed_hist);
+        for _ in 0..ALERT_CYCLES - 1 {
+            assert!(
+                system_alert_picks(
+                    &crate::platform::SystemStats::default(),
+                    &mut state,
+                    &limits(Some(1.0)),
+                    3
+                )
+                .is_empty(),
+                "no fire before the window completes"
+            );
+        }
+        let fires = system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(1.0)),
+            3,
+        );
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        let d = &fires[0].1;
+        assert!(d.contains("/data"), "{d}");
+        assert!(d.contains("60%"), "{d}"); // 6000/10000 used
+        assert!(d.contains("GB/h"), "{d}"); // 2000MB over 20min = 6000MB/h ≈ 5.9GB/h
+        assert!(d.contains("full in ~40m"), "{d}"); // 4000MB avail / 6000MB/h = 0.67h
+        // trend gone (mount dropped from the sweep) → recovery
+        let mut quiet = limits(Some(1.0));
+        quiet.mounts.clear();
+        let rec = system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &quiet,
+            3,
+        );
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert!(rec[0].2, "{rec:?}");
+    }
+
+    #[test]
     fn psi_full_stall_alert_fires_and_names_resources() {
         // mem full-stall over the line; cpu/io quiet
         let s = crate::platform::SystemStats {
@@ -2817,6 +3285,9 @@ mod tests {
             drop_limit: None,
             drop_rate: None,
             repeat: None,
+            disk_eta_hours: None,
+            oom_limit: None,
+            oom_kills: None,
         };
         // no PSI report at all → silent even with the limit armed
         let none = crate::platform::SystemStats::default();

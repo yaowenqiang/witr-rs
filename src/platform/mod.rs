@@ -586,6 +586,11 @@ pub struct SystemStats {
     /// /proc/net/snmp). `None` where the platform reports no TCP counters —
     /// the --alert-retrans sentinel diffs it into segments/s.
     pub retrans_segs: Option<u64>,
+    /// Cumulative host OOM kills since boot (Linux /proc/vmstat `oom_kill`
+    /// — the kernel's own tally, cgroup kills folded in). `None` where the
+    /// platform reports no vmstat — the --alert-oom sentinel diffs it into
+    /// a trailing-window kill count.
+    pub oom_kills: Option<u64>,
 }
 
 /// Pressure Stall Information, avg10 window (the last 10 seconds): the

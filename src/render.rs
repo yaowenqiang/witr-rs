@@ -1719,6 +1719,153 @@ pub fn grafana_dashboard() -> serde_json::Value {
     })
 }
 
+/// `--export-alert-rules FILE`: the --export-grafana sibling. The machine
+/// sentinels as Prometheus alerting rules — every threshold the built-in
+/// --alert-* flags watch has a PromQL counterpart over /metrics, so the
+/// rules file drops into Alertmanager's side of the stack and both halves
+/// of the setup are one command each. Thresholds are round defaults (the
+/// flag defaults, roughly); operators tune them per deployment like any
+/// rules file.
+pub fn alert_rules_yaml() -> String {
+    // (alert, expr, for, severity, summary, description)
+    let rules: Vec<(&str, &str, &str, &str, &str, &str)> = vec![
+        (
+            "WitrMachineCpuHigh",
+            "witr_machine_cpu_percent > 90",
+            "5m",
+            "warning",
+            "Machine CPU above 90% for 5 minutes",
+            "Total CPU busy across all cores has been over 90% for 5m ({{ $value | humanize }}%).",
+        ),
+        (
+            "WitrMachineLoadHigh",
+            "witr_machine_load1 > 4",
+            "5m",
+            "warning",
+            "1-minute load average above 4 for 5 minutes",
+            "The run queue is deep: load1 {{ $value | humanize }} over 4 for 5m.",
+        ),
+        (
+            "WitrMachineMemoryHigh",
+            "witr_machine_mem_used_bytes / witr_machine_mem_total_bytes * 100 > 90",
+            "5m",
+            "warning",
+            "Machine memory above 90% for 5 minutes",
+            "RAM use {{ $value | humanize }}% — over 90% for 5m.",
+        ),
+        (
+            "WitrMachineMemoryLow",
+            "witr_machine_mem_available_bytes < 536870912",
+            "2m",
+            "critical",
+            "Reclaimable memory below 512 MB",
+            "MemAvailable {{ $value | humanize }}B — the last sentinel before the OOM killer; percentage thresholds lie on big-RAM machines, this one doesn't.",
+        ),
+        (
+            "WitrSwapHigh",
+            "(witr_machine_swap_used_bytes / witr_machine_swap_total_bytes * 100 > 80) and (witr_machine_swap_total_bytes > 0)",
+            "5m",
+            "warning",
+            "Swap above 80% used",
+            "Memory pressure is spilling onto disk: swap {{ $value | humanize }}% full.",
+        ),
+        (
+            "WitrPsiStallHigh",
+            "max(witr_machine_psi_stall_percent{kind=\"full\"}) by (resource) > 20",
+            "5m",
+            "warning",
+            "PSI full stall above 20%",
+            "Tasks are stalled on {{ $labels.resource }} ({{ $value | humanize }}% of the window) — when the machine is this stuck, load average lags but PSI is already shouting.",
+        ),
+        (
+            "WitrTcpRetransHigh",
+            "rate(witr_machine_tcp_retransmissions_total[5m]) > 100",
+            "5m",
+            "warning",
+            "TCP retransmit rate above 100 segments/s",
+            "The top cause of \"the network got slow\", invisible to load and PSI: {{ $value | humanize }} segments/s retransmitted.",
+        ),
+        (
+            "WitrNicDropsHigh",
+            "rate(witr_machine_nic_drop_total[5m]) > 50",
+            "5m",
+            "warning",
+            "NIC drop/error rate above 50 packets/s",
+            "Packets are falling off {{ $labels.nic }} ({{ $labels.direction }}) at {{ $value | humanize }}/s — throughput can look fine while packets never arrive.",
+        ),
+        (
+            "WitrProcessCountHigh",
+            "witr_process_count > 1000",
+            "5m",
+            "warning",
+            "Visible process count above 1000",
+            "{{ $value | humanize }} processes — a sentinel for table explosions (fork bombs, runaway task spawners).",
+        ),
+        (
+            "WitrContainerThrottling",
+            "rate(witr_container_throttled_seconds_total[5m]) * 100 > 25",
+            "10m",
+            "warning",
+            "Container throttled over 25% of the time",
+            "{{ $labels.name }} is CFS-throttled {{ $value | humanize }}% of the time — the \"container is slow but the host looks idle\" signature.",
+        ),
+        (
+            "WitrContainerOomKills",
+            "increase(witr_container_oom_kills_total[10m]) > 0",
+            "0m",
+            "critical",
+            "Kernel OOM killed inside a container",
+            "{{ $labels.name }}: {{ $value | humanize }} OOM kill(s) in 10m — a restart policy can hide the exit code, the cgroup counter can't.",
+        ),
+        (
+            "WitrProcessRestarted",
+            "changes(witr_process_start_time_seconds[10m]) > 0",
+            "0m",
+            "warning",
+            "Process restarted under a new pid",
+            "{{ $labels.name }} (was pid {{ $labels.pid }}) started fresh within the last 10m — the standard Prometheus restart signal.",
+        ),
+    ];
+    let mut out = String::from(
+        "# Prometheus alerting rules over witr-rs /metrics — generated by\n\
+         # `witr-rs --export-alert-rules`. Thresholds are round defaults\n\
+         # (the flag defaults, roughly); tune them like any rules file.\n\
+         # Validate with `promtool check rules <this file>` if you have it.\n\
+         groups:\n  - name: witr-rs-machine\n    rules:\n",
+    );
+    for (alert, expr, for_, severity, summary, desc) in &rules {
+        out.push_str(&format!(
+            "      - alert: {alert}\n        expr: >-\n{expr_indented}\n        for: {for_}\n        labels:\n          severity: {severity}\n          source: witr-rs\n        annotations:\n          summary: {summary}\n          description: >-\n{desc_indented}\n",
+            expr_indented = indent_expr(expr, 10),
+            desc_indented = indent_expr(desc, 12),
+        ));
+    }
+    out
+}
+
+/// Fold a one-line PromQL (or annotation) string into a YAML folded block
+/// scalar: each wrap point becomes a line under the 11-space indent, and
+/// YAML rejoins the lines with single spaces — the quoted PromQL keeps
+/// its meaning and stays readable in the file.
+fn indent_expr(s: &str, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    let mut out = String::new();
+    let mut line = pad.clone();
+    for word in s.split(' ') {
+        if line.chars().count() + word.len() + 1 > 76 {
+            out.push_str(&line);
+            out.push('\n');
+            line = pad.clone();
+        }
+        if line.len() > pad.len() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    out.push_str(&line);
+    out
+}
+
 /// `--report-html FILE`: a self-contained report — no JS, no external
 /// assets. Summary + top-5 lists + the full table, with css bars for the
 /// cpu/mem columns so outliers read at a glance.
@@ -2998,6 +3145,7 @@ mod tests {
             }),
             temp: Some(("acpitz".into(), 54.0)),
             retrans_segs: Some(4242),
+            oom_kills: Some(2),
         };
         let frame = SysFrame {
             stats,
@@ -3081,6 +3229,55 @@ mod tests {
         let csv = render_sys_csv(&frame);
         assert!(csv.lines().nth(1).unwrap().starts_with(",,,,"));
     }
+    #[test]
+    fn alert_rules_file_covers_the_metric_vocabulary() {
+        let yaml = alert_rules_yaml();
+        let alerts = yaml.matches("      - alert:").count();
+        assert!(alerts >= 10, "{alerts} rules");
+        // every rule carries the four mandatory sections
+        for block in yaml.split("      - alert:").skip(1) {
+            assert!(block.contains("expr: >-"), "{block}");
+            assert!(block.contains("for:"), "{block}");
+            assert!(block.contains("severity:"), "{block}");
+            assert!(block.contains("summary:"), "{block}");
+            assert!(block.contains("description: >-"), "{block}");
+            // block-scalar content must sit deeper than its key line
+            for (key, deeper) in [("expr: >-", 10), ("description: >-", 12)] {
+                if let Some(i) = block.find(key) {
+                    let after = &block[i + key.len()..];
+                    let line = after.lines().nth(1).unwrap_or("");
+                    assert!(
+                        line.starts_with(&" ".repeat(deeper)) && !line.starts_with(&" ".repeat(deeper + 1)),
+                        "content after {key} sits at the wrong indent: {line:?}"
+                    );
+                }
+            }
+        }
+        // YAML folds block scalars with single spaces — no tabs anywhere
+        assert!(!yaml.contains('\t'), "tabs would break the YAML");
+        // the whole /metrics vocabulary the sentinels watch is alertable
+        for probe in [
+            "witr_machine_cpu_percent",
+            "witr_machine_load1",
+            "witr_machine_mem_available_bytes",
+            "witr_machine_swap_used_bytes",
+            "witr_machine_psi_stall_percent",
+            "witr_machine_tcp_retransmissions_total",
+            "witr_machine_nic_drop_total",
+            "witr_process_count",
+            "witr_container_throttled_seconds_total",
+            "witr_container_oom_kills_total",
+            "witr_process_start_time_seconds",
+        ] {
+            assert!(yaml.contains(probe), "{probe} has a rule:\n{yaml}");
+        }
+        // the one quoted-label PromQL survives the folding intact
+        assert!(
+            yaml.contains("witr_machine_psi_stall_percent{kind=\"full\"}"),
+            "{yaml}"
+        );
+    }
+
     #[test]
     fn grafana_dashboard_is_import_ready() {
         let doc = grafana_dashboard();

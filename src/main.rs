@@ -859,6 +859,367 @@ pub(crate) fn json_tree_forest(procs: &[Process]) -> String {
 /// excursion drops back under; with --alert-repeat, re-sent about every N
 /// seconds while the excursion keeps burning.
 #[allow(clippy::too_many_arguments)]
+/// `--check`: one pass over the armed `--alert-*` thresholds. Levels are
+/// single comparisons; rates take two samples a second apart (the
+/// --top io-rate trick), which is also what the per-process CPU counters
+/// and the machine NIC/TCP/OOM diffs need — every cumulative counter is
+/// seeded on sweep 1 and diffed on sweep 2. Returns the exit code: 1
+/// when anything sits over its line, 0 when clean. The history-hungry
+/// sentinels (disk-eta trend, deviation baseline, new-process, port
+/// canary, container edges) stay --watch's territory — a one-shot has no
+/// trailing window to judge them with.
+fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
+    let armed = cli.alert_cpu.is_some()
+        || cli.alert_mem.is_some()
+        || cli.alert_fd.is_some()
+        || cli.alert_io.is_some()
+        || cli.alert_conn.is_some()
+        || cli.alert_threads.is_some()
+        || cli.alert_net_per_proc.is_some()
+        || cli.alert_load.is_some()
+        || cli.alert_mem_pct.is_some()
+        || cli.alert_count.is_some()
+        || cli.alert_disk.is_some()
+        || cli.alert_net.is_some()
+        || cli.alert_psi.is_some()
+        || cli.alert_mem_avail_mb.is_some()
+        || cli.alert_swap_pct.is_some()
+        || cli.alert_retrans.is_some()
+        || cli.alert_nic_drop.is_some()
+        || cli.alert_oom.is_some();
+    if !armed {
+        eprintln!(
+            "--check evaluates --alert-* thresholds; arm at least one (e.g. --check --alert-cpu 90 --alert-load 4)"
+        );
+        std::process::exit(4);
+    }
+    let rate_checks = cli.alert_cpu.is_some()
+        || cli.alert_io.is_some()
+        || cli.alert_net_per_proc.is_some()
+        || cli.alert_net.is_some()
+        || cli.alert_retrans.is_some()
+        || cli.alert_nic_drop.is_some()
+        || cli.alert_oom.is_some();
+
+    let sweep = || -> Vec<Process> {
+        let mut procs = match platform.list_processes() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cannot list processes: {e}");
+                std::process::exit(5);
+            }
+        };
+        platform.enrich_listing(&mut procs);
+        procs
+    };
+
+    let mut hist = history::History::new();
+    // one shared state diffs sweep 1 → sweep 2 for every machine rate
+    let mut sys = history::SysAlertState::default();
+
+    // sweep 1: seeds every cumulative counter
+    let procs1 = sweep();
+    let _ = hist.update(&procs1);
+    let nc1 = (cli.alert_net.is_some() || cli.alert_nic_drop.is_some())
+        .then(|| platform.net_counters());
+    let stats1 = platform.system_stats();
+    if cli.alert_retrans.is_some() {
+        if let Some(segs) = stats1.as_ref().and_then(|s| s.retrans_segs) {
+            let _ = history::machine_retrans_rate(segs, &mut sys);
+        }
+    }
+    if cli.alert_oom.is_some() {
+        if let Some(kills) = stats1.as_ref().and_then(|s| s.oom_kills) {
+            let _ = history::machine_oom_window(kills, &mut sys, 1);
+        }
+    }
+
+    if rate_checks {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    // sweep 2: the reading the verdicts come from
+    let procs = sweep();
+    let _ = hist.update(&procs);
+    let nc2 = nc1.is_some().then(|| platform.net_counters());
+    let stats = platform.system_stats().unwrap_or_default();
+    let retrans_rate = if cli.alert_retrans.is_some() {
+        stats
+            .retrans_segs
+            .and_then(|segs| history::machine_retrans_rate(segs, &mut sys))
+    } else {
+        None
+    };
+    let oom_in_window = if cli.alert_oom.is_some() {
+        stats.oom_kills.map(|k| history::machine_oom_window(k, &mut sys, 1))
+    } else {
+        None
+    };
+    let fold = |nics: &[platform::NicCounters]| {
+        nics.iter().fold((0u64, 0u64, 0u64), |(rx, tx, dr), n| {
+            (rx + n.rx_bytes, tx + n.tx_bytes, dr + n.rx_drops + n.tx_drops)
+        })
+    };
+    let (net_rate, drop_rate) = match (nc1.as_ref(), nc2.as_ref()) {
+        (Some(a), Some(b)) => {
+            let _ = history::machine_net_rate((fold(a).0, fold(a).1), &mut sys);
+            let _ = history::machine_drop_rate(fold(a).2, &mut sys);
+            let rate = history::machine_net_rate((fold(b).0, fold(b).1), &mut sys);
+            let drop = history::machine_drop_rate(fold(b).2, &mut sys);
+            (rate, drop)
+        }
+        _ => (None, None),
+    };
+
+    let mut violations: Vec<(Pid, String, String)> = Vec::new();
+
+    // ---- per-process thresholds over the fresh table ----
+    let fd_counts = if cli.alert_fd.is_some() {
+        platform.fd_counts().unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let conn_counts = if cli.alert_conn.is_some() {
+        tui::established_per_pid(&platform.list_all_sockets().unwrap_or_default())
+    } else {
+        HashMap::new()
+    };
+    for p in &procs {
+        if let Some(limit) = cli.alert_cpu {
+            if let Some(c) = hist.cpu_now.get(&p.pid) {
+                if *c > limit as f64 {
+                    violations.push((p.pid, p.name.clone(), format!("CPU {c:.0}% above {limit}%")));
+                }
+            }
+        }
+        if let Some(limit_mb) = cli.alert_mem {
+            let mb = p.mem_kb.map(|kb| kb / 1024);
+            if mb.is_some_and(|m| m > limit_mb) {
+                violations.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!("RSS {} MB above {limit_mb} MB", mb.unwrap_or(0)),
+                ));
+            }
+        }
+        if let Some(limit) = cli.alert_fd {
+            let n = fd_counts.get(&p.pid).copied();
+            if n.is_some_and(|c| c > limit) {
+                violations.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!("{} open fds above {limit}", n.unwrap_or(0)),
+                ));
+            }
+        }
+        if let Some(limit) = cli.alert_conn {
+            let n = conn_counts.get(&p.pid).copied();
+            if n.is_some_and(|c| c > limit) {
+                violations.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!("{} established connection(s) above {limit}", n.unwrap_or(0)),
+                ));
+            }
+        }
+        if let Some(limit) = cli.alert_threads {
+            let n = p.threads.map(|t| t as u64);
+            if n.is_some_and(|c| c > limit) {
+                violations.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!("{} thread(s) above {limit}", n.unwrap_or(0)),
+                ));
+            }
+        }
+        if let Some(limit) = cli.alert_io {
+            let bps = hist.io_rate_of(p.pid).map(|(r, w)| r + w);
+            if bps.is_some_and(|b| b > limit as f64 * 1024.0 * 1024.0) {
+                violations.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!(
+                        "I/O {:.1} MB/s above {limit} MB/s",
+                        bps.unwrap_or(0.0) / 1024.0 / 1024.0
+                    ),
+                ));
+            }
+        }
+        if let Some(limit) = cli.alert_net_per_proc {
+            let rate = hist.net_rate_of(p.pid);
+            if rate.is_some_and(|r| r > limit as f64 * 1024.0 * 1024.0) {
+                violations.push((
+                    p.pid,
+                    p.name.clone(),
+                    format!(
+                        "TCP {r:.1} MB/s above {limit} MB/s",
+                        r = rate.unwrap_or(0.0) / 1024.0 / 1024.0
+                    ),
+                ));
+            }
+        }
+    }
+
+    // ---- machine-wide thresholds over the fresh snapshot ----
+    if let Some(limit) = cli.alert_load {
+        if let Some(l) = stats.load1 {
+            if l > limit {
+                violations.push((0, "system".into(), format!("load average {l:.2} above {limit}")));
+            }
+        }
+    }
+    if let Some(limit) = cli.alert_mem_pct {
+        if let (Some(u), Some(t)) = (stats.mem_used_mb, stats.mem_total_mb) {
+            if t > 0 {
+                let pct = (u * 100) / t;
+                if pct > limit {
+                    violations.push((0, "system".into(), format!("RAM {pct}% above {limit}%")));
+                }
+            }
+        }
+    }
+    if let Some(limit) = cli.alert_count {
+        if procs.len() > limit as usize {
+            violations.push((
+                0,
+                "system".into(),
+                format!("{} visible processes above {limit}", procs.len()),
+            ));
+        }
+    }
+    if cli.alert_disk.is_some() {
+        let mut over_mounts: Vec<(u64, String)> = platform
+            .mount_usage()
+            .iter()
+            .filter(|m| m.total_mb > 0)
+            .map(|m| ((m.used_mb * 100) / m.total_mb, m.target.clone()))
+            .filter(|(pct, _)| Some(*pct) > cli.alert_disk)
+            .collect();
+        over_mounts.sort_by(|a, b| b.0.cmp(&a.0));
+        if !over_mounts.is_empty() {
+            let named: Vec<String> = over_mounts
+                .iter()
+                .take(3)
+                .map(|(pct, t)| format!("{t} {pct}%"))
+                .collect();
+            violations.push((
+                0,
+                "system".into(),
+                format!("disk {} above {}%", named.join(", "), cli.alert_disk.unwrap_or(0)),
+            ));
+        }
+    }
+    if let (Some(limit), Some(rate)) = (cli.alert_net, net_rate) {
+        if rate > limit as f64 {
+            violations.push((
+                0,
+                "system".into(),
+                format!("net {rate:.1} MB/s above {limit} MB/s"),
+            ));
+        }
+    }
+    if let Some(limit) = cli.alert_psi {
+        if let Some(psi) = &stats.psi {
+            let over: Vec<String> = [
+                ("cpu", psi.cpu_full),
+                ("mem", psi.mem_full),
+                ("io", psi.io_full),
+            ]
+            .into_iter()
+            .filter(|(_, v)| *v > limit as f64)
+            .map(|(r, v)| format!("{r} {v:.1}%"))
+            .collect();
+            if !over.is_empty() {
+                violations.push((
+                    0,
+                    "system".into(),
+                    format!("PSI full {} above {limit}%", over.join(", ")),
+                ));
+            }
+        }
+    }
+    if let Some(floor) = cli.alert_mem_avail_mb {
+        if let Some(a) = stats.mem_avail_mb {
+            if a < floor {
+                violations.push((
+                    0,
+                    "system".into(),
+                    format!("MemAvailable {a} MB below {floor} MB floor"),
+                ));
+            }
+        }
+    }
+    if let Some(limit) = cli.alert_swap_pct {
+        if let (Some(u), Some(t)) = (stats.swap_used_mb, stats.swap_total_mb) {
+            if t > 0 {
+                let pct = (u * 100) / t;
+                if pct > limit {
+                    violations.push((0, "system".into(), format!("swap {pct}% above {limit}%")));
+                }
+            }
+        }
+    }
+    if let (Some(limit), Some(rate)) = (cli.alert_retrans.map(|v| v as f64), retrans_rate) {
+        if rate > limit {
+            violations.push((
+                0,
+                "system".into(),
+                format!("TCP retransmits {rate:.0}/s above {limit:.0}/s"),
+            ));
+        }
+    }
+    if let (Some(limit), Some(rate)) = (cli.alert_nic_drop.map(|v| v as f64), drop_rate) {
+        if rate > limit {
+            violations.push((
+                0,
+                "system".into(),
+                format!("NIC drops {rate:.0}/s above {limit:.0}/s"),
+            ));
+        }
+    }
+    if let Some(limit) = cli.alert_oom {
+        if oom_in_window.is_some_and(|w| w >= limit) {
+            violations.push((
+                0,
+                "system".into(),
+                format!(
+                    "OOM killer {} kill(s) within the sample gap",
+                    oom_in_window.unwrap_or(0)
+                ),
+            ));
+        }
+    }
+
+    if cli.json {
+        let doc = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": util::now_unix(),
+            "violations": violations
+                .iter()
+                .map(|(pid, name, detail)| serde_json::json!({
+                    "pid": pid,
+                    "name": name,
+                    "detail": detail,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+    } else if violations.is_empty() {
+        write_out("✔ all armed checks clean");
+    } else {
+        for (pid, name, detail) in &violations {
+            let who = if *pid == 0 {
+                name.clone()
+            } else {
+                format!("{name} (pid {pid})")
+            };
+            write_out(&format!("⚠ {who} — {detail}"));
+        }
+        write_out(&format!("{} violation(s)", violations.len()));
+    }
+    i32::from(!violations.is_empty())
+}
+
 fn watch_alert_picks(
     platform: &dyn Platform,
     cli: &cli::Cli,
@@ -2471,6 +2832,57 @@ fn main() {
         std::process::exit(0);
     }
 
+    // --export-alert-rules: the Prometheus side of the same setup — write
+    // the ready-made alerting rules and exit, a no-target standalone.
+    if let Some(path) = &cli.export_alert_rules {
+        if !specs.is_empty() || cli.interactive {
+            eprintln!("--export-alert-rules writes a rules file; drop the targets or -i");
+            std::process::exit(4);
+        }
+        if cli.watch.is_some() {
+            eprintln!("--export-alert-rules writes one file and exits; drop --watch");
+            std::process::exit(4);
+        }
+        let body = render::alert_rules_yaml();
+        if let Err(e) = std::fs::write(path, &body) {
+            // the report writers create missing parent dirs — same courtesy
+            let p = std::path::Path::new(path);
+            if e.kind() == std::io::ErrorKind::NotFound {
+                if let Some(dir) = p.parent() {
+                    if std::fs::create_dir_all(dir).is_ok() {
+                        let _ = std::fs::write(path, &body);
+                    }
+                }
+            }
+            if !std::path::Path::new(path).exists() {
+                eprintln!("--export-alert-rules {path}: {e}");
+                std::process::exit(5);
+            }
+        }
+        let n = body.matches("      - alert:").count();
+        write_out(&format!(
+            "Prometheus alert rules written → {path} ({n} rules — drop it in rule_files and reload Prometheus)"
+        ));
+        std::process::exit(0);
+    }
+
+    // --check: the alert vocabulary without a resident watcher — one pass
+    // over every armed threshold, violations exit 1, clean exits 0.
+    // cron+mail health checks and pre-deploy gates run the same
+    // thresholds the --watch loop patrols.
+    if cli.check {
+        if !specs.is_empty() || cli.interactive {
+            eprintln!("--check sweeps the whole machine; drop the targets or -i");
+            std::process::exit(4);
+        }
+        if cli.watch.is_some() {
+            eprintln!("--check is one pass; plain --watch already patrols continuously");
+            std::process::exit(4);
+        }
+        let platform = platform::get();
+        std::process::exit(run_check_once(&*platform, &cli));
+    }
+
     // --plot: render one --record file into a self-contained HTML chart (or
     // overlay several into one comparison) — a no-target operation like
     // --snap/--diff.
@@ -3659,9 +4071,11 @@ fn main() {
                     || cli.alert_swap_pct.is_some()
                     || cli.alert_retrans.is_some()
                     || cli.alert_nic_drop.is_some()
+                    || cli.alert_oom.is_some()
+                    || cli.alert_disk_eta.is_some()
                 {
                     if let Some(stats) = platform.system_stats() {
-                        let mounts = if cli.alert_disk.is_some() {
+                        let mounts = if cli.alert_disk.is_some() || cli.alert_disk_eta.is_some() {
                             platform.mount_usage()
                         } else {
                             Vec::new()
@@ -3718,6 +4132,9 @@ fn main() {
                             retrans_rate,
                             drop_limit: cli.alert_nic_drop.map(|v| v as f64),
                             drop_rate,
+                            oom_limit: cli.alert_oom,
+                            oom_kills: stats.oom_kills,
+                            disk_eta_hours: cli.alert_disk_eta,
                             repeat: cli.alert_repeat,
                         };
                         for (name, detail, rec) in history::system_alert_picks(
@@ -4752,6 +5169,59 @@ mod tests {
             watch_alert_picks(&platform, &cli, &leaky, &hist, 1, &mut state, &mut fds, &mut conns)
                 .is_empty()
         );
+    }
+
+    /// `--check`'s test double: one hog (9.7 GB RSS) and an overloaded
+    /// machine (load1 9), nothing else. Level checks only, so the run
+    /// never sleeps.
+    struct CheckPlatform;
+
+    impl Platform for CheckPlatform {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        fn capabilities(&self) -> platform::Capabilities {
+            platform::Capabilities { file_lookup: false, env: false }
+        }
+        fn list_processes(&self) -> platform::PlatResult<Vec<Process>> {
+            Ok(vec![proc(9, "hog", None, Some(9999 * 1024))])
+        }
+        fn detail(&self, brief: &Process, _want_env: bool) -> Process {
+            brief.clone()
+        }
+        fn port_to_sockets(&self, _port: u16) -> platform::PlatResult<Vec<model::Socket>> {
+            Ok(Vec::new())
+        }
+        fn list_sockets(&self) -> platform::PlatResult<Vec<model::Socket>> {
+            Ok(Vec::new())
+        }
+        fn file_to_pids(&self, _path: &str) -> platform::PlatResult<Vec<i32>> {
+            Ok(Vec::new())
+        }
+        fn container_of(&self, _pid: i32) -> Option<model::Source> {
+            None
+        }
+        fn service_source(&self, _procs: &[Process]) -> Option<model::Source> {
+            None
+        }
+        fn system_stats(&self) -> Option<platform::SystemStats> {
+            Some(platform::SystemStats {
+                load1: Some(9.0),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn check_reports_violations_and_cleans() {
+        // level thresholds only — no rate checks, no sleep, no history
+        let cli = cli::Cli::parse_from(["witr", "--check", "--alert-mem", "1024", "--alert-load", "4"]);
+        let code = run_check_once(&CheckPlatform, &cli);
+        assert_eq!(code, 1, "hog RSS + load1 over the line");
+        // under the line everywhere: clean, exit 0
+        let cli = cli::Cli::parse_from(["witr", "--check", "--alert-mem", "999999", "--alert-load", "40"]);
+        let code = run_check_once(&CheckPlatform, &cli);
+        assert_eq!(code, 0, "everything under its line");
     }
 
     #[test]
