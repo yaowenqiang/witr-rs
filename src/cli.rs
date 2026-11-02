@@ -236,6 +236,9 @@ impl Cli {
         self.alert_count = self.alert_count.or(cfg.alert_count);
         self.alert_disk = self.alert_disk.or(cfg.alert_disk);
         self.alert_disk_eta = self.alert_disk_eta.or(cfg.alert_disk_eta);
+        self.alert_disk_busy = self.alert_disk_busy.or(cfg.alert_disk_busy);
+        self.alert_temp = self.alert_temp.or(cfg.alert_temp);
+        self.alert_zombies = self.alert_zombies.or(cfg.alert_zombies);
         self.alert_net = self.alert_net.or(cfg.alert_net);
         self.alert_psi = self.alert_psi.or(cfg.alert_psi);
         self.alert_mem_avail_mb = self.alert_mem_avail_mb.or(cfg.alert_mem_avail_mb);
@@ -806,6 +809,36 @@ pub struct Cli {
         )
     )]
     pub alert_disk_eta: Option<f64>,
+
+    #[arg(
+        long = "alert-disk-busy",
+        value_name = "PCT",
+        help = t(
+            "磁盘饱和哨兵：任一块物理盘在刷新间隔内带 IO 在飞的时间占比（iostat %util 的孪生，Linux /proc/diskstats 差分）连续 5 次采样超过该值即触发，详情点名最忙的设备——空间哨兵（--alert-disk/--alert-disk-eta）管\"快满了\"，每进程 io-rate 管\"谁在写\"，这块管\"哪块盘是瓶颈\"。TUI 和 --watch",
+            "Disk-saturation sentinel: fire when any block device spends over this share of the refresh interval with IO in flight (the iostat %util twin, diffed from Linux /proc/diskstats) for 5 consecutive samples; the detail names the busiest devices — the space sentinels (--alert-disk/--alert-disk-eta) handle \"nearly full\" and per-process io-rate handles \"who writes\", this one answers \"which disk is the bottleneck\". TUI and --watch"
+        )
+    )]
+    pub alert_disk_busy: Option<f64>,
+
+    #[arg(
+        long = "alert-temp",
+        value_name = "C",
+        help = t(
+            "温度哨兵：最热的可读传感器连续 5 次采样超过该摄氏度即触发，详情点名传感器——机房没有 IPMI 告警或不想配置时，一个旗标顶上。TUI 和 --watch",
+            "Thermal sentinel: fire when the hottest readable sensor exceeds this many degrees Celsius for 5 consecutive samples; the detail names the sensor — one flag instead of an IPMI alert setup. TUI and --watch"
+        )
+    )]
+    pub alert_temp: Option<f64>,
+
+    #[arg(
+        long = "alert-zombies",
+        value_name = "N",
+        help = t(
+            "僵尸进程计数哨兵：defunct（state Z）进程数连续 5 次采样超过该值即触发——尸体堆积说明有人停止收割子进程（init 未接管、父进程卡死或已失控）；--zombies 列名单，这个管总量水位。TUI 和 --watch",
+            "Zombie-count sentinel: fire when more than this many processes sit defunct (state Z) for 5 consecutive samples — a corpse pile means something stopped reaping its children (init hasn't collected them, the parent is stuck or run away); --zombies lists the names, this one watches the waterline. TUI and --watch"
+        )
+    )]
+    pub alert_zombies: Option<u64>,
 
     #[arg(
         long = "alert-net",

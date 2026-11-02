@@ -1393,6 +1393,43 @@ pub fn render_sys(frame: &SysFrame, p: &Painter) -> String {
         let _ = writeln!(out, "disk  {}", cells.join("  "));
     }
 
+    // per-device IO: busy% (the iostat %util twin) + queue depth + IOPS —
+    // which disk is the bottleneck, right next to which disk is nearly
+    // full; red past 80% busy
+    if !frame.stats.disks.is_empty() {
+        let mut ds: Vec<&crate::platform::DiskIoSample> = frame.stats.disks.iter().collect();
+        ds.sort_by(|a, b| {
+            b.busy_pct
+                .partial_cmp(&a.busy_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let cells: Vec<String> = ds
+            .iter()
+            .take(6)
+            .map(|d| {
+                let iops = match (d.read_iops, d.write_iops) {
+                    (Some(r), Some(w)) => format!(" {r:.0}r/{w:.0}w"),
+                    _ => String::new(),
+                };
+                let q = if d.in_flight > 0 {
+                    format!(" q{}", d.in_flight)
+                } else {
+                    String::new()
+                };
+                let txt = match d.busy_pct {
+                    Some(b) => format!("{} {:.0}%{q}{iops}", d.device, b),
+                    None => format!("{} q{}{iops}", d.device, d.in_flight),
+                };
+                match d.busy_pct {
+                    Some(b) if b >= 80.0 => p.red(&txt),
+                    Some(b) if b >= 50.0 => p.yellow(&txt),
+                    _ => txt,
+                }
+            })
+            .collect();
+        let _ = writeln!(out, "io    {}", cells.join("  "));
+    }
+
     // network: the busiest eight interfaces by rx+tx
     if !frame.nics.is_empty() {
         let cells: Vec<String> = frame
@@ -1483,6 +1520,17 @@ fn sys_flat_cells(frame: &SysFrame) -> Vec<(String, String)> {
         (
             "DISK_USED_PCT".into(),
             worst.map(|(p, _)| format!("{p:.1}")).unwrap_or_default(),
+        ),
+        (
+            "DISK_BUSY_PCT".into(),
+            frame
+                .stats
+                .disks
+                .iter()
+                .filter_map(|d| d.busy_pct)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|b| format!("{b:.1}"))
+                .unwrap_or_default(),
         ),
         (
             "DISK_MOUNT".into(),
@@ -1694,6 +1742,23 @@ pub fn grafana_dashboard() -> serde_json::Value {
         None,
         &[("{{name}} (pid {{pid}})", "topk(5, witr_process_rss_bytes)")],
     );
+    add(
+        "Disk IO busy",
+        0, 53, 12, 8,
+        "percent",
+        Some(100.0),
+        &[("{{device}}", "witr_machine_disk_busy_percent")],
+    );
+    add(
+        "Disk IOPS",
+        12, 53, 12, 8,
+        "iops",
+        None,
+        &[
+            ("{{device}} read", "witr_machine_disk_iops{direction=\"read\"}"),
+            ("{{device}} write", "witr_machine_disk_iops{direction=\"write\"}"),
+        ],
+    );
 
     serde_json::json!({
         "id": null,
@@ -1824,6 +1889,22 @@ pub fn alert_rules_yaml() -> String {
             "warning",
             "Process restarted under a new pid",
             "{{ $labels.name }} (was pid {{ $labels.pid }}) started fresh within the last 10m — the standard Prometheus restart signal.",
+        ),
+        (
+            "WitrDiskBusyHigh",
+            "witr_machine_disk_busy_percent > 90",
+            "5m",
+            "warning",
+            "Disk IO busy above 90%",
+            "{{ $labels.device }} has been busy (iostat %util) {{ $value | humanize }}% of the time for 5m — the bottleneck disk; space sentinels won't catch this.",
+        ),
+        (
+            "WitrTemperatureHigh",
+            "witr_machine_temp_celsius > 80",
+            "5m",
+            "warning",
+            "Temperature above 80°C",
+            "The hottest sensor ({{ $labels.sensor }}) reads {{ $value | humanize }}°C.",
         ),
     ];
     let mut out = String::from(
@@ -3146,6 +3227,13 @@ mod tests {
             temp: Some(("acpitz".into(), 54.0)),
             retrans_segs: Some(4242),
             oom_kills: Some(2),
+            disks: vec![crate::platform::DiskIoSample {
+                device: "vda".into(),
+                busy_pct: Some(87.4),
+                in_flight: 3,
+                read_iops: Some(120.0),
+                write_iops: Some(45.0),
+            }],
         };
         let frame = SysFrame {
             stats,
@@ -3167,6 +3255,9 @@ mod tests {
         assert!(text.contains("net   eth0"));
         assert!(text.contains("temp  acpitz 54°C"));
         assert!(text.contains("psi   cpu 1.2/0.0"));
+        // per-device IO under the space bars: busiest device with busy%,
+        // queue depth and the IOPS tail; past 80% busy it goes red
+        assert!(text.contains("io    vda 87% q3 120r/45w"), "{text}");
 
         let csv = render_sys_csv(&frame);
         let mut lines = csv.lines();
@@ -3176,10 +3267,12 @@ mod tests {
         assert!(header.starts_with("cpu_pct,mem_used_mb"));
         assert!(row.starts_with("37.2,6000,10000,16000,512,4096,0.42,0.35,0.30,214,"));
         assert!(row.contains("97.7"), "disk used pct: {row}");
+        assert!(row.contains("87.4"), "busiest device busy pct: {row}");
         assert!(row.ends_with(",54.0,acpitz,12.5"), "temp/psi tail: {row}");
 
         let md = render_sys_markdown(&frame);
         assert!(md.starts_with("| CPU_PCT |"));
+        assert!(md.contains("DISK_BUSY_PCT"));
         assert!(md.contains("| 37.2 | 6000 |"));
     }
 
@@ -3268,6 +3361,8 @@ mod tests {
             "witr_container_throttled_seconds_total",
             "witr_container_oom_kills_total",
             "witr_process_start_time_seconds",
+            "witr_machine_disk_busy_percent",
+            "witr_machine_temp_celsius",
         ] {
             assert!(yaml.contains(probe), "{probe} has a rule:\n{yaml}");
         }
@@ -3315,6 +3410,8 @@ mod tests {
             "witr_container_throttled_seconds_total",
             "witr_container_oom_kills_total",
             "witr_process_cpu_percent",
+            "witr_machine_disk_busy_percent",
+            "witr_machine_disk_iops",
         ] {
             assert!(
                 exprs.iter().any(|e| e.contains(probe)),

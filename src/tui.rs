@@ -412,6 +412,12 @@ struct TuiApp {
     alert_disk: Option<u64>,
     /// --alert-disk-eta: predicted time-to-full horizon (hours)
     alert_disk_eta: Option<f64>,
+    /// --alert-disk-busy: any-device %util threshold
+    alert_disk_busy: Option<f64>,
+    /// --alert-temp: hottest-sensor celsius threshold
+    alert_temp: Option<f64>,
+    /// --alert-zombies: defunct-process count threshold
+    alert_zombies: Option<u64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
     alert_net: Option<u64>,
     /// --alert-psi: PSI "full" stall percent threshold (Linux only)
@@ -635,6 +641,12 @@ pub struct Seed {
     pub alert_disk: Option<u64>,
     /// --alert-disk-eta: predicted time-to-full horizon (hours)
     pub alert_disk_eta: Option<f64>,
+    /// --alert-disk-busy: any-device %util threshold
+    pub alert_disk_busy: Option<f64>,
+    /// --alert-temp: hottest-sensor celsius threshold
+    pub alert_temp: Option<f64>,
+    /// --alert-zombies: defunct-process count threshold
+    pub alert_zombies: Option<u64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
     pub alert_net: Option<u64>,
     /// --alert-psi: PSI "full" stall percent threshold (Linux only)
@@ -740,6 +752,9 @@ impl Seed {
         self.alert_count = cli.alert_count;
         self.alert_disk = cli.alert_disk;
         self.alert_disk_eta = cli.alert_disk_eta;
+        self.alert_disk_busy = cli.alert_disk_busy;
+        self.alert_temp = cli.alert_temp;
+        self.alert_zombies = cli.alert_zombies;
         self.alert_net = cli.alert_net;
         self.alert_psi = cli.alert_psi;
         self.alert_mem_avail_mb = cli.alert_mem_avail_mb;
@@ -884,6 +899,9 @@ impl TuiApp {
             alert_count: seed.alert_count,
             alert_disk: seed.alert_disk,
             alert_disk_eta: seed.alert_disk_eta,
+            alert_disk_busy: seed.alert_disk_busy,
+            alert_temp: seed.alert_temp,
+            alert_zombies: seed.alert_zombies,
             alert_net: seed.alert_net,
             alert_psi: seed.alert_psi,
             alert_mem_avail_mb: seed.alert_mem_avail_mb,
@@ -1171,6 +1189,9 @@ impl TuiApp {
         self.alert_count = seed.alert_count;
         self.alert_disk = seed.alert_disk;
         self.alert_disk_eta = seed.alert_disk_eta;
+        self.alert_disk_busy = seed.alert_disk_busy;
+        self.alert_temp = seed.alert_temp;
+        self.alert_zombies = seed.alert_zombies;
         self.alert_net = seed.alert_net;
         self.alert_psi = seed.alert_psi;
         self.alert_mem_avail_mb = seed.alert_mem_avail_mb;
@@ -1347,6 +1368,9 @@ impl TuiApp {
                     || self.alert_count.is_some()
                     || self.alert_disk.is_some()
                     || self.alert_disk_eta.is_some()
+                    || self.alert_disk_busy.is_some()
+                    || self.alert_temp.is_some()
+                    || self.alert_zombies.is_some()
                     || self.alert_net.is_some()
                     || self.alert_psi.is_some()
                     || self.alert_mem_avail_mb.is_some()
@@ -1424,17 +1448,27 @@ impl TuiApp {
                         oom_limit: self.alert_oom,
                         oom_kills: stats.oom_kills,
                         disk_eta_hours: self.alert_disk_eta,
+                        disk_busy_limit: self.alert_disk_busy,
+                        temp_limit: self.alert_temp,
+                        zombie_limit: self.alert_zombies,
+                        zombie_count: self
+                            .procs
+                            .iter()
+                            .filter(|p| p.state.as_deref() == Some("Z"))
+                            .count(),
                         repeat: self.alert_repeat,
                     };
+                    let mut sys_picks = crate::history::system_alert_picks(
+                        &stats,
+                        &mut self.sys_alert,
+                        &limits,
+                        interval,
+                    );
+                    crate::attribute_oom(&mut sys_picks, self.platform.as_ref(), interval);
                     picks.extend(
-                        crate::history::system_alert_picks(
-                            &stats,
-                            &mut self.sys_alert,
-                            &limits,
-                            interval,
-                        )
-                        .into_iter()
-                        .map(|(name, detail, rec)| (0, name, detail, rec)),
+                        sys_picks
+                            .into_iter()
+                            .map(|(name, detail, rec)| (0, name, detail, rec)),
                     );
                 }
             }
@@ -2197,6 +2231,54 @@ impl TuiApp {
                 } else {
                     Span::raw(text)
                 }));
+            }
+        }
+        // per-device IO, right under the space bars — busy% (the iostat
+        // %util twin) + queue depth + IOPS; red past 80% busy
+        if let Some(stats) = self.platform.system_stats() {
+            let mut disks = stats.disks.clone();
+            disks.sort_by(|a, b| {
+                b.busy_pct
+                    .partial_cmp(&a.busy_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if !disks.is_empty() {
+                lines.push(Line::from(Span::styled("io", Style::new().bold())));
+                for d in disks.iter().take(8) {
+                    let iops = match (d.read_iops, d.write_iops) {
+                        (Some(r), Some(w)) => format!("  {:.0}r/{:.0}w/s", r, w),
+                        _ => String::new(),
+                    };
+                    let q = if d.in_flight > 0 {
+                        format!(" q{}", d.in_flight)
+                    } else {
+                        String::new()
+                    };
+                    let text = match d.busy_pct {
+                        Some(b) => {
+                            let n = ((b / 100.0).clamp(0.0, 0.999) * 10.0) as usize;
+                            format!(
+                                "  {:<24}│{}{}│ {:>3.0}%{}{}",
+                                d.device,
+                                "█".repeat(n),
+                                "░".repeat(10 - n),
+                                b,
+                                q,
+                                iops
+                            )
+                        }
+                        None => format!("  {:<24} q{}{}", d.device, q, iops),
+                    };
+                    lines.push(Line::from(match d.busy_pct {
+                        Some(b) if b >= 80.0 => {
+                            Span::styled(text, Style::new().fg(Color::Red))
+                        }
+                        Some(b) if b >= 50.0 => {
+                            Span::styled(text, Style::new().fg(Color::Yellow))
+                        }
+                        _ => Span::raw(text),
+                    }));
+                }
             }
         }
         // network: total-rate sparkline (window peak annotated) plus one
@@ -10270,6 +10352,9 @@ mod tests {
                 alert_count: None,
                 alert_disk: None,
                 alert_disk_eta: None,
+                alert_disk_busy: None,
+                alert_temp: None,
+                alert_zombies: None,
                 alert_net: None,
                 alert_psi: None,
                 alert_mem_avail_mb: None,

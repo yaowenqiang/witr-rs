@@ -18,6 +18,15 @@ pub struct Linux {
     /// /proc/stat tick snapshot from the previous [`Linux::system_stats`]
     /// call — CPU% is a tick delta, so the first call reports no percents.
     prev_stat: std::cell::RefCell<Option<StatSnapshot>>,
+    /// /proc/diskstats counters from the previous [`Linux::system_stats`]
+    /// call — busy% and IOPS are wall-time deltas, same shape as prev_stat
+    /// (device → io_ticks_ms, reads, writes; plus when it was taken).
+    prev_disks: std::cell::RefCell<
+        Option<(
+            std::time::Instant,
+            std::collections::HashMap<String, (u64, u64, u64)>,
+        )>,
+    >,
 }
 
 impl Linux {
@@ -25,6 +34,7 @@ impl Linux {
         Linux {
             users,
             prev_stat: std::cell::RefCell::new(None),
+            prev_disks: std::cell::RefCell::new(None),
         }
     }
 
@@ -316,6 +326,68 @@ fn parse_vmstat_oom(text: &str) -> Option<u64> {
         l.strip_prefix("oom_kill ")
             .and_then(|v| v.trim().parse::<u64>().ok())
     })
+}
+
+/// /proc/diskstats rows for real block devices — `(device, io_ticks_ms,
+/// reads, writes, in_flight)`. Loop/ram/floppy pseudo-devices are skipped
+/// (they never hold interesting IO); partitions are dropped by the
+/// caller, which knows the full device-name set.
+fn parse_diskstats(text: &str) -> Vec<(String, u64, u64, u64, u32)> {
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() < 14 {
+                return None;
+            }
+            let name = f[2];
+            if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("fd") {
+                return None;
+            }
+            Some((
+                name.to_string(),
+                f[12].parse().ok()?, // io_ticks_ms: wall time with IO in flight
+                f[3].parse().ok()?,  // reads completed
+                f[7].parse().ok()?,  // writes completed
+                f[11].parse().ok()?, // requests issued but not completed
+            ))
+        })
+        .collect()
+}
+
+/// One kernel-log line → the OOM victim it names: "nginx (pid 1234)".
+/// Matches the classic "Out of memory: Killed process 1234 (nginx)
+/// total-vm:…" anywhere in the line (journal prefixes and oom-report
+/// wrappers vary by kernel); everything else is None.
+fn parse_oom_victim(line: &str) -> Option<String> {
+    let i = line.find("Killed process ")?;
+    let rest = &line[i + "Killed process ".len()..];
+    let mut it = rest.split_whitespace();
+    let pid = it.next()?;
+    let name = it
+        .next()
+        .unwrap_or("?")
+        .trim_start_matches('(')
+        .trim_end_matches(|c| c == ')' || c == ',');
+    Some(format!("{name} (pid {pid})"))
+}
+
+/// Drop partition rows (vda1) whose whole device (vda) also reported —
+/// the device row is the one that answers "which disk is busy".
+fn drop_partitions(
+    mut rows: Vec<(String, u64, u64, u64, u32)>,
+) -> Vec<(String, u64, u64, u64, u32)> {
+    let names: std::collections::HashSet<String> =
+        rows.iter().map(|(n, ..)| n.clone()).collect();
+    rows.retain(|(n, ..)| {
+        // a partition's parent is the name minus its suffix: trailing
+        // digits (vda1) or "p<digits>" (nvme0n1p1)
+        let base1 = n.trim_end_matches(|c: char| c.is_ascii_digit());
+        let base2 = base1.strip_suffix('p').unwrap_or(base1);
+        let is_partition =
+            |base: &str| base != n.as_str() && names.contains(base);
+        !is_partition(base1) && !is_partition(base2)
+    });
+    rows
 }
 
 /// cpu.stat's `throttled_usec <n>` line → n. This cgroup's tasks spent
@@ -1280,6 +1352,54 @@ impl Platform for Linux {
         if let Some(vm) = read_ok(Path::new("/proc/vmstat")) {
             out.oom_kills = parse_vmstat_oom(&vm);
         }
+        // per-device IO: diff this sweep's counters against the previous
+        // call's — busy% is io_ticks delta over elapsed wall time (the
+        // iostat %util, clamped at 100: NVMe's parallelism can hold more
+        // than one device-second of IO per wall second), IOPS likewise
+        let now = std::time::Instant::now();
+        let rows = drop_partitions(parse_diskstats(
+            &read_ok(Path::new("/proc/diskstats")).unwrap_or_default(),
+        ));
+        {
+            let mut prev = self.prev_disks.borrow_mut();
+            match prev.take() {
+                Some((at, counters)) => {
+                    let secs = now.duration_since(at).as_secs_f64().max(0.001);
+                    let ms = secs * 1000.0;
+                    for (name, io_ticks, reads, writes, in_flight) in &rows {
+                        let Some((pt, pr, pw)) = counters.get(name) else {
+                            continue;
+                        };
+                        out.disks.push(super::DiskIoSample {
+                            device: name.clone(),
+                            busy_pct: Some(
+                                ((*io_ticks).saturating_sub(*pt) as f64 / ms * 100.0)
+                                    .clamp(0.0, 100.0),
+                            ),
+                            in_flight: *in_flight,
+                            read_iops: Some((*reads).saturating_sub(*pr) as f64 / secs),
+                            write_iops: Some((*writes).saturating_sub(*pw) as f64 / secs),
+                        });
+                    }
+                }
+                None => {
+                    // first sweep: queue depth only — no previous to diff
+                    for (name, _t, _r, _w, in_flight) in &rows {
+                        out.disks.push(super::DiskIoSample {
+                            device: name.clone(),
+                            in_flight: *in_flight,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+            *prev = Some((
+                now,
+                rows.iter()
+                    .map(|(n, t, r, w, _)| (n.clone(), (*t, *r, *w)))
+                    .collect(),
+            ));
+        }
         Some(out)
     }
 
@@ -1287,6 +1407,37 @@ impl Platform for Linux {
         read_ok(Path::new("/proc/net/dev"))
             .map(|t| parse_net_dev(&t))
             .unwrap_or_default()
+    }
+
+    /// The OOM killer's victims, from `journalctl -k` over the trailing
+    /// window — the classic kernel line names pid and binary. Unreadable
+    /// (no journalctl, no privilege) means `None` and the alert stays
+    /// count-only.
+    fn oom_victims(&self, since_secs: u64) -> Option<Vec<String>> {
+        let log = crate::util::run_ok(
+            "journalctl",
+            &[
+                "-k",
+                "--since",
+                &format!("-{since_secs}s"),
+                "-o",
+                "cat",
+                "--no-pager",
+            ],
+            CMD_TIMEOUT,
+        )?;
+        let mut victims: Vec<String> = Vec::new();
+        for line in log.lines() {
+            if let Some(who) = parse_oom_victim(line) {
+                if !victims.contains(&who) {
+                    victims.push(who);
+                }
+            }
+            if victims.len() >= 3 {
+                break; // the detail line is a pointer, not a report
+            }
+        }
+        Some(victims)
     }
 
     /// Effective capabilities from /proc/<pid>/status CapEff, decoded to the
@@ -1821,6 +1972,26 @@ fn classify_cgroup(path: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_oom_victim_names_the_dead_process() {
+        // the classic x86 report, with and without the journal prefix
+        assert_eq!(
+            parse_oom_victim(
+                "Out of memory: Killed process 1234 (nginx) total-vm:204800kB, anon-rss:10240kB"
+            ),
+            Some("nginx (pid 1234)".to_string())
+        );
+        assert_eq!(
+            parse_oom_victim(
+                "kernel: Out of memory: Killed process 42 (python3), uid 1000, oom_score_adj 0"
+            ),
+            Some("python3 (pid 42)".to_string())
+        );
+        // everything else stays None
+        assert_eq!(parse_oom_victim("oom-kill:constraint=CONSTRAINT_NONE"), None);
+        assert_eq!(parse_oom_victim("systemd[1]: nginx.service: A fatal signal"), None);
+    }
 
     #[test]
     fn parse_vmstat_oom_finds_the_kill_line() {

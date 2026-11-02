@@ -610,6 +610,26 @@ fn parse_system_snapshot(doc: &serde_json::Value) -> Option<FleetSample> {
         let g = |k: &str| n.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
         (g("rx_bytes"), g("tx_bytes"), g("drop_total"))
     });
+    let disks = s
+        .get("disks")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| {
+                    Some(crate::platform::DiskIoSample {
+                        device: d.get("device")?.as_str()?.to_string(),
+                        busy_pct: d.get("busy_pct").and_then(|v| v.as_f64()),
+                        in_flight: d
+                            .get("in_flight")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32,
+                        read_iops: d.get("read_iops").and_then(|v| v.as_f64()),
+                        write_iops: d.get("write_iops").and_then(|v| v.as_f64()),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mounts = s
         .get("mounts")
         .and_then(|m| m.as_array())
@@ -640,6 +660,7 @@ fn parse_system_snapshot(doc: &serde_json::Value) -> Option<FleetSample> {
             temp: s.get("temp_c").and_then(|t| t.as_f64()).map(|c| ("remote".into(), c)),
             retrans_segs: u("retrans_segs"),
             oom_kills: u("oom_kills"),
+            disks,
             ..Default::default()
         },
         net,
@@ -673,6 +694,9 @@ fn fleet_machine_armed(cli: &cli::Cli) -> bool {
         || cli.alert_count.is_some()
         || cli.alert_disk.is_some()
         || cli.alert_disk_eta.is_some()
+        || cli.alert_disk_busy.is_some()
+        || cli.alert_temp.is_some()
+        || cli.alert_zombies.is_some()
         || cli.alert_net.is_some()
         || cli.alert_psi.is_some()
         || cli.alert_mem_avail_mb.is_some()
@@ -757,7 +781,7 @@ fn fleet_rates(
 fn fleet_alert_picks(
     cli: &cli::Cli,
     sample: &FleetSample,
-    proc_count: usize,
+    procs: &[Process],
     st: &mut history::SysAlertState,
     interval: u64,
 ) -> Vec<history::SysPick> {
@@ -766,7 +790,7 @@ fn fleet_alert_picks(
         load: cli.alert_load,
         mem_pct: cli.alert_mem_pct,
         count: cli.alert_count,
-        proc_count,
+        proc_count: procs.len(),
         mounts: sample.mounts.clone(),
         disk_pct: cli.alert_disk,
         net_limit: cli.alert_net,
@@ -781,6 +805,13 @@ fn fleet_alert_picks(
         oom_limit: cli.alert_oom,
         oom_kills: sample.stats.oom_kills,
         disk_eta_hours: cli.alert_disk_eta,
+        disk_busy_limit: cli.alert_disk_busy,
+        temp_limit: cli.alert_temp,
+        zombie_limit: cli.alert_zombies,
+        zombie_count: procs
+            .iter()
+            .filter(|p| p.state.as_deref() == Some("Z"))
+            .count(),
         repeat: cli.alert_repeat,
     };
     history::system_alert_picks(&sample.stats, st, &limits, interval)
@@ -860,7 +891,7 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
                             };
                             let st = states.entry(base.clone()).or_default();
                             for (name, detail, rec) in
-                                fleet_alert_picks(cli, &sample, procs.len(), st, interval)
+                                fleet_alert_picks(cli, &sample, procs, st, interval)
                             {
                                 emit_fleet_pick(
                                     cli,
@@ -1179,7 +1210,10 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         || cli.alert_swap_pct.is_some()
         || cli.alert_retrans.is_some()
         || cli.alert_nic_drop.is_some()
-        || cli.alert_oom.is_some();
+        || cli.alert_oom.is_some()
+        || cli.alert_disk_busy.is_some()
+        || cli.alert_temp.is_some()
+        || cli.alert_zombies.is_some();
     if !armed {
         eprintln!(
             "--check evaluates --alert-* thresholds; arm at least one (e.g. --check --alert-cpu 90 --alert-load 4)"
@@ -1192,7 +1226,9 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         || cli.alert_net.is_some()
         || cli.alert_retrans.is_some()
         || cli.alert_nic_drop.is_some()
-        || cli.alert_oom.is_some();
+        || cli.alert_oom.is_some()
+        // busy% needs a previous tick to diff against
+        || cli.alert_disk_busy.is_some();
 
     let sweep = || -> Vec<Process> {
         let mut procs = match platform.list_processes() {
@@ -1359,11 +1395,16 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
     } else {
         Vec::new()
     };
+    let zombie_count = procs
+        .iter()
+        .filter(|p| p.state.as_deref() == Some("Z"))
+        .count();
     for detail in machine_check_lines(
         cli,
         &stats,
         &mounts,
         procs.len(),
+        zombie_count,
         net_rate,
         drop_rate,
         retrans_rate,
@@ -1402,6 +1443,33 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
     i32::from(!violations.is_empty())
 }
 
+/// Name the OOM killer's victims on a firing: any fresh "OOM killer"
+/// detail gains the kernel log's account — `… — victims: nginx (pid 123),
+/// python (pid 456)`. The window matches the sentinel's (ALERT_CYCLES
+/// samples at the current cadence); unreadable kernel logs leave the
+/// detail count-only. Fleet alerts skip this deliberately: the victims
+/// died on the far host, whose kernel log the local fetch can't read.
+pub(crate) fn attribute_oom(picks: &mut [history::SysPick], platform: &dyn Platform, interval: u64) {
+    if !picks
+        .iter()
+        .any(|(_, d, rec)| !*rec && d.starts_with("OOM killer"))
+    {
+        return;
+    }
+    let Some(victims) = platform.oom_victims(history::ALERT_CYCLES as u64 * interval.max(1)) else {
+        return;
+    };
+    if victims.is_empty() {
+        return;
+    }
+    let suffix = format!(" — victims: {}", victims.join(", "));
+    for (_, detail, rec) in picks.iter_mut() {
+        if !*rec && detail.starts_with("OOM killer") {
+            detail.push_str(&suffix);
+        }
+    }
+}
+
 /// The machine-wide half of `--check`, shared by the local run and the
 /// fleet run: every armed level/rate threshold judged against one
 /// snapshot, violation detail lines back (no host/pid wrapping — the
@@ -1413,6 +1481,7 @@ fn machine_check_lines(
     stats: &crate::platform::SystemStats,
     mounts: &[crate::platform::MountUsage],
     proc_count: usize,
+    zombie_count: usize,
     net_rate: Option<f64>,
     drop_rate: Option<f64>,
     retrans_rate: Option<f64>,
@@ -1518,6 +1587,31 @@ fn machine_check_lines(
             ));
         }
     }
+    if let Some(limit) = cli.alert_disk_busy {
+        let over: Vec<String> = stats
+            .disks
+            .iter()
+            .filter(|d| d.busy_pct.is_some_and(|b| b > limit))
+            .map(|d| format!("{} {:.0}%", d.device, d.busy_pct.unwrap_or(0.0)))
+            .collect();
+        if !over.is_empty() {
+            out.push(format!("disk IO {} above {limit}% busy", over.join(", ")));
+        }
+    }
+    if let Some(limit) = cli.alert_temp {
+        if let Some((label, c)) = &stats.temp {
+            if *c > limit {
+                out.push(format!("temperature {c:.0}°C at {label} above {limit}°C"));
+            }
+        }
+    }
+    if let Some(limit) = cli.alert_zombies {
+        if zombie_count > limit as usize {
+            out.push(format!(
+                "{zombie_count} defunct (zombie) processes above {limit}"
+            ));
+        }
+    }
     out
 }
 
@@ -1557,11 +1651,16 @@ fn run_check_fleet(bases: &[String], cli: &cli::Cli) -> i32 {
                 let st = states.entry(base.clone()).or_default();
                 let (net_rate, drop_rate, retrans_rate, oom_window) =
                     fleet_rates(cli, &sample, st);
+                let zombie_count = procs
+                    .iter()
+                    .filter(|p| p.state.as_deref() == Some("Z"))
+                    .count();
                 for detail in machine_check_lines(
                     cli,
                     &sample.stats,
                     &sample.mounts,
                     procs.len(),
+                    zombie_count,
                     net_rate,
                     drop_rate,
                     retrans_rate,
@@ -5021,6 +5120,9 @@ fn main() {
                     || cli.alert_nic_drop.is_some()
                     || cli.alert_oom.is_some()
                     || cli.alert_disk_eta.is_some()
+                    || cli.alert_disk_busy.is_some()
+                    || cli.alert_temp.is_some()
+                    || cli.alert_zombies.is_some()
                 {
                     if let Some(stats) = platform.system_stats() {
                         let mounts = if cli.alert_disk.is_some() || cli.alert_disk_eta.is_some() {
@@ -5083,14 +5185,23 @@ fn main() {
                             oom_limit: cli.alert_oom,
                             oom_kills: stats.oom_kills,
                             disk_eta_hours: cli.alert_disk_eta,
+                            disk_busy_limit: cli.alert_disk_busy,
+                            temp_limit: cli.alert_temp,
+                            zombie_limit: cli.alert_zombies,
+                            zombie_count: procs
+                                .iter()
+                                .filter(|p| p.state.as_deref() == Some("Z"))
+                                .count(),
                             repeat: cli.alert_repeat,
                         };
-                        for (name, detail, rec) in history::system_alert_picks(
+                        let mut sys_picks = history::system_alert_picks(
                             &stats,
                             &mut sys_alert,
                             &limits,
                             interval,
-                        ) {
+                        );
+                        attribute_oom(&mut sys_picks, platform.as_ref(), interval);
+                        for (name, detail, rec) in sys_picks {
                             picks.push((0, name, detail, rec));
                         }
                     }
@@ -6293,6 +6404,56 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
     }
 
     #[test]
+    fn check_lines_cover_disk_busy_temp_and_zombies() {
+        let cli = cli::Cli::parse_from([
+            "witr",
+            "--check",
+            "--alert-disk-busy",
+            "80",
+            "--alert-temp",
+            "80",
+            "--alert-zombies",
+            "5",
+        ]);
+        let stats = crate::platform::SystemStats {
+            temp: Some(("acpitz".into(), 85.0)),
+            disks: vec![
+                crate::platform::DiskIoSample {
+                    device: "vda".into(),
+                    busy_pct: Some(87.4),
+                    in_flight: 3,
+                    ..Default::default()
+                },
+                crate::platform::DiskIoSample {
+                    device: "vdb".into(),
+                    busy_pct: Some(12.0),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let lines = machine_check_lines(&cli, &stats, &[], 0, 7, None, None, None, None);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("disk IO vda 87% above 80% busy")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("temperature 85°C at acpitz above 80°C")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("7 defunct (zombie) processes above 5")),
+            "{lines:?}"
+        );
+        // under every line → nothing to report
+        let quiet = crate::platform::SystemStats::default();
+        assert!(machine_check_lines(&cli, &quiet, &[], 0, 0, None, None, None, None).is_empty());
+    }
+
+    #[test]
     fn fleet_snapshot_round_trips_into_the_local_sentinels() {
         let stats = crate::platform::SystemStats {
             load1: Some(7.25),
@@ -6312,6 +6473,13 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             }),
             retrans_segs: Some(12345),
             oom_kills: Some(2),
+            disks: vec![crate::platform::DiskIoSample {
+                device: "vda".into(),
+                busy_pct: Some(87.4),
+                in_flight: 3,
+                read_iops: Some(120.0),
+                write_iops: Some(45.0),
+            }],
             ..Default::default()
         };
         let nics = vec![crate::platform::NicCounters {
@@ -6329,7 +6497,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         }];
         let doc = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
-            "system": crate::serve::system_snapshot(&stats, &nics, &mounts, 42),
+            "system": crate::serve::system_snapshot(&stats, &nics, &mounts, 42, 3),
             "processes": [],
         });
         let sample = parse_system_snapshot(&doc).expect("the system key parses");
@@ -6341,6 +6509,12 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         assert_eq!(s.oom_kills, Some(2));
         assert_eq!(sample.net, Some((100, 200, 7))); // (rx, tx, drops folded)
         assert_eq!(sample.mounts[0].target, "/data");
+        // the disk family rides through: the disk-busy sentinel reads it
+        // fleet-side exactly as the local one does
+        assert_eq!(s.disks.len(), 1);
+        assert_eq!(s.disks[0].device, "vda");
+        assert_eq!(s.disks[0].busy_pct, Some(87.4));
+        assert_eq!(s.disks[0].in_flight, 3);
         // a server without the snapshot (or a null one) disarms cleanly
         assert!(parse_system_snapshot(&serde_json::json!({"processes": []})).is_none());
         assert!(parse_system_snapshot(&serde_json::json!({"system": null})).is_none());
@@ -6362,11 +6536,11 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         let mut st = history::SysAlertState::default();
         for _ in 0..history::ALERT_CYCLES - 1 {
             assert!(
-                fleet_alert_picks(&cli, &sample, 10, &mut st, 3).is_empty(),
+                fleet_alert_picks(&cli, &sample, &[], &mut st, 3).is_empty(),
                 "no fire before the window completes"
             );
         }
-        let picks = fleet_alert_picks(&cli, &sample, 10, &mut st, 3);
+        let picks = fleet_alert_picks(&cli, &sample, &[], &mut st, 3);
         assert_eq!(picks.len(), 1, "{picks:?}");
         assert!(
             picks[0].1.contains("load average 9.00 above 4"),

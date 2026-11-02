@@ -300,6 +300,7 @@ pub(crate) fn system_snapshot(
     nics: &[crate::platform::NicCounters],
     mounts: &[crate::platform::MountUsage],
     proc_count: usize,
+    zombie_count: usize,
 ) -> serde_json::Value {
     let pct = |u: Option<u64>, t: Option<u64>| match (u, t) {
         (Some(u), Some(t)) if t > 0 => Some((u * 100) / t),
@@ -342,6 +343,20 @@ pub(crate) fn system_snapshot(
         "retrans_segs": stats.retrans_segs,
         "oom_kills": stats.oom_kills,
         "proc_count": proc_count,
+        "zombie_count": zombie_count,
+        "disks": stats
+            .disks
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "device": d.device,
+                    "busy_pct": d.busy_pct,
+                    "in_flight": d.in_flight,
+                    "read_iops": d.read_iops,
+                    "write_iops": d.write_iops,
+                })
+            })
+            .collect::<Vec<_>>(),
         "net": net,
         "mounts": mounts
             .iter()
@@ -431,6 +446,54 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
                     "witr_machine_psi_stall_percent{{resource=\"{resource}\",kind=\"full\"}} {full:.2}\n"
                 ));
             }
+        }
+        // per-device IO — busy% answers "which disk is the bottleneck",
+        // in-flight the queue depth, IOPS the request rates (already
+        // diffed refresh-to-refresh by the platform, so they're gauges)
+        if !s.disks.is_empty() {
+            out.push_str("# HELP witr_machine_disk_busy_percent Share of wall time the device had IO in flight (iostat %util)\n");
+            out.push_str("# TYPE witr_machine_disk_busy_percent gauge\n");
+            for d in &s.disks {
+                if let Some(b) = d.busy_pct {
+                    out.push_str(&format!(
+                        "witr_machine_disk_busy_percent{{device=\"{}\"}} {b:.2}\n",
+                        label_escape(&d.device),
+                    ));
+                }
+            }
+            out.push_str("# HELP witr_machine_disk_io_in_flight Requests issued but not completed (queue depth)\n");
+            out.push_str("# TYPE witr_machine_disk_io_in_flight gauge\n");
+            for d in &s.disks {
+                out.push_str(&format!(
+                    "witr_machine_disk_io_in_flight{{device=\"{}\"}} {}\n",
+                    label_escape(&d.device),
+                    d.in_flight,
+                ));
+            }
+            out.push_str("# HELP witr_machine_disk_iops Per-device read/write request rates, diffed refresh-to-refresh\n");
+            out.push_str("# TYPE witr_machine_disk_iops gauge\n");
+            for d in &s.disks {
+                if let Some(r) = d.read_iops {
+                    out.push_str(&format!(
+                        "witr_machine_disk_iops{{device=\"{}\",direction=\"read\"}} {r:.2}\n",
+                        label_escape(&d.device),
+                    ));
+                }
+                if let Some(w) = d.write_iops {
+                    out.push_str(&format!(
+                        "witr_machine_disk_iops{{device=\"{}\",direction=\"write\"}} {w:.2}\n",
+                        label_escape(&d.device),
+                    ));
+                }
+            }
+        }
+        if let Some((label, c)) = &s.temp {
+            out.push_str("# HELP witr_machine_temp_celsius Hottest readable thermal sensor reading\n");
+            out.push_str("# TYPE witr_machine_temp_celsius gauge\n");
+            out.push_str(&format!(
+                "witr_machine_temp_celsius{{sensor=\"{}\"}} {c:.2}\n",
+                label_escape(label),
+            ));
         }
     }
     // cumulative NIC bytes as counters (loopback excluded) — rate() gives
@@ -970,11 +1033,15 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                     let platform = platform.lock().unwrap_or_else(|e| e.into_inner());
                     let mut procs = platform.list_processes().unwrap_or_default();
                     platform.enrich_listing(&mut procs);
+                    let zombies = procs
+                        .iter()
+                        .filter(|p| p.state.as_deref() == Some("Z"))
+                        .count();
                     let stats = platform.system_stats();
                     let nics = platform.net_counters();
                     let mounts = platform.mount_usage();
                     let system = stats
-                        .map(|s| system_snapshot(&s, &nics, &mounts, procs.len()));
+                        .map(|s| system_snapshot(&s, &nics, &mounts, procs.len(), zombies));
                     (procs, system)
                 };
                 let doc = serde_json::json!({

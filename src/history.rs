@@ -521,6 +521,15 @@ pub struct SysAlertState {
     pub disk_eta_streak: u32,
     pub disk_eta_firing: bool,
     pub disk_eta_fired_secs: u32,
+    pub disk_busy_streak: u32,
+    pub disk_busy_firing: bool,
+    pub disk_busy_fired_secs: u32,
+    pub temp_streak: u32,
+    pub temp_firing: bool,
+    pub temp_fired_secs: u32,
+    pub zombie_streak: u32,
+    pub zombie_firing: bool,
+    pub zombie_fired_secs: u32,
 }
 
 /// The armed machine-wide alert thresholds plus the inputs they compare
@@ -579,6 +588,22 @@ pub struct SysAlertLimits {
     /// filling". Disarmed when None; needs the `mounts` sweep like
     /// `disk_pct` does.
     pub disk_eta_hours: Option<f64>,
+    /// --alert-disk-busy: fire when any block device spends over this
+    /// share of the refresh interval with IO in flight (the iostat %util
+    /// twin). Answers "which disk is the bottleneck" — a question neither
+    /// the space sentinels nor the per-process write rates can. Disarmed
+    /// when None or the platform reports no per-device stats.
+    pub disk_busy_limit: Option<f64>,
+    /// --alert-temp: fire when the hottest readable sensor exceeds this
+    /// many degrees Celsius. Disarmed when None or no sensor is readable.
+    pub temp_limit: Option<f64>,
+    /// --alert-zombies: fire when more than this many processes sit in
+    /// the Z (defunct) state — a corpse pile means someone stopped
+    /// reaping their children. `zombie_count` is only read when this is
+    /// armed.
+    pub zombie_limit: Option<u64>,
+    /// This sample's defunct-process count.
+    pub zombie_count: usize,
     pub repeat: Option<u64>,
 }
 
@@ -943,6 +968,10 @@ pub fn system_alert_picks(
         oom_limit,
         oom_kills: oom_kills_opt,
         disk_eta_hours,
+        disk_busy_limit,
+        temp_limit,
+        zombie_limit,
+        zombie_count,
         repeat: repeat_secs,
     } = limits;
     let load_limit = *load_limit;
@@ -962,6 +991,10 @@ pub fn system_alert_picks(
     let oom_limit = *oom_limit;
     let oom_kills = *oom_kills_opt;
     let disk_eta_limit = *disk_eta_hours;
+    let disk_busy_limit = *disk_busy_limit;
+    let temp_limit = *temp_limit;
+    let zombie_limit = *zombie_limit;
+    let zombie_count = *zombie_count;
     let repeat_secs = *repeat_secs;
     let mut out = Vec::new();
     if let Some(limit) = load_limit {
@@ -1344,6 +1377,105 @@ pub fn system_alert_picks(
             out.push((
                 "system".to_string(),
                 "OOM killer quiet again".to_string(),
+                true,
+            ));
+        }
+    }
+    if let Some(limit) = disk_busy_limit {
+        let over_devices: Vec<(&str, f64)> = stats
+            .disks
+            .iter()
+            .filter(|d| d.busy_pct.is_some_and(|b| b > limit))
+            .map(|d| (d.device.as_str(), d.busy_pct.unwrap_or(0.0)))
+            .collect();
+        let over = !over_devices.is_empty();
+        let edge = alert_cycle_repeat(
+            &mut state.disk_busy_streak,
+            &mut state.disk_busy_firing,
+            over,
+            &mut state.disk_busy_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            let mut named: Vec<(f64, String)> = over_devices
+                .iter()
+                .map(|(d, b)| (*b, format!("{d} {b:.0}%")))
+                .collect();
+            named.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let named: Vec<String> = named.into_iter().take(3).map(|(_, s)| s).collect();
+            out.push((
+                "system".to_string(),
+                format!(
+                    "disk IO {} above {limit}% busy for {}s — the bottleneck disk",
+                    named.join(", "),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("disk IO back under {limit}% busy"),
+                true,
+            ));
+        }
+    }
+    if let Some(limit) = temp_limit {
+        let reading = stats
+            .temp
+            .as_ref()
+            .and_then(|(label, c)| c.ge(&limit).then_some((label.as_str(), *c)));
+        let over = reading.is_some();
+        let edge = alert_cycle_repeat(
+            &mut state.temp_streak,
+            &mut state.temp_firing,
+            over,
+            &mut state.temp_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            let (label, c) = reading.unwrap_or(("", 0.0));
+            out.push((
+                "system".to_string(),
+                format!(
+                    "temperature {c:.0}°C at {label} above {limit}°C for {}s",
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("temperature back under {limit}°C"),
+                true,
+            ));
+        }
+    }
+    if let Some(limit) = zombie_limit {
+        let over = zombie_count > limit as usize;
+        let edge = alert_cycle_repeat(
+            &mut state.zombie_streak,
+            &mut state.zombie_firing,
+            over,
+            &mut state.zombie_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            out.push((
+                "system".to_string(),
+                format!(
+                    "{zombie_count} defunct (zombie) processes above {limit} for {}s — something stopped reaping its children",
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("zombie count back under {limit}"),
                 true,
             ));
         }
@@ -2594,6 +2726,10 @@ mod tests {
             drop_limit: None,
             drop_rate: None,
             repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -2658,6 +2794,10 @@ mod tests {
             drop_limit: None,
             drop_rate: None,
             repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -2738,6 +2878,10 @@ mod tests {
             drop_limit: drop.map(|v| v as f64),
             drop_rate,
             repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -2924,6 +3068,10 @@ mod tests {
             drop_limit: None,
             drop_rate: None,
             repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -2974,6 +3122,10 @@ mod tests {
                 drop_limit: None,
                 drop_rate: None,
                 repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3036,6 +3188,10 @@ mod tests {
             drop_limit: None,
             drop_rate: None,
             repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3092,6 +3248,10 @@ mod tests {
             oom_limit: oom,
             oom_kills: Some(kills),
             repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
             disk_eta_hours: None,
         };
         // one kill lands (counter 5 → 6): the first tick only arms the
@@ -3208,6 +3368,10 @@ mod tests {
             oom_kills: None,
             disk_eta_hours: eta,
             repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
         };
         // seed the mount's trailing history directly (the real history
         // accrues one sample per tick — same shape, shorter wait)
@@ -3285,6 +3449,10 @@ mod tests {
             drop_limit: None,
             drop_rate: None,
             repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3313,6 +3481,215 @@ mod tests {
         );
         // latched; repeat=None means one fire per excursion
         assert!(system_alert_picks(&s, &mut state, &limits(Some(10.0)), 3).is_empty());
+    }
+
+    #[test]
+    fn disk_busy_alert_fires_names_the_bottleneck_and_recovers() {
+        // two devices over the line: the detail names the busiest first
+        let s = crate::platform::SystemStats {
+            disks: vec![
+                crate::platform::DiskIoSample {
+                    device: "vda".into(),
+                    busy_pct: Some(87.0),
+                    in_flight: 3,
+                    read_iops: Some(120.0),
+                    write_iops: Some(45.0),
+                },
+                crate::platform::DiskIoSample {
+                    device: "vdb".into(),
+                    busy_pct: Some(95.0),
+                    in_flight: 9,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let limits = |busy_limit: Option<f64>| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
+            repeat: None,
+            disk_busy_limit: busy_limit,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
+            disk_eta_hours: None,
+            oom_limit: None,
+            oom_kills: None,
+        };
+        // no per-device stats yet (the platform's first sweep) → silent
+        // even with the limit armed — same shape as the PSI "no report" case
+        let first = crate::platform::SystemStats::default();
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                system_alert_picks(&first, &mut state, &limits(Some(80.0)), 3).is_empty(),
+                "no measurement → no fire"
+            );
+        }
+        // 95% vdb over an 80% line: quiet for the arming samples, then one
+        // fire naming both devices, busiest (vdb 95%) before vda 87%
+        let mut fires = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            fires = system_alert_picks(&s, &mut state, &limits(Some(80.0)), 3);
+        }
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert_eq!(fires[0].0, "system");
+        let d = &fires[0].1;
+        assert!(d.contains("above 80% busy"), "{d}");
+        assert!(d.contains("vdb 95%"), "{d}");
+        assert!(d.contains("vda 87%"), "{d}");
+        assert!(d.find("vdb").unwrap() < d.find("vda").unwrap(), "{d}");
+        // latched; repeat=None means one fire per excursion
+        assert!(system_alert_picks(&s, &mut state, &limits(Some(80.0)), 3).is_empty());
+        // every device back under the line → recovery
+        let quiet = crate::platform::SystemStats {
+            disks: vec![crate::platform::DiskIoSample {
+                device: "vda".into(),
+                busy_pct: Some(4.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rec = system_alert_picks(&quiet, &mut state, &limits(Some(80.0)), 3);
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert!(rec[0].2, "{rec:?}");
+        assert!(rec[0].1.contains("back under 80% busy"), "{}", rec[0].1);
+    }
+
+    #[test]
+    fn temp_alert_fires_names_the_sensor_and_recovers() {
+        let s = crate::platform::SystemStats {
+            temp: Some(("acpitz".into(), 85.0)),
+            ..Default::default()
+        };
+        let limits = |temp_limit: Option<f64>| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
+            repeat: None,
+            disk_busy_limit: None,
+            temp_limit,
+            zombie_limit: None,
+            zombie_count: 0,
+            disk_eta_hours: None,
+            oom_limit: None,
+            oom_kills: None,
+        };
+        // no readable sensor → silent even with the limit armed
+        let none = crate::platform::SystemStats::default();
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                system_alert_picks(&none, &mut state, &limits(Some(80.0)), 3).is_empty(),
+                "no sensor → no fire"
+            );
+        }
+        // 85°C over an 80°C line: arming samples, then one fire naming the
+        // sensor
+        let mut fires = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            fires = system_alert_picks(&s, &mut state, &limits(Some(80.0)), 3);
+        }
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert!(fires[0].1.contains("85°C at acpitz above 80°C"), "{}", fires[0].1);
+        assert!(system_alert_picks(&s, &mut state, &limits(Some(80.0)), 3).is_empty());
+        // cooled off → recovery
+        let cool = crate::platform::SystemStats {
+            temp: Some(("acpitz".into(), 54.0)),
+            ..Default::default()
+        };
+        let rec = system_alert_picks(&cool, &mut state, &limits(Some(80.0)), 3);
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert!(rec[0].2, "{rec:?}");
+        assert!(rec[0].1.contains("back under 80°C"), "{}", rec[0].1);
+    }
+
+    #[test]
+    fn zombie_alert_fires_on_the_waterline() {
+        let limits = |zombie_limit: Option<u64>, zombie_count: usize| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
+            repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit,
+            zombie_count,
+            disk_eta_hours: None,
+            oom_limit: None,
+            oom_kills: None,
+        };
+        // 7 defunct over a waterline of 5: arming samples, then one fire
+        let mut state = SysAlertState::default();
+        let mut fires = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            fires = system_alert_picks(
+                &crate::platform::SystemStats::default(),
+                &mut state,
+                &limits(Some(5), 7),
+                3,
+            );
+        }
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert!(
+            fires[0].1.contains("7 defunct (zombie) processes above 5"),
+            "{}",
+            fires[0].1
+        );
+        assert!(system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(5), 7),
+            3
+        )
+        .is_empty());
+        // reaped → recovery
+        let rec = system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(5), 0),
+            3,
+        );
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert!(rec[0].2, "{rec:?}");
+        assert!(rec[0].1.contains("back under 5"), "{}", rec[0].1);
     }
 
     #[test]

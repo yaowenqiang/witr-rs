@@ -591,6 +591,28 @@ pub struct SystemStats {
     /// platform reports no vmstat — the --alert-oom sentinel diffs it into
     /// a trailing-window kill count.
     pub oom_kills: Option<u64>,
+    /// Per-block-device IO pulse (Linux /proc/diskstats — busy percent is
+    /// the iostat %util twin, diffed refresh-to-refresh; empty where the
+    /// platform has no per-device source). The --alert-disk-busy sentinel
+    /// watches it, the system page and /metrics render it.
+    pub disks: Vec<DiskIoSample>,
+}
+
+/// One block device's IO sample. `busy_pct` answers "which disk is the
+/// bottleneck" — the question neither the space sentinels (fullness) nor
+/// the per-process rates (who writes) can answer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DiskIoSample {
+    /// Device name as the kernel spells it ("vda", "nvme0n1", "dm-0").
+    pub device: String,
+    /// Percent of elapsed wall time the device had IO in flight (io_ticks
+    /// delta / elapsed, clamped at 100). `None` on the first sample — no
+    /// previous tick snapshot to diff against.
+    pub busy_pct: Option<f64>,
+    /// Queue depth at sample time: requests issued but not completed.
+    pub in_flight: u32,
+    pub read_iops: Option<f64>,
+    pub write_iops: Option<f64>,
 }
 
 /// Pressure Stall Information, avg10 window (the last 10 seconds): the
@@ -703,6 +725,17 @@ pub trait Platform {
     /// platform with no cheap source returns empty. Default: unsupported.
     fn net_counters(&self) -> Vec<NicCounters> {
         Vec::new()
+    }
+
+    /// The OOM killer's victims from the kernel log over the trailing
+    /// window — "Out of memory: Killed process N (name)" lines — so a
+    /// --alert-oom firing can name who died, not just how many. `None`
+    /// where the platform has no kernel-log access (fleet hosts: the
+    /// victims live in the far machine's log; the alert stays count-only
+    /// there).
+    fn oom_victims(&self, since_secs: u64) -> Option<Vec<String>> {
+        let _ = since_secs;
+        None
     }
 
     /// All sockets whose local port equals `port` (any proto), with owning
