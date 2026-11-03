@@ -1399,7 +1399,7 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         .iter()
         .filter(|p| p.state.as_deref() == Some("Z"))
         .count();
-    for detail in machine_check_lines(
+    let mut machine_lines = machine_check_lines(
         cli,
         &stats,
         &mounts,
@@ -1409,7 +1409,9 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         drop_rate,
         retrans_rate,
         oom_in_window,
-    ) {
+    );
+    attribute_oom_lines(&mut machine_lines, platform);
+    for detail in machine_lines {
         violations.push((0, "system".into(), detail));
     }
 
@@ -1443,6 +1445,17 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
     i32::from(!violations.is_empty())
 }
 
+/// The kernel log's account of an OOM firing — ` — victims: nginx (pid
+/// 123), python (pid 456)` — or None when the log is unreadable or names
+/// nobody.
+fn oom_victim_suffix(platform: &dyn Platform, since_secs: u64) -> Option<String> {
+    let victims = platform.oom_victims(since_secs)?;
+    if victims.is_empty() {
+        return None;
+    }
+    Some(format!(" — victims: {}", victims.join(", ")))
+}
+
 /// Name the OOM killer's victims on a firing: any fresh "OOM killer"
 /// detail gains the kernel log's account — `… — victims: nginx (pid 123),
 /// python (pid 456)`. The window matches the sentinel's (ALERT_CYCLES
@@ -1456,16 +1469,32 @@ pub(crate) fn attribute_oom(picks: &mut [history::SysPick], platform: &dyn Platf
     {
         return;
     }
-    let Some(victims) = platform.oom_victims(history::ALERT_CYCLES as u64 * interval.max(1)) else {
+    let Some(suffix) = oom_victim_suffix(platform, history::ALERT_CYCLES as u64 * interval.max(1))
+    else {
         return;
     };
-    if victims.is_empty() {
-        return;
-    }
-    let suffix = format!(" — victims: {}", victims.join(", "));
     for (_, detail, rec) in picks.iter_mut() {
         if !*rec && detail.starts_with("OOM killer") {
             detail.push_str(&suffix);
+        }
+    }
+}
+
+/// The `--check` twin of [`attribute_oom`]: a local check run can read the
+/// kernel log, so its OOM violation line names victims too. The window is
+/// the sample gap (two sweeps a second apart) padded to cover the
+/// journal's timestamping lag; the fleet check path never calls this — the
+/// victims died in the far host's log.
+fn attribute_oom_lines(lines: &mut [String], platform: &dyn Platform) {
+    if !lines.iter().any(|l| l.starts_with("OOM killer")) {
+        return;
+    }
+    let Some(suffix) = oom_victim_suffix(platform, 2) else {
+        return;
+    };
+    for line in lines.iter_mut() {
+        if line.starts_with("OOM killer") {
+            line.push_str(&suffix);
         }
     }
 }
@@ -6451,6 +6480,92 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         // under every line → nothing to report
         let quiet = crate::platform::SystemStats::default();
         assert!(machine_check_lines(&cli, &quiet, &[], 0, 0, None, None, None, None).is_empty());
+    }
+
+    #[test]
+    fn check_oom_lines_name_victims_when_the_log_is_readable() {
+        // one mock covers all three cases: log content Some/None, and a
+        // `queried` flag proving the kernel log is never read without a
+        // firing
+        struct LogPlatform {
+            log: Option<Vec<String>>,
+            queried: std::sync::atomic::AtomicBool,
+        }
+        impl Platform for LogPlatform {
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            fn capabilities(&self) -> platform::Capabilities {
+                platform::Capabilities { file_lookup: false, env: false }
+            }
+            fn list_processes(&self) -> platform::PlatResult<Vec<Process>> {
+                Ok(Vec::new())
+            }
+            fn detail(&self, brief: &Process, _want_env: bool) -> Process {
+                brief.clone()
+            }
+            fn port_to_sockets(&self, _port: u16) -> platform::PlatResult<Vec<model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn list_sockets(&self) -> platform::PlatResult<Vec<model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn file_to_pids(&self, _path: &str) -> platform::PlatResult<Vec<i32>> {
+                Ok(Vec::new())
+            }
+            fn container_of(&self, _pid: i32) -> Option<model::Source> {
+                None
+            }
+            fn service_source(&self, _procs: &[Process]) -> Option<model::Source> {
+                None
+            }
+            fn oom_victims(&self, _since_secs: u64) -> Option<Vec<String>> {
+                self.queried
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.log.clone()
+            }
+        }
+        let readable = || LogPlatform {
+            log: Some(vec!["nginx (pid 123)".into(), "python (pid 456)".into()]),
+            queried: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut lines = vec![
+            "OOM killer 2 kill(s) within the sample gap".to_string(),
+            "load average 9.00 above 4".to_string(),
+        ];
+        attribute_oom_lines(&mut lines, &readable());
+        assert!(
+            lines[0].contains(" — victims: nginx (pid 123), python (pid 456)"),
+            "{}",
+            lines[0]
+        );
+        // non-OOM lines untouched
+        assert_eq!(lines[1], "load average 9.00 above 4");
+
+        // an unreadable (or victim-less) kernel log leaves the line
+        // count-only — the pre-existing behavior
+        let mut lines = vec!["OOM killer 1 kill(s) within the sample gap".to_string()];
+        attribute_oom_lines(
+            &mut lines,
+            &LogPlatform {
+                log: None,
+                queried: std::sync::atomic::AtomicBool::new(false),
+            },
+        );
+        assert_eq!(lines[0], "OOM killer 1 kill(s) within the sample gap");
+
+        // no OOM line → the kernel log is never queried
+        let blind = LogPlatform {
+            log: Some(vec!["nginx (pid 123)".into()]),
+            queried: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut lines = vec!["load average 9.00 above 4".to_string()];
+        attribute_oom_lines(&mut lines, &blind);
+        assert_eq!(lines[0], "load average 9.00 above 4");
+        assert!(
+            !blind.queried.load(std::sync::atomic::Ordering::Relaxed),
+            "no firing, no journalctl call"
+        );
     }
 
     #[test]
