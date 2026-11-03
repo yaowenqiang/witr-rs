@@ -425,6 +425,15 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
     out.push_str("# HELP witr_process_count Visible processes\n");
     out.push_str("# TYPE witr_process_count gauge\n");
     out.push_str(&format!("witr_process_count {}\n", procs.len()));
+    // the --alert-zombies sentinel's raw input — derivable from the
+    // process table already in hand, so it exports unconditionally
+    let zombies = procs
+        .iter()
+        .filter(|p| p.state.as_deref() == Some("Z"))
+        .count();
+    out.push_str("# HELP witr_machine_zombie_count Defunct (state Z) processes — a corpse pile means something stopped reaping its children\n");
+    out.push_str("# TYPE witr_machine_zombie_count gauge\n");
+    out.push_str(&format!("witr_machine_zombie_count {zombies}\n"));
     out.push_str("# HELP witr_rss_total_mb Sum of resident memory (MB) across visible processes\n");
     out.push_str("# TYPE witr_rss_total_mb gauge\n");
     out.push_str(&format!("witr_rss_total_mb {rss_total}\n"));
@@ -475,6 +484,14 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
             out.push_str("# HELP witr_machine_tcp_retransmissions_total Cumulative TCP retransmitted segments\n");
             out.push_str("# TYPE witr_machine_tcp_retransmissions_total counter\n");
             out.push_str(&format!("witr_machine_tcp_retransmissions_total {segs}\n"));
+        }
+        // the host kernel's kill tally (--alert-oom's input) — the
+        // container-scoped witr_container_oom_kills_total has shipped all
+        // along; this is the bare-host counter it never covered
+        if let Some(kills) = s.oom_kills {
+            out.push_str("# HELP witr_machine_oom_kills_total Cumulative host kernel OOM-killer kills since boot\n");
+            out.push_str("# TYPE witr_machine_oom_kills_total counter\n");
+            out.push_str(&format!("witr_machine_oom_kills_total {kills}\n"));
         }
         if let Some(psi) = &s.psi {
             out.push_str("# HELP witr_machine_psi_stall_percent Pressure Stall Information, 10-second window share\n");
@@ -538,6 +555,33 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
             out.push_str(&format!(
                 "witr_machine_temp_celsius{{sensor=\"{}\"}} {c:.2}\n",
                 label_escape(label),
+            ));
+        }
+    }
+    // filesystem usage — the space sentinels' (--alert-disk/--alert-disk-eta)
+    // raw input. The mount sweep is one df spawn per scrape, the same cost
+    // the /api/ps refresh pays every few seconds; used_percent is the
+    // direct rule target, total_bytes the capacity anchor for fill math
+    let mounts = platform.mount_usage();
+    if !mounts.is_empty() {
+        out.push_str("# HELP witr_machine_fs_used_percent Percent of each device-backed filesystem used\n");
+        out.push_str("# TYPE witr_machine_fs_used_percent gauge\n");
+        for m in &mounts {
+            if m.total_mb > 0 {
+                let pct = m.used_mb as f64 * 100.0 / m.total_mb as f64;
+                out.push_str(&format!(
+                    "witr_machine_fs_used_percent{{mount=\"{}\"}} {pct:.2}\n",
+                    label_escape(&m.target),
+                ));
+            }
+        }
+        out.push_str("# HELP witr_machine_fs_total_bytes Total size of each device-backed filesystem in bytes\n");
+        out.push_str("# TYPE witr_machine_fs_total_bytes gauge\n");
+        for m in &mounts {
+            out.push_str(&format!(
+                "witr_machine_fs_total_bytes{{mount=\"{}\"}} {}\n",
+                label_escape(&m.target),
+                m.total_mb * 1024 * 1024,
             ));
         }
     }
@@ -1550,6 +1594,13 @@ mod tests {
         let platform = crate::platform::get();
         let out = scrape(platform.as_ref(), None);
         assert!(out.contains("witr_process_count "));
+        // the zombie waterline rides the process table every platform
+        // lists, so it emits unconditionally — armed sentinel or not
+        assert!(
+            out.contains("witr_machine_zombie_count 0\n") || out.contains("witr_machine_zombie_count 1\n")
+                || out.contains("witr_machine_zombie_count 2\n"),
+            "zombie gauge always emits: {out}"
+        );
         // net counters ship as a matched rx/tx pair, labeled per interface
         let has_rx = out.contains("witr_machine_net_rx_bytes_total ");
         let has_tx = out.contains("witr_machine_net_tx_bytes_total ");
@@ -1562,6 +1613,21 @@ mod tests {
             let has_mem = out.contains("witr_machine_mem_used_bytes ")
                 || out.contains("witr_machine_mem_total_bytes ");
             assert!(has_mem, "memory gauges emit whenever the platform measures");
+        }
+        // a platform with mounts sweeps them into the fs gauges; oom kills
+        // ride system_stats like the other counters (Linux has both)
+        if !platform.mount_usage().is_empty() {
+            assert!(
+                out.contains("witr_machine_fs_used_percent{mount=\""),
+                "fs gauges emit alongside the mount sweep"
+            );
+            assert!(out.contains("witr_machine_fs_total_bytes{mount=\""));
+        }
+        if platform.system_stats().map(|s| s.oom_kills).is_some() {
+            assert!(
+                out.contains("witr_machine_oom_kills_total "),
+                "host oom counter emits with vmstat"
+            );
         }
     }
 

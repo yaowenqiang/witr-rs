@@ -1759,6 +1759,20 @@ pub fn grafana_dashboard() -> serde_json::Value {
             ("{{device}} write", "witr_machine_disk_iops{direction=\"write\"}"),
         ],
     );
+    add(
+        "Filesystem usage",
+        0, 61, 16, 8,
+        "percent",
+        Some(100.0),
+        &[("{{mount}}", "witr_machine_fs_used_percent")],
+    );
+    add(
+        "Temperature",
+        16, 61, 8, 8,
+        "celsius",
+        None,
+        &[("{{sensor}}", "witr_machine_temp_celsius")],
+    );
 
     serde_json::json!({
         "id": null,
@@ -1905,6 +1919,30 @@ pub fn alert_rules_yaml() -> String {
             "warning",
             "Temperature above 80°C",
             "The hottest sensor ({{ $labels.sensor }}) reads {{ $value | humanize }}°C.",
+        ),
+        (
+            "WitrFilesystemAlmostFull",
+            "witr_machine_fs_used_percent > 90",
+            "10m",
+            "warning",
+            "Filesystem above 90% used",
+            "{{ $labels.mount }} has been over 90% used for 10m — the --alert-disk sentinel's own rule.",
+        ),
+        (
+            "WitrZombiesHigh",
+            "witr_machine_zombie_count > 10",
+            "10m",
+            "warning",
+            "Zombie process pile-up",
+            "{{ $value | humanize }} defunct processes for 10m — something stopped reaping its children; `witr-rs --zombies` on the host lists them.",
+        ),
+        (
+            "WitrHostOomKills",
+            "increase(witr_machine_oom_kills_total[10m]) > 0",
+            "0m",
+            "warning",
+            "Host kernel OOM kill",
+            "The host kernel's OOM killer claimed {{ $value | humanize }} victim(s) in 10m — one kill is worth shouting about.",
         ),
     ];
     let mut out = String::from(
@@ -3363,6 +3401,9 @@ mod tests {
             "witr_process_start_time_seconds",
             "witr_machine_disk_busy_percent",
             "witr_machine_temp_celsius",
+            "witr_machine_fs_used_percent",
+            "witr_machine_zombie_count",
+            "witr_machine_oom_kills_total",
         ] {
             assert!(yaml.contains(probe), "{probe} has a rule:\n{yaml}");
         }
@@ -3412,6 +3453,8 @@ mod tests {
             "witr_process_cpu_percent",
             "witr_machine_disk_busy_percent",
             "witr_machine_disk_iops",
+            "witr_machine_fs_used_percent",
+            "witr_machine_temp_celsius",
         ] {
             assert!(
                 exprs.iter().any(|e| e.contains(probe)),
