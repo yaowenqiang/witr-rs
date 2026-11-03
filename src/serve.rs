@@ -219,6 +219,51 @@ fn dashboard_html(platform: &dyn Platform, containers: &[crate::model::Container
     }
     out.push_str("</table>\n");
 
+    // per-device IO — the same busy%/queue/IOPS picture the sys page and
+    // TUI render, busiest first; busy% needs a previous tick to diff
+    // against, so the first view after startup shows in-flight only
+    if !stats.disks.is_empty() {
+        let mut ds: Vec<&crate::platform::DiskIoSample> = stats.disks.iter().collect();
+        ds.sort_by(|a, b| {
+            b.busy_pct
+                .partial_cmp(&a.busy_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let _ = writeln!(
+            out,
+            "<h2>disk io</h2><table><tr><th>DEVICE</th><th>BUSY</th><th>IN FLIGHT</th><th>READ IOPS</th><th>WRITE IOPS</th></tr>"
+        );
+        for d in ds.iter().take(8) {
+            let (busy, cls) = match d.busy_pct {
+                Some(b) => (
+                    format!("{b:.0}<span style=\"font-size:12px\">%</span>"),
+                    if b >= 80.0 {
+                        "hot"
+                    } else if b >= 50.0 {
+                        "warm"
+                    } else {
+                        ""
+                    },
+                ),
+                None => ("–".to_string(), ""),
+            };
+            let _ = writeln!(
+                out,
+                "<tr><td><b>{}</b></td><td class=\"{cls}\">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&d.device),
+                busy,
+                d.in_flight,
+                d.read_iops
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_else(|| "–".into()),
+                d.write_iops
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_else(|| "–".into()),
+            );
+        }
+        out.push_str("</table>\n");
+    }
+
     if !containers.is_empty() {
         let _ = writeln!(
             out,
@@ -1572,6 +1617,21 @@ mod tests {
                 mem_used_mb: Some(1000),
                 mem_total_mb: Some(4000),
                 load1: Some(0.10),
+                disks: vec![
+                    crate::platform::DiskIoSample {
+                        device: "vda".into(),
+                        busy_pct: Some(87.4),
+                        in_flight: 3,
+                        read_iops: Some(120.0),
+                        write_iops: Some(45.0),
+                    },
+                    crate::platform::DiskIoSample {
+                        device: "vdb".into(),
+                        busy_pct: None,
+                        in_flight: 0,
+                        ..Default::default()
+                    },
+                ],
                 ..Default::default()
             })
         }
@@ -1607,6 +1667,17 @@ mod tests {
         assert!(html.contains("12.5"), "cpu gauge renders");
         assert!(html.contains("top cpu"), "top table section");
         assert!(html.contains("top memory"));
+        // the disk io section: busiest device first, the never-diffed
+        // device showing a dash, hot past 80% busy
+        assert!(html.contains("disk io"), "disk io section present");
+        let io = html.find("disk io").unwrap();
+        let vda = html.find(">vda<").unwrap();
+        let vdb = html.find(">vdb<").unwrap();
+        assert!(vda < vdb, "busiest device sorts first:\n{html}");
+        assert!(html[io..].contains("87"), "busy pct renders: {html}");
+        assert!(html[io..].contains("hot"), "80%+ busy paints hot");
+        let vdb_row = &html[vdb..html[vdb..].find("</table>").map(|i| vdb + i).unwrap_or(html.len())];
+        assert!(vdb_row.contains("–"), "un-diffed busy shows a dash: {vdb_row}");
         assert!(html.contains("listeners"));
         assert!(html.contains(">8080<"), "listener port in its table");
         assert!(html.contains("internet"), "wildcard bind is flagged");
