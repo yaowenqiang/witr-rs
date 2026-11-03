@@ -697,6 +697,7 @@ fn fleet_machine_armed(cli: &cli::Cli) -> bool {
         || cli.alert_disk_busy.is_some()
         || cli.alert_temp.is_some()
         || cli.alert_zombies.is_some()
+        || cli.alert_dstate.is_some()
         || cli.alert_net.is_some()
         || cli.alert_psi.is_some()
         || cli.alert_mem_avail_mb.is_some()
@@ -808,10 +809,9 @@ fn fleet_alert_picks(
         disk_busy_limit: cli.alert_disk_busy,
         temp_limit: cli.alert_temp,
         zombie_limit: cli.alert_zombies,
-        zombie_count: procs
-            .iter()
-            .filter(|p| p.state.as_deref() == Some("Z"))
-            .count(),
+        zombie_count: state_count(procs, &["Z"]),
+        dstate_limit: cli.alert_dstate,
+        dstate_count: state_count(procs, &["D", "U"]),
         repeat: cli.alert_repeat,
     };
     history::system_alert_picks(&sample.stats, st, &limits, interval)
@@ -1213,7 +1213,8 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         || cli.alert_oom.is_some()
         || cli.alert_disk_busy.is_some()
         || cli.alert_temp.is_some()
-        || cli.alert_zombies.is_some();
+        || cli.alert_zombies.is_some()
+        || cli.alert_dstate.is_some();
     if !armed {
         eprintln!(
             "--check evaluates --alert-* thresholds; arm at least one (e.g. --check --alert-cpu 90 --alert-load 4)"
@@ -1395,16 +1396,15 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
     } else {
         Vec::new()
     };
-    let zombie_count = procs
-        .iter()
-        .filter(|p| p.state.as_deref() == Some("Z"))
-        .count();
+    let zombie_count = state_count(&procs, &["Z"]);
+    let dstate_count = state_count(&procs, &["D", "U"]);
     let mut machine_lines = machine_check_lines(
         cli,
         &stats,
         &mounts,
         procs.len(),
         zombie_count,
+        dstate_count,
         net_rate,
         drop_rate,
         retrans_rate,
@@ -1499,6 +1499,20 @@ fn attribute_oom_lines(lines: &mut [String], platform: &dyn Platform) {
     }
 }
 
+/// Count processes in the given single-letter kernel states — the
+/// state-waterline sentinels' input: "Z" defunct, "D"/"U" stuck in
+/// uninterruptible wait (Linux spells it D, macOS U).
+fn state_count(procs: &[Process], states: &[&str]) -> usize {
+    procs
+        .iter()
+        .filter(|p| {
+            p.state
+                .as_deref()
+                .is_some_and(|s| states.contains(&s))
+        })
+        .count()
+}
+
 /// The machine-wide half of `--check`, shared by the local run and the
 /// fleet run: every armed level/rate threshold judged against one
 /// snapshot, violation detail lines back (no host/pid wrapping — the
@@ -1511,6 +1525,7 @@ fn machine_check_lines(
     mounts: &[crate::platform::MountUsage],
     proc_count: usize,
     zombie_count: usize,
+    dstate_count: usize,
     net_rate: Option<f64>,
     drop_rate: Option<f64>,
     retrans_rate: Option<f64>,
@@ -1641,6 +1656,13 @@ fn machine_check_lines(
             ));
         }
     }
+    if let Some(limit) = cli.alert_dstate {
+        if dstate_count > limit as usize {
+            out.push(format!(
+                "{dstate_count} processes stuck in uninterruptible IO wait above {limit}"
+            ));
+        }
+    }
     out
 }
 
@@ -1680,16 +1702,15 @@ fn run_check_fleet(bases: &[String], cli: &cli::Cli) -> i32 {
                 let st = states.entry(base.clone()).or_default();
                 let (net_rate, drop_rate, retrans_rate, oom_window) =
                     fleet_rates(cli, &sample, st);
-                let zombie_count = procs
-                    .iter()
-                    .filter(|p| p.state.as_deref() == Some("Z"))
-                    .count();
+                let zombie_count = state_count(&procs, &["Z"]);
+                let dstate_count = state_count(&procs, &["D", "U"]);
                 for detail in machine_check_lines(
                     cli,
                     &sample.stats,
                     &sample.mounts,
                     procs.len(),
                     zombie_count,
+                    dstate_count,
                     net_rate,
                     drop_rate,
                     retrans_rate,
@@ -5152,6 +5173,7 @@ fn main() {
                     || cli.alert_disk_busy.is_some()
                     || cli.alert_temp.is_some()
                     || cli.alert_zombies.is_some()
+                    || cli.alert_dstate.is_some()
                 {
                     if let Some(stats) = platform.system_stats() {
                         let mounts = if cli.alert_disk.is_some() || cli.alert_disk_eta.is_some() {
@@ -5217,10 +5239,9 @@ fn main() {
                             disk_busy_limit: cli.alert_disk_busy,
                             temp_limit: cli.alert_temp,
                             zombie_limit: cli.alert_zombies,
-                            zombie_count: procs
-                                .iter()
-                                .filter(|p| p.state.as_deref() == Some("Z"))
-                                .count(),
+                            zombie_count: state_count(&procs, &["Z"]),
+                            dstate_limit: cli.alert_dstate,
+                            dstate_count: state_count(&procs, &["D", "U"]),
                             repeat: cli.alert_repeat,
                         };
                         let mut sys_picks = history::system_alert_picks(
@@ -6443,6 +6464,8 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             "80",
             "--alert-zombies",
             "5",
+            "--alert-dstate",
+            "3",
         ]);
         let stats = crate::platform::SystemStats {
             temp: Some(("acpitz".into(), 85.0)),
@@ -6461,8 +6484,9 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             ],
             ..Default::default()
         };
-        let lines = machine_check_lines(&cli, &stats, &[], 0, 7, None, None, None, None);
-        assert_eq!(lines.len(), 3, "{lines:?}");
+        let lines =
+            machine_check_lines(&cli, &stats, &[], 0, 7, 4, None, None, None, None);
+        assert_eq!(lines.len(), 4, "{lines:?}");
         assert!(
             lines.iter().any(|l| l.contains("disk IO vda 87% above 80% busy")),
             "{lines:?}"
@@ -6477,9 +6501,39 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                 .any(|l| l.contains("7 defunct (zombie) processes above 5")),
             "{lines:?}"
         );
+        assert!(
+            lines.iter().any(|l| {
+                l.contains("4 processes stuck in uninterruptible IO wait above 3")
+            }),
+            "{lines:?}"
+        );
         // under every line → nothing to report
         let quiet = crate::platform::SystemStats::default();
-        assert!(machine_check_lines(&cli, &quiet, &[], 0, 0, None, None, None, None).is_empty());
+        assert!(machine_check_lines(&cli, &quiet, &[], 0, 0, 0, None, None, None, None).is_empty());
+    }
+
+    #[test]
+    fn state_count_reads_the_kernel_state_letter() {
+        let p = |pid: i32, state: Option<&str>| Process {
+            pid,
+            name: format!("p{pid}"),
+            state: state.map(|s| s.to_string()),
+            ..Default::default()
+        };
+        let procs = vec![
+            p(1, Some("Z")),
+            p(2, Some("Z")),
+            p(3, Some("D")),
+            p(4, Some("U")),
+            p(5, Some("R")),
+            p(6, Some("S")),
+            p(7, None),
+        ];
+        assert_eq!(state_count(&procs, &["Z"]), 2);
+        // D on Linux and U on macOS are the same uninterruptible wait
+        assert_eq!(state_count(&procs, &["D", "U"]), 2);
+        assert_eq!(state_count(&procs, &["R"]), 1);
+        assert_eq!(state_count(&procs, &["T"]), 0);
     }
 
     #[test]

@@ -434,6 +434,15 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
     out.push_str("# HELP witr_machine_zombie_count Defunct (state Z) processes — a corpse pile means something stopped reaping its children\n");
     out.push_str("# TYPE witr_machine_zombie_count gauge\n");
     out.push_str(&format!("witr_machine_zombie_count {zombies}\n"));
+    // the --alert-dstate sentinel's raw input — D on Linux, U on macOS,
+    // both uninterruptible wait
+    let dstate = procs
+        .iter()
+        .filter(|p| matches!(p.state.as_deref(), Some("D") | Some("U")))
+        .count();
+    out.push_str("# HELP witr_machine_dstate_count Processes stuck in uninterruptible IO wait (Linux state D / macOS state U)\n");
+    out.push_str("# TYPE witr_machine_dstate_count gauge\n");
+    out.push_str(&format!("witr_machine_dstate_count {dstate}\n"));
     out.push_str("# HELP witr_rss_total_mb Sum of resident memory (MB) across visible processes\n");
     out.push_str("# TYPE witr_rss_total_mb gauge\n");
     out.push_str(&format!("witr_rss_total_mb {rss_total}\n"));
@@ -1600,6 +1609,14 @@ mod tests {
             out.contains("witr_machine_zombie_count 0\n") || out.contains("witr_machine_zombie_count 1\n")
                 || out.contains("witr_machine_zombie_count 2\n"),
             "zombie gauge always emits: {out}"
+        );
+        // the D-state waterline likewise (D on Linux, U on macOS)
+        assert!(
+            out.contains("witr_machine_dstate_count 0\n")
+                || out.contains("witr_machine_dstate_count 1\n")
+                || out.contains("witr_machine_dstate_count 2\n")
+                || out.contains("witr_machine_dstate_count 3\n"),
+            "dstate gauge always emits: {out}"
         );
         // net counters ship as a matched rx/tx pair, labeled per interface
         let has_rx = out.contains("witr_machine_net_rx_bytes_total ");

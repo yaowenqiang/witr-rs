@@ -239,6 +239,7 @@ impl Cli {
         self.alert_disk_busy = self.alert_disk_busy.or(cfg.alert_disk_busy);
         self.alert_temp = self.alert_temp.or(cfg.alert_temp);
         self.alert_zombies = self.alert_zombies.or(cfg.alert_zombies);
+        self.alert_dstate = self.alert_dstate.or(cfg.alert_dstate);
         self.alert_net = self.alert_net.or(cfg.alert_net);
         self.alert_psi = self.alert_psi.or(cfg.alert_psi);
         self.alert_mem_avail_mb = self.alert_mem_avail_mb.or(cfg.alert_mem_avail_mb);
@@ -839,6 +840,16 @@ pub struct Cli {
         )
     )]
     pub alert_zombies: Option<u64>,
+
+    #[arg(
+        long = "alert-dstate",
+        value_name = "N",
+        help = t(
+            "不可中断等待哨兵：卡在 uninterruptible sleep（Linux state D / macOS state U——等 IO 等到调度都排不进）的进程数连续 5 次采样超过该值即触发——存储或 NFS 挂起时 CPU 看着空闲、load 却顶天，进程成排 D 态就是现场；--alert-disk-busy 管\"哪块盘是瓶颈\"，这个管\"有多少人被它卡住\"。TUI 和 --watch",
+            "D-state sentinel: fire when more than this many processes sit in uninterruptible sleep (Linux state D / macOS state U — waiting on IO so hard they can't even be scheduled out) for 5 consecutive samples — when storage or NFS hangs, CPU looks idle while load pegs and processes pile up in D; --alert-disk-busy answers \"which disk is the bottleneck\", this one answers \"how many are stuck behind it\". TUI and --watch"
+        )
+    )]
+    pub alert_dstate: Option<u64>,
 
     #[arg(
         long = "alert-net",

@@ -418,6 +418,8 @@ struct TuiApp {
     alert_temp: Option<f64>,
     /// --alert-zombies: defunct-process count threshold
     alert_zombies: Option<u64>,
+    /// --alert-dstate: uninterruptible-wait count threshold
+    alert_dstate: Option<u64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
     alert_net: Option<u64>,
     /// --alert-psi: PSI "full" stall percent threshold (Linux only)
@@ -647,6 +649,8 @@ pub struct Seed {
     pub alert_temp: Option<f64>,
     /// --alert-zombies: defunct-process count threshold
     pub alert_zombies: Option<u64>,
+    /// --alert-dstate: uninterruptible-wait count threshold
+    pub alert_dstate: Option<u64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
     pub alert_net: Option<u64>,
     /// --alert-psi: PSI "full" stall percent threshold (Linux only)
@@ -755,6 +759,7 @@ impl Seed {
         self.alert_disk_busy = cli.alert_disk_busy;
         self.alert_temp = cli.alert_temp;
         self.alert_zombies = cli.alert_zombies;
+        self.alert_dstate = cli.alert_dstate;
         self.alert_net = cli.alert_net;
         self.alert_psi = cli.alert_psi;
         self.alert_mem_avail_mb = cli.alert_mem_avail_mb;
@@ -902,6 +907,7 @@ impl TuiApp {
             alert_disk_busy: seed.alert_disk_busy,
             alert_temp: seed.alert_temp,
             alert_zombies: seed.alert_zombies,
+            alert_dstate: seed.alert_dstate,
             alert_net: seed.alert_net,
             alert_psi: seed.alert_psi,
             alert_mem_avail_mb: seed.alert_mem_avail_mb,
@@ -1192,6 +1198,7 @@ impl TuiApp {
         self.alert_disk_busy = seed.alert_disk_busy;
         self.alert_temp = seed.alert_temp;
         self.alert_zombies = seed.alert_zombies;
+        self.alert_dstate = seed.alert_dstate;
         self.alert_net = seed.alert_net;
         self.alert_psi = seed.alert_psi;
         self.alert_mem_avail_mb = seed.alert_mem_avail_mb;
@@ -1371,6 +1378,7 @@ impl TuiApp {
                     || self.alert_disk_busy.is_some()
                     || self.alert_temp.is_some()
                     || self.alert_zombies.is_some()
+                    || self.alert_dstate.is_some()
                     || self.alert_net.is_some()
                     || self.alert_psi.is_some()
                     || self.alert_mem_avail_mb.is_some()
@@ -1455,6 +1463,14 @@ impl TuiApp {
                             .procs
                             .iter()
                             .filter(|p| p.state.as_deref() == Some("Z"))
+                            .count(),
+                        dstate_limit: self.alert_dstate,
+                        dstate_count: self
+                            .procs
+                            .iter()
+                            .filter(|p| {
+                                matches!(p.state.as_deref(), Some("D") | Some("U"))
+                            })
                             .count(),
                         repeat: self.alert_repeat,
                     };
@@ -10355,6 +10371,7 @@ mod tests {
                 alert_disk_busy: None,
                 alert_temp: None,
                 alert_zombies: None,
+                alert_dstate: None,
                 alert_net: None,
                 alert_psi: None,
                 alert_mem_avail_mb: None,

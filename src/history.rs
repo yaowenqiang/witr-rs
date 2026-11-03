@@ -530,6 +530,9 @@ pub struct SysAlertState {
     pub zombie_streak: u32,
     pub zombie_firing: bool,
     pub zombie_fired_secs: u32,
+    pub dstate_streak: u32,
+    pub dstate_firing: bool,
+    pub dstate_fired_secs: u32,
 }
 
 /// The armed machine-wide alert thresholds plus the inputs they compare
@@ -604,6 +607,14 @@ pub struct SysAlertLimits {
     pub zombie_limit: Option<u64>,
     /// This sample's defunct-process count.
     pub zombie_count: usize,
+    /// --alert-dstate: fire when more than this many processes sit in
+    /// uninterruptible sleep (Linux state D, macOS state U) — a storage
+    /// or NFS hang piles processes up where neither CPU% nor PSI's
+    /// shorter windows can see them. `dstate_count` is only read when
+    /// this is armed.
+    pub dstate_limit: Option<u64>,
+    /// This sample's uninterruptible-wait count.
+    pub dstate_count: usize,
     pub repeat: Option<u64>,
 }
 
@@ -972,6 +983,8 @@ pub fn system_alert_picks(
         temp_limit,
         zombie_limit,
         zombie_count,
+        dstate_limit,
+        dstate_count,
         repeat: repeat_secs,
     } = limits;
     let load_limit = *load_limit;
@@ -995,6 +1008,8 @@ pub fn system_alert_picks(
     let temp_limit = *temp_limit;
     let zombie_limit = *zombie_limit;
     let zombie_count = *zombie_count;
+    let dstate_limit = *dstate_limit;
+    let dstate_count = *dstate_count;
     let repeat_secs = *repeat_secs;
     let mut out = Vec::new();
     if let Some(limit) = load_limit {
@@ -1476,6 +1491,33 @@ pub fn system_alert_picks(
             out.push((
                 "system".to_string(),
                 format!("zombie count back under {limit}"),
+                true,
+            ));
+        }
+    }
+    if let Some(limit) = dstate_limit {
+        let over = dstate_count > limit as usize;
+        let edge = alert_cycle_repeat(
+            &mut state.dstate_streak,
+            &mut state.dstate_firing,
+            over,
+            &mut state.dstate_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            out.push((
+                "system".to_string(),
+                format!(
+                    "{dstate_count} processes stuck in uninterruptible IO wait above {limit} for {}s — storage or NFS is hanging while CPU looks idle",
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("uninterruptible-wait count back under {limit}"),
                 true,
             ));
         }
@@ -2729,7 +2771,9 @@ mod tests {
             disk_busy_limit: None,
             temp_limit: None,
             zombie_limit: None,
+            dstate_limit: None,
             zombie_count: 0,
+            dstate_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -2797,7 +2841,9 @@ mod tests {
             disk_busy_limit: None,
             temp_limit: None,
             zombie_limit: None,
+            dstate_limit: None,
             zombie_count: 0,
+            dstate_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -2881,7 +2927,9 @@ mod tests {
             disk_busy_limit: None,
             temp_limit: None,
             zombie_limit: None,
+            dstate_limit: None,
             zombie_count: 0,
+            dstate_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3071,7 +3119,9 @@ mod tests {
             disk_busy_limit: None,
             temp_limit: None,
             zombie_limit: None,
+            dstate_limit: None,
             zombie_count: 0,
+            dstate_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3125,7 +3175,9 @@ mod tests {
             disk_busy_limit: None,
             temp_limit: None,
             zombie_limit: None,
+            dstate_limit: None,
             zombie_count: 0,
+            dstate_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3191,7 +3243,9 @@ mod tests {
             disk_busy_limit: None,
             temp_limit: None,
             zombie_limit: None,
+            dstate_limit: None,
             zombie_count: 0,
+            dstate_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3251,7 +3305,9 @@ mod tests {
             disk_busy_limit: None,
             temp_limit: None,
             zombie_limit: None,
+            dstate_limit: None,
             zombie_count: 0,
+            dstate_count: 0,
             disk_eta_hours: None,
         };
         // one kill lands (counter 5 → 6): the first tick only arms the
@@ -3371,7 +3427,9 @@ mod tests {
             disk_busy_limit: None,
             temp_limit: None,
             zombie_limit: None,
+            dstate_limit: None,
             zombie_count: 0,
+            dstate_count: 0,
         };
         // seed the mount's trailing history directly (the real history
         // accrues one sample per tick — same shape, shorter wait)
@@ -3452,7 +3510,9 @@ mod tests {
             disk_busy_limit: None,
             temp_limit: None,
             zombie_limit: None,
+            dstate_limit: None,
             zombie_count: 0,
+            dstate_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3524,7 +3584,9 @@ mod tests {
             disk_busy_limit: busy_limit,
             temp_limit: None,
             zombie_limit: None,
+            dstate_limit: None,
             zombie_count: 0,
+            dstate_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3595,7 +3657,9 @@ mod tests {
             disk_busy_limit: None,
             temp_limit,
             zombie_limit: None,
+            dstate_limit: None,
             zombie_count: 0,
+            dstate_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3652,6 +3716,8 @@ mod tests {
             temp_limit: None,
             zombie_limit,
             zombie_count,
+            dstate_limit: None,
+            dstate_count: 0,
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3690,6 +3756,78 @@ mod tests {
         assert_eq!(rec.len(), 1, "{rec:?}");
         assert!(rec[0].2, "{rec:?}");
         assert!(rec[0].1.contains("back under 5"), "{}", rec[0].1);
+    }
+
+    #[test]
+    fn dstate_alert_fires_on_the_waterline() {
+        let limits = |dstate_limit: Option<u64>, dstate_count: usize| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
+            repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
+            dstate_limit,
+            dstate_count,
+            disk_eta_hours: None,
+            oom_limit: None,
+            oom_kills: None,
+        };
+        // 4 processes stuck in D over a waterline of 2: arming samples,
+        // then one fire
+        let mut state = SysAlertState::default();
+        let mut fires = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            fires = system_alert_picks(
+                &crate::platform::SystemStats::default(),
+                &mut state,
+                &limits(Some(2), 4),
+                3,
+            );
+        }
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert!(
+            fires[0]
+                .1
+                .contains("4 processes stuck in uninterruptible IO wait above 2"),
+            "{}",
+            fires[0].1
+        );
+        assert!(system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(2), 4),
+            3
+        )
+        .is_empty());
+        // the hang clears → recovery
+        let rec = system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(2), 0),
+            3,
+        );
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert!(rec[0].2, "{rec:?}");
+        assert!(
+            rec[0].1.contains("uninterruptible-wait count back under 2"),
+            "{}",
+            rec[0].1
+        );
     }
 
     #[test]
