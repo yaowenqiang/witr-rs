@@ -4569,6 +4569,38 @@ fn main() {
         std::process::exit(if rows.is_empty() { 0 } else { 1 });
     }
 
+    // --dstate: processes stuck in uninterruptible wait — the --zombies
+    // twin for the storage-hang signature. Exit 1 when any exist so
+    // scripts can branch directly.
+    if cli.dstate {
+        let platform = platform::get();
+        let listed = match platform.list_processes() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cannot list processes: {}", e);
+                std::process::exit(5);
+            }
+        };
+        let rows = render::collect_dstates(&listed);
+        if cli.json {
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "dstate_count": rows.len(),
+                "dstates": rows,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if cli.csv {
+            write_out(&render::render_dstates_csv(&rows));
+        } else if cli.markdown {
+            write_out(&render::render_dstates_markdown(&rows));
+        } else {
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            write_out(&render::render_dstates(&rows, &painter));
+        }
+        std::process::exit(if rows.is_empty() { 0 } else { 1 });
+    }
+
     // --locks: every file lock currently held system-wide (the Locks tab's
     // CLI twin; --json shares the LockEntry rows)
     if cli.locks {

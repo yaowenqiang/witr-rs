@@ -114,6 +114,8 @@ A Rust implementation of [pranshuparmar/witr](https://github.com/pranshuparmar/w
 
 **Zombie quick list (`--zombies`)**: `witr-rs --zombies` lists every `<defunct>` zombie in the table — columns PID / NAME / PARENT (`(gone)` when the parent has exited) / AGE (oldest first). Zombies cost nothing themselves, but a field of them is the signature of a parent that never `wait()`s. `--json` emits the versioned envelope (`zombie_count` + `zombies`), with `--csv` / `--markdown` working too; the **exit code is 1 when zombies are found**, 0 otherwise — `witr-rs --zombies || alert` is a ready-made patrol probe.
 
+**D-state quick list (`--dstate`)**: `witr-rs --dstate` lists every process stuck in uninterruptible wait (Linux state D / macOS state U — the same wait under two spellings) — columns PID / USER / NAME / ST / AGE (oldest first). When storage or NFS hangs, CPU looks idle while load pegs and processes pile up in D; `--alert-dstate` watches the waterline, this one lists the names. `--json` emits the versioned envelope (`dstate_count` + `dstates`), with `--csv` / `--markdown` working too; the **exit code is 1 when any are found**, 0 otherwise — `witr-rs --dstate || alert` is the same ready-made patrol probe.
+
 **Service-unit overview (`--services`)**: skip the UI and list the service manager's current units — columns MANAGER / NAME / STATE / PID / DESCRIPTION (Linux systemd / macOS launchd / Windows SCM), running units (a main pid in hand) floating to the top. The CLI twin of the TUI's Services tab (6): `--json` emits the versioned envelope (`service_count` + `services`), with `--csv` / `--markdown` working too — "which services run on this machine, and are they alive" in one command.
 
 **Drift watchdog (`--diff-auto`)**: `witr-rs --watch 30 --diff-auto 30` — while watching, an in-memory frame is taken and compared against the previous one every N seconds; anything changed prints `== drift · N new / M gone / K restarted / J changed ==` plus the color-coded change rows. Where `--alert-port` watches one port's edges, `--diff-auto` watches the whole table — "what appeared on this machine in the last half hour" without anyone remembering to run `--diff`; the watchdog shouts on its own. Requires `--watch`; with **`--json`** every drift check emits a versioned envelope frame (`summary: {new, gone, restarted, changed, listen_new, listen_gone, total}` + `entries`, shaped exactly like `--diff --json` — `| jq '.summary'` watches the counts), and a check with no changes prints nothing. Frames never touch disk — pure in-memory comparison, zero writes.
@@ -231,7 +233,7 @@ Details of the selected process refresh 500ms after the cursor stops moving (deb
 | Disk time-to-full countdown (`--alert-disk-eta`) | ✓ df sweep + trend extrapolation | ✓ same | ✓ same |
 | Disk saturation (sys-page io row / `--alert-disk-busy`) | ✓ `/proc/diskstats` deltas (iostat %util) | ✗ | ✓ PowerShell perf counters (cooked PercentDiskTime) |
 | Zombie processes (`--zombies` / `--alert-zombies`) | ✓ `/proc` state Z | ✓ `ps` state column | ✗ (no zombie concept) |
-| Uninterruptible wait (`--alert-dstate`) | ✓ `/proc` state D | ✓ `ps` state U | ✗ |
+| Uninterruptible wait (`--dstate` / `--alert-dstate`) | ✓ `/proc` state D | ✓ `ps` state U | ✗ |
 | systemd failed units (`--alert-failed-units` / Services tab) | ✓ `systemctl --failed` | ✗ | ✗ |
 | Per-process network throughput (`--top net` / `--alert-net-per-proc`) | ✓ `ss(8)` tcp_info deltas | ✗ | ✗ |
 | Start time | btime + starttime | `ps etime` | CIM CreationDate |
@@ -337,6 +339,7 @@ witr-rs --audit 'cargo build --release' --json # same, as a machine-readable env
 witr-rs --ports               # current LISTEN port overview (--json / --csv machine-readable)
 witr-rs --locks               # system-wide file-lock listing (--json / --csv / --markdown)
 witr-rs --zombies             # zombie process quick list (oldest first; exit 1 when found — a patrol probe)
+witr-rs --dstate              # D-state quick list (storage/NFS hangs leave CPU idle while load pegs; exit code as --zombies)
 witr-rs --conns               # every non-LISTEN connection: local/peer/state/owner (loopback peers attributed; --watch N for a live board)
 witr-rs --services            # the service manager's units (systemd/launchd/SCM; running ones first)
 witr-rs --watch 5 --alert-load 8 --alert-mem-pct 90 # machine-wide watchdog: load / memory-percent threshold alerts

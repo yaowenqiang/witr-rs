@@ -521,6 +521,115 @@ pub fn render_zombies_markdown(rows: &[ZombieRow]) -> String {
     out
 }
 
+/// One `--dstate` row: a process stuck in uninterruptible wait — the
+/// --alert-dstate sentinel's lister twin.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DStateRow {
+    pub pid: Pid,
+    pub name: String,
+    pub user: Option<String>,
+    /// Kernel state letter: D on Linux, U on macOS — the same
+    /// uninterruptible wait under two spellings, kept verbatim so
+    /// scripts can tell the platforms apart.
+    pub state: String,
+    pub age_secs: Option<i64>,
+}
+
+/// Filter the table to uninterruptible-wait processes (Linux state D /
+/// macOS state U). Oldest first — stuck-since-yesterday is the
+/// interesting one.
+pub fn collect_dstates(procs: &[Process]) -> Vec<DStateRow> {
+    let mut rows: Vec<DStateRow> = procs
+        .iter()
+        .filter(|p| matches!(p.state.as_deref(), Some("D") | Some("U")))
+        .map(|p| DStateRow {
+            pid: p.pid,
+            name: p.name.clone(),
+            user: p.user.clone(),
+            state: p.state.clone().unwrap_or_default(),
+            age_secs: p.started.map(|t| crate::util::now_unix() - t),
+        })
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.age_secs));
+    rows
+}
+
+/// `--dstate` text table: PID / USER / NAME / ST / AGE, oldest first.
+pub fn render_dstates(rows: &[DStateRow], p: &Painter) -> String {
+    if rows.is_empty() {
+        return "no processes stuck in uninterruptible wait — clean\n".to_string();
+    }
+    let pid_w = rows
+        .iter()
+        .map(|r| r.pid.to_string().len())
+        .max()
+        .unwrap_or(3)
+        .max(3);
+    let user_w = rows
+        .iter()
+        .map(|r| r.user.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 24);
+    let name_w = rows
+        .iter()
+        .map(|r| r.name.len())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 48);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:>pid_w$}  {:<user_w$}  {:<name_w$}  {:>2}  {}",
+        "PID", "USER", "NAME", "ST", "AGE"
+    );
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "{:>pid_w$}  {:<user_w$}  {:<name_w$}  {}  {}",
+            r.pid,
+            r.user.as_deref().unwrap_or("-"),
+            r.name,
+            p.red(&r.state),
+            r.age_secs.map(fmt_age).unwrap_or_default(),
+        );
+    }
+    out
+}
+
+/// `--dstate --csv`: age as raw seconds (scripts diff it, not read it).
+pub fn render_dstates_csv(rows: &[DStateRow]) -> String {
+    let mut out = String::from("pid,user,name,state,age_secs\n");
+    for r in rows {
+        out.push_str(&format!(
+            "{},{},{},{},{}\n",
+            r.pid,
+            csv_field(r.user.as_deref().unwrap_or("")),
+            csv_field(&r.name),
+            r.state,
+            r.age_secs.map(|a| a.to_string()).unwrap_or_default(),
+        ));
+    }
+    out
+}
+
+/// `--dstate --markdown`: the same rows, human-format ages.
+pub fn render_dstates_markdown(rows: &[DStateRow]) -> String {
+    let mut out = String::from("| PID | USER | NAME | ST | AGE |\n|---|---|---|---|---|\n");
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} |",
+            r.pid,
+            r.user.as_deref().unwrap_or("-"),
+            r.name,
+            r.state,
+            r.age_secs.map(fmt_age).unwrap_or_default(),
+        );
+    }
+    out
+}
+
 /// `--locks` text table: PID / OWNER / MODE / TYPE / PATH, pid then path.
 pub fn render_locks_table(entries: &[crate::model::LockEntry], p: &Painter) -> String {
     if entries.is_empty() {
@@ -2956,6 +3065,52 @@ mod tests {
         assert!(md.starts_with("| PID | NAME | PARENT | AGE |"));
         assert!(md.contains("| init (pid 1) |"), "{md}");
         assert!(md.contains("| 1m 40s |"), "{md}");
+    }
+
+    #[test]
+    fn dstates_collect_sort_and_render_like_the_zombie_lister() {
+        let mk = |pid: i32, state: Option<&str>, name: &str, user: &str, started: Option<i64>| Process {
+            pid,
+            state: state.map(|s| s.into()),
+            name: name.into(),
+            user: Some(user.into()),
+            started,
+            ..Default::default()
+        };
+        let now = crate::util::now_unix();
+        let procs = vec![
+            mk(1, Some("S"), "init", "root", Some(now - 500)),
+            // D on Linux and U on macOS are the same wait — both collected
+            mk(2, Some("D"), "nfs-io", "www", Some(now - 400)),
+            mk(3, Some("U"), "stuck-mac", "bob", Some(now - 50)),
+            // running/sleeping states stay out
+            mk(4, Some("R"), "live", "root", Some(now - 10)),
+            mk(5, None, "unknown", "root", Some(now - 10)),
+        ];
+        let rows = collect_dstates(&procs);
+        let pids: Vec<i32> = rows.iter().map(|r| r.pid).collect();
+        // oldest first; the state letter rides verbatim
+        assert_eq!(pids, vec![2, 3], "{rows:?}");
+        assert_eq!(rows[0].state, "D");
+        assert_eq!(rows[0].age_secs, Some(400));
+        assert_eq!(rows[1].state, "U");
+        let p = Painter::new(false);
+        assert!(render_dstates(&[], &p).contains("clean"));
+        let table = render_dstates(&rows, &p);
+        assert!(table.contains("PID  USER  NAME"), "{table}");
+        assert!(table.contains("nfs-io"), "{table}");
+        assert!(table.lines().nth(1).unwrap().contains("D"), "{table}");
+        assert!(table.lines().nth(2).unwrap().contains("U"), "{table}");
+
+        // csv keeps raw ages; markdown mirrors the columns
+        let csv = render_dstates_csv(&rows);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "pid,user,name,state,age_secs");
+        assert_eq!(lines[1], "2,www,nfs-io,D,400");
+        assert_eq!(lines[2], "3,bob,stuck-mac,U,50");
+        let md = render_dstates_markdown(&rows);
+        assert!(md.starts_with("| PID | USER | NAME | ST | AGE |"), "{md}");
+        assert!(md.contains("| nfs-io |"), "{md}");
     }
 
     #[test]

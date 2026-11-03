@@ -472,6 +472,15 @@ pub struct Cli {
     #[arg(
         long,
         help = t(
+            "列出卡在 uninterruptible wait（Linux state D / macOS state U）的进程——存储或 NFS 挂起时 CPU 空闲而 load 顶天，成排 D 态就是现场；--alert-dstate 盯水位，这个列名单。发现即退出码 1，干净则 0。属于无目标操作；--csv / --markdown / --json 同样支持",
+            "List every process stuck in uninterruptible wait (Linux state D / macOS state U) — when storage or NFS hangs, CPU looks idle while load pegs and processes pile up in D; --alert-dstate watches the waterline, this one lists the names. Exit 1 when any exist, 0 when clean. A no-target operation; --csv / --markdown / --json work too"
+        )
+    )]
+    pub dstate: bool,
+
+    #[arg(
+        long,
+        help = t(
             "列出全系统当前持有的文件锁（持锁进程 / 模式 / 文件路径）——“哪个进程锁着这个文件”一条命令。属于无目标操作；--csv / --markdown / --json 同样支持",
             "List every file lock currently held system-wide (holder / mode / file path) — \"which process locks this file\" in one command. A no-target operation; --csv / --markdown / --json work too"
         )
@@ -846,8 +855,8 @@ pub struct Cli {
         long = "alert-dstate",
         value_name = "N",
         help = t(
-            "不可中断等待哨兵：卡在 uninterruptible sleep（Linux state D / macOS state U——等 IO 等到调度都排不进）的进程数连续 5 次采样超过该值即触发——存储或 NFS 挂起时 CPU 看着空闲、load 却顶天，进程成排 D 态就是现场；--alert-disk-busy 管\"哪块盘是瓶颈\"，这个管\"有多少人被它卡住\"。TUI 和 --watch",
-            "D-state sentinel: fire when more than this many processes sit in uninterruptible sleep (Linux state D / macOS state U — waiting on IO so hard they can't even be scheduled out) for 5 consecutive samples — when storage or NFS hangs, CPU looks idle while load pegs and processes pile up in D; --alert-disk-busy answers \"which disk is the bottleneck\", this one answers \"how many are stuck behind it\". TUI and --watch"
+            "不可中断等待哨兵：卡在 uninterruptible sleep（Linux state D / macOS state U——等 IO 等到调度都排不进）的进程数连续 5 次采样超过该值即触发——存储或 NFS 挂起时 CPU 看着空闲、load 却顶天，进程成排 D 态就是现场；--dstate 列名单，这个管水位。TUI 和 --watch",
+            "D-state sentinel: fire when more than this many processes sit in uninterruptible sleep (Linux state D / macOS state U — waiting on IO so hard they can't even be scheduled out) for 5 consecutive samples — when storage or NFS hangs, CPU looks idle while load pegs and processes pile up in D; --dstate lists the names, this one watches the waterline. TUI and --watch"
         )
     )]
     pub alert_dstate: Option<u64>,

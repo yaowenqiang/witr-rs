@@ -112,6 +112,8 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **僵尸进程速查（`--zombies`）**：`witr-rs --zombies` 列出全表 `<defunct>` 僵尸——列 PID / NAME / PARENT（父进程名，已退出则 `(gone)`）/ AGE（最老优先）——僵尸本身不耗资源，但成片的僵尸是父进程没 `wait()` 的信号。`--json` 出版本化信封（`zombie_count` + `zombies`），`--csv` / `--markdown` 同样支持；**发现僵尸时退出码 1**，无僵尸 0——`witr-rs --zombies || alert` 直接当巡检探针。
 
+**D 态速查（`--dstate`）**：`witr-rs --dstate` 列出卡在 uninterruptible wait（Linux state D / macOS state U——同一种等待的两种拼法）的进程——列 PID / USER / NAME / ST / AGE（最老优先）——存储或 NFS 挂起时 CPU 看着空闲、load 却顶天，成排 D 态就是现场；`--alert-dstate` 盯水位，这个列名单。`--json` 出版本化信封（`dstate_count` + `dstates`），`--csv` / `--markdown` 同样支持；**发现即退出码 1**，干净 0——`witr-rs --dstate || alert` 同样是巡检探针。
+
 **服务单元总览（`--services`）**：不进界面，直接列出服务管理器当前的单元——列 MANAGER / NAME / STATE / PID / DESCRIPTION（Linux systemd / macOS launchd / Windows SCM），运行中的（有主 pid）排前面。TUI Services 页（6）的 CLI 孪生：`--json` 出版本化信封（`service_count` + `services`），`--csv` / `--markdown` 同样支持——"这台机器上跑着哪些服务、活没活着"一条命令。
 
 **漂移看门狗（`--diff-auto`）**：`witr-rs --watch 30 --diff-auto 30`——常驻观察时每 N 秒在内存里自动拍一帧快照并与上一帧对比，有变化才打印 `== drift · N new / M gone / K restarted / J changed ==` 加着色变化行。`--alert-port` 盯指定端口的边缘，`--diff-auto` 盯全表的漂移——"这半小时机器上多了什么"不用人去跑 `--diff`，watchdog 自己会喊。需要 `--watch`；配 **`--json`** 时每次漂移检查输出一个带版本信封的 drift 帧（`summary: {new, gone, restarted, changed, listen_new, listen_gone, total}` + `entries`，与 `--diff --json` 同构——`| jq '.summary'` 直接盯计数），无变化的检查不产生输出。快照不落盘，纯内存对比，零磁盘写入。
@@ -229,7 +231,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 | 磁盘填满倒计时（`--alert-disk-eta`） | ✓ df 扫描 + 趋势外推 | ✓ 同左 | ✓ 同左 |
 | 磁盘饱和（系统页 io 行 / `--alert-disk-busy`） | ✓ `/proc/diskstats` 差分（iostat %util） | ✗ | ✓ PowerShell 性能计数器（PercentDiskTime 熟值） |
 | 僵尸进程（`--zombies` / `--alert-zombies`） | ✓ `/proc` 状态 Z | ✓ `ps` state 列 | ✗（无僵尸概念） |
-| 不可中断等待（`--alert-dstate`） | ✓ `/proc` 状态 D | ✓ `ps` state U | ✗ |
+| 不可中断等待（`--dstate` / `--alert-dstate`） | ✓ `/proc` 状态 D | ✓ `ps` state U | ✗ |
 | systemd 失败单元（`--alert-failed-units` / Services 页） | ✓ `systemctl --failed` | ✗ | ✗ |
 | 每进程网络吞吐（`--top net` / `--alert-net-per-proc`） | ✓ `ss(8)` tcp_info 差分 | ✗ | ✗ |
 | 启动时间 | btime + starttime | `ps etime` | CIM CreationDate |
@@ -336,6 +338,7 @@ witr-rs --audit 'cargo build --release' --json # 同上，机器可读信封（C
 witr-rs --ports               # 当前 LISTEN 端口总览（--json / --csv 机器可读）
 witr-rs --locks               # 全系统文件锁列表（--json / --csv / --markdown）
 witr-rs --zombies             # 僵尸进程速查（最老优先；有僵尸退出码 1——巡检探针）
+witr-rs --dstate              # D 态速查（存储/NFS 挂起时 CPU 空闲而 load 顶天；退出码同 --zombies）
 witr-rs --conns               # 全机非 LISTEN 连接表：本地/对端/状态/属主（回环对端自动归因；--watch N 常驻）
 witr-rs --services            # 服务管理器单元列表（systemd/launchd/SCM；运行中的排前面）
 witr-rs --watch 5 --alert-load 8 --alert-mem-pct 90 # 机器级 watchdog：load / 内存百分比超阈值告警
