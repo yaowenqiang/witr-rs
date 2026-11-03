@@ -533,6 +533,9 @@ pub struct SysAlertState {
     pub dstate_streak: u32,
     pub dstate_firing: bool,
     pub dstate_fired_secs: u32,
+    pub failed_streak: u32,
+    pub failed_firing: bool,
+    pub failed_fired_secs: u32,
 }
 
 /// The armed machine-wide alert thresholds plus the inputs they compare
@@ -615,6 +618,15 @@ pub struct SysAlertLimits {
     pub dstate_limit: Option<u64>,
     /// This sample's uninterruptible-wait count.
     pub dstate_count: usize,
+    /// --alert-failed-units: fire when more than this many systemd
+    /// units sit in failed state — a unit left failed stays failed until
+    /// someone resets it, so even quiet machines owe this a glance.
+    /// Disarmed when None; `failed_units` is only fetched when armed (one
+    /// systemctl sweep per tick). Fleet mode never carries it — the units
+    /// live on the far host.
+    pub failed_limit: Option<u64>,
+    /// This sample's failed unit names (the detail names the first few).
+    pub failed_units: Vec<String>,
     pub repeat: Option<u64>,
 }
 
@@ -985,6 +997,8 @@ pub fn system_alert_picks(
         zombie_count,
         dstate_limit,
         dstate_count,
+        failed_limit,
+        failed_units,
         repeat: repeat_secs,
     } = limits;
     let load_limit = *load_limit;
@@ -1010,6 +1024,8 @@ pub fn system_alert_picks(
     let zombie_count = *zombie_count;
     let dstate_limit = *dstate_limit;
     let dstate_count = *dstate_count;
+    let failed_limit = *failed_limit;
+    let failed_units = failed_units.as_slice();
     let repeat_secs = *repeat_secs;
     let mut out = Vec::new();
     if let Some(limit) = load_limit {
@@ -1518,6 +1534,37 @@ pub fn system_alert_picks(
             out.push((
                 "system".to_string(),
                 format!("uninterruptible-wait count back under {limit}"),
+                true,
+            ));
+        }
+    }
+    if let Some(limit) = failed_limit {
+        let over = failed_units.len() > limit as usize;
+        let edge = alert_cycle_repeat(
+            &mut state.failed_streak,
+            &mut state.failed_firing,
+            over,
+            &mut state.failed_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            let named: Vec<String> = failed_units.iter().take(3).cloned().collect();
+            out.push((
+                "system".to_string(),
+                format!(
+                    "{} systemd units failed above {limit} for {}s — {}{}",
+                    failed_units.len(),
+                    ALERT_CYCLES as u64 * interval_secs.max(1),
+                    named.join(", "),
+                    if failed_units.len() > named.len() { "…" } else { "" }
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("failed unit count back under {limit}"),
                 true,
             ));
         }
@@ -2774,6 +2821,8 @@ mod tests {
             dstate_limit: None,
             zombie_count: 0,
             dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -2844,6 +2893,8 @@ mod tests {
             dstate_limit: None,
             zombie_count: 0,
             dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -2930,6 +2981,8 @@ mod tests {
             dstate_limit: None,
             zombie_count: 0,
             dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3122,6 +3175,8 @@ mod tests {
             dstate_limit: None,
             zombie_count: 0,
             dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3178,6 +3233,8 @@ mod tests {
             dstate_limit: None,
             zombie_count: 0,
             dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3246,6 +3303,8 @@ mod tests {
             dstate_limit: None,
             zombie_count: 0,
             dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3308,6 +3367,8 @@ mod tests {
             dstate_limit: None,
             zombie_count: 0,
             dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
             disk_eta_hours: None,
         };
         // one kill lands (counter 5 → 6): the first tick only arms the
@@ -3430,6 +3491,8 @@ mod tests {
             dstate_limit: None,
             zombie_count: 0,
             dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
         };
         // seed the mount's trailing history directly (the real history
         // accrues one sample per tick — same shape, shorter wait)
@@ -3513,6 +3576,8 @@ mod tests {
             dstate_limit: None,
             zombie_count: 0,
             dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3587,6 +3652,8 @@ mod tests {
             dstate_limit: None,
             zombie_count: 0,
             dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3660,6 +3727,8 @@ mod tests {
             dstate_limit: None,
             zombie_count: 0,
             dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3718,6 +3787,8 @@ mod tests {
             zombie_count,
             dstate_limit: None,
             dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3783,6 +3854,8 @@ mod tests {
             zombie_count: 0,
             dstate_limit,
             dstate_count,
+            failed_limit: None,
+            failed_units: Vec::new(),
             disk_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
@@ -3828,6 +3901,76 @@ mod tests {
             "{}",
             rec[0].1
         );
+    }
+
+    #[test]
+    fn failed_units_alert_fires_names_units_and_recovers() {
+        let limits = |failed_limit: Option<u64>, failed_units: &[&str]| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
+            repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
+            dstate_limit: None,
+            dstate_count: 0,
+            failed_limit,
+            failed_units: failed_units.iter().map(|u| u.to_string()).collect(),
+            disk_eta_hours: None,
+            oom_limit: None,
+            oom_kills: None,
+        };
+        // three failed units over a waterline of 1: arming samples, then
+        // one fire naming the units (first three, then an ellipsis)
+        let units = ["ipmi.service", "lightdm.service", "plymouth-quit.service", "extra.service"];
+        let mut state = SysAlertState::default();
+        let mut fires = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            fires = system_alert_picks(
+                &crate::platform::SystemStats::default(),
+                &mut state,
+                &limits(Some(1), &units),
+                3,
+            );
+        }
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        let d = &fires[0].1;
+        assert!(d.contains("4 systemd units failed above 1"), "{d}");
+        assert!(d.contains("ipmi.service"), "{d}");
+        assert!(d.contains("plymouth-quit.service"), "{d}");
+        assert!(d.contains('…'), "fourth unit elided: {d}");
+        assert!(!d.contains("extra.service"), "{d}");
+        assert!(system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(1), &units),
+            3
+        )
+        .is_empty());
+        // reset-failed → recovery
+        let rec = system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(1), &[]),
+            3,
+        );
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert!(rec[0].2, "{rec:?}");
+        assert!(rec[0].1.contains("back under 1"), "{}", rec[0].1);
     }
 
     #[test]

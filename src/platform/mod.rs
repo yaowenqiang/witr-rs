@@ -422,6 +422,48 @@ fn systemd_unit_pid(unit: &str) -> Option<Pid> {
     out.trim().parse().ok().filter(|p| *p > 0)
 }
 
+/// Names of systemd units sitting in failed state — the
+/// --alert-failed-units sentinel's raw input and the
+/// `witr_machine_failed_units` gauge's. `None` where there is no systemd
+/// to ask (other platforms, systemctl missing, not booted with systemd);
+/// an empty list means systemd answered and nothing failed. One targeted
+/// sweep, the same cost class as the mount sweep — paid by watchers that
+/// arm the sentinel and by /metrics scrapes.
+pub fn failed_units() -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    return systemd_failed_units();
+    #[cfg(not(target_os = "linux"))]
+    return None;
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_failed_units() -> Option<Vec<String>> {
+    // the list form exits 0 even when units are failed (the count-as-exit
+    // behavior belongs to `is-failed UNIT`), so a plain Ok carries the rows
+    let text = crate::util::run_ok(
+        "systemctl",
+        &["--failed", "--no-legend", "--plain", "--no-pager"],
+        std::time::Duration::from_secs(8),
+    )?;
+    Some(parse_failed_units(&text))
+}
+
+/// `unit.service loaded failed failed Description` rows → unit names. A
+/// leading `●` marks queued jobs; anything systemd prints beyond the first
+/// field is description the sentinel doesn't need.
+#[allow(dead_code)] // every parse fn is unit-tested on all platforms
+pub fn parse_failed_units(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            l.trim_start_matches('●')
+                .split_whitespace()
+                .next()
+                .map(|u| u.to_string())
+        })
+        .collect()
+}
+
 #[cfg(target_os = "macos")]
 fn launchd_services() -> Vec<Service> {
     let Ok(text) = crate::util::run(
@@ -974,6 +1016,30 @@ sys-devices-loaded.device loaded active plugged stub\
         // failed stands out (the tab paints it red)
         assert_eq!(ss[2].state, "failed");
         assert!(ss.iter().all(|s| s.pid.is_none()), "systemd resolves pids lazily");
+    }
+
+    #[test]
+    fn failed_units_parse_keeps_the_unit_names() {
+        // the --failed --no-legend rows: UNIT LOAD ACTIVE SUB DESCRIPTION
+        // (queued jobs carry a leading bullet; descriptions may be absent)
+        let text = "\
+ipmi.service          loaded failed failed IPMI Driver\
+\nlightdm.service       loaded failed failed Light Display Manager\
+\n● docker.service      loaded failed failed Docker Engine\
+\nplymouth-quit.service loaded failed failed\
+\n";
+        let names = parse_failed_units(&text);
+        assert_eq!(
+            names,
+            vec![
+                "ipmi.service",
+                "lightdm.service",
+                "docker.service",
+                "plymouth-quit.service"
+            ]
+        );
+        // an empty answer means systemd replied and nothing failed
+        assert!(parse_failed_units("\n").is_empty());
     }
 
     #[test]

@@ -443,6 +443,14 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
     out.push_str("# HELP witr_machine_dstate_count Processes stuck in uninterruptible IO wait (Linux state D / macOS state U)\n");
     out.push_str("# TYPE witr_machine_dstate_count gauge\n");
     out.push_str(&format!("witr_machine_dstate_count {dstate}\n"));
+    // the failed-units sentinel's raw input — one systemctl sweep per
+    // scrape, the same cost class as the df sweep above; no systemd (or
+    // not booted with it) leaves the series out entirely
+    if let Some(units) = crate::platform::failed_units() {
+        out.push_str("# HELP witr_machine_failed_units Systemd units sitting in failed state\n");
+        out.push_str("# TYPE witr_machine_failed_units gauge\n");
+        out.push_str(&format!("witr_machine_failed_units {}\n", units.len()));
+    }
     out.push_str("# HELP witr_rss_total_mb Sum of resident memory (MB) across visible processes\n");
     out.push_str("# TYPE witr_rss_total_mb gauge\n");
     out.push_str(&format!("witr_rss_total_mb {rss_total}\n"));

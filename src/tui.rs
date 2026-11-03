@@ -420,6 +420,8 @@ struct TuiApp {
     alert_zombies: Option<u64>,
     /// --alert-dstate: uninterruptible-wait count threshold
     alert_dstate: Option<u64>,
+    /// --alert-failed-units: failed systemd units threshold
+    alert_failed_units: Option<u64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
     alert_net: Option<u64>,
     /// --alert-psi: PSI "full" stall percent threshold (Linux only)
@@ -651,6 +653,8 @@ pub struct Seed {
     pub alert_zombies: Option<u64>,
     /// --alert-dstate: uninterruptible-wait count threshold
     pub alert_dstate: Option<u64>,
+    /// --alert-failed-units: failed systemd units threshold
+    pub alert_failed_units: Option<u64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
     pub alert_net: Option<u64>,
     /// --alert-psi: PSI "full" stall percent threshold (Linux only)
@@ -760,6 +764,7 @@ impl Seed {
         self.alert_temp = cli.alert_temp;
         self.alert_zombies = cli.alert_zombies;
         self.alert_dstate = cli.alert_dstate;
+        self.alert_failed_units = cli.alert_failed_units;
         self.alert_net = cli.alert_net;
         self.alert_psi = cli.alert_psi;
         self.alert_mem_avail_mb = cli.alert_mem_avail_mb;
@@ -908,6 +913,7 @@ impl TuiApp {
             alert_temp: seed.alert_temp,
             alert_zombies: seed.alert_zombies,
             alert_dstate: seed.alert_dstate,
+            alert_failed_units: seed.alert_failed_units,
             alert_net: seed.alert_net,
             alert_psi: seed.alert_psi,
             alert_mem_avail_mb: seed.alert_mem_avail_mb,
@@ -1199,6 +1205,7 @@ impl TuiApp {
         self.alert_temp = seed.alert_temp;
         self.alert_zombies = seed.alert_zombies;
         self.alert_dstate = seed.alert_dstate;
+        self.alert_failed_units = seed.alert_failed_units;
         self.alert_net = seed.alert_net;
         self.alert_psi = seed.alert_psi;
         self.alert_mem_avail_mb = seed.alert_mem_avail_mb;
@@ -1379,6 +1386,7 @@ impl TuiApp {
                     || self.alert_temp.is_some()
                     || self.alert_zombies.is_some()
                     || self.alert_dstate.is_some()
+                    || self.alert_failed_units.is_some()
                     || self.alert_net.is_some()
                     || self.alert_psi.is_some()
                     || self.alert_mem_avail_mb.is_some()
@@ -1472,6 +1480,12 @@ impl TuiApp {
                                 matches!(p.state.as_deref(), Some("D") | Some("U"))
                             })
                             .count(),
+                        failed_limit: self.alert_failed_units,
+                        failed_units: if self.alert_failed_units.is_some() {
+                            crate::platform::failed_units().unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        },
                         repeat: self.alert_repeat,
                     };
                     let mut sys_picks = crate::history::system_alert_picks(
@@ -10372,6 +10386,7 @@ mod tests {
                 alert_temp: None,
                 alert_zombies: None,
                 alert_dstate: None,
+                alert_failed_units: None,
                 alert_net: None,
                 alert_psi: None,
                 alert_mem_avail_mb: None,

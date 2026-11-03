@@ -812,6 +812,10 @@ fn fleet_alert_picks(
         zombie_count: state_count(procs, &["Z"]),
         dstate_limit: cli.alert_dstate,
         dstate_count: state_count(procs, &["D", "U"]),
+        // the failed-unit sweep is the far host's systemctl — fleet mode
+        // deliberately stays blind to it
+        failed_limit: None,
+        failed_units: Vec::new(),
         repeat: cli.alert_repeat,
     };
     history::system_alert_picks(&sample.stats, st, &limits, interval)
@@ -1214,7 +1218,8 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         || cli.alert_disk_busy.is_some()
         || cli.alert_temp.is_some()
         || cli.alert_zombies.is_some()
-        || cli.alert_dstate.is_some();
+        || cli.alert_dstate.is_some()
+        || cli.alert_failed_units.is_some();
     if !armed {
         eprintln!(
             "--check evaluates --alert-* thresholds; arm at least one (e.g. --check --alert-cpu 90 --alert-load 4)"
@@ -1398,6 +1403,12 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
     };
     let zombie_count = state_count(&procs, &["Z"]);
     let dstate_count = state_count(&procs, &["D", "U"]);
+    // the failed-unit sweep is one systemctl call, paid only when armed
+    let failed_units = if cli.alert_failed_units.is_some() {
+        crate::platform::failed_units().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut machine_lines = machine_check_lines(
         cli,
         &stats,
@@ -1405,6 +1416,7 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         procs.len(),
         zombie_count,
         dstate_count,
+        &failed_units,
         net_rate,
         drop_rate,
         retrans_rate,
@@ -1526,6 +1538,7 @@ fn machine_check_lines(
     proc_count: usize,
     zombie_count: usize,
     dstate_count: usize,
+    failed_units: &[String],
     net_rate: Option<f64>,
     drop_rate: Option<f64>,
     retrans_rate: Option<f64>,
@@ -1663,6 +1676,17 @@ fn machine_check_lines(
             ));
         }
     }
+    if let Some(limit) = cli.alert_failed_units {
+        if failed_units.len() > limit as usize {
+            let named: Vec<String> = failed_units.iter().take(3).cloned().collect();
+            out.push(format!(
+                "{} systemd units failed above {limit} — {}{}",
+                failed_units.len(),
+                named.join(", "),
+                if failed_units.len() > named.len() { "…" } else { "" }
+            ));
+        }
+    }
     out
 }
 
@@ -1711,6 +1735,9 @@ fn run_check_fleet(bases: &[String], cli: &cli::Cli) -> i32 {
                     procs.len(),
                     zombie_count,
                     dstate_count,
+                    // fleet checks stay blind to systemd: the units live
+                    // on the far host and the local sweep can't see them
+                    &[],
                     net_rate,
                     drop_rate,
                     retrans_rate,
@@ -5174,6 +5201,7 @@ fn main() {
                     || cli.alert_temp.is_some()
                     || cli.alert_zombies.is_some()
                     || cli.alert_dstate.is_some()
+                    || cli.alert_failed_units.is_some()
                 {
                     if let Some(stats) = platform.system_stats() {
                         let mounts = if cli.alert_disk.is_some() || cli.alert_disk_eta.is_some() {
@@ -5242,6 +5270,12 @@ fn main() {
                             zombie_count: state_count(&procs, &["Z"]),
                             dstate_limit: cli.alert_dstate,
                             dstate_count: state_count(&procs, &["D", "U"]),
+                            failed_limit: cli.alert_failed_units,
+                            failed_units: if cli.alert_failed_units.is_some() {
+                                crate::platform::failed_units().unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            },
                             repeat: cli.alert_repeat,
                         };
                         let mut sys_picks = history::system_alert_picks(
@@ -6466,6 +6500,8 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             "5",
             "--alert-dstate",
             "3",
+            "--alert-failed-units",
+            "1",
         ]);
         let stats = crate::platform::SystemStats {
             temp: Some(("acpitz".into(), 85.0)),
@@ -6484,9 +6520,31 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             ],
             ..Default::default()
         };
-        let lines =
-            machine_check_lines(&cli, &stats, &[], 0, 7, 4, None, None, None, None);
-        assert_eq!(lines.len(), 4, "{lines:?}");
+        let failed = vec![
+            "ipmi.service".to_string(),
+            "lightdm.service".to_string(),
+            "plymouth-quit.service".to_string(),
+        ];
+        let lines = machine_check_lines(
+            &cli,
+            &stats,
+            &[],
+            0,
+            7,
+            4,
+            &failed,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains(
+                "3 systemd units failed above 1 — ipmi.service, lightdm.service, plymouth-quit.service"
+            )),
+            "{lines:?}"
+        );
         assert!(
             lines.iter().any(|l| l.contains("disk IO vda 87% above 80% busy")),
             "{lines:?}"
@@ -6509,7 +6567,10 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         );
         // under every line → nothing to report
         let quiet = crate::platform::SystemStats::default();
-        assert!(machine_check_lines(&cli, &quiet, &[], 0, 0, 0, None, None, None, None).is_empty());
+        assert!(
+            machine_check_lines(&cli, &quiet, &[], 0, 0, 0, &[], None, None, None, None)
+                .is_empty()
+        );
     }
 
     #[test]

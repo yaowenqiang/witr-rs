@@ -240,6 +240,7 @@ impl Cli {
         self.alert_temp = self.alert_temp.or(cfg.alert_temp);
         self.alert_zombies = self.alert_zombies.or(cfg.alert_zombies);
         self.alert_dstate = self.alert_dstate.or(cfg.alert_dstate);
+        self.alert_failed_units = self.alert_failed_units.or(cfg.alert_failed_units);
         self.alert_net = self.alert_net.or(cfg.alert_net);
         self.alert_psi = self.alert_psi.or(cfg.alert_psi);
         self.alert_mem_avail_mb = self.alert_mem_avail_mb.or(cfg.alert_mem_avail_mb);
@@ -850,6 +851,16 @@ pub struct Cli {
         )
     )]
     pub alert_dstate: Option<u64>,
+
+    #[arg(
+        long = "alert-failed-units",
+        value_name = "N",
+        help = t(
+            "systemd 失败单元哨兵：处于 failed 状态的单元数连续 5 次采样超过该值即触发，详情点名单元（systemctl --failed 的清单）——失败的单元会一直挂着直到有人 reset-failed，静默的机器也值得扫一眼。本机哨兵（舰队模式不带——单元在远端主机上）。TUI 和 --watch",
+            "Failed-units sentinel: fire when more than this many systemd units sit in failed state for 5 consecutive samples, the detail naming them (the systemctl --failed list) — a failed unit stays failed until someone runs reset-failed, so even quiet machines owe this a glance. Local sentinel (fleet mode doesn't carry it — the units live on the far host). TUI and --watch"
+        )
+    )]
+    pub alert_failed_units: Option<u64>,
 
     #[arg(
         long = "alert-net",
