@@ -591,9 +591,12 @@ pub struct SystemStats {
     /// platform reports no vmstat — the --alert-oom sentinel diffs it into
     /// a trailing-window kill count.
     pub oom_kills: Option<u64>,
-    /// Per-block-device IO pulse (Linux /proc/diskstats — busy percent is
-    /// the iostat %util twin, diffed refresh-to-refresh; empty where the
-    /// platform has no per-device source). The --alert-disk-busy sentinel
+    /// Per-block-device IO pulse (Linux /proc/diskstats diffed
+    /// refresh-to-refresh — busy percent is the iostat %util twin;
+    /// Windows Win32_PerfFormattedData_PerfDisk_PhysicalDisk, cooked
+    /// rates with no delta state; empty on macOS, whose iostat only
+    /// exposes combined tps — no read/write split, no %util twin — and
+    /// half a sample is worse than none). The --alert-disk-busy sentinel
     /// watches it, the system page and /metrics render it.
     pub disks: Vec<DiskIoSample>,
 }
@@ -603,11 +606,15 @@ pub struct SystemStats {
 /// the per-process rates (who writes) can answer.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DiskIoSample {
-    /// Device name as the kernel spells it ("vda", "nvme0n1", "dm-0").
+    /// Device name as the source spells it ("vda", "nvme0n1", "dm-0";
+    /// Windows perf-counter instance "0 C:" with spaces kept).
     pub device: String,
-    /// Percent of elapsed wall time the device had IO in flight (io_ticks
-    /// delta / elapsed, clamped at 100). `None` on the first sample — no
-    /// previous tick snapshot to diff against.
+    /// Percent of elapsed wall time the device had IO in flight. Linux:
+    /// io_ticks delta / elapsed, clamped at 100, `None` on the first
+    /// sample (no previous tick snapshot to diff against). Windows:
+    /// PercentDiskTime straight off the formatted counter class (already
+    /// a rate, so Some from the first sweep; clamped too — multi-spindle
+    /// instances can exceed 100).
     pub busy_pct: Option<f64>,
     /// Queue depth at sample time: requests issued but not completed.
     pub in_flight: u32,

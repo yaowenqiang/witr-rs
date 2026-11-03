@@ -95,6 +95,47 @@ fn parse_windows_mounts(text: &str) -> Vec<MountUsage> {
     out
 }
 
+/// `disk <instance> <busy_pct> <queue> <rps> <wps>` rows from the
+/// formatted physical-disk perf-counter class → per-device IO samples.
+/// The instance name holds spaces ("0 C: D:"), so the four numbers are
+/// read from the line's end, like the NIC parser. `_Total` is dropped —
+/// it double-counts every real instance. The formatted class reports
+/// cooked per-second values (no delta state, unlike the Linux diff), so
+/// busy% is Some from the very first sweep; PercentDiskTime can exceed
+/// 100 on multi-spindle instances, clamped like the Linux diff.
+fn parse_windows_disks(text: &str) -> Vec<super::DiskIoSample> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        if it.next() != Some("disk") {
+            continue;
+        }
+        let fields: Vec<&str> = it.collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        let name = fields[..fields.len() - 4].join(" ");
+        if name.is_empty() || name == "_Total" {
+            continue;
+        }
+        let Ok(vals) = fields[fields.len() - 4..]
+            .iter()
+            .map(|v| v.parse::<f64>())
+            .collect::<Result<Vec<f64>, _>>()
+        else {
+            continue;
+        };
+        out.push(super::DiskIoSample {
+            device: name,
+            busy_pct: Some(vals[0].clamp(0.0, 100.0)),
+            in_flight: vals[1].max(0.0) as u32,
+            read_iops: Some(vals[2].max(0.0)),
+            write_iops: Some(vals[3].max(0.0)),
+        });
+    }
+    out
+}
+
 /// `nic <name> <rx_bytes> <tx_bytes>` lines → cumulative counters. Names
 /// with spaces survive because the numbers are read from the line's end.
 /// Loopback never appears as an adapter here, so no explicit skip.
@@ -717,15 +758,20 @@ impl Platform for Windows {
     }
 
     /// One PowerShell call: the OS class for memory, the formatted
-    /// perf-counter class for total + per-core CPU (cooked values — no
-    /// delta state needed). Only sampled while the system page is open;
-    /// load average doesn't exist on Windows.
+    /// perf-counter classes for total + per-core CPU and the physical
+    /// disks (cooked values — no delta state needed anywhere). Only
+    /// sampled while the system page is open; load average doesn't exist
+    /// on Windows.
     fn system_stats(&self) -> Option<SystemStats> {
         let script = concat!(
             "$os = Get-CimInstance Win32_OperatingSystem\n",
             "\"mem {0} {1}\" -f $os.TotalVisibleMemorySize, $os.FreePhysicalMemory\n",
             "Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor | ",
             "ForEach-Object { \"cpu {0} {1}\" -f $_.Name, $_.PercentProcessorTime }\n",
+            "Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk | ",
+            "Where-Object { $_.Name -ne '_Total' } | ",
+            "ForEach-Object { \"disk {0} {1} {2} {3} {4}\" -f $_.Name, $_.PercentDiskTime, ",
+            "$_.CurrentDiskQueueLength, $_.DiskReadsPerSec, $_.DiskWritesPerSec }\n",
         );
         let text = run(
             "powershell",
@@ -733,7 +779,9 @@ impl Platform for Windows {
             PS_TIMEOUT,
         )
         .ok()?;
-        Some(parse_windows_system_stats(&text))
+        let mut stats = parse_windows_system_stats(&text);
+        stats.disks = parse_windows_disks(&text);
+        Some(stats)
     }
 
     fn mount_usage(&self) -> Vec<MountUsage> {
@@ -1030,5 +1078,32 @@ cpu 0,1 21
         // nothing usable → an all-empty stats struct (sections hide)
         let s = parse_windows_system_stats("garbage");
         assert_eq!(s, SystemStats::default());
+    }
+
+    #[test]
+    fn windows_disk_parse_reads_numbers_from_the_lines_end() {
+        // the instance name holds spaces and _Total double-counts
+        let text = "\
+disk 0 C: 12 0 140.5 32.25
+disk 1 D: E: 103.7 4 0 12
+disk _Total 55 4 140.5 44.25
+disk 0 C: broken
+disk
+";
+        let ds = parse_windows_disks(text);
+        assert_eq!(ds.len(), 2, "{ds:?}");
+        assert_eq!(ds[0].device, "0 C:");
+        assert_eq!(ds[0].busy_pct, Some(12.0));
+        assert_eq!(ds[0].in_flight, 0);
+        assert_eq!(ds[0].read_iops, Some(140.5));
+        assert_eq!(ds[0].write_iops, Some(32.25));
+        // the combined instance keeps its full name; PercentDiskTime over
+        // 100 clamps (multi-spindle can exceed it)
+        assert_eq!(ds[1].device, "1 D: E:");
+        assert_eq!(ds[1].busy_pct, Some(100.0));
+        assert_eq!(ds[1].in_flight, 4);
+        // junk rows (short, or unparseable numbers) drop silently
+        let s = parse_windows_disks("nothing here");
+        assert!(s.is_empty());
     }
 }
