@@ -187,6 +187,38 @@ fn dashboard_html(platform: &dyn Platform, containers: &[crate::model::Container
             None,
         ));
     }
+    // the state waterlines the machine sentinels watch — tiles only when
+    // they read nonzero (zero dead width), failed units when systemd has
+    // any; a quiet machine shows exactly the base tiles
+    let zombies = procs
+        .iter()
+        .filter(|p| p.state.as_deref() == Some("Z"))
+        .count();
+    if zombies > 0 {
+        out.push_str(&tile("zombies", zombies.to_string(), None));
+    }
+    let dstates = procs
+        .iter()
+        .filter(|p| matches!(p.state.as_deref(), Some("D") | Some("U")))
+        .count();
+    if dstates > 0 {
+        out.push_str(&tile(
+            "stuck in D",
+            dstates.to_string(),
+            Some(dstates.min(10) as f64 * 10.0),
+        ));
+    }
+    if let Some(units) = crate::platform::failed_units() {
+        if !units.is_empty() {
+            let mut v = format!(
+                "{}<span style=\"font-size:12px\"> unit{}",
+                units.len(),
+                if units.len() == 1 { "" } else { "s" }
+            );
+            v.push_str("</span>");
+            out.push_str(&tile("failed", v, None));
+        }
+    }
     out.push_str("</div>\n");
 
     let head = "<tr><th>PID</th><th>USER</th><th>NAME</th><th>COMMAND</th><th>VALUE</th></tr>";

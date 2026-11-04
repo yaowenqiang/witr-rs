@@ -1078,9 +1078,14 @@ pub const SCHEMA_VERSION: u32 = 1;
 fn sys_frame(
     platform: &dyn Platform,
     net_prev: &mut Option<(Vec<platform::NicCounters>, Instant)>,
-    procs: usize,
+    procs: &[Process],
 ) -> render::SysFrame {
     let stats = platform.system_stats().unwrap_or_default();
+    // the state waterlines the sentinels watch, from the table the caller
+    // swept; failed units cost one systemctl sweep (None hides the line)
+    let zombies = state_count(procs, &["Z"]);
+    let dstates = state_count(procs, &["D", "U"]);
+    let failed_units = crate::platform::failed_units().unwrap_or_default();
     let mounts = platform.mount_usage();
     let counters = platform.net_counters();
     let mut nics: Vec<(String, f64, f64)> = Vec::new();
@@ -1108,7 +1113,10 @@ fn sys_frame(
         stats,
         mounts,
         nics,
-        procs,
+        procs: procs.len(),
+        zombies,
+        dstates,
+        failed_units,
     }
 }
 
@@ -4257,16 +4265,14 @@ fn main() {
     if cli.sys {
         let platform = platform::get();
         let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
-        let count = |platform: &dyn Platform| -> usize {
-            platform.list_processes().map(|p| p.len()).unwrap_or(0)
-        };
         if let Some(secs) = cli.watch {
             let interval = secs.max(1);
             install_sigint_flag();
             let mut net_prev: Option<(Vec<platform::NicCounters>, Instant)> = None;
             let mut ticks: u64 = 0;
             loop {
-                let frame = sys_frame(platform.as_ref(), &mut net_prev, count(platform.as_ref()));
+                let procs = platform.list_processes().unwrap_or_default();
+                let frame = sys_frame(platform.as_ref(), &mut net_prev, &procs);
                 write_out("\x1b[2J\x1b[1;1H");
                 write_out(&format!(
                     "witr-rs sys · every {interval}s · Ctrl-C to stop\n{}",
@@ -4282,9 +4288,11 @@ fn main() {
             }
         }
         let mut net_prev: Option<(Vec<platform::NicCounters>, Instant)> = None;
-        let _ = sys_frame(platform.as_ref(), &mut net_prev, count(platform.as_ref()));
+        let procs = platform.list_processes().unwrap_or_default();
+        let _ = sys_frame(platform.as_ref(), &mut net_prev, &procs);
         std::thread::sleep(Duration::from_secs(1));
-        let frame = sys_frame(platform.as_ref(), &mut net_prev, count(platform.as_ref()));
+        let procs = platform.list_processes().unwrap_or_default();
+        let frame = sys_frame(platform.as_ref(), &mut net_prev, &procs);
         if cli.json {
             let s = &frame.stats;
             let doc = serde_json::json!({
@@ -6857,15 +6865,19 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         }
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let platform = NetPlatform { rx: AtomicU64::new(0) };
+        // three table rows (any states — the frame only counts them)
+        let procs: Vec<Process> = (0..3)
+            .map(|i| Process { pid: i, name: format!("p{i}"), ..Default::default() })
+            .collect();
         let mut prev = None;
         // first frame arms only — no rates yet
-        let f = sys_frame(&platform, &mut prev, 3);
+        let f = sys_frame(&platform, &mut prev, &procs);
         assert!(f.nics.is_empty());
         assert_eq!(f.procs, 3);
         // 1 MB arriving over ~60 ms → a real rx rate on the second frame
         platform.rx.store(1024 * 1024, Relaxed);
         std::thread::sleep(Duration::from_millis(60));
-        let frame = sys_frame(&platform, &mut prev, 3);
+        let frame = sys_frame(&platform, &mut prev, &[]);
         assert_eq!(frame.nics.len(), 1);
         assert_eq!(frame.nics[0].0, "eth0");
         assert!(frame.nics[0].1 > 1.0, "rx MB/s: {:?}", frame.nics);

@@ -1370,6 +1370,12 @@ pub struct SysFrame {
     /// top 8, the flat formats total them
     pub nics: Vec<(String, f64, f64)>,
     pub procs: usize,
+    /// The state waterlines the machine sentinels watch, at rest — shown
+    /// only when nonzero (zero dead width). Failed units ride as names;
+    /// None/empty where there's no systemd to ask.
+    pub zombies: usize,
+    pub dstates: usize,
+    pub failed_units: Vec<String>,
 }
 
 impl SysFrame {
@@ -1461,12 +1467,47 @@ pub fn render_sys(frame: &SysFrame, p: &Painter) -> String {
     }
     let _ = writeln!(out, "{mem}");
 
-    // load + process count
+    // load + process count, with the state waterlines when any is nonzero
+    // (zero dead width — quiet machines look exactly like before)
     let loads = match (frame.stats.load1, frame.stats.load5, frame.stats.load15) {
         (Some(a), Some(b), Some(c)) => format!("{a:.2} {b:.2} {c:.2}"),
         _ => "-".to_string(),
     };
-    let _ = writeln!(out, "load  {}   procs {}", loads, frame.procs);
+    let mut suffix = String::new();
+    if frame.zombies > 0 {
+        suffix.push_str(&format!(
+            " · {} zombie{}",
+            frame.zombies,
+            if frame.zombies == 1 { "" } else { "s" }
+        ));
+    }
+    if frame.dstates > 0 {
+        suffix.push_str(&format!(" · {} stuck in D", frame.dstates));
+    }
+    if suffix.is_empty() {
+        let _ = writeln!(out, "load  {}   procs {}", loads, frame.procs);
+    } else {
+        let _ = writeln!(
+            out,
+            "load  {}   procs {}{}",
+            loads,
+            frame.procs,
+            p.yellow(&suffix)
+        );
+    }
+    // failed systemd units — the sentinel's raw list, red while pending
+    if !frame.failed_units.is_empty() {
+        let named: Vec<String> = frame.failed_units.iter().take(3).cloned().collect();
+        let _ = writeln!(
+            out,
+            "{}",
+            p.red(&format!(
+                "failed {}{}",
+                named.join(", "),
+                if frame.failed_units.len() > named.len() { "…" } else { "" }
+            ))
+        );
+    }
 
     // disks: the fullest six, red past 90% like the y page
     if !frame.mounts.is_empty() {
@@ -1644,6 +1685,18 @@ fn sys_flat_cells(frame: &SysFrame) -> Vec<(String, String)> {
         (
             "DISK_MOUNT".into(),
             worst.map(|(_, t)| t.to_string()).unwrap_or_default(),
+        ),
+        (
+            "ZOMBIES".into(),
+            (frame.zombies > 0).then(|| frame.zombies.to_string()).unwrap_or_default(),
+        ),
+        (
+            "DSTATE".into(),
+            (frame.dstates > 0).then(|| frame.dstates.to_string()).unwrap_or_default(),
+        ),
+        (
+            "FAILED_UNITS".into(),
+            frame.failed_units.len().to_string(),
         ),
         ("NET_RX_MBPS".into(), f(Some(frame.net_rx_total()), 2)),
         ("NET_TX_MBPS".into(), f(Some(frame.net_tx_total()), 2)),
@@ -3453,6 +3506,9 @@ mod tests {
             }],
             nics: vec![("eth0".into(), 12.5, 1.25), ("eth1".into(), 0.0, 0.0)],
             procs: 214,
+            zombies: 2,
+            dstates: 1,
+            failed_units: vec!["ipmi.service".into(), "lightdm.service".into(), "plymouth-quit.service".into()],
         };
         let text = render_sys(&frame, &painter);
         assert!(text.contains("cpu   37.2%"), "{text}");
@@ -3460,6 +3516,14 @@ mod tests {
         assert!(text.contains("swap"));
         assert!(text.contains("load  0.42 0.35 0.30"));
         assert!(text.contains("procs 214"));
+        // the state waterlines ride the procs line only when nonzero, and
+        // the failed units get their own red line (the fixture arms all
+        // three: 2 zombies, 1 stuck in D, 3 failed units elided to three)
+        assert!(text.contains("procs 214 · 2 zombies · 1 stuck in D"), "{text}");
+        assert!(
+            text.contains("failed ipmi.service, lightdm.service, plymouth-quit.service"),
+            "{text}"
+        );
         assert!(text.contains("disk  /"), "fullest mount first: {text}");
         assert!(text.contains("net   eth0"));
         assert!(text.contains("temp  acpitz 54°C"));
@@ -3474,6 +3538,12 @@ mod tests {
         let row = lines.next().unwrap();
         assert_eq!(header.split(',').count(), row.split(',').count(), "{csv}");
         assert!(header.starts_with("cpu_pct,mem_used_mb"));
+        // the state waterlines ride the flat row: counts (failed units as
+        // a count — the names live in the text view and the json commands)
+        assert!(
+            header.contains("zombies,dstate,failed_units"),
+            "{header}"
+        );
         assert!(row.starts_with("37.2,6000,10000,16000,512,4096,0.42,0.35,0.30,214,"));
         assert!(row.contains("97.7"), "disk used pct: {row}");
         assert!(row.contains("87.4"), "busiest device busy pct: {row}");
@@ -3482,6 +3552,9 @@ mod tests {
         let md = render_sys_markdown(&frame);
         assert!(md.starts_with("| CPU_PCT |"));
         assert!(md.contains("DISK_BUSY_PCT"));
+        assert!(md.contains("ZOMBIES"));
+        assert!(md.contains("DSTATE"));
+        assert!(md.contains("FAILED_UNITS"));
         assert!(md.contains("| 37.2 | 6000 |"));
     }
 
@@ -3521,6 +3594,9 @@ mod tests {
             mounts: Vec::new(),
             nics: Vec::new(),
             procs: 0,
+            zombies: 0,
+            dstates: 0,
+            failed_units: Vec::new(),
         };
         let text = render_sys(&frame, &painter);
         assert!(text.contains("cpu   -"));
