@@ -827,6 +827,136 @@ pub fn disk_eta_picks(
 /// `<metric> back under <limit>`.
 pub type SysPick = (String, String, bool);
 
+/// Per-container resource thresholds — `--alert-container-cpu` /
+/// `--alert-container-mem-pct`. The edge detector's sibling: fed from the
+/// same background sweeps, but judging levels instead of edges. Each
+/// container gets its own "5 samples + latch" pair (the machine
+/// sentinels' machinery, keyed by runtime/id); a container reporting no
+/// cpu% (the stats sweep hasn't landed yet) or no memory limit simply
+/// can't be judged and stays quiet — armed-but-unmeasured never fires.
+/// Containers that die or leave the enumeration drop their state, so a
+/// later restart re-arms from zero.
+#[derive(Default)]
+pub struct ContainerThresholds {
+    /// "runtime/id" → per-container streak/latch pair.
+    seen: std::collections::HashMap<String, ThreshState>,
+}
+
+#[derive(Default)]
+struct ThreshState {
+    cpu_streak: u32,
+    cpu_firing: bool,
+    cpu_fired_secs: u32,
+    mem_streak: u32,
+    mem_firing: bool,
+    mem_fired_secs: u32,
+}
+
+impl ContainerThresholds {
+    /// How many running containers carry threshold state (tests).
+    #[allow(dead_code)]
+    pub fn tracked(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// Fold one stats-merged enumeration in, return (name, detail,
+    /// recovery) firings. `interval_secs` is the sweep cadence — the
+    /// stats sweep rides ~10s in the TUI and the enumeration cadence in
+    /// watch mode, so "5 consecutive samples" costs about a minute.
+    pub fn update(
+        &mut self,
+        cs: &[crate::model::Container],
+        cpu_limit: Option<f64>,
+        mem_pct_limit: Option<u64>,
+        repeat_secs: Option<u64>,
+        interval_secs: u64,
+    ) -> Vec<(String, String, bool)> {
+        let mut out = Vec::new();
+        if cpu_limit.is_none() && mem_pct_limit.is_none() {
+            return out;
+        }
+        for c in cs {
+            let key = format!("{}/{}", c.runtime, c.id);
+            if c.state != "running" {
+                self.seen.remove(&key);
+                continue;
+            }
+            let pod_tag = match &c.pod {
+                Some(p) => format!(" · pod {p}"),
+                None => String::new(),
+            };
+            let st = self.seen.entry(key.clone()).or_default();
+            if let (Some(limit), Some(pct)) = (cpu_limit, c.cpu_pct) {
+                let edge = alert_cycle_repeat(
+                    &mut st.cpu_streak,
+                    &mut st.cpu_firing,
+                    pct > limit,
+                    &mut st.cpu_fired_secs,
+                    repeat_secs,
+                    interval_secs,
+                );
+                match edge {
+                    AlertEdge::Fire => out.push((
+                        format!("container {}", c.name),
+                        format!(
+                            "CPU {pct:.0}% above {limit}% for {}s{pod_tag}",
+                            ALERT_CYCLES as u64 * interval_secs.max(1)
+                        ),
+                        false,
+                    )),
+                    AlertEdge::Recover => out.push((
+                        format!("container {}", c.name),
+                        format!("CPU back under {limit}%{pod_tag}"),
+                        true,
+                    )),
+                    AlertEdge::None => {}
+                }
+            }
+            // percent of the container's own limit — an absolute MB line
+            // would mean different things to a 64MB sidecar and a 64GB
+            // database; containers without a limit can't be judged
+            if let (Some(limit), Some(used), Some(total)) =
+                (mem_pct_limit, c.mem_used_mb, c.mem_total_mb)
+            {
+                if total > 0 {
+                    let pct = (used * 100) / total;
+                    let edge = alert_cycle_repeat(
+                        &mut st.mem_streak,
+                        &mut st.mem_firing,
+                        pct > limit,
+                        &mut st.mem_fired_secs,
+                        repeat_secs,
+                        interval_secs,
+                    );
+                    match edge {
+                        AlertEdge::Fire => out.push((
+                            format!("container {}", c.name),
+                            format!(
+                                "memory {pct}% of limit above {limit}% for {}s{pod_tag}",
+                                ALERT_CYCLES as u64 * interval_secs.max(1)
+                            ),
+                            false,
+                        )),
+                        AlertEdge::Recover => out.push((
+                            format!("container {}", c.name),
+                            format!("memory back under {limit}% of limit{pod_tag}"),
+                            true,
+                        )),
+                        AlertEdge::None => {}
+                    }
+                }
+            }
+        }
+        let live: std::collections::HashSet<String> = cs
+            .iter()
+            .filter(|c| c.state == "running")
+            .map(|c| format!("{}/{}", c.runtime, c.id))
+            .collect();
+        self.seen.retain(|k, _| live.contains(k));
+        out
+    }
+}
+
 /// Shared container/pod edge detector. The TUI (Containers tab open) and
 /// the headless `--watch --alert-container` loop both feed it fresh
 /// enumerations; first sighting arms quietly, afterwards each edge fires
@@ -4242,6 +4372,88 @@ mod tests {
         // a vanished pid leaves no data behind
         h3.update(&[]);
         assert!(h3.thread_chart(10, 80).is_none());
+    }
+
+    #[test]
+    fn container_thresholds_fire_per_container_and_recover() {
+        let c = |name: &str, cpu: Option<f64>, used: Option<u64>, total: Option<u64>| crate::model::Container {
+            runtime: "docker".into(),
+            id: name.to_string(),
+            name: name.to_string(),
+            image: String::new(),
+            command: String::new(),
+            state: "running".into(),
+            status: String::new(),
+            ports: String::new(),
+            pod: None,
+            restarts: None,
+            cpu_pct: cpu,
+            mem_used_mb: used,
+            mem_total_mb: total,
+            compose: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            throttled_usec: None,
+            oom_kills: None,
+        };
+        let mut st = ContainerThresholds::default();
+        // hot container + a quiet one + one without a limit (can't be
+        // judged — must stay silent even with the threshold armed)
+        let mk = || vec![
+            c("hot", Some(250.0), Some(900), Some(1000)),
+            c("quiet", Some(4.0), Some(100), Some(1000)),
+            c("nolimit", Some(250.0), Some(900), None),
+        ];
+        // arming samples: nothing fires
+        for _ in 0..ALERT_CYCLES - 1 {
+            let picks = st.update(&mk(), Some(200.0), Some(80), None, 10);
+            assert!(picks.is_empty(), "{picks:?}");
+        }
+        // cpu fires (the no-limit container's CPU still counts — only the
+        // memory judgment needs a limit); memory (90% of limit over 80)
+        // fires for hot only
+        let picks = st.update(&mk(), Some(200.0), Some(80), None, 10);
+        assert_eq!(picks.len(), 3, "{picks:?}");
+        let cpu_fire = picks
+            .iter()
+            .find(|(n, d, _)| *n == "container hot" && d.contains("CPU"))
+            .unwrap();
+        assert!(cpu_fire.1.contains("CPU 250% above 200% for 50s"), "{}", cpu_fire.1);
+        assert!(!cpu_fire.2, "a fire, not a recovery");
+        // the no-limit container gets a CPU fire but no memory line
+        let nl = picks
+            .iter()
+            .find(|(n, _, _)| *n == "container nolimit")
+            .unwrap();
+        assert!(nl.1.contains("CPU"), "{:?}", nl);
+        let mem_fires: Vec<_> = picks.iter().filter(|(n, d, _)| d.contains("memory")).collect();
+        assert_eq!(mem_fires.len(), 1, "{picks:?}");
+        assert!(mem_fires[0].1.contains("memory 90% of limit above 80%"), "{}", mem_fires[0].1);
+        // latched — one fire per excursion
+        assert!(st.update(&mk(), Some(200.0), Some(80), None, 10).is_empty());
+        // quiet container never crossed anything; hot cools off → recoveries
+        let cool = vec![
+            c("hot", Some(20.0), Some(300), Some(1000)),
+            c("quiet", Some(4.0), Some(100), Some(1000)),
+        ];
+        let recs = st.update(&cool, Some(200.0), Some(80), None, 10);
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert!(recs.iter().all(|(_, _, rec)| *rec), "{recs:?}");
+        // the dead container leaves the memory — a restart re-arms from zero
+        let mut dead = mk();
+        dead[0].state = "exited".into();
+        st.update(&dead, Some(200.0), Some(80), None, 10);
+        assert_eq!(
+            st.tracked(),
+            2,
+            "the dead container is forgotten, the running two stay"
+        );
+        // disarmed → no-op even over blazing containers
+        let mut st = ContainerThresholds::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(st.update(&mk(), None, None, None, 10).is_empty());
+        }
+        assert_eq!(st.tracked(), 0, "disarmed sweep records nothing");
     }
 
     #[test]

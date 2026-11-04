@@ -49,6 +49,8 @@ pub struct Config {
     pub alert_conn: Option<u64>,
     pub alert_threads: Option<u64>,
     pub alert_container: Option<bool>,
+    pub alert_container_cpu: Option<f64>,
+    pub alert_container_mem_pct: Option<u64>,
     pub alert_load: Option<f64>,
     pub alert_mem_pct: Option<u64>,
     pub alert_count: Option<u32>,
@@ -394,6 +396,8 @@ fn set_alert(key: &str, value: &str, cfg: &mut Config) -> Result<(), String> {
             .parse::<bool>()
             .map(|v| cfg.alert_container = Some(v))
             .map_err(|_| format!("{key} {value:?} is not true/false")),
+        "alert_container_cpu" => num(&mut cfg.alert_container_cpu),
+        "alert_container_mem_pct" => int(&mut cfg.alert_container_mem_pct),
         "alert_repeat" => int(&mut cfg.alert_repeat),
         "alert_count" => value
             .parse::<u32>()

@@ -231,6 +231,8 @@ impl Cli {
         self.alert_conn = self.alert_conn.or(cfg.alert_conn);
         self.alert_threads = self.alert_threads.or(cfg.alert_threads);
         self.alert_container = self.alert_container || cfg.alert_container.unwrap_or(false);
+        self.alert_container_cpu = self.alert_container_cpu.or(cfg.alert_container_cpu);
+        self.alert_container_mem_pct = self.alert_container_mem_pct.or(cfg.alert_container_mem_pct);
         self.alert_load = self.alert_load.or(cfg.alert_load);
         self.alert_mem_pct = self.alert_mem_pct.or(cfg.alert_mem_pct);
         self.alert_count = self.alert_count.or(cfg.alert_count);
@@ -770,6 +772,26 @@ pub struct Cli {
         )
     )]
     pub alert_container: bool,
+
+    #[arg(
+        long = "alert-container-cpu",
+        value_name = "PCT",
+        help = t(
+            "容器 CPU 哨兵：任一运行中容器的 CPU% 连续 5 次采样超该值即触发（stats 扫描的瞬时值——TUI 约 10 秒一采、watch 随枚举节奏，触发约需一分钟）——THR 限流看的是被 cgroup 压住的量，这个看吃满配额的量。TUI 和 --watch",
+            "Container CPU sentinel: fires when any running container's CPU% exceeds this for 5 consecutive samples (instantaneous stats-sweep readings — ~10s per sample in the TUI, the enumeration cadence in watch mode, so a fire costs about a minute) — THR shows what the cgroup throttled, this shows what's eating the quota. TUI and --watch"
+        )
+    )]
+    pub alert_container_cpu: Option<f64>,
+
+    #[arg(
+        long = "alert-container-mem-pct",
+        value_name = "PCT",
+        help = t(
+            "容器内存哨兵：任一运行中容器相对自身内存限额的占比连续 5 次采样超该值即触发——OOM kill 之前喊；限额没设的容器无法判定、不参与（绝对 MB 线对一个 64MB sidecar 和一个 64GB 数据库不是一回事）。TUI 和 --watch",
+            "Container memory sentinel: fires when any running container's share of its own memory limit exceeds this for 5 consecutive samples — a shout before the OOM kill; containers without a limit can't be judged and sit out (an absolute MB line means different things to a 64MB sidecar and a 64GB database). TUI and --watch"
+        )
+    )]
+    pub alert_container_mem_pct: Option<u64>,
 
     #[arg(
         long = "alert-load",

@@ -40,7 +40,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **Grafana 仪表盘导出（`--export-grafana FILE`）**：写出一份现成的 Grafana 仪表盘 JSON——16 块面板把 `/metrics` 的全部语汇铺成一屏：整机 cpu / 内存 / swap / load / 进程数、PSI 停顿、网卡吞吐与丢包、TCP 重传速率、容器 cpu / 内存 / 限流速率 / OOM 计数 / 磁盘、top CPU / top RSS 进程板（`topk(5, …)`）；PromQL 全部预填，导入 Grafana 选好数据源即用——建面板是导出之后剩下的唯一苦活，一条命令清零。
 
-**Prometheus 告警规则导出（`--export-alert-rules FILE`）**：`--export-grafana` 的姊妹篇——面板管"看见"，规则管"喊人"。写出一份现成的告警规则 YAML（19 条，覆盖 `/metrics` 全部哨兵语汇：CPU / 负载 / 内存 / 可用内存下限 / swap / PSI 停顿 / TCP 重传 / 网卡丢包 / 磁盘 IO 饱和 / 温度 / 文件系统占用 / 僵尸进程 / D 态堆积 / systemd 失败单元 / 宿主 OOM 击杀 / 进程数 + 容器限流 / 容器 OOM 击杀 + 进程重启信号），`expr` / `for` / `severity` / `annotations` 全部预填，扔进 `rule_files` 重载 Prometheus 即用（有 promtool 就先 `promtool check rules` 一把）；阈值取的是取整默认值，按部署自己调——Prometheus 侧的配置同样一条命令清零。
+**Prometheus 告警规则导出（`--export-alert-rules FILE`）**：`--export-grafana` 的姊妹篇——面板管"看见"，规则管"喊人"。写出一份现成的告警规则 YAML（21 条，覆盖 `/metrics` 全部哨兵语汇：CPU / 负载 / 内存 / 可用内存下限 / swap / PSI 停顿 / TCP 重传 / 网卡丢包 / 磁盘 IO 饱和 / 温度 / 文件系统占用 / 僵尸进程 / D 态堆积 / systemd 失败单元 / 宿主 OOM 击杀 / 进程数 + 容器限流 / 容器 OOM 击杀 / 容器 CPU / 容器内存逼近限额 + 进程重启信号），`expr` / `for` / `severity` / `annotations` 全部预填，扔进 `rule_files` 重载 Prometheus 即用（有 promtool 就先 `promtool check rules` 一把）；阈值取的是取整默认值，按部署自己调——Prometheus 侧的配置同样一条命令清零。
 
 **一次性体检（`--check`）**：告警语汇不用常驻也能用——`witr-rs --check --alert-cpu 90 --alert-load 4 --alert-disk 90` 单次采样评估全部已武装阈值，逐行打印违规（`⚠ 进程名 (pid N) — CPU 95% above 90%`），有违规退出码 1、干净退出 0（`✔ all armed checks clean`）；速率类阈值采样两次、间隔 1s（`--top io-rate` 的老技巧），整机计数器同样两遍差分。`--json` 出机读版（违规列表 + schema_version，退出码照常）——cron + 邮件体检、发布前置检查、systemd `OnFailure` 挂钩都拿它当探针；趋势 / 基线类哨兵（`--alert-disk-eta`、`--alert-deviation`、`--alert-new-proc` 等）需要历史窗口，仍是 `--watch` 的领地。
 
@@ -189,7 +189,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **K8s Pod 归因**（可选）：装有 `kubectl` 且集群可达时，容器会标注所属 Pod（`docker: mongo-demo-2 (id 6838b8ba3c49) · pod data/mongo-0`），TUI Containers 页出现 Pod 列；一次 `kubectl get pods -A -o json` 顺路取出 Pod 的 phase / 重启总数 / 第一个非例行 waiting reason（CrashLoopBackOff、ImagePullBackOff…），供容器/Pod 告警边缘使用。无 kubectl 时零开销跳过。
 
-**容器健康**：Containers 页状态列着色（healthy/running 绿、unhealthy 红、restarting/starting 黄）；容器详情页与 `-c` 目标输出 `inspect` 的 RestartCount（>0 时标注 "restart policy fired"）。Containers 页还会**盯容器的边缘**（打开过 Containers 页的会话自动生效）：机器上有运行时 CLI 时自动起一条 **`docker/podman/nerdctl events` 事件流**——容器的 die / OOM / 健康检查翻红在**毫秒级**直达（`>> container: web — exited (exit code 137)`），不等下一次枚举；事件流不可用（无运行时）时退回**枚举差分**检测：运行中的容器在两次枚举间消失/转死时取 `inspect` 的死因——`exited — OOMKilled (exit 137)` 点名 OOM、`exit N: <错误信息>` 点名 runtime 报错；RestartCount 攀升（旧值 → 新值）即提示 crash loop（差分侧独立生效）；cgroup `memory.events` 的 oom_kill 计数攀升即告警——内核在容器里真的 OOM 杀过进程，restart policy 再快也盖不住这个账；无 kubectl 时到此为止，集群可达时 **Pod 状态也一并盯**：容器 waiting 出现非例行 reason（CrashLoopBackOff / ImagePullBackOff…，部署期的 ContainerCreating / PodInitializing 不算）、Pod 从 Running 退回 Pending、进入 Failed、Pod 级重启数攀升都各触发一条告警。同一套"边缘触发 + 只报一次"机制：桌面通知、`--alert-exec`、`--alert-webhook`、`--events-log` 全部照常生效。TUI 无需旗标；`--watch` 无头跑加 **`--alert-container`** 把同一条边缘接进告警管线（容器与 Pod 枚举走后台线程，每 ≥10 秒一轮，不占采样 tick；`events` 流活着时死亡边缘归流——毫秒级 `>>` 行先到，差分只兜底）——cron/systemd 里容器 OOM 与 Pod CrashLoopBackOff 同样喊得出来。
+**容器健康**：Containers 页状态列着色（healthy/running 绿、unhealthy 红、restarting/starting 黄）；容器详情页与 `-c` 目标输出 `inspect` 的 RestartCount（>0 时标注 "restart policy fired"）。Containers 页还会**盯容器的边缘**（打开过 Containers 页的会话自动生效）：机器上有运行时 CLI 时自动起一条 **`docker/podman/nerdctl events` 事件流**——容器的 die / OOM / 健康检查翻红在**毫秒级**直达（`>> container: web — exited (exit code 137)`），不等下一次枚举；事件流不可用（无运行时）时退回**枚举差分**检测：运行中的容器在两次枚举间消失/转死时取 `inspect` 的死因——`exited — OOMKilled (exit 137)` 点名 OOM、`exit N: <错误信息>` 点名 runtime 报错；RestartCount 攀升（旧值 → 新值）即提示 crash loop（差分侧独立生效）；cgroup `memory.events` 的 oom_kill 计数攀升即告警——内核在容器里真的 OOM 杀过进程，restart policy 再快也盖不住这个账；无 kubectl 时到此为止，集群可达时 **Pod 状态也一并盯**：容器 waiting 出现非例行 reason（CrashLoopBackOff / ImagePullBackOff…，部署期的 ContainerCreating / PodInitializing 不算）、Pod 从 Running 退回 Pending、进入 Failed、Pod 级重启数攀升都各触发一条告警。同一套"边缘触发 + 只报一次"机制：桌面通知、`--alert-exec`、`--alert-webhook`、`--events-log` 全部照常生效。阈值哨兵同一管线：**`--alert-container-cpu PCT`**（任一运行中容器 CPU% 连续 5 次采样超线即触发——THR 限流看被压住的量，这个看吃满配额的量）与 **`--alert-container-mem-pct PCT`**（相对**自身限额**的占比连续 5 次采样超线即触发——OOM 之前喊；限额没设的容器无法判定、不参与）。stats 扫描约 10 秒一采，触发约需一分钟持续超标；`/metrics` 早已导出容器 CPU/内存 gauge，Prometheus 规则（`WitrContainerCpuHigh` / `WitrContainerMemNearLimit`）与内置哨兵同语汇。TUI 无需旗标；`--watch` 无头跑加 **`--alert-container`** 把同一条边缘接进告警管线（容器与 Pod 枚举走后台线程，每 ≥10 秒一轮，不占采样 tick；`events` 流活着时死亡边缘归流——毫秒级 `>>` 行先到，差分只兜底）——cron/systemd 里容器 OOM 与 Pod CrashLoopBackOff 同样喊得出来。
 
 **崩溃关联日志**：详情页与 Events 页按 `l` 拉取该进程最近的日志（容器走 `docker/podman/nerdctl logs`，Linux 走 `journalctl _PID=<pid>`，macOS 走统一日志 `log show --predicate`）——Events 页看到 crash loop 之后按 `l`，"它为什么一直重启"的答案通常就在最近这几行里。日志在后台线程获取（`log show` 可能要跑好几秒，界面不冻结），全屏 Logs 页滚动查看。Logs 页按 `F` 可切换**实时流**（按来源自动选命令：容器 `logs -f`、Linux `journalctl -f _PID=`、macOS `log stream --predicate`）：停在底部时自动跟随滚动，最多保留最近 500 行，离开页面或退出 TUI 时自动杀掉子进程。CLI 同款：`witr-rs --pid 1234 --logs [N]`（默认 100 行）。
 
@@ -313,7 +313,7 @@ witr-rs --samples load.csv     # 录制文件导入 TUI Samples 页（sparkline 
 witr-rs --tree --json         # 全表嵌套 JSON（子进程挂 children，孤儿/ppid 环升级为根）
 witr-rs --report-html status.html   # 自包含单文件 HTML 报告（CPU/内存条 + Top 榜 + 全表）
 witr-rs --export-grafana dash.json  # 20 面板 Grafana 仪表盘：/metrics 全语汇预填 PromQL，导入即用
-witr-rs --export-alert-rules rules.yaml  # 19 条 Prometheus 告警规则：哨兵语汇预填 PromQL，扔进 rule_files 即用
+witr-rs --export-alert-rules rules.yaml  # 21 条 Prometheus 告警规则：哨兵语汇预填 PromQL，扔进 rule_files 即用
 witr-rs --check --alert-cpu 90 --alert-load 4  # 一次性体检：逐行打印违规，有违规退出码 1（cron 体检 / 发布前置门禁）
 witr-rs --watch 5 --alert-oom 1  # 宿主机 OOM 击杀哨兵：内核杀进程就喊（--alert-disk-eta 4 是填满倒计时，同门）
 witr-rs --watch 5 --alert-disk-busy 80 --alert-temp 85 --alert-zombies 10  # 磁盘饱和 / 温度 / 僵尸计数哨兵（同门）
@@ -357,6 +357,7 @@ witr-rs --remote http://a:9100 --remote http://b:9100 --watch 5 --alert-load 4 -
 witr-rs --check --remote http://a:9100 --remote http://b:9100 --alert-load 4 # 舰队一次性体检：任一违规退出码 1
 witr-rs --plot-events events.jsonl  # 事件落盘画成自包含 HTML 甘特图（生命周期条 + 告警标记 + system 泳道）
 witr-rs --watch 10 --alert-container # 无头容器哨兵：容器退出/OOM、Pod CrashLoopBackOff 即喊（边缘触发只报一次）
+witr-rs --watch 10 --alert-container-cpu 80 --alert-container-mem-pct 90  # 容器资源阈值哨兵：吃满配额 / 逼近限额即喊（相对各自限额）
 witr-rs --sys                 # 整机仪表盘：CPU/内存/load/磁盘/网卡/温度/PSI（--watch 2 常驻；--csv/--markdown/--json 同源；哨兵水位非零才现身）
 witr-rs --conns --by-peer      # 连接按对端聚合：谁连得最多、哪条链路最忙（--json/--csv/--markdown 同源）
 witr-rs --watch 30 --diff-auto 30 # 漂移看门狗：每 30s 自动对比前后帧，有增减才打印

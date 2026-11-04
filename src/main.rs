@@ -5080,6 +5080,7 @@ fn main() {
             // thread (runtime CLIs take seconds) on a slower cadence than
             // the tick; the shared edge detector fires once per edge
             let mut container_edges = history::ContainerEdges::default();
+            let mut container_thresholds = history::ContainerThresholds::default();
             let mut container_rx: Option<std::sync::mpsc::Receiver<(Vec<model::Container>, Vec<crate::k8s::Pod>)>> = None;
             let mut container_swept_at: Option<Instant> = None;
             let container_every = Duration::from_secs(10).max(Duration::from_secs(interval.max(1)));
@@ -5342,6 +5343,8 @@ fn main() {
                         if due {
                             container_swept_at = Some(Instant::now());
                             let (tx, rx) = std::sync::mpsc::channel();
+                            let cpu_lim = cli.alert_container_cpu;
+                            let mem_lim = cli.alert_container_mem_pct;
                             std::thread::spawn(move || {
                                 let mut cs = platform::enumerate_containers();
                                 let pods = k8s::pods().unwrap_or_default();
@@ -5363,6 +5366,22 @@ fn main() {
                                         c.io_write_bytes = Some(p.io_write);
                                     }
                                 }
+                                // the resource thresholds read cpu%/memory off
+                                // this snapshot — merge the stats sweep in when
+                                // armed (seconds per container, never paid
+                                // otherwise); the threshold flags ride in by
+                                // value because `cli` can't cross the spawn
+                                if cpu_lim.is_some() || mem_lim.is_some() {
+                                    let stats = platform::container_stats();
+                                    for c in cs.iter_mut() {
+                                        let key: String = c.id.chars().take(12).collect();
+                                        if let Some((pct, used, total)) = stats.get(&key) {
+                                            c.cpu_pct = Some(*pct);
+                                            c.mem_used_mb = Some(*used);
+                                            c.mem_total_mb = Some(*total);
+                                        }
+                                    }
+                                }
                                 let _ = tx.send((cs, pods));
                             });
                             container_rx = Some(rx);
@@ -5375,6 +5394,18 @@ fn main() {
                                 container_edges.update(&cs, &pods, container_stream.is_some())
                             {
                                 picks.push((0, name, detail, false));
+                            }
+                            // level thresholds over the same snapshot — the
+                            // stats sweep rides this enumeration only when
+                            // armed, so unarmed runs pay nothing extra
+                            for (name, detail, rec) in container_thresholds.update(
+                                &cs,
+                                cli.alert_container_cpu,
+                                cli.alert_container_mem_pct,
+                                cli.alert_repeat,
+                                interval,
+                            ) {
+                                picks.push((0, name, detail, rec));
                             }
                         }
                     }

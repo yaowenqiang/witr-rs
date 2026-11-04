@@ -439,9 +439,14 @@ struct TuiApp {
     /// shared container/pod edge detector memory (first sighting arms, no
     /// alerts) — the same core the headless `--alert-container` loop runs
     container_edges: crate::history::ContainerEdges,
+    container_thresholds: crate::history::ContainerThresholds,
+    /// --alert-container-cpu / --alert-container-mem-pct: the level
+    /// thresholds the stats-merge feed judges.
+    alert_container_cpu: Option<f64>,
+    alert_container_mem_pct: Option<u64>,
     /// container alerts (death edge / climbing restarts) waiting for the
     /// next refresh's picks loop to dispatch them
-    pending_alerts: Vec<(Pid, String, String)>,
+    pending_alerts: Vec<(Pid, String, String, bool)>,
     /// --alert-exec: shell command per alert firing (context in env vars)
     alert_exec: Option<String>,
     /// --alert-webhook: POST each alert firing as JSON to this URL
@@ -656,6 +661,9 @@ pub struct Seed {
     pub alert_zombies: Option<u64>,
     /// --alert-dstate: uninterruptible-wait count threshold
     pub alert_dstate: Option<u64>,
+    /// --alert-container-cpu / --alert-container-mem-pct
+    pub alert_container_cpu: Option<f64>,
+    pub alert_container_mem_pct: Option<u64>,
     /// --alert-failed-units: failed systemd units threshold
     pub alert_failed_units: Option<u64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
@@ -768,6 +776,8 @@ impl Seed {
         self.alert_zombies = cli.alert_zombies;
         self.alert_dstate = cli.alert_dstate;
         self.alert_failed_units = cli.alert_failed_units;
+        self.alert_container_cpu = cli.alert_container_cpu;
+        self.alert_container_mem_pct = cli.alert_container_mem_pct;
         self.alert_net = cli.alert_net;
         self.alert_psi = cli.alert_psi;
         self.alert_mem_avail_mb = cli.alert_mem_avail_mb;
@@ -926,6 +936,9 @@ impl TuiApp {
             alert_oom: seed.alert_oom,
             sys_alert: crate::history::SysAlertState::default(),
             container_edges: crate::history::ContainerEdges::default(),
+            container_thresholds: crate::history::ContainerThresholds::default(),
+            alert_container_cpu: seed.alert_container_cpu,
+            alert_container_mem_pct: seed.alert_container_mem_pct,
             pending_alerts: Vec::new(),
             alert_exec: seed.alert_exec.clone(),
             alert_webhook: seed.alert_webhook.clone(),
@@ -1210,6 +1223,8 @@ impl TuiApp {
         self.alert_zombies = seed.alert_zombies;
         self.alert_dstate = seed.alert_dstate;
         self.alert_failed_units = seed.alert_failed_units;
+        self.alert_container_cpu = seed.alert_container_cpu;
+        self.alert_container_mem_pct = seed.alert_container_mem_pct;
         self.alert_net = seed.alert_net;
         self.alert_psi = seed.alert_psi;
         self.alert_mem_avail_mb = seed.alert_mem_avail_mb;
@@ -1506,11 +1521,7 @@ impl TuiApp {
                     );
                 }
             }
-            for (pid, name, detail, recovery) in picks.into_iter().chain(
-                self.pending_alerts
-                    .drain(..)
-                    .map(|(pid, n, d)| (pid, n, d, false)),
-            ) {
+            for (pid, name, detail, recovery) in picks.into_iter().chain(self.pending_alerts.drain(..)) {
                 let kind = if recovery { "recovered" } else { "alert" };
                 // 'M' mutes the session; --alert-silence holds down
                 // maintenance windows — either way the pick lands in the
@@ -1761,7 +1772,7 @@ impl TuiApp {
     ) {
         let stream_live = self.container_events.is_some();
         for (name, detail) in self.container_edges.update(cs, pods, stream_live) {
-            self.pending_alerts.push((0, name, detail));
+            self.pending_alerts.push((0, name, detail, false));
         }
     }
 
@@ -1800,6 +1811,18 @@ impl TuiApp {
             self.container_stats_rx = None;
             self.apply_container_stats();
             self.rebuild_container_view();
+            // level thresholds over the freshly merged cpu%/memory — the
+            // sweep cadence (~10s) is the sample cadence, so "5 consecutive
+            // samples" costs about a minute of sustained pressure
+            for (name, detail, rec) in self.container_thresholds.update(
+                &self.containers,
+                self.alert_container_cpu,
+                self.alert_container_mem_pct,
+                self.alert_repeat,
+                10,
+            ) {
+                self.pending_alerts.push((0, name, detail, rec));
+            }
         }
     }
 
@@ -10579,6 +10602,8 @@ mod tests {
                 alert_zombies: None,
                 alert_dstate: None,
                 alert_failed_units: None,
+                alert_container_cpu: None,
+                alert_container_mem_pct: None,
                 alert_net: None,
                 alert_psi: None,
                 alert_mem_avail_mb: None,
