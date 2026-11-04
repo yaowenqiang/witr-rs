@@ -422,7 +422,10 @@ fn systemd_unit_pid(unit: &str) -> Option<Pid> {
     out.trim().parse().ok().filter(|p| *p > 0)
 }
 
-#[cfg(target_os = "linux")]
+/// Unconditional on purpose: linux.rs compiles on every target (the
+/// module tree is flat), and "run systemctl + parse the rows" is pure
+/// subprocess work that needs no OS gate — the impl only ever runs where
+/// a Linux platform instance does.
 fn systemd_failed_units() -> Option<Vec<String>> {
     // the list form exits 0 even when units are failed (the count-as-exit
     // behavior belongs to `is-failed UNIT`), so a plain Ok carries the rows
