@@ -4426,7 +4426,7 @@ mod tests {
             .find(|(n, _, _)| *n == "container nolimit")
             .unwrap();
         assert!(nl.1.contains("CPU"), "{:?}", nl);
-        let mem_fires: Vec<_> = picks.iter().filter(|(n, d, _)| d.contains("memory")).collect();
+        let mem_fires: Vec<_> = picks.iter().filter(|(_, d, _)| d.contains("memory")).collect();
         assert_eq!(mem_fires.len(), 1, "{picks:?}");
         assert!(mem_fires[0].1.contains("memory 90% of limit above 80%"), "{}", mem_fires[0].1);
         // latched — one fire per excursion

@@ -1227,7 +1227,9 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         || cli.alert_temp.is_some()
         || cli.alert_zombies.is_some()
         || cli.alert_dstate.is_some()
-        || cli.alert_failed_units.is_some();
+        || cli.alert_failed_units.is_some()
+        || cli.alert_container_cpu.is_some()
+        || cli.alert_container_mem_pct.is_some();
     if !armed {
         eprintln!(
             "--check evaluates --alert-* thresholds; arm at least one (e.g. --check --alert-cpu 90 --alert-load 4)"
@@ -1434,6 +1436,9 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
     for detail in machine_lines {
         violations.push((0, "system".into(), detail));
     }
+    for (name, detail) in container_check_lines(cli, &container_check_sweep()) {
+        violations.push((0, name, detail));
+    }
 
     if cli.json {
         let doc = serde_json::json!({
@@ -1517,6 +1522,72 @@ fn attribute_oom_lines(lines: &mut [String], platform: &dyn Platform) {
             line.push_str(&suffix);
         }
     }
+}
+
+/// Judge one stats-merged container snapshot against the armed container
+/// thresholds — the `--check` half of the container sentinels. Single
+/// comparison per container (no streaks: check has no history), the same
+/// lines the watch-path sentinel fires. Pure: the sweep happens in the
+/// caller, so tests can hand it a literal snapshot.
+fn container_check_lines(
+    cli: &cli::Cli,
+    cs: &[crate::model::Container],
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if cli.alert_container_cpu.is_none() && cli.alert_container_mem_pct.is_none() {
+        return out;
+    }
+    let pod_tag = |c: &crate::model::Container| match &c.pod {
+        Some(p) => format!(" · pod {p}"),
+        None => String::new(),
+    };
+    for c in cs.iter().filter(|c| c.state == "running") {
+        if let (Some(limit), Some(pct)) = (cli.alert_container_cpu, c.cpu_pct) {
+            if pct > limit {
+                out.push((
+                    format!("container {}", c.name),
+                    format!("CPU {pct:.0}% above {limit}%{}", pod_tag(c)),
+                ));
+            }
+        }
+        if let (Some(limit), Some(used), Some(total)) =
+            (cli.alert_container_mem_pct, c.mem_used_mb, c.mem_total_mb)
+        {
+            if total > 0 {
+                let pct = (used * 100) / total;
+                if pct > limit {
+                    out.push((
+                        format!("container {}", c.name),
+                        format!(
+                            "memory {pct}% of limit above {limit}%{}",
+                            pod_tag(c)
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Sweep containers for [`container_check_lines`]: enumeration + pod
+/// attribution + the stats sweep (seconds per container — paid only when
+/// a container threshold is armed). Local only; the fleet's containers
+/// live on the far host.
+fn container_check_sweep() -> Vec<crate::model::Container> {
+    let mut cs = platform::enumerate_containers();
+    let pods = crate::k8s::pods().unwrap_or_default();
+    crate::k8s::annotate_with(&pods, &mut cs);
+    let stats = platform::container_stats();
+    for c in cs.iter_mut() {
+        let key: String = c.id.chars().take(12).collect();
+        if let Some((pct, used, total)) = stats.get(&key) {
+            c.cpu_pct = Some(*pct);
+            c.mem_used_mb = Some(*used);
+            c.mem_total_mb = Some(*total);
+        }
+    }
+    cs
 }
 
 /// Count processes in the given single-letter kernel states — the
@@ -6642,6 +6713,72 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             machine_check_lines(&cli, &quiet, &[], 0, 0, 0, &[], None, None, None, None)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn container_check_lines_judge_levels_without_history() {
+        let c = |name: &str, cpu: Option<f64>, used: Option<u64>, total: Option<u64>,
+                 state: &str, pod: Option<&str>| crate::model::Container {
+            runtime: "docker".into(),
+            id: name.to_string(),
+            name: name.to_string(),
+            image: String::new(),
+            command: String::new(),
+            state: state.into(),
+            status: String::new(),
+            ports: String::new(),
+            pod: pod.map(|p| p.into()),
+            restarts: None,
+            cpu_pct: cpu,
+            mem_used_mb: used,
+            mem_total_mb: total,
+            compose: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            throttled_usec: None,
+            oom_kills: None,
+        };
+        let cli = cli::Cli::parse_from([
+            "witr",
+            "--check",
+            "--alert-container-cpu",
+            "200",
+            "--alert-container-mem-pct",
+            "80",
+        ]);
+        let cs = vec![
+            c("hot", Some(250.0), Some(900), Some(1000), "running", Some("prod/web")),
+            c("quiet", Some(4.0), Some(100), Some(1000), "running", None),
+            // no limit: the memory judgment sits out, the CPU one doesn't
+            c("nolimit", Some(250.0), Some(900), None, "running", None),
+            // dead: never judged
+            c("corpse", Some(250.0), Some(900), Some(1000), "exited", None),
+        ];
+        let lines = container_check_lines(&cli, &cs);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        let hot_cpu = lines
+            .iter()
+            .find(|(n, d)| *n == "container hot" && d.contains("CPU"))
+            .unwrap();
+        assert!(
+            hot_cpu.1.contains("CPU 250% above 200% · pod prod/web"),
+            "{}",
+            hot_cpu.1
+        );
+        let hot_mem = lines
+            .iter()
+            .find(|(n, d)| *n == "container hot" && d.contains("memory"))
+            .unwrap();
+        assert!(hot_mem.1.contains("memory 90% of limit above 80%"), "{}", hot_mem.1);
+        let nl = lines.iter().find(|(n, _)| *n == "container nolimit").unwrap();
+        assert!(nl.1.contains("CPU"), "{:?}", nl);
+        // under every line → nothing
+        let quiet: Vec<crate::model::Container> =
+            vec![c("calm", Some(1.0), Some(10), Some(1000), "running", None)];
+        assert!(container_check_lines(&cli, &quiet).is_empty());
+        // unarmed → no-op even over blazing containers
+        let bare = cli::Cli::parse_from(["witr", "--check", "--alert-load", "4"]);
+        assert!(container_check_lines(&bare, &cs).is_empty());
     }
 
     #[test]
