@@ -1029,7 +1029,7 @@ ipmi.service          loaded failed failed IPMI Driver\
 \n● docker.service      loaded failed failed Docker Engine\
 \nplymouth-quit.service loaded failed failed\
 \n";
-        let names = parse_failed_units(&text);
+        let names = parse_failed_units(text);
         assert_eq!(
             names,
             vec![

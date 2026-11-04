@@ -779,6 +779,8 @@ fn fleet_rates(
     (net_rate, drop_rate, retrans_rate, oom_window)
 }
 
+type FleetFetch = Vec<(String, Result<(Vec<Process>, Option<FleetSample>), String>)>;
+
 fn fleet_alert_picks(
     cli: &cli::Cli,
     sample: &FleetSample,
@@ -826,7 +828,7 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
     let fetch = |base: &str| -> Result<(Vec<Process>, Option<FleetSample>), String> {
         fetch_fleet(base)
     };
-    let fetch_all = || -> Vec<(String, Result<(Vec<Process>, Option<FleetSample>), String>)> {
+    let fetch_all = || -> FleetFetch {
         bases
             .iter()
             .map(|b| (b.clone(), fetch(b)))
@@ -895,7 +897,7 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
                             };
                             let st = states.entry(base.clone()).or_default();
                             for (name, detail, rec) in
-                                fleet_alert_picks(cli, &sample, procs, st, interval)
+                                fleet_alert_picks(cli, sample, procs, st, interval)
                             {
                                 emit_fleet_pick(
                                     cli,
@@ -1332,7 +1334,7 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
     for p in &procs {
         if let Some(limit) = cli.alert_cpu {
             if let Some(c) = hist.cpu_now.get(&p.pid) {
-                if *c > limit as f64 {
+                if *c > limit {
                     violations.push((p.pid, p.name.clone(), format!("CPU {c:.0}% above {limit}%")));
                 }
             }
@@ -1379,7 +1381,7 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         }
         if let Some(limit) = cli.alert_io {
             let bps = hist.io_rate_of(p.pid).map(|(r, w)| r + w);
-            if bps.is_some_and(|b| b > limit as f64 * 1024.0 * 1024.0) {
+            if bps.is_some_and(|b| b > limit * 1024.0 * 1024.0) {
                 violations.push((
                     p.pid,
                     p.name.clone(),
@@ -1554,7 +1556,7 @@ fn container_check_lines(
             (cli.alert_container_mem_pct, c.mem_used_mb, c.mem_total_mb)
         {
             if total > 0 {
-                let pct = (used * 100) / total;
+                let pct = (used * 100).checked_div(total).unwrap_or(0);
                 if pct > limit {
                     out.push((
                         format!("container {}", c.name),
@@ -1610,6 +1612,7 @@ fn state_count(procs: &[Process], states: &[&str]) -> usize {
 /// caller wraps). Levels are single comparisons; the rates arrive
 /// pre-diffed by the caller (two samples, or two fetches, a second
 /// apart).
+#[allow(clippy::too_many_arguments)] // one bundle per armed threshold family
 fn machine_check_lines(
     cli: &cli::Cli,
     stats: &crate::platform::SystemStats,
@@ -1634,7 +1637,7 @@ fn machine_check_lines(
     if let Some(limit) = cli.alert_mem_pct {
         if let (Some(u), Some(t)) = (stats.mem_used_mb, stats.mem_total_mb) {
             if t > 0 {
-                let pct = (u * 100) / t;
+                let pct = (u * 100).checked_div(t).unwrap_or(0);
                 if pct > limit {
                     out.push(format!("RAM {pct}% above {limit}%"));
                 }
@@ -1650,8 +1653,12 @@ fn machine_check_lines(
         let mut over_mounts: Vec<(u64, &crate::platform::MountUsage)> = mounts
             .iter()
             .filter(|m| m.total_mb > 0)
-            .map(|m| ((m.used_mb * 100) / m.total_mb, m))
+            .map(|m| {
+                let pct = (m.used_mb * 100).checked_div(m.total_mb).unwrap_or(0);
+                (pct, m)
+            })
             .filter(|(pct, _)| Some(*pct) > cli.alert_disk)
+
             .collect();
         over_mounts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.target.cmp(&b.1.target)));
         if !over_mounts.is_empty() {
@@ -1680,7 +1687,7 @@ fn machine_check_lines(
                 ("io", psi.io_full),
             ]
             .into_iter()
-            .filter(|(_, v)| *v > limit as f64)
+            .filter(|(_, v)| *v > limit)
             .map(|(r, v)| format!("{r} {v:.1}%"))
             .collect();
             if !over.is_empty() {
@@ -1698,7 +1705,7 @@ fn machine_check_lines(
     if let Some(limit) = cli.alert_swap_pct {
         if let (Some(u), Some(t)) = (stats.swap_used_mb, stats.swap_total_mb) {
             if t > 0 {
-                let pct = (u * 100) / t;
+                let pct = (u * 100).checked_div(t).unwrap_or(0);
                 if pct > limit {
                     out.push(format!("swap {pct}% above {limit}%"));
                 }
@@ -1780,7 +1787,7 @@ fn run_check_fleet(bases: &[String], cli: &cli::Cli) -> i32 {
         );
         std::process::exit(4);
     }
-    let sweep = || -> Vec<(String, Result<(Vec<Process>, Option<FleetSample>), String>)> {
+    let sweep = || -> FleetFetch {
         bases
             .iter()
             .map(|b| (b.clone(), fetch_fleet(b)))
@@ -1868,6 +1875,7 @@ fn run_check_fleet(bases: &[String], cli: &cli::Cli) -> i32 {
     i32::from(!violations.is_empty())
 }
 
+#[allow(clippy::too_many_arguments)] // one bundle per armed threshold family
 fn watch_alert_picks(
     platform: &dyn Platform,
     cli: &cli::Cli,
@@ -6926,7 +6934,6 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             tx_bytes: 200,
             rx_drops: 3,
             tx_drops: 4,
-            ..Default::default()
         }];
         let mounts = vec![crate::platform::MountUsage {
             target: "/data".into(),

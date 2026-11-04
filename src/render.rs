@@ -580,8 +580,8 @@ pub fn render_dstates(rows: &[DStateRow], p: &Painter) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:>pid_w$}  {:<user_w$}  {:<name_w$}  {:>2}  {}",
-        "PID", "USER", "NAME", "ST", "AGE"
+        "{:>pid_w$}  {:<user_w$}  {:<name_w$}  {:>2}  AGE",
+        "PID", "USER", "NAME", "ST"
     );
     for r in rows {
         let _ = writeln!(
@@ -1688,11 +1688,11 @@ fn sys_flat_cells(frame: &SysFrame) -> Vec<(String, String)> {
         ),
         (
             "ZOMBIES".into(),
-            (frame.zombies > 0).then(|| frame.zombies.to_string()).unwrap_or_default(),
+            if frame.zombies > 0 { frame.zombies.to_string() } else { String::new() },
         ),
         (
             "DSTATE".into(),
-            (frame.dstates > 0).then(|| frame.dstates.to_string()).unwrap_or_default(),
+            if frame.dstates > 0 { frame.dstates.to_string() } else { String::new() },
         ),
         (
             "FAILED_UNITS".into(),
@@ -1726,6 +1726,7 @@ fn sys_flat_cells(frame: &SysFrame) -> Vec<(String, String)> {
 /// One Grafana panel: a timeseries box on the 24-column grid with plain
 /// PromQL targets (legend, expr). The datasource rides the `${datasource}`
 /// template variable so the dashboard works against any Prometheus input.
+#[allow(clippy::too_many_arguments)] // one knob per dashboard field
 fn grafana_panel(
     id: u32,
     title: &str,

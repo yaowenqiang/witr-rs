@@ -13,6 +13,13 @@ use crate::platform::{Capabilities, PlatError, PlatResult, Platform, SystemStats
 const CLK_TCK: f64 = 100.0; // kernel CONFIG_HZ userspace value on effectively all distros
 const CMD_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// One sweep's /proc/diskstats counters — the diff baseline for busy% and
+/// IOPS (device → io_ticks_ms, reads, writes; plus when it was taken).
+type DiskPrev = Option<(
+    std::time::Instant,
+    std::collections::HashMap<String, (u64, u64, u64)>,
+)>;
+
 pub struct Linux {
     users: Users,
     /// /proc/stat tick snapshot from the previous [`Linux::system_stats`]
@@ -21,12 +28,7 @@ pub struct Linux {
     /// /proc/diskstats counters from the previous [`Linux::system_stats`]
     /// call — busy% and IOPS are wall-time deltas, same shape as prev_stat
     /// (device → io_ticks_ms, reads, writes; plus when it was taken).
-    prev_disks: std::cell::RefCell<
-        Option<(
-            std::time::Instant,
-            std::collections::HashMap<String, (u64, u64, u64)>,
-        )>,
-    >,
+    prev_disks: std::cell::RefCell<DiskPrev>,
 }
 
 impl Linux {
@@ -367,7 +369,7 @@ fn parse_oom_victim(line: &str) -> Option<String> {
         .next()
         .unwrap_or("?")
         .trim_start_matches('(')
-        .trim_end_matches(|c| c == ')' || c == ',');
+        .trim_end_matches([')', ',']);
     Some(format!("{name} (pid {pid})"))
 }
 

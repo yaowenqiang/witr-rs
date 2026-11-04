@@ -919,7 +919,7 @@ impl ContainerThresholds {
                 (mem_pct_limit, c.mem_used_mb, c.mem_total_mb)
             {
                 if total > 0 {
-                    let pct = (used * 100) / total;
+                    let pct = (used * 100).checked_div(total).unwrap_or(0);
                     let edge = alert_cycle_repeat(
                         &mut st.mem_streak,
                         &mut st.mem_firing,
