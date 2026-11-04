@@ -1085,7 +1085,7 @@ fn sys_frame(
     // swept; failed units cost one systemctl sweep (None hides the line)
     let zombies = state_count(procs, &["Z"]);
     let dstates = state_count(procs, &["D", "U"]);
-    let failed_units = crate::platform::failed_units().unwrap_or_default();
+    let failed_units = platform.failed_units().unwrap_or_default();
     let mounts = platform.mount_usage();
     let counters = platform.net_counters();
     let mut nics: Vec<(String, f64, f64)> = Vec::new();
@@ -1413,7 +1413,7 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
     let dstate_count = state_count(&procs, &["D", "U"]);
     // the failed-unit sweep is one systemctl call, paid only when armed
     let failed_units = if cli.alert_failed_units.is_some() {
-        crate::platform::failed_units().unwrap_or_default()
+        platform.failed_units().unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -5312,7 +5312,7 @@ fn main() {
                             dstate_count: state_count(&procs, &["D", "U"]),
                             failed_limit: cli.alert_failed_units,
                             failed_units: if cli.alert_failed_units.is_some() {
-                                crate::platform::failed_units().unwrap_or_default()
+                                platform.failed_units().unwrap_or_default()
                             } else {
                                 Vec::new()
                             },

@@ -422,20 +422,6 @@ fn systemd_unit_pid(unit: &str) -> Option<Pid> {
     out.trim().parse().ok().filter(|p| *p > 0)
 }
 
-/// Names of systemd units sitting in failed state — the
-/// --alert-failed-units sentinel's raw input and the
-/// `witr_machine_failed_units` gauge's. `None` where there is no systemd
-/// to ask (other platforms, systemctl missing, not booted with systemd);
-/// an empty list means systemd answered and nothing failed. One targeted
-/// sweep, the same cost class as the mount sweep — paid by watchers that
-/// arm the sentinel and by /metrics scrapes.
-pub fn failed_units() -> Option<Vec<String>> {
-    #[cfg(target_os = "linux")]
-    return systemd_failed_units();
-    #[cfg(not(target_os = "linux"))]
-    return None;
-}
-
 #[cfg(target_os = "linux")]
 fn systemd_failed_units() -> Option<Vec<String>> {
     // the list form exits 0 even when units are failed (the count-as-exit
@@ -784,6 +770,18 @@ pub trait Platform {
     /// there).
     fn oom_victims(&self, since_secs: u64) -> Option<Vec<String>> {
         let _ = since_secs;
+        None
+    }
+
+    /// Names of systemd units sitting in failed state — the
+    /// --alert-failed-units sentinel's raw input and the
+    /// `witr_machine_failed_units` gauge's. `None` where there is no
+    /// systemd to ask (macOS/Windows, systemctl missing, not booted with
+    /// systemd); an empty list means systemd answered and nothing failed.
+    /// One targeted sweep, the same cost class as the mount sweep — paid
+    /// by watchers that arm the sentinel, /metrics scrapes and the
+    /// machine dashboards.
+    fn failed_units(&self) -> Option<Vec<String>> {
         None
     }
 

@@ -1409,6 +1409,12 @@ impl Platform for Linux {
             .unwrap_or_default()
     }
 
+    /// The systemd failed-unit list — the super helper asks
+    /// `systemctl --failed` and returns None where there's no systemd.
+    fn failed_units(&self) -> Option<Vec<String>> {
+        super::systemd_failed_units()
+    }
+
     /// The OOM killer's victims, from `journalctl -k` over the trailing
     /// window — the classic kernel line names pid and binary. Unreadable
     /// (no journalctl, no privilege) means `None` and the alert stays

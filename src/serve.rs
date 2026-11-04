@@ -208,7 +208,7 @@ fn dashboard_html(platform: &dyn Platform, containers: &[crate::model::Container
             Some(dstates.min(10) as f64 * 10.0),
         ));
     }
-    if let Some(units) = crate::platform::failed_units() {
+    if let Some(units) = platform.failed_units() {
         if !units.is_empty() {
             let mut v = format!(
                 "{}<span style=\"font-size:12px\"> unit{}",
@@ -478,7 +478,7 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
     // the failed-units sentinel's raw input — one systemctl sweep per
     // scrape, the same cost class as the df sweep above; no systemd (or
     // not booted with it) leaves the series out entirely
-    if let Some(units) = crate::platform::failed_units() {
+    if let Some(units) = platform.failed_units() {
         out.push_str("# HELP witr_machine_failed_units Systemd units sitting in failed state\n");
         out.push_str("# TYPE witr_machine_failed_units gauge\n");
         out.push_str(&format!("witr_machine_failed_units {}\n", units.len()));

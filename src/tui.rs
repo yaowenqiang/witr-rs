@@ -345,6 +345,9 @@ struct TuiApp {
     /// Latest whole-machine snapshot ('y' system page "now" column:
     /// load / cores / swap live here, history rings only chart cpu+mem)
     sys_stats: Option<crate::platform::SystemStats>,
+    /// Failed systemd units, sampled with the page (one systemctl sweep
+    /// per sampling tick, not per UI draw) — the red line's data.
+    sys_failed_units: Option<Vec<String>>,
     /// device-backed mounts for the system page's disk section — one df /
     /// CIM sweep per refresh while the page is open
     sys_mounts: Vec<crate::platform::MountUsage>,
@@ -1002,6 +1005,7 @@ impl TuiApp {
             summary: None,
             summary_window: seed.since.unwrap_or(u64::MAX),
             sys_stats: None,
+            sys_failed_units: None,
             sys_mounts: Vec::new(),
             sys_net_prev: HashMap::new(),
             sys_net_prev_at: None,
@@ -1482,7 +1486,7 @@ impl TuiApp {
                             .count(),
                         failed_limit: self.alert_failed_units,
                         failed_units: if self.alert_failed_units.is_some() {
-                            crate::platform::failed_units().unwrap_or_default()
+                            self.platform.failed_units().unwrap_or_default()
                         } else {
                             Vec::new()
                         },
@@ -1556,6 +1560,7 @@ impl TuiApp {
             }
             if self.page == Page::System {
                 self.sys_mounts = self.platform.mount_usage();
+                self.sys_failed_units = self.platform.failed_units();
             }
             // net section: Windows pays a PowerShell subprocess per sweep
             // (page open only); Linux's /proc/net/dev and macOS's
@@ -1907,6 +1912,7 @@ impl TuiApp {
             self.hist.update_system(s.clone());
             self.sys_stats = Some(s);
         }
+        self.sys_failed_units = self.platform.failed_units();
         self.logs_scroll = 0;
         self.page = Page::System;
     }
@@ -2162,6 +2168,49 @@ impl TuiApp {
                     f(stats.load15)
                 )),
             ]));
+        }
+        // the state waterlines the machine sentinels watch, at rest — the
+        // counts come from the table the app already sweeps; shown only
+        // when nonzero (zero dead width). Failed units ride the page's
+        // sampling tick (one systemctl sweep per sample, not per draw).
+        let zombies = self
+            .procs
+            .iter()
+            .filter(|p| p.state.as_deref() == Some("Z"))
+            .count();
+        let dstates = self
+            .procs
+            .iter()
+            .filter(|p| matches!(p.state.as_deref(), Some("D") | Some("U")))
+            .count();
+        if zombies > 0 || dstates > 0 {
+            let mut parts: Vec<String> = Vec::new();
+            if zombies > 0 {
+                parts.push(format!(
+                    "{zombies} zombie{}",
+                    if zombies == 1 { "" } else { "s" }
+                ));
+            }
+            if dstates > 0 {
+                parts.push(format!("{dstates} stuck in D"));
+            }
+            lines.push(Line::from(vec![
+                Span::styled("watch   ", Style::new().bold()),
+                Span::styled(parts.join(" · "), Style::new().fg(Color::Yellow)),
+            ]));
+        }
+        if let Some(units) = self.sys_failed_units.as_ref() {
+            if !units.is_empty() {
+                let named: Vec<String> = units.iter().take(3).cloned().collect();
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "failed  {}{}",
+                        named.join(", "),
+                        if units.len() > named.len() { "…" } else { "" }
+                    ),
+                    Style::new().fg(Color::Red),
+                )));
+            }
         }
         // memory: now/total even before the chart has two samples
         let mem_now = match (stats.mem_used_mb, stats.mem_total_mb) {
@@ -8642,6 +8691,149 @@ mod tests {
         assert_eq!(app.page, Page::System);
         on_key(&mut app, KeyCode::Esc);
         assert_eq!(app.page, Page::Browse);
+    }
+
+    #[test]
+    fn system_page_shows_the_waterlines_only_when_nonzero() {
+        // one mock serves all three shapes: waterline procs, a failed-unit
+        // list to name, and (structurally) the platform trait surface the
+        // page samples
+        struct WatchPlatform;
+        impl crate::platform::Platform for WatchPlatform {
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            fn capabilities(&self) -> crate::platform::Capabilities {
+                crate::platform::Capabilities { file_lookup: false, env: false }
+            }
+            fn list_processes(
+                &self,
+            ) -> crate::platform::PlatResult<Vec<crate::model::Process>> {
+                let p = |pid: i32, state: Option<&str>, name: &str| crate::model::Process {
+                    pid,
+                    name: name.into(),
+                    state: state.map(|s| s.into()),
+                    ..Default::default()
+                };
+                Ok(vec![
+                    p(1, Some("D"), "nfs-io"),
+                    p(2, Some("Z"), "corpse"),
+                    p(3, Some("R"), "live"),
+                ])
+            }
+            fn detail(&self, brief: &crate::model::Process, _want_env: bool) -> crate::model::Process {
+                brief.clone()
+            }
+            fn port_to_sockets(
+                &self,
+                _port: u16,
+            ) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn list_sockets(&self) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn file_to_pids(&self, _path: &str) -> crate::platform::PlatResult<Vec<i32>> {
+                Ok(Vec::new())
+            }
+            fn container_of(&self, _pid: i32) -> Option<crate::model::Source> {
+                None
+            }
+            fn service_source(&self, _procs: &[crate::model::Process]) -> Option<crate::model::Source> {
+                None
+            }
+            fn system_stats(&self) -> Option<crate::platform::SystemStats> {
+                Some(crate::platform::SystemStats::default())
+            }
+            // four failed units: the page names three and elides the rest
+            fn failed_units(&self) -> Option<Vec<String>> {
+                Some(vec![
+                    "ipmi.service".into(),
+                    "lightdm.service".into(),
+                    "plymouth-quit.service".into(),
+                    "extra.service".into(),
+                ])
+            }
+        }
+        let mut app = TuiApp::new(Box::new(WatchPlatform), Seed::default());
+        // the counts come from the table the app sweeps; seed it directly
+        app.procs = app.platform.list_processes().unwrap_or_default();
+        app.open_system();
+        let text: String = app
+            .system_page_lines()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(text.contains("watch"), "waterline line present: {text}");
+        assert!(text.contains("1 zombie · 1 stuck in D"), "{text}");
+        assert!(text.contains("failed  ipmi.service"), "{text}");
+        assert!(text.contains("plymouth-quit.service…"), "{text}");
+        assert!(!text.contains("extra.service"), "fourth unit elided: {text}");
+
+        // a quiet platform renders neither line (zero dead width)
+        struct QuietPlatform;
+        impl crate::platform::Platform for QuietPlatform {
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            fn capabilities(&self) -> crate::platform::Capabilities {
+                crate::platform::Capabilities { file_lookup: false, env: false }
+            }
+            fn list_processes(
+                &self,
+            ) -> crate::platform::PlatResult<Vec<crate::model::Process>> {
+                Ok(vec![crate::model::Process {
+                    pid: 1,
+                    name: "init".into(),
+                    state: Some("S".into()),
+                    ..Default::default()
+                }])
+            }
+            fn detail(&self, brief: &crate::model::Process, _want_env: bool) -> crate::model::Process {
+                brief.clone()
+            }
+            fn port_to_sockets(
+                &self,
+                _port: u16,
+            ) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn list_sockets(&self) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn file_to_pids(&self, _path: &str) -> crate::platform::PlatResult<Vec<i32>> {
+                Ok(Vec::new())
+            }
+            fn container_of(&self, _pid: i32) -> Option<crate::model::Source> {
+                None
+            }
+            fn service_source(&self, _procs: &[crate::model::Process]) -> Option<crate::model::Source> {
+                None
+            }
+            fn system_stats(&self) -> Option<crate::platform::SystemStats> {
+                Some(crate::platform::SystemStats::default())
+            }
+        }
+        let mut app = TuiApp::new(Box::new(QuietPlatform), Seed::default());
+        app.procs = app.platform.list_processes().unwrap_or_default();
+        app.open_system();
+        let text: String = app
+            .system_page_lines()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(!text.contains("watch"), "{text}");
+        assert!(!text.contains("failed"), "{text}");
     }
 
     #[test]
