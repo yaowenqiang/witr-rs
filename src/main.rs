@@ -694,6 +694,7 @@ fn fleet_machine_armed(cli: &cli::Cli) -> bool {
         || cli.alert_count.is_some()
         || cli.alert_disk.is_some()
         || cli.alert_disk_eta.is_some()
+        || cli.alert_mem_eta.is_some()
         || cli.alert_disk_busy.is_some()
         || cli.alert_temp.is_some()
         || cli.alert_zombies.is_some()
@@ -808,6 +809,7 @@ fn fleet_alert_picks(
         oom_limit: cli.alert_oom,
         oom_kills: sample.stats.oom_kills,
         disk_eta_hours: cli.alert_disk_eta,
+        mem_eta_hours: cli.alert_mem_eta,
         disk_busy_limit: cli.alert_disk_busy,
         temp_limit: cli.alert_temp,
         zombie_limit: cli.alert_zombies,
@@ -5317,6 +5319,7 @@ fn main() {
                     || cli.alert_nic_drop.is_some()
                     || cli.alert_oom.is_some()
                     || cli.alert_disk_eta.is_some()
+                    || cli.alert_mem_eta.is_some()
                     || cli.alert_disk_busy.is_some()
                     || cli.alert_temp.is_some()
                     || cli.alert_zombies.is_some()
@@ -5384,6 +5387,7 @@ fn main() {
                             oom_limit: cli.alert_oom,
                             oom_kills: stats.oom_kills,
                             disk_eta_hours: cli.alert_disk_eta,
+                            mem_eta_hours: cli.alert_mem_eta,
                             disk_busy_limit: cli.alert_disk_busy,
                             temp_limit: cli.alert_temp,
                             zombie_limit: cli.alert_zombies,

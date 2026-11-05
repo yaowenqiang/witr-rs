@@ -238,6 +238,7 @@ impl Cli {
         self.alert_count = self.alert_count.or(cfg.alert_count);
         self.alert_disk = self.alert_disk.or(cfg.alert_disk);
         self.alert_disk_eta = self.alert_disk_eta.or(cfg.alert_disk_eta);
+        self.alert_mem_eta = self.alert_mem_eta.or(cfg.alert_mem_eta);
         self.alert_disk_busy = self.alert_disk_busy.or(cfg.alert_disk_busy);
         self.alert_temp = self.alert_temp.or(cfg.alert_temp);
         self.alert_zombies = self.alert_zombies.or(cfg.alert_zombies);
@@ -842,6 +843,16 @@ pub struct Cli {
         )
     )]
     pub alert_disk_eta: Option<f64>,
+
+    #[arg(
+        long = "alert-mem-eta",
+        value_name = "HOURS",
+        help = t(
+            "内存耗尽倒计时哨兵:按 MemAvailable 最近 1 小时的趋势外推(最小二乘斜率,趋势需统计显著、噪声不配预测),预计耗尽时间短于该小时数即触发——floor 哨兵(--alert-mem-avail-mb)只会喊\"已经只剩 200MB\",趋势哨兵喊的是\"按当前速率 43 分钟后见底\",OOM 前兆比地板更早。需要约 10 分钟采样开始外推,与 --alert-disk-eta 同一套趋势机器。TUI 和 --watch",
+            "Memory-exhaustion countdown: extrapolate the trailing 1h trend of MemAvailable (least-squares slope, statistically significant only — noise doesn't get to predict) and fire when its predicted time-to-empty drops under this many hours — the floor sentinel (--alert-mem-avail-mb) shouts \"already down to 200MB\", a trend shouts \"exhausted in 43 minutes at the rate you're actually leaking\"; the OOM omen arrives before the floor does. Needs ~10 minutes of samples before it predicts; the same trend machinery as --alert-disk-eta. TUI and --watch"
+        )
+    )]
+    pub alert_mem_eta: Option<f64>,
 
     #[arg(
         long = "alert-disk-busy",

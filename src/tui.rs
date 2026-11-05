@@ -415,6 +415,8 @@ struct TuiApp {
     alert_disk: Option<u64>,
     /// --alert-disk-eta: predicted time-to-full horizon (hours)
     alert_disk_eta: Option<f64>,
+    /// --alert-mem-eta: predicted time-to-empty horizon (hours)
+    alert_mem_eta: Option<f64>,
     /// --alert-disk-busy: any-device %util threshold
     alert_disk_busy: Option<f64>,
     /// --alert-temp: hottest-sensor celsius threshold
@@ -653,6 +655,8 @@ pub struct Seed {
     pub alert_disk: Option<u64>,
     /// --alert-disk-eta: predicted time-to-full horizon (hours)
     pub alert_disk_eta: Option<f64>,
+    /// --alert-mem-eta: predicted time-to-empty horizon (hours)
+    pub alert_mem_eta: Option<f64>,
     /// --alert-disk-busy: any-device %util threshold
     pub alert_disk_busy: Option<f64>,
     /// --alert-temp: hottest-sensor celsius threshold
@@ -771,6 +775,7 @@ impl Seed {
         self.alert_count = cli.alert_count;
         self.alert_disk = cli.alert_disk;
         self.alert_disk_eta = cli.alert_disk_eta;
+        self.alert_mem_eta = cli.alert_mem_eta;
         self.alert_disk_busy = cli.alert_disk_busy;
         self.alert_temp = cli.alert_temp;
         self.alert_zombies = cli.alert_zombies;
@@ -922,6 +927,7 @@ impl TuiApp {
             alert_count: seed.alert_count,
             alert_disk: seed.alert_disk,
             alert_disk_eta: seed.alert_disk_eta,
+            alert_mem_eta: seed.alert_mem_eta,
             alert_disk_busy: seed.alert_disk_busy,
             alert_temp: seed.alert_temp,
             alert_zombies: seed.alert_zombies,
@@ -1218,6 +1224,7 @@ impl TuiApp {
         self.alert_count = seed.alert_count;
         self.alert_disk = seed.alert_disk;
         self.alert_disk_eta = seed.alert_disk_eta;
+        self.alert_mem_eta = seed.alert_mem_eta;
         self.alert_disk_busy = seed.alert_disk_busy;
         self.alert_temp = seed.alert_temp;
         self.alert_zombies = seed.alert_zombies;
@@ -1401,6 +1408,7 @@ impl TuiApp {
                     || self.alert_count.is_some()
                     || self.alert_disk.is_some()
                     || self.alert_disk_eta.is_some()
+                    || self.alert_mem_eta.is_some()
                     || self.alert_disk_busy.is_some()
                     || self.alert_temp.is_some()
                     || self.alert_zombies.is_some()
@@ -1483,6 +1491,7 @@ impl TuiApp {
                         oom_limit: self.alert_oom,
                         oom_kills: stats.oom_kills,
                         disk_eta_hours: self.alert_disk_eta,
+                        mem_eta_hours: self.alert_mem_eta,
                         disk_busy_limit: self.alert_disk_busy,
                         temp_limit: self.alert_temp,
                         zombie_limit: self.alert_zombies,
@@ -10597,6 +10606,7 @@ mod tests {
                 alert_count: None,
                 alert_disk: None,
                 alert_disk_eta: None,
+                alert_mem_eta: None,
                 alert_disk_busy: None,
                 alert_temp: None,
                 alert_zombies: None,

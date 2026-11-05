@@ -518,9 +518,13 @@ pub struct SysAlertState {
     /// elapsed time; unix seconds (not `Instant`) keeps the math
     /// injectable from tests.
     pub disk_eta_hist: std::collections::HashMap<String, std::collections::VecDeque<(f64, u64)>>,
+    pub mem_eta_hist: std::collections::VecDeque<(f64, u64)>,
     pub disk_eta_streak: u32,
     pub disk_eta_firing: bool,
     pub disk_eta_fired_secs: u32,
+    pub mem_eta_streak: u32,
+    pub mem_eta_firing: bool,
+    pub mem_eta_fired_secs: u32,
     pub disk_busy_streak: u32,
     pub disk_busy_firing: bool,
     pub disk_busy_fired_secs: u32,
@@ -594,6 +598,12 @@ pub struct SysAlertLimits {
     /// filling". Disarmed when None; needs the `mounts` sweep like
     /// `disk_pct` does.
     pub disk_eta_hours: Option<f64>,
+    /// --alert-mem-eta: fire when the trailing trend of MemAvailable
+    /// predicts exhaustion sooner than this many hours — the disk-eta
+    /// sentinel's twin, answering "OOM in how long at this rate" instead
+    /// of "the floor already broke". Needs the same trailing history the
+    /// disk one accrues, so it's --watch/fleet territory, not --check.
+    pub mem_eta_hours: Option<f64>,
     /// --alert-disk-busy: fire when any block device spends over this
     /// share of the refresh interval with IO in flight (the iostat %util
     /// twin). Answers "which disk is the bottleneck" — a question neither
@@ -820,6 +830,40 @@ pub fn disk_eta_picks(
     out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     out.truncate(3);
     out
+}
+
+/// Fold this tick's MemAvailable reading into the trailing history and
+/// return `(eta_hours, mb_per_hour)` when the trend predicts exhaustion
+/// sooner than `eta_limit`. The disk-eta sentinel's twin — same least
+/// squares, same significance gate (noise doesn't get to predict); the
+/// y value is simply MemAvailable instead of a mount's free space. A
+/// tick with no reading (platform reports none) clears the history: a
+/// trend whose measurement vanished is meaningless, same rule as an
+/// unmounted mount.
+pub fn mem_eta_picks(
+    state: &mut SysAlertState,
+    avail_mb: Option<u64>,
+    eta_limit: f64,
+) -> Option<(f64, f64)> {
+    let now = crate::util::now_unix() as f64;
+    match avail_mb {
+        Some(a) => {
+            state.mem_eta_hist.push_back((now, a));
+            while state
+                .mem_eta_hist
+                .front()
+                .is_some_and(|(t, _)| now - *t > DISK_ETA_WINDOW_SECS as f64)
+            {
+                state.mem_eta_hist.pop_front();
+            }
+            while state.mem_eta_hist.len() > DISK_ETA_MAX_SAMPLES {
+                state.mem_eta_hist.pop_front();
+            }
+        }
+        None => state.mem_eta_hist.clear(),
+    }
+    let hist: std::vec::Vec<(f64, u64)> = state.mem_eta_hist.iter().copied().collect();
+    disk_eta_of(&hist).filter(|(eta, _)| *eta < eta_limit)
 }
 
 /// One machine-wide alert edge: `(name, detail, is_recovery)` — name is
@@ -1121,6 +1165,7 @@ pub fn system_alert_picks(
         oom_limit,
         oom_kills: oom_kills_opt,
         disk_eta_hours,
+        mem_eta_hours,
         disk_busy_limit,
         temp_limit,
         zombie_limit,
@@ -1148,6 +1193,7 @@ pub fn system_alert_picks(
     let oom_limit = *oom_limit;
     let oom_kills = *oom_kills_opt;
     let disk_eta_limit = *disk_eta_hours;
+    let mem_eta_limit = *mem_eta_hours;
     let disk_busy_limit = *disk_busy_limit;
     let temp_limit = *temp_limit;
     let zombie_limit = *zombie_limit;
@@ -1323,6 +1369,46 @@ pub fn system_alert_picks(
             out.push((
                 "system".to_string(),
                 format!("no disk filling fast enough to hit {eta_limit:.1}h"),
+                true,
+            ));
+        }
+    }
+    if let Some(eta_limit) = mem_eta_limit {
+        let pick = mem_eta_picks(state, stats.mem_avail_mb, eta_limit);
+        let over = pick.is_some();
+        let edge = alert_cycle_repeat(
+            &mut state.mem_eta_streak,
+            &mut state.mem_eta_firing,
+            over,
+            &mut state.mem_eta_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            let (eta, mbh) = pick.unwrap_or((0.0, 0.0));
+            let avail = stats.mem_avail_mb.unwrap_or(0);
+            let eta_s = if eta < 1.0 {
+                format!("~{}m", ((eta * 60.0).round() as u64).max(1))
+            } else {
+                format!("~{eta:.1}h")
+            };
+            let rate_s = if mbh.abs() >= 1024.0 {
+                format!("{:.1} GB/h", mbh.abs() / 1024.0)
+            } else {
+                format!("{:.0} MB/h", mbh.abs())
+            };
+            out.push((
+                "system".to_string(),
+                format!(
+                    "memory draining fast: {avail}MB available — {rate_s} → exhausted in {eta_s} (under the {eta_limit}h line) for {}s",
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("memory trend no longer heading under {eta_limit:.1}h"),
                 true,
             ));
         }
@@ -2954,6 +3040,7 @@ mod tests {
             failed_limit: None,
             failed_units: Vec::new(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3026,6 +3113,7 @@ mod tests {
             failed_limit: None,
             failed_units: Vec::new(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3114,6 +3202,7 @@ mod tests {
             failed_limit: None,
             failed_units: Vec::new(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3308,6 +3397,7 @@ mod tests {
             failed_limit: None,
             failed_units: Vec::new(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3366,6 +3456,7 @@ mod tests {
             failed_limit: None,
             failed_units: Vec::new(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
             }
@@ -3436,6 +3527,7 @@ mod tests {
             failed_limit: None,
             failed_units: Vec::new(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3500,6 +3592,7 @@ mod tests {
             failed_limit: None,
             failed_units: Vec::new(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
         };
         // one kill lands (counter 5 → 6): the first tick only arms the
         // previous counter, then the kill sits in the window long enough
@@ -3614,6 +3707,7 @@ mod tests {
             oom_limit: None,
             oom_kills: None,
             disk_eta_hours: eta,
+            mem_eta_hours: None,
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -3674,6 +3768,124 @@ mod tests {
     }
 
     #[test]
+    fn mem_eta_alert_predicts_exhaustion_and_recovers() {
+        // mirrors the disk-eta test: seed the trailing history directly —
+        // the real one accrues one MemAvailable sample per tick
+        let now = crate::util::now_unix() as f64;
+        let limits = |eta: Option<f64>| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
+            repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
+            dstate_limit: None,
+            dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
+            disk_eta_hours: None,
+            mem_eta_hours: eta,
+            oom_limit: None,
+            oom_kills: None,
+        };
+        // 6GB draining to 2GB over 20 minutes: 12GB/h → floor (2GB left)
+        // in ~10m — well under a 1h line, and steep enough that the flat
+        // arming samples can't push the trend across the t=-2 significance
+        // edge (a gentler slope sits on that edge and fires only sometimes)
+        let hist: std::collections::VecDeque<(f64, u64)> = (0..41)
+            .map(|i| {
+                let t = now - (41 - i) as f64 * 30.0;
+                let avail = 6_000.0 - (i as f64 / 40.0) * 4_000.0;
+                (t, avail as u64)
+            })
+            .collect();
+        let mut state = SysAlertState {
+            mem_eta_hist: hist,
+            ..Default::default()
+        };
+        let draining = crate::platform::SystemStats {
+            mem_avail_mb: Some(2_000),
+            ..Default::default()
+        };
+        for _ in 0..ALERT_CYCLES - 1 {
+            assert!(
+                system_alert_picks(&draining, &mut state, &limits(Some(1.0)), 3).is_empty(),
+                "no fire before the window completes"
+            );
+        }
+        let fires = system_alert_picks(&draining, &mut state, &limits(Some(1.0)), 3);
+        eprintln!("DEBUG len={} first_t={:?} last={:?} fires={fires:?} firing={}",
+            state.mem_eta_hist.len(),
+            state.mem_eta_hist.front().map(|(t, _)| t),
+            state.mem_eta_hist.back(),
+            state.mem_eta_firing);
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        let d = &fires[0].1;
+        assert!(d.contains("memory draining fast"), "{d}");
+        assert!(d.contains("2000MB available"), "{d}");
+        assert!(d.contains("exhausted in"), "{d}");
+        assert!(d.contains("under the 1h line"), "{d}");
+        // the reading vanishes (platform stopped reporting): the history
+        // clears, the trend is gone, and the latched alert recovers —
+        // the same rule that drops an unmounted mount's trend
+        let vanished = crate::platform::SystemStats::default();
+        let rec = system_alert_picks(&vanished, &mut state, &limits(Some(1.0)), 3);
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert!(rec[0].2, "{rec:?}");
+        assert!(
+            rec[0].1.contains("memory trend no longer heading under 1.0h"),
+            "{}",
+            rec[0].1
+        );
+        assert!(state.mem_eta_hist.is_empty(), "vanished reading clears history");
+
+        // a flat-but-noisy history (allocate/free cycles, not a leak)
+        // never earns a prediction: noise doesn't get to fire
+        let noisy: std::collections::VecDeque<(f64, u64)> = (0..41)
+            .map(|i| {
+                let t = now - (41 - i) as f64 * 30.0;
+                (t, 5_000 + if i % 2 == 0 { 50 } else { 0 })
+            })
+            .collect();
+        let mut state = SysAlertState {
+            mem_eta_hist: noisy.clone(),
+            ..Default::default()
+        };
+        let flat = crate::platform::SystemStats {
+            mem_avail_mb: Some(5_000),
+            ..Default::default()
+        };
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                system_alert_picks(&flat, &mut state, &limits(Some(1.0)), 3).is_empty(),
+                "noise stays silent"
+            );
+        }
+        // disarmed → silent even with history that would otherwise predict
+        let mut state = SysAlertState {
+            mem_eta_hist: noisy,
+            ..Default::default()
+        };
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(system_alert_picks(&flat, &mut state, &limits(None), 3).is_empty());
+        }
+    }
+
+    #[test]
     fn psi_full_stall_alert_fires_and_names_resources() {
         // mem full-stall over the line; cpu/io quiet
         let s = crate::platform::SystemStats {
@@ -3709,6 +3921,7 @@ mod tests {
             failed_limit: None,
             failed_units: Vec::new(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3785,6 +3998,7 @@ mod tests {
             failed_limit: None,
             failed_units: Vec::new(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3860,6 +4074,7 @@ mod tests {
             failed_limit: None,
             failed_units: Vec::new(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3920,6 +4135,7 @@ mod tests {
             failed_limit: None,
             failed_units: Vec::new(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3987,6 +4203,7 @@ mod tests {
             failed_limit: None,
             failed_units: Vec::new(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4061,6 +4278,7 @@ mod tests {
             failed_limit,
             failed_units: failed_units.iter().map(|u| u.to_string()).collect(),
             disk_eta_hours: None,
+            mem_eta_hours: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4961,3 +5179,4 @@ mod tests {
         assert!(load_events_log("/nonexistent/witr-events.jsonl").is_err());
     }
 }
+
