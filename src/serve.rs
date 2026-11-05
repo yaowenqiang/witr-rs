@@ -446,8 +446,25 @@ pub(crate) fn system_snapshot(
     })
 }
 
+/// Trend histories behind the eta gauges — the disk-eta / mem-eta
+/// machinery accrues its trailing window across scrapes (scrape
+/// frequency IS the sample rate here too). One per serve process,
+/// mutated under the platform lock: every scrape path takes that lock
+/// around scrape(), so the Mutex serializes the only writers. Predictions
+/// need ~10 minutes of scrapes before the significance gate trusts them —
+/// the gauges simply don't exist until then, like busy%'s first-sample
+/// gap.
+static TRENDS: std::sync::OnceLock<Mutex<crate::history::SysAlertState>> =
+    std::sync::OnceLock::new();
+
+fn trends() -> &'static Mutex<crate::history::SysAlertState> {
+    TRENDS.get_or_init(|| Mutex::new(crate::history::SysAlertState::default()))
+}
+
 /// One scrape: sample the platform and render the Prometheus exposition.
-fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
+/// `trends` carries the eta machinery's trailing windows — the handler
+/// passes the process-wide store; tests pass their own.
+fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>, trends: &mut crate::history::SysAlertState) -> String {
     let mut out = String::with_capacity(16 * 1024);
     let mut procs = platform.list_processes().unwrap_or_default();
     // IO counters need enrich_listing (proc_pid_rusage / /proc/<pid>/io per
@@ -491,7 +508,9 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
     // be the only node exporter a small host needs. CPU is a delta between
     // scrapes — the very first one reports nothing (same as the TUI's
     // first tick).
+    let mut mem_avail: Option<u64> = None;
     if let Some(s) = platform.system_stats() {
+        mem_avail = s.mem_avail_mb;
         if let Some(cpu) = s.cpu_percent {
             out.push_str("# HELP witr_machine_cpu_percent Total CPU busy percent across all cores\n");
             out.push_str("# TYPE witr_machine_cpu_percent gauge\n");
@@ -632,6 +651,32 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>) -> String {
                 label_escape(&m.target),
                 m.total_mb * 1024 * 1024,
             ));
+        }
+    }
+    // trend predictions — the disk-eta / mem-eta sentinels' exact machinery
+    // (least squares + significance gate), exported so a Grafana line can
+    // draw "full in ~4h" without every dashboard re-deriving slopes from
+    // raw history. INFINITY passes the threshold filter: anything the gate
+    // deems trustworthy exports, whatever its horizon. Absent until ~10
+    // minutes of scrapes accrue.
+    {
+        let picks = crate::history::disk_eta_picks(trends, &mounts, f64::INFINITY);
+        if !picks.is_empty() {
+            out.push_str("# HELP witr_machine_disk_eta_hours Predicted hours until each filesystem fills (least-squares trend, significance-gated)\n");
+            out.push_str("# TYPE witr_machine_disk_eta_hours gauge\n");
+            for (eta, _mbh, m) in &picks {
+                out.push_str(&format!(
+                    "witr_machine_disk_eta_hours{{mount=\"{}\"}} {eta:.2}\n",
+                    label_escape(&m.target),
+                ));
+            }
+        }
+        if let Some((eta, _mbh)) =
+            crate::history::mem_eta_picks(trends, mem_avail, f64::INFINITY)
+        {
+            out.push_str("# HELP witr_machine_mem_eta_hours Predicted hours until MemAvailable exhausts (least-squares trend, significance-gated)\n");
+            out.push_str("# TYPE witr_machine_mem_eta_hours gauge\n");
+            out.push_str(&format!("witr_machine_mem_eta_hours {eta:.2}\n"));
         }
     }
     // cumulative NIC bytes as counters (loopback excluded) — rate() gives
@@ -1523,7 +1568,11 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
             let started = std::time::Instant::now();
             let body = {
                 let platform = platform.lock().unwrap_or_else(|e| e.into_inner());
-                scrape(platform.as_ref(), fds.as_ref())
+                scrape(
+                    platform.as_ref(),
+                    fds.as_ref(),
+                    &mut trends().lock().unwrap_or_else(|e| e.into_inner()),
+                )
             };
             LAST_SCRAPE_MICROS.store(
                 started.elapsed().as_micros() as u64,
@@ -1639,9 +1688,97 @@ mod tests {
     }
 
     #[test]
+    fn scrape_exports_eta_gauges_only_once_the_trend_is_trusted() {
+        struct QuietPlatform;
+        impl crate::platform::Platform for QuietPlatform {
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            fn capabilities(&self) -> crate::platform::Capabilities {
+                crate::platform::Capabilities { file_lookup: false, env: false }
+            }
+            fn list_processes(&self) -> crate::platform::PlatResult<Vec<Process>> {
+                Ok(Vec::new())
+            }
+            fn detail(&self, brief: &Process, _want_env: bool) -> Process {
+                brief.clone()
+            }
+            fn port_to_sockets(&self, _port: u16) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn list_sockets(&self) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn file_to_pids(&self, _path: &str) -> crate::platform::PlatResult<Vec<i32>> {
+                Ok(Vec::new())
+            }
+            fn container_of(&self, _pid: i32) -> Option<crate::model::Source> {
+                None
+            }
+            fn service_source(&self, _procs: &[Process]) -> Option<crate::model::Source> {
+                None
+            }
+            fn system_stats(&self) -> Option<crate::platform::SystemStats> {
+                Some(crate::platform::SystemStats {
+                    mem_avail_mb: Some(2_000),
+                    ..Default::default()
+                })
+            }
+            fn mount_usage(&self) -> Vec<crate::platform::MountUsage> {
+                vec![crate::platform::MountUsage {
+                    target: "/data".into(),
+                    total_mb: 10_000,
+                    used_mb: 4_000,
+                }]
+            }
+        }
+        let now = crate::util::now_unix() as f64;
+        // fresh state: no window yet → no prediction gauges, whatever the
+        // platform reads
+        let mut trends = crate::history::SysAlertState::default();
+        let out = scrape(&QuietPlatform, None, &mut trends);
+        assert!(!out.contains("witr_machine_disk_eta_hours"), "{out}");
+        assert!(!out.contains("witr_machine_mem_eta_hours"), "{out}");
+        // seed a steep disk trend for /data and a steep memory leak: the
+        // gauges appear, naming the mount and the horizon in hours
+        trends.disk_eta_hist.insert(
+            "/data".into(),
+            (0..41)
+                .map(|i| {
+                    let t = now - (41 - i) as f64 * 30.0;
+                    (t, (6_000.0 - (i as f64 / 40.0) * 2_000.0) as u64)
+                })
+                .collect(),
+        );
+        trends.mem_eta_hist = (0..41)
+            .map(|i| {
+                let t = now - (41 - i) as f64 * 30.0;
+                (t, (4_000.0 - (i as f64 / 40.0) * 3_000.0) as u64)
+            })
+            .collect();
+        let out = scrape(&QuietPlatform, None, &mut trends);
+        assert!(out.contains("witr_machine_disk_eta_hours{mount=\"/data\"}"), "{out}");
+        assert!(out.contains("witr_machine_mem_eta_hours "), "{out}");
+        // the horizon reads sane: 6GB→4GB disk (~5h) and the steeper memory
+        // trend (~0.4h) both under their naive windows
+        let eta_line = out
+            .lines()
+            .find(|l| l.starts_with("witr_machine_disk_eta_hours{"))
+            .unwrap();
+        let v: f64 = eta_line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!(v > 0.0 && v < 24.0, "{eta_line}");
+        let mem_line = out
+            .lines()
+            .find(|l| l.starts_with("witr_machine_mem_eta_hours "))
+            .unwrap();
+        let v: f64 = mem_line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!(v > 0.0 && v < 2.0, "{mem_line}");
+    }
+
+    #[test]
     fn scrape_includes_machine_gauges_when_measurable() {
         let platform = crate::platform::get();
-        let out = scrape(platform.as_ref(), None);
+        let out = scrape(platform.as_ref(), None, &mut crate::history::SysAlertState::default());
         assert!(out.contains("witr_process_count "));
         // the zombie waterline rides the process table every platform
         // lists, so it emits unconditionally — armed sentinel or not

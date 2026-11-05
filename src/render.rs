@@ -1964,6 +1964,16 @@ pub fn grafana_dashboard() -> serde_json::Value {
         None,
         &[("{{sensor}}", "witr_machine_temp_celsius")],
     );
+    add(
+        "Predicted hours to full / exhausted",
+        0, 69, 24, 8,
+        "none",
+        None,
+        &[
+            ("{{mount}}", "witr_machine_disk_eta_hours"),
+            ("MemAvailable", "witr_machine_mem_eta_hours"),
+        ],
+    );
 
     serde_json::json!({
         "id": null,
@@ -2166,6 +2176,22 @@ pub fn alert_rules_yaml() -> String {
             "warning",
             "Container memory near its limit",
             "{{ $labels.name }} sits over 90% of its own memory limit — the OOM kill's doorstep; containers without a limit produce no total series and can't alert.",
+        ),
+        (
+            "WitrDiskFillPredicted",
+            "witr_machine_disk_eta_hours < 4",
+            "10m",
+            "warning",
+            "Filesystem predicted to fill",
+            "{{ $labels.mount }} is predicted to fill in {{ $value }}h at the current fill rate — the trend behind --alert-disk-eta, exported so a rule can shout on the prediction.",
+        ),
+        (
+            "WitrMemExhaustionPredicted",
+            "witr_machine_mem_eta_hours < 4",
+            "10m",
+            "warning",
+            "Memory predicted to exhaust",
+            "MemAvailable is predicted to run out in {{ $value }}h at the current drain rate — the trend behind --alert-mem-eta, the OOM omen before the floor breaks.",
         ),
     ];
     let mut out = String::from(
@@ -3772,6 +3798,8 @@ mod tests {
             "witr_machine_failed_units",
             "witr_container_cpu_percent",
             "witr_container_mem_total_bytes",
+            "witr_machine_disk_eta_hours",
+            "witr_machine_mem_eta_hours",
         ] {
             assert!(yaml.contains(probe), "{probe} has a rule:\n{yaml}");
         }
