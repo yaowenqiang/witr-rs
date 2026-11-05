@@ -163,6 +163,7 @@ pub fn now_unix() -> i64 {
 /// connect, HTTP status — for the caller's one-line message.
 pub fn http_get(url: &str) -> Result<String, String> {
     use std::io::Read as _;
+    let (auth, url) = split_userinfo(url);
     let Some(rest) = url.strip_prefix("http://") else {
         return Err(format!("only http:// URLs are supported (no TLS): {url}"));
     };
@@ -184,8 +185,12 @@ pub fn http_get(url: &str) -> Result<String, String> {
             continue;
         };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let auth_line = auth
+            .as_deref()
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
         let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+            "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nAccept: application/json\r\n{auth_line}Connection: close\r\n\r\n"
         );
         use std::io::Write as _;
         if let Err(e) = stream.write_all(req.as_bytes()) {
@@ -219,6 +224,26 @@ pub fn http_get(url: &str) -> Result<String, String> {
         return Ok(String::from_utf8_lossy(&raw[pos + skip..]).to_string());
     }
     Err(last_err)
+}
+
+/// Split `http://token@host:9100/...` into `(Some("token"),
+/// "http://host:9100/...")`. The userinfo slot is how a fleet fetch
+/// authenticates against a `--serve-token` peer: zero extra flags, one
+/// string in the URL. Only the `@` before the first `/` counts, so a
+/// path may contain `@` freely; userinfo containing `@` itself doesn't
+/// parse (the last `@` before the slash wins, so percent-free tokens
+/// with `@` are the one thing to avoid).
+fn split_userinfo(url: &str) -> (Option<String>, String) {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return (None, url.to_string());
+    };
+    let slash = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..slash].rfind('@') else {
+        return (None, url.to_string());
+    };
+    let token = rest[..at].to_string();
+    let host_path = &rest[at + 1..];
+    (Some(token), format!("http://{host_path}"))
 }
 
 /// uid → username resolver with a lookup cache (including negative
@@ -517,6 +542,39 @@ mod tests {
         let (p, deleted) = strip_deleted_suffix("/usr/bin/foo");
         assert_eq!(p, "/usr/bin/foo");
         assert!(!deleted);
+    }
+
+    #[test]
+    fn split_userinfo_peels_the_bearer_token_off_the_url() {
+        assert_eq!(
+            split_userinfo("http://sekret@10.0.0.7:9100/api/ps"),
+            (Some("sekret".into()), "http://10.0.0.7:9100/api/ps".to_string())
+        );
+        // token only, no path
+        assert_eq!(
+            split_userinfo("http://sekret@host:9100"),
+            (Some("sekret".into()), "http://host:9100".to_string())
+        );
+        // no userinfo: URL passes through untouched
+        assert_eq!(
+            split_userinfo("http://host:9100/api/ps"),
+            (None, "http://host:9100/api/ps".to_string())
+        );
+        // an @ in the path is not a separator
+        assert_eq!(
+            split_userinfo("http://host/api@v2"),
+            (None, "http://host/api@v2".to_string())
+        );
+        // non-http (rejected later) passes through for the real error
+        assert_eq!(
+            split_userinfo("https://t@host"),
+            (None, "https://t@host".to_string())
+        );
+        // the last @ before the slash wins
+        assert_eq!(
+            split_userinfo("http://a@b@host:1"),
+            (Some("a@b".into()), "http://host:1".to_string())
+        );
     }
 
     #[test]

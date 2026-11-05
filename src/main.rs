@@ -830,12 +830,93 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
     let fetch = |base: &str| -> Result<(Vec<Process>, Option<FleetSample>), String> {
         fetch_fleet(base)
     };
+    // fleet rows carry their owning host when more than one peer is in
+    // play — the top board's HOST column, the CSV host column and the
+    // JSON host field all read it (single-host remote stays host-less,
+    // exactly like local output)
+    let multi = bases.len() > 1;
     let fetch_all = || -> FleetFetch {
         bases
             .iter()
-            .map(|b| (b.clone(), fetch(b)))
+            .map(|b| {
+                let mut r = (b.clone(), fetch(b));
+                if multi {
+                    if let Ok((ps, _)) = &mut r.1 {
+                        for p in ps.iter_mut() {
+                            p.host = Some(b.clone());
+                        }
+                    }
+                }
+                r
+            })
             .collect()
     };
+
+    // --top across the fleet: merge the fetched tables and rank once. The
+    // table-carried metrics (cpu/mem/age/threads/swap) work; anything
+    // needing a local probe (fd/conn/io-rate/net/gpu) is refused with the
+    // supported set named — a silent whole-table render used to eat the
+    // flag.
+    if let Some(metric) = cli.top {
+        if !matches!(
+            metric,
+            cli::TopMetric::Cpu
+                | cli::TopMetric::Mem
+                | cli::TopMetric::Age
+                | cli::TopMetric::Threads
+                | cli::TopMetric::Swap
+        ) {
+            eprintln!(
+                "--top {metric:?} across --remote hosts reads the fetched process tables; fd/conn/io/io-rate/net/gpu need local probes — use cpu/mem/age/threads/swap"
+            );
+            std::process::exit(4);
+        }
+        let color = !no_color && std::io::stdout().is_terminal();
+        let painter = render::Painter::new(color);
+        let count = cli.count.unwrap_or(15);
+        let draw = |results: &FleetFetch| -> String {
+            let mut procs: Vec<Process> = Vec::new();
+            for (_, result) in results {
+                if let Ok((ps, _)) = result {
+                    procs.extend(ps.iter().cloned());
+                }
+            }
+            render::render_top(&procs, metric, count, None, None, None, &painter)
+        };
+        match cli.watch {
+            Some(secs) => {
+                let interval = secs.max(1);
+                install_sigint_flag();
+                let label = bases.join(" · ");
+                let mut ticks = 0u64;
+                loop {
+                    let results = fetch_all();
+                    if !cli.quiet {
+                        write_out("\x1b[2J\x1b[1;1H");
+                        let now = util::fmt_time(util::now_unix());
+                        write_out(&format!(
+                            "witr-rs fleet top {} · {} host(s) · {label} · every {interval}s · {now} · Ctrl-C to stop",
+                            format!("{metric:?}").to_lowercase(),
+                            bases.len()
+                        ));
+                    }
+                    write_out(&draw(&results));
+                    ticks += 1;
+                    if cli.times.is_some_and(|n| ticks >= n.max(1)) {
+                        return;
+                    }
+                    if !sleep_interruptible(interval) {
+                        return;
+                    }
+                }
+            }
+            None => {
+                let results = fetch_all();
+                write_out(&draw(&results));
+                return;
+            }
+        }
+    }
     let render_host = |procs: &[Process]| -> String {
         let color = !no_color && std::io::stdout().is_terminal() && !cli.json;
         let painter = render::Painter::new(color);

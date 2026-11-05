@@ -1175,11 +1175,20 @@ fn listing_row(p: &Process, now: i64) -> ListingRow {
 /// `--csv` on the listing / --top: one header row, one row per process.
 pub fn render_csv(procs: &[Process]) -> String {
     let now = crate::util::now_unix();
-    let mut out = String::from(
-        "pid,ppid,user,cpu_pct,rss_mb,state,age,name,command\n",
-    );
+    // fleet rows carry their owning host in-line — the section dividers a
+    // multi-host --remote prints never reached scripts, and jq/awk want
+    // the column, not the banner
+    let fleet = procs.iter().any(|p| p.host.is_some());
+    let mut out = String::from(if fleet {
+        "host,pid,ppid,user,cpu_pct,rss_mb,state,age,name,command\n"
+    } else {
+        "pid,ppid,user,cpu_pct,rss_mb,state,age,name,command\n"
+    });
     for p in procs {
         let r = listing_row(p, now);
+        if fleet {
+            out.push_str(&format!("{},", csv_field(p.host.as_deref().unwrap_or(""))));
+        }
         out.push_str(&format!(
             "{},{},{},{},{},{},{},{},{}\n",
             r.pid,
@@ -1264,19 +1273,34 @@ pub fn render_top(
             Some((v, pr))
         })
         .collect();
-    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // cross-host ties read host-then-pid, not hash order
+            .then_with(|| a.1.host.cmp(&b.1.host))
+            .then_with(|| a.1.pid.cmp(&b.1.pid))
+    });
     ranked.truncate(count);
 
+    // a fleet board (--remote over several peers) opens with a HOST
+    // column — the same process on two machines is two rows and needs
+    // saying which machine owns each
+    let fleet = procs.iter().any(|pr| pr.host.is_some());
     // age ranking already shows the age — swap the trailing AGE column for
     // the process state so the table doesn't repeat itself
     let age_col = if metric == crate::cli::TopMetric::Age { "STATE" } else { "AGE" };
-    let mut rows: Vec<[String; 5]> = vec![[
+    let mut header: Vec<String> = Vec::new();
+    if fleet {
+        header.push("HOST".into());
+    }
+    header.extend([
         "PID".into(),
         "USER".into(),
         metric.header().into(),
         age_col.into(),
         "COMMAND".into(),
-    ]];
+    ]);
+    let mut rows: Vec<Vec<String>> = vec![header];
     for (v, pr) in &ranked {
         let val = match metric {
             crate::cli::TopMetric::Cpu => format!("{v:.1}"),
@@ -1303,45 +1327,49 @@ pub fn render_top(
         } else {
             pr.started.map(|t| fmt_age(now - t)).unwrap_or_else(|| "-".into())
         };
-        rows.push([
+        let mut row: Vec<String> = Vec::new();
+        if fleet {
+            row.push(pr.host.clone().unwrap_or_else(|| "-".into()));
+        }
+        row.extend([
             pr.pid.to_string(),
             pr.user.clone().unwrap_or_else(|| "-".into()),
             val,
             extra,
             pr.command_line(),
         ]);
+        rows.push(row);
     }
-    let w = [
-        rows.iter().map(|r| r[0].chars().count()).max().unwrap_or(3),
-        rows.iter().map(|r| r[1].chars().count()).max().unwrap_or(4),
-        rows.iter().map(|r| r[2].chars().count()).max().unwrap_or(3),
-        rows.iter().map(|r| r[3].chars().count()).max().unwrap_or(3),
-    ];
+    // per-column widths; everything except USER (left-aligned) and the
+    // trailing COMMAND (unpadded) runs right-aligned
+    let ncols = rows[0].len();
+    let w: Vec<usize> = (0..ncols)
+        .map(|c| {
+            rows.iter()
+                .map(|r| r[c].chars().count())
+                .max()
+                .unwrap_or(3)
+        })
+        .collect();
     let mut out = String::new();
-    let head = p.bold(&rows[0][0]);
-    let _ = writeln!(
-        out,
-        "{:>w0$}  {:<w1$}  {:>w2$}  {:>w3$}  {}",
-        head,
-        p.bold(&rows[0][1]),
-        p.bold(&rows[0][2]),
-        p.bold(&rows[0][3]),
-        p.bold(&rows[0][4]),
-        w0 = w[0],
-        w1 = w[1],
-        w2 = w[2],
-        w3 = w[3]
-    );
+    let emit = |out: &mut String, r: &[String], head: bool| {
+        for (c, cell) in r.iter().enumerate() {
+            let shown = if head { p.bold(cell) } else { cell.clone() };
+            let last = c + 1 == r.len();
+            let width = w[c];
+            if last {
+                out.push_str(&shown);
+                out.push('\n');
+            } else if c == if fleet { 2 } else { 1 } {
+                out.push_str(&format!("{shown:<width$}  "));
+            } else {
+                out.push_str(&format!("{shown:>width$}  "));
+            }
+        }
+    };
+    emit(&mut out, &rows[0], true);
     for r in rows.iter().skip(1) {
-        let _ = writeln!(
-            out,
-            "{:>w0$}  {:<w1$}  {:>w2$}  {:>w3$}  {}",
-            r[0], r[1], r[2], r[3], r[4],
-            w0 = w[0],
-            w1 = w[1],
-            w2 = w[2],
-            w3 = w[3]
-        );
+        emit(&mut out, r, false);
     }
     if ranked.is_empty() {
         let why = match metric {
@@ -3454,6 +3482,78 @@ mod tests {
         assert!(html.contains("width:100%"), "max-cpu row gets a full bar");
         assert!(html.contains("Top CPU"));
         assert!(html.contains("1 processes"));
+    }
+
+    #[test]
+    fn render_top_names_the_host_on_a_fleet_board() {
+        let mk = |pid: i32, host: Option<&str>, cpu: Option<f64>, name: &str| Process {
+            pid,
+            name: name.into(),
+            host: host.map(|h| h.into()),
+            cpu,
+            ..Default::default()
+        };
+        // two machines' tables merged: equal-cpu ties read host-then-pid,
+        // not arrival order
+        let procs = vec![
+            mk(1, Some("hostB"), Some(30.0), "web-b"),
+            mk(2, Some("hostA"), Some(30.0), "web-a"),
+            mk(3, Some("hostA"), Some(90.0), "db-a"),
+            mk(4, None, Some(5.0), "local"),
+        ];
+        let p = Painter::new(false);
+        let out = render_top(
+            &procs,
+            crate::cli::TopMetric::Cpu,
+            10,
+            None,
+            None,
+            None,
+            &p,
+        );
+        assert!(out.contains("HOST"), "header gains HOST: {out}");
+        // ranks first (90 db-a), then the tie: hostA pid2 before hostB pid1
+        let lines: Vec<&str> = out.lines().collect();
+        let db = lines.iter().position(|l| l.contains("db-a")).unwrap();
+        let a = lines.iter().position(|l| l.contains("web-a")).unwrap();
+        let b = lines.iter().position(|l| l.contains("web-b")).unwrap();
+        assert!(db < a && a < b, "{out}");
+        assert!(lines[db].contains("hostA"), "{out}");
+        // a local-only table (no hosts) renders exactly as before — no
+        // HOST column, no width drift
+        let local = vec![mk(1, None, Some(9.0), "solo")];
+        let out = render_top(
+            &local,
+            crate::cli::TopMetric::Cpu,
+            10,
+            None,
+            None,
+            None,
+            &p,
+        );
+        assert!(!out.contains("HOST"), "{out}");
+    }
+
+    #[test]
+    fn render_csv_carries_the_host_in_line_on_fleet_rows() {
+        let mk = |pid: i32, host: Option<&str>| Process {
+            pid,
+            name: format!("p{pid}"),
+            host: host.map(|h| h.into()),
+            ..Default::default()
+        };
+        let fleet = vec![mk(1, Some("a")), mk(2, Some("b")), mk(3, Some("a"))];
+        let csv = render_csv(&fleet);
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "host,pid,ppid,user,cpu_pct,rss_mb,state,age,name,command"
+        );
+        assert!(lines.next().unwrap().starts_with("a,1,"), "{csv}");
+        assert!(lines.next().unwrap().starts_with("b,2,"), "{csv}");
+        // a local table keeps the classic header (no dead host column)
+        let local = vec![mk(1, None)];
+        assert!(render_csv(&local).starts_with("pid,ppid,user,"));
     }
 
     #[test]

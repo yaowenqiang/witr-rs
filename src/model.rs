@@ -100,6 +100,13 @@ pub struct Process {
     pub cgroup_mem_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cgroup_cpu_usec: Option<u64>,
+    /// Owning host in fleet mode (`--remote` over several `--serve`
+    /// peers) — filled by the fetch when more than one host is in play;
+    /// local runs and single-host remote leave it None. Drives the HOST
+    /// column on the fleet top board and the fleet CSV rows (whose
+    /// section-divider lines never reached scripts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 impl Process {
