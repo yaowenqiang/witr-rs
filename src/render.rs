@@ -1646,6 +1646,45 @@ pub fn render_sys(frame: &SysFrame, p: &Painter) -> String {
 
 /// `--sys --csv`: the whole frame as one flat row (empty cell = the
 /// platform doesn't report it; disk/net ride their busiest/total summaries).
+/// The `--sys --json` envelope's value: one machine's flat snapshot as a
+/// JSON object. `host` names the machine on the fleet form (`--remote ×
+/// --sys` — one entry per peer); local runs omit the key entirely so the
+/// existing shape stays byte-compatible.
+pub fn sys_json(frame: &SysFrame, host: Option<&str>) -> serde_json::Value {
+    let s = &frame.stats;
+    let mut doc = serde_json::json!({
+        "cpu_pct": s.cpu_percent,
+        "cores": s.cores,
+        "mem_used_mb": s.mem_used_mb,
+        "mem_avail_mb": s.mem_avail_mb,
+        "mem_total_mb": s.mem_total_mb,
+        "swap_used_mb": s.swap_used_mb,
+        "swap_total_mb": s.swap_total_mb,
+        "load1": s.load1,
+        "load5": s.load5,
+        "load15": s.load15,
+        "procs": frame.procs,
+        "mounts": frame.mounts.iter().map(|m| serde_json::json!({
+            "target": m.target, "used_mb": m.used_mb, "total_mb": m.total_mb,
+        })).collect::<Vec<_>>(),
+        "nics": frame.nics.iter().map(|(n, r, t)| serde_json::json!({
+            "name": n, "rx_mbps": r, "tx_mbps": t,
+        })).collect::<Vec<_>>(),
+        "temp": s.temp.as_ref().map(|(l, c)| serde_json::json!({
+            "sensor": l, "celsius": c,
+        })),
+        "psi": s.psi.as_ref().map(|p| serde_json::json!({
+            "cpu_some": p.cpu_some, "cpu_full": p.cpu_full,
+            "mem_some": p.mem_some, "mem_full": p.mem_full,
+            "io_some": p.io_some, "io_full": p.io_full,
+        })),
+    });
+    if let Some(h) = host {
+        doc["host"] = serde_json::json!(h);
+    }
+    doc
+}
+
 pub fn render_sys_csv(frame: &SysFrame) -> String {
     let cells = sys_flat_cells(frame);
     let mut out = String::new();

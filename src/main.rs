@@ -917,6 +917,97 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
             }
         }
     }
+
+    // --sys across the fleet: every peer's machine dashboard in one sweep —
+    // the machine snapshot already rides the /api/ps envelope, so this is
+    // pure rendering. `--watch` turns it into the estate's cockpit.
+    if cli.sys {
+        // machine-readable frames are one-shot, same rule as the local --sys
+        if cli.watch.is_some() && (cli.json || cli.csv || cli.markdown) {
+            eprintln!("machine-readable --sys is one-shot; drop --watch or the format flag");
+            std::process::exit(4);
+        }
+        let multi = bases.len() > 1;
+        let frames = |results: &FleetFetch| -> Vec<(String, Option<render::SysFrame>)> {
+            results
+                .iter()
+                .map(|(base, result)| {
+                    let frame = result.as_ref().ok().and_then(|(procs, sample)| {
+                        sample.as_ref().map(|smp| fleet_sys_frame(smp, procs))
+                    });
+                    (base.clone(), frame)
+                })
+                .collect()
+        };
+        let draw = |results: &FleetFetch, painter: &render::Painter| -> String {
+            let mut out = String::new();
+            for (base, entry) in frames(results) {
+                let Some(frame) = entry else {
+                    if multi {
+                        out.push_str(&format!("----- [{base}] -----\nfetch failed\n"));
+                    }
+                    continue;
+                };
+                if multi {
+                    out.push_str(&format!("----- [{base}] -----\n"));
+                }
+                if cli.json {
+                    let doc = serde_json::json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "generated_at": util::now_unix(),
+                        "hosts": [render::sys_json(&frame, Some(&base))],
+                    });
+                    out.push_str(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+                    out.push('\n');
+                } else if cli.csv {
+                    out.push_str(&render::render_sys_csv(&frame));
+                } else if cli.markdown {
+                    out.push_str(&render::render_sys_markdown(&frame));
+                } else {
+                    out.push_str(&render::render_sys(&frame, painter));
+                }
+            }
+            out
+        };
+        let color = !no_color && std::io::stdout().is_terminal();
+        let painter = render::Painter::new(color);
+        match cli.watch {
+            Some(secs) => {
+                let interval = secs.max(1);
+                install_sigint_flag();
+                let label = bases.join(" · ");
+                let mut ticks = 0u64;
+                loop {
+                    let results = fetch_all();
+                    if !cli.quiet {
+                        write_out("\x1b[2J\x1b[1;1H");
+                        let now = util::fmt_time(util::now_unix());
+                        write_out(&format!(
+                            "witr-rs fleet sys · {} host(s) · {label} · every {interval}s · {now} · Ctrl-C to stop",
+                            bases.len()
+                        ));
+                    }
+                    write_out(&draw(&results, &painter));
+                    ticks += 1;
+                    if cli.times.is_some_and(|n| ticks >= n.max(1)) {
+                        return;
+                    }
+                    if !sleep_interruptible(interval) {
+                        return;
+                    }
+                }
+            }
+            None => {
+                // one fetch per peer: the fleet snapshot carries machine
+                // totals, not per-NIC counters, so the local one-shot's
+                // rate-diff second sweep has nothing to feed here (the
+                // dashboard's NIC section just doesn't render)
+                let results = fetch_all();
+                write_out(&draw(&results, &painter));
+                return;
+            }
+        }
+    }
     let render_host = |procs: &[Process]| -> String {
         let color = !no_color && std::io::stdout().is_terminal() && !cli.json;
         let painter = render::Painter::new(color);
@@ -1202,6 +1293,24 @@ fn sys_frame(
         zombies,
         dstates,
         failed_units,
+    }
+}
+
+/// One fleet `--sys` frame from a peer's machine snapshot — the local
+/// [`sys_frame`]'s remote twin. Per-NIC rates stay empty (the fleet
+/// snapshot carries machine-wide totals, not per-interface counters), and
+/// failed systemd units stay unknown (they live on the far host); the
+/// state waterlines count from the fetched table, which does carry the
+/// state letters.
+fn fleet_sys_frame(sample: &FleetSample, procs: &[Process]) -> render::SysFrame {
+    render::SysFrame {
+        stats: sample.stats.clone(),
+        mounts: sample.mounts.clone(),
+        nics: Vec::new(),
+        procs: procs.len(),
+        zombies: state_count(procs, &["Z"]),
+        dstates: state_count(procs, &["D", "U"]),
+        failed_units: Vec::new(),
     }
 }
 
@@ -4424,7 +4533,7 @@ fn main() {
     // --sys: the machine dashboard (the system page's CLI twin). CPU% and
     // NIC rates are delta metrics — a one-shot takes two samples a second
     // apart (the io-rate pattern); --watch diffs across ticks.
-    if cli.sys {
+    if cli.sys && cli.remote.is_empty() {
         let platform = platform::get();
         let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
         if let Some(secs) = cli.watch {
@@ -4456,37 +4565,17 @@ fn main() {
         let procs = platform.list_processes().unwrap_or_default();
         let frame = sys_frame(platform.as_ref(), &mut net_prev, &procs);
         if cli.json {
-            let s = &frame.stats;
-            let doc = serde_json::json!({
+            // the flat fields merge straight into the envelope (the shape
+            // predates the fleet form; keep it byte-compatible)
+            let mut doc = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "generated_at": util::now_unix(),
-                "cpu_pct": s.cpu_percent,
-                "cores": s.cores,
-                "mem_used_mb": s.mem_used_mb,
-                "mem_avail_mb": s.mem_avail_mb,
-                "mem_total_mb": s.mem_total_mb,
-                "swap_used_mb": s.swap_used_mb,
-                "swap_total_mb": s.swap_total_mb,
-                "load1": s.load1,
-                "load5": s.load5,
-                "load15": s.load15,
-                "procs": frame.procs,
-                "mounts": frame.mounts.iter().map(|m| serde_json::json!({
-                    "target": m.target, "used_mb": m.used_mb, "total_mb": m.total_mb,
-                })).collect::<Vec<_>>(),
-                "nics": frame.nics.iter().map(|(n, r, t)| serde_json::json!({
-                    "name": n, "rx_mbps": r, "tx_mbps": t,
-                })).collect::<Vec<_>>(),
-                "temp": s.temp.as_ref().map(|(l, c)| serde_json::json!({
-                    "sensor": l, "celsius": c,
-                })),
-                "psi": s.psi.as_ref().map(|p| serde_json::json!({
-                    "cpu_some": p.cpu_some, "cpu_full": p.cpu_full,
-                    "mem_some": p.mem_some, "mem_full": p.mem_full,
-                    "io_some": p.io_some, "io_full": p.io_full,
-                })),
             });
-            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+            if let serde_json::Value::Object(map) = render::sys_json(&frame, None) {
+                for (k, v) in map {
+                    doc[k] = v;
+                }
+            }
         } else if cli.csv {
             write_out(&render::render_sys_csv(&frame));
         } else if cli.markdown {
@@ -6872,6 +6961,52 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         // unarmed → no-op even over blazing containers
         let bare = cli::Cli::parse_from(["witr", "--check", "--alert-load", "4"]);
         assert!(container_check_lines(&bare, &cs).is_empty());
+    }
+
+    #[test]
+    fn fleet_sys_frame_counts_waterlines_and_skips_fleet_blind_sections() {
+        let p = |pid: i32, state: Option<&str>| Process {
+            pid,
+            name: format!("p{pid}"),
+            state: state.map(|s| s.to_string()),
+            ..Default::default()
+        };
+        let sample = FleetSample {
+            stats: crate::platform::SystemStats {
+                load1: Some(3.0),
+                mem_avail_mb: Some(2_000),
+                ..Default::default()
+            },
+            net: Some((100, 200, 7)),
+            mounts: vec![crate::platform::MountUsage {
+                target: "/data".into(),
+                total_mb: 10_000,
+                used_mb: 6_000,
+            }],
+        };
+        let procs = vec![p(1, Some("Z")), p(2, Some("D")), p(3, Some("R"))];
+        let frame = fleet_sys_frame(&sample, &procs);
+        assert_eq!(frame.procs, 3);
+        assert_eq!(frame.zombies, 1);
+        assert_eq!(frame.dstates, 1);
+        assert_eq!(frame.stats.load1, Some(3.0));
+        assert_eq!(frame.mounts.len(), 1);
+        // the fleet snapshot has no per-NIC counters and no reach into the
+        // far host's systemd — both sections honestly absent
+        assert!(frame.nics.is_empty());
+        assert!(frame.failed_units.is_empty());
+        // a peer whose serve predates the system snapshot still renders:
+        // empty stats, dashes in the text view, no panic
+        let frame = fleet_sys_frame(
+            &FleetSample {
+                stats: crate::platform::SystemStats::default(),
+                net: None,
+                mounts: Vec::new(),
+            },
+            &[],
+        );
+        assert_eq!(frame.procs, 0);
+        assert!(frame.stats.load1.is_none());
     }
 
     #[test]
