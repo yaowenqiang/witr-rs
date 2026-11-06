@@ -4518,6 +4518,18 @@ fn follow_command_for(src: &crate::logs::LogSource) -> Option<(String, Vec<Strin
             ],
             format!("journal (_PID={pid})"),
         )),
+        crate::logs::LogSource::SystemdUnit { unit } => Some((
+            "journalctl".to_string(),
+            vec![
+                "--no-pager".to_string(),
+                "-f".to_string(),
+                "-n".to_string(),
+                "100".to_string(),
+                "-u".to_string(),
+                unit.clone(),
+            ],
+            format!("journal (-u {unit})"),
+        )),
         crate::logs::LogSource::UnifiedLog { name } => {
             let pred = format!(
                 "process == \"{}\"",

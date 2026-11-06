@@ -453,6 +453,104 @@ pub fn parse_failed_units(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// One systemd unit's report — the `-u UNIT` one-shot's body: the status
+/// line pieces, the process hook (main pid), the restart count (crash
+/// loops), enablement, and the last exit's code/signal (the "why did it
+/// die" facts a failed unit owes you).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct UnitReport {
+    pub unit: String,
+    pub load_state: Option<String>,
+    pub active_state: Option<String>,
+    pub sub_state: Option<String>,
+    pub description: Option<String>,
+    pub main_pid: Option<Pid>,
+    pub n_restarts: Option<u32>,
+    pub unit_file_state: Option<String>,
+    /// ExecMainStatus — the exit code, or the signal number when
+    /// ExecMainCode is "killed".
+    pub exit_status: Option<u32>,
+    pub exit_code: Option<String>,
+    pub since: Option<String>,
+}
+
+/// `systemctl show <unit>` (key=value rows) → a report. Unknown keys are
+/// skipped, so a property set from a different systemd version degrades
+/// instead of failing.
+#[allow(dead_code)] // every parse fn is unit-tested on all platforms
+pub fn parse_unit_report(unit: &str, text: &str) -> UnitReport {
+    let mut r = UnitReport {
+        unit: unit.to_string(),
+        ..Default::default()
+    };
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        // systemctl answers unset properties with an empty value — an
+        // empty string is "no fact", stored as None like the rest
+        let v = v.trim();
+        let fact = (!v.is_empty()).then(|| v.to_string());
+        match k {
+            "LoadState" => r.load_state = fact,
+            "ActiveState" => r.active_state = fact,
+            "SubState" => r.sub_state = fact,
+            "Description" => r.description = fact,
+            "ExecMainPID" => r.main_pid = v.parse().ok().filter(|p| *p > 0),
+            "NRestarts" => r.n_restarts = v.parse().ok(),
+            "UnitFileState" => r.unit_file_state = fact,
+            "ExecMainStatus" => r.exit_status = v.parse().ok(),
+            "ExecMainCode" => r.exit_code = fact,
+            "ActiveEnterTimestamp" => r.since = fact,
+            _ => {}
+        }
+    }
+    r
+}
+
+/// The `-u UNIT` report's data: one `systemctl show` sweep. None where
+/// there is no systemd to ask (other platforms, systemctl missing, not
+/// booted with systemd) or the unit doesn't exist.
+pub fn unit_report(unit: &str) -> Option<UnitReport> {
+    #[cfg(target_os = "linux")]
+    {
+        // unconditional on purpose — "run systemctl + parse the rows" is
+        // pure subprocess work (see systemd_failed_units)
+        // one -p per property, not the combined --properties= form —
+        // older systemds (this box's included) don't recognize it
+        let text = crate::util::run_ok(
+            "systemctl",
+            &[
+                "show",
+                unit,
+                "--no-pager",
+                "-p", "LoadState",
+                "-p", "ActiveState",
+                "-p", "SubState",
+                "-p", "Description",
+                "-p", "ExecMainPID",
+                "-p", "NRestarts",
+                "-p", "UnitFileState",
+                "-p", "ExecMainStatus",
+                "-p", "ExecMainCode",
+                "-p", "ActiveEnterTimestamp",
+            ],
+            std::time::Duration::from_secs(8),
+        )?;
+        // a missing unit answers with LoadState=not-found
+        let r = parse_unit_report(unit, &text);
+        if r.load_state.as_deref() == Some("not-found") {
+            return None;
+        }
+        Some(r)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = unit;
+        None
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn launchd_services() -> Vec<Service> {
     let Ok(text) = crate::util::run(
@@ -1017,6 +1115,41 @@ sys-devices-loaded.device loaded active plugged stub\
         // failed stands out (the tab paints it red)
         assert_eq!(ss[2].state, "failed");
         assert!(ss.iter().all(|s| s.pid.is_none()), "systemd resolves pids lazily");
+    }
+
+    #[test]
+    fn unit_report_parses_the_show_rows() {
+        let text = "\
+LoadState=loaded
+ActiveState=failed
+SubState=exit
+Description=Light Display Manager
+ExecMainPID=0
+NRestarts=7
+UnitFileState=enabled
+ExecMainStatus=1
+ExecMainCode=exited
+ActiveEnterTimestamp=Tue 2026-11-03 09:14:02 CST
+UnknownKeyFromAFutureSystemd=whatever
+";
+        let r = parse_unit_report("lightdm.service", text);
+        assert_eq!(r.unit, "lightdm.service");
+        assert_eq!(r.load_state.as_deref(), Some("loaded"));
+        assert_eq!(r.active_state.as_deref(), Some("failed"));
+        assert_eq!(r.sub_state.as_deref(), Some("exit"));
+        assert_eq!(r.main_pid, None, "pid 0 is no process");
+        assert_eq!(r.n_restarts, Some(7));
+        assert_eq!(r.unit_file_state.as_deref(), Some("enabled"));
+        assert_eq!(r.exit_status, Some(1));
+        assert_eq!(r.exit_code.as_deref(), Some("exited"));
+        assert!(r.since.is_some());
+        // a running unit's pid survives; unknown keys skip silently
+        let r = parse_unit_report(
+            "ssh.service",
+            "ActiveState=active\nSubState=running\nExecMainPID=4242\n",
+        );
+        assert_eq!(r.main_pid, Some(4242));
+        assert_eq!(r.exit_status, None);
     }
 
     #[test]

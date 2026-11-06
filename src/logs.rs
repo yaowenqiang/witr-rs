@@ -23,6 +23,9 @@ pub enum LogSource {
     /// `journalctl _PID=<pid>` — covers every process that logs to the
     /// journal (system services need privileges to see).
     Journald { pid: Pid },
+    /// `journalctl -u <unit>` — the systemd unit's own slice, the "why is
+    /// this service failed" view (crash backtraces, restart banners).
+    SystemdUnit { unit: String },
     /// macOS unified log, filtered by process name (log show is slow —
     /// 2–10 s wall time, hence the longer timeout).
     UnifiedLog { name: String },
@@ -53,6 +56,7 @@ impl LogSource {
                 format!("{runtime} logs · {}", short_id(ref_))
             }
             LogSource::Journald { pid } => format!("journalctl (_PID={pid})"),
+            LogSource::SystemdUnit { unit } => format!("journalctl (-u {unit})"),
             LogSource::UnifiedLog { name } => format!("unified log (process {name})"),
             LogSource::EventLog { pid, name } => {
                 format!("event log (pid {pid} / {name})")
@@ -128,6 +132,26 @@ pub fn fetch(src: &LogSource, n: usize) -> Result<Vec<String>, String> {
                 Ok(out) => Ok(tail_lines(&out, n)),
                 // journalctl exits 1 when nothing matches — that's "no logs",
                 // not a failure
+                Err(e) if e.to_string().contains("exited with 1") => Ok(Vec::new()),
+                Err(e) => Err(format!("journalctl: {e}")),
+            }
+        }
+        LogSource::SystemdUnit { unit } => {
+            let count = n.to_string();
+            match run(
+                "journalctl",
+                &["--no-pager", "-n", &count, "-u", unit],
+                FETCH_TIMEOUT,
+            ) {
+                Ok(out) => {
+                    // the "-- No entries --" placeholder is journalctl's
+                    // prose, not a log line
+                    let lines: Vec<String> = tail_lines(&out, n)
+                        .into_iter()
+                        .filter(|l| l.trim() != "-- No entries --")
+                        .collect();
+                    Ok(lines)
+                }
                 Err(e) if e.to_string().contains("exited with 1") => Ok(Vec::new()),
                 Err(e) => Err(format!("journalctl: {e}")),
             }

@@ -4958,6 +4958,107 @@ fn main() {
         std::process::exit(0);
     }
 
+    // -u UNIT: a systemd unit's report — status line, main pid, restart
+    // count, enablement, last exit code/signal, with --logs appending the
+    // unit's journal tail. Exit mirrors the patrol probes: 0 clean,
+    // 1 failed, 2 missing.
+    if let Some(unit) = &cli.unit {
+        let Some(r) = platform::unit_report(unit) else {
+            if cli.json {
+                let doc = serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "generated_at": util::now_unix(),
+                    "unit": unit,
+                    "found": false,
+                });
+                write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+            } else {
+                eprintln!("unit {unit}: not found (or no systemd to ask)");
+            }
+            std::process::exit(2);
+        };
+        let failed = r.active_state.as_deref() == Some("failed");
+        if cli.json {
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "found": true,
+                "failed": failed,
+                "report": r,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else {
+            let color = !no_color && std::io::stdout().is_terminal();
+            let painter = render::Painter::new(color);
+            let painter = &painter;
+            let status = format!(
+                "{} / {} / {}",
+                r.load_state.as_deref().unwrap_or("?"),
+                r.active_state.as_deref().unwrap_or("?"),
+                r.sub_state.as_deref().unwrap_or("?"),
+            );
+            let status_line = if failed {
+                painter.red(&status)
+            } else {
+                status
+            };
+            write_out(&format!("unit   {}  [{}]", r.unit, status_line));
+            if let Some(d) = &r.description {
+                write_out(&format!("desc   {d}"));
+            }
+            if let Some(pid) = r.main_pid {
+                write_out(&format!(
+                    "pid    {pid}  (witr-rs --pid {pid} traces it; --logs tails its journal)"
+                ));
+            }
+            if let Some(n) = r.n_restarts.filter(|n| *n > 0) {
+                let tag = if n >= 3 { " — crash loop?" } else { "" };
+                write_out(&painter.yellow(&format!("restarts {n}{tag}")));
+            }
+            if let Some(s) = &r.unit_file_state {
+                write_out(&format!("boot   {s}"));
+            }
+            if let Some(code) = &r.exit_code {
+                let line = match r.exit_status {
+                    Some(st) => format!("last exit {code} {st}"),
+                    None => format!("last exit {code}"),
+                };
+                write_out(&painter.yellow(&line));
+            }
+            if let Some(since) = &r.since {
+                write_out(&format!("since  {since}"));
+            }
+        }
+        // --logs appends the unit's journal slice (the unit's own
+        // `-u` filter, not a pid's)
+        if let Some(n) = cli.logs {
+            let src = logs::LogSource::SystemdUnit { unit: unit.clone() };
+            write_out("");
+            let grep_note = cli
+                .grep
+                .as_deref()
+                .map(|g| format!(" · grep '{g}'"))
+                .unwrap_or_default();
+            write_out(&format!(
+                "== recent logs · {} · last {n}{grep_note} ==",
+                src.describe()
+            ));
+            match logs::fetch(&src, n.max(1) as usize) {
+                Ok(lines) if lines.is_empty() => write_out("(no log entries for this unit)"),
+                Ok(lines) => {
+                    for l in lines {
+                        match cli.grep.as_deref() {
+                            Some(g) if !l.contains(g) => continue,
+                            _ => write_out(&l),
+                        }
+                    }
+                }
+                Err(e) => write_out(&format!("⚠ {e}")),
+            }
+        }
+        std::process::exit(if failed { 1 } else { 0 });
+    }
+
     // --services: the service manager's units (the Services tab's CLI
     // twin). One enumerate call per invocation — the table is meant for
     // humans and scripts, not polling loops.

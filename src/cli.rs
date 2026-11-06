@@ -353,6 +353,17 @@ pub struct Cli {
     )]
     pub short: bool,
 
+    #[arg(
+        short = 'u',
+        long = "unit",
+        value_name = "UNIT",
+        help = t(
+            "systemd 单元报告:状态行(Load/Active/Sub)、主 pid、重启计数、开机自启与否、上次退出码/信号,--logs 附 journal 尾巴(--grep 过滤)——失败单元为什么挂,一条命令说完。发现 failed 退出码 1,干净 0,不存在 2",
+            "A systemd unit report: the status line (Load/Active/Sub), main pid, restart count, enablement, last exit code/signal, with --logs appending a journal tail (--grep filters) — why a unit is failed, one command. Exit 1 when failed, 0 clean, 2 when missing"
+        )
+    )]
+    pub unit: Option<String>,
+
     #[arg(short = 'j', long, help = t("输出机器可读的 JSON", "Machine-readable JSON"))]
     pub json: bool,
 

@@ -110,6 +110,8 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **文件锁总览（`--locks`）**：不进界面，直接打印全系统文件锁——列 PID / OWNER / MODE / TYPE / PATH（按 pid 再按路径排序，属主灰显）。TUI Locks 页的 CLI 孪生：`--json` 出版本化信封（`lock_count` + `locks`），`--csv` / `--markdown` 同样支持。数据源与 Locks 页同一套（Linux `/proc/locks`、macOS `lsof` 锁标志）——"谁攥着这个文件不放"脚本里也能问。
 
+**systemd 单元报告（`-u UNIT` / `--unit`）**：`witr-rs -u nginx.service` 一条命令回答"这个单元现在什么状态、为什么挂过"——状态行（Load / Active / Sub 三段）、描述、主 pid（附 trace 提示）、重启计数（≥3 标注 "crash loop?"）、开机自启与否、**上次退出的码/信号**（失败单元欠你的"死因"），`--logs N` 附 journal 尾巴（`journalctl -u` 的单元切片，`--grep` 过滤）；`--json` 出版本化信封。退出码走巡检探针惯例：failed 为 1、干净为 0、单元不存在（或没有 systemd 可问）为 2——`witr-rs -u nginx.service || alert` 直接进巡检。systemd 单元名因发行版而异（ssh vs sshd），不存在即报 not-found 而不是猜。与 `--alert-failed-units` 哨兵成对：哨兵喊名字，`-u` 回答为什么。
+
 **僵尸进程速查（`--zombies`）**：`witr-rs --zombies` 列出全表 `<defunct>` 僵尸——列 PID / NAME / PARENT（父进程名，已退出则 `(gone)`）/ AGE（最老优先）——僵尸本身不耗资源，但成片的僵尸是父进程没 `wait()` 的信号。`--json` 出版本化信封（`zombie_count` + `zombies`），`--csv` / `--markdown` 同样支持；**发现僵尸时退出码 1**，无僵尸 0——`witr-rs --zombies || alert` 直接当巡检探针。
 
 **D 态速查（`--dstate`）**：`witr-rs --dstate` 列出卡在 uninterruptible wait（Linux state D / macOS state U——同一种等待的两种拼法）的进程——列 PID / USER / NAME / ST / AGE（最老优先）——存储或 NFS 挂起时 CPU 看着空闲、load 却顶天，成排 D 态就是现场；`--alert-dstate` 盯水位，这个列名单。`--json` 出版本化信封（`dstate_count` + `dstates`），`--csv` / `--markdown` 同样支持；**发现即退出码 1**，干净 0——`witr-rs --dstate || alert` 同样是巡检探针。
@@ -341,6 +343,7 @@ witr-rs --zombies             # 僵尸进程速查（最老优先；有僵尸退
 witr-rs --dstate              # D 态速查（存储/NFS 挂起时 CPU 空闲而 load 顶天；退出码同 --zombies）
 witr-rs --conns               # 全机非 LISTEN 连接表：本地/对端/状态/属主（回环对端自动归因；--watch N 常驻）
 witr-rs --services            # 服务管理器单元列表（systemd/launchd/SCM；运行中的排前面）
+witr-rs -u nginx.service --logs 50 --grep error  # systemd 单元报告：状态 + 上次退出码 + journal 尾巴（failed 退出码 1——巡检探针）
 witr-rs --watch 5 --alert-load 8 --alert-mem-pct 90 # 机器级 watchdog：load / 内存百分比超阈值告警
 witr-rs --watch 5 --alert-count 800 # 机器级 watchdog：可见进程数超 800 告警（fork 炸弹哨兵）
 witr-rs --watch 5 --alert-disk 90 # 机器级 watchdog：任一磁盘已用 % 超阈值告警（写满哨兵）
