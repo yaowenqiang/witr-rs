@@ -582,9 +582,14 @@ fn run_on_exit(cmd: &str) {
 /// disk/disk-eta sentinels. `None` when the server predates the `system`
 /// key (older witr-rs --serve) — machine sentinels disarm for that host,
 /// the table still renders.
+#[derive(Clone)]
 struct FleetSample {
     stats: crate::platform::SystemStats,
     net: Option<(u64, u64, u64)>,
+    /// Per-NIC cumulative counters — the fleet --sys diffs them into
+    /// rates (totals live in `net`; these feed the dashboard's NIC rows).
+    /// Empty from servers predating the field.
+    nics: Vec<crate::platform::NicCounters>,
     mounts: Vec<crate::platform::MountUsage>,
 }
 
@@ -610,6 +615,23 @@ fn parse_system_snapshot(doc: &serde_json::Value) -> Option<FleetSample> {
         let g = |k: &str| n.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
         (g("rx_bytes"), g("tx_bytes"), g("drop_total"))
     });
+    let nics = s
+        .get("nics")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|n| {
+                    Some(crate::platform::NicCounters {
+                        name: n.get("name")?.as_str()?.to_string(),
+                        rx_bytes: n.get("rx_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
+                        tx_bytes: n.get("tx_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
+                        rx_drops: n.get("rx_drops").and_then(|v| v.as_u64()).unwrap_or(0),
+                        tx_drops: n.get("tx_drops").and_then(|v| v.as_u64()).unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let disks = s
         .get("disks")
         .and_then(|d| d.as_array())
@@ -664,6 +686,7 @@ fn parse_system_snapshot(doc: &serde_json::Value) -> Option<FleetSample> {
             ..Default::default()
         },
         net,
+        nics,
         mounts,
     })
 }
@@ -928,20 +951,40 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
             std::process::exit(4);
         }
         let multi = bases.len() > 1;
-        let frames = |results: &FleetFetch| -> Vec<(String, Option<render::SysFrame>)> {
+        // one rate-diff state per host — each machine's counters diff
+        // against its own previous sweep, carried across ticks
+        let mut net_prevs: HashMap<String, Option<(Vec<crate::platform::NicCounters>, Instant)>> =
+            HashMap::new();
+        let frames = |results: &FleetFetch,
+                      net_prevs: &mut HashMap<
+            String,
+            Option<(Vec<crate::platform::NicCounters>, Instant)>,
+        >|
+         -> Vec<(String, Option<render::SysFrame>)> {
             results
                 .iter()
                 .map(|(base, result)| {
                     let frame = result.as_ref().ok().and_then(|(procs, sample)| {
-                        sample.as_ref().map(|smp| fleet_sys_frame(smp, procs))
+                        sample
+                            .as_ref()
+                            .map(|smp| {
+                                let prev = net_prevs.entry(base.clone()).or_default();
+                                fleet_sys_frame(smp, procs, prev)
+                            })
                     });
                     (base.clone(), frame)
                 })
                 .collect()
         };
-        let draw = |results: &FleetFetch, painter: &render::Painter| -> String {
+        let draw = |results: &FleetFetch,
+                    painter: &render::Painter,
+                    net_prevs: &mut HashMap<
+            String,
+            Option<(Vec<crate::platform::NicCounters>, Instant)>,
+        >|
+         -> String {
             let mut out = String::new();
-            for (base, entry) in frames(results) {
+            for (base, entry) in frames(results, net_prevs) {
                 let Some(frame) = entry else {
                     if multi {
                         out.push_str(&format!("----- [{base}] -----\nfetch failed\n"));
@@ -987,7 +1030,7 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
                             bases.len()
                         ));
                     }
-                    write_out(&draw(&results, &painter));
+                    write_out(&draw(&results, &painter, &mut net_prevs));
                     ticks += 1;
                     if cli.times.is_some_and(|n| ticks >= n.max(1)) {
                         return;
@@ -998,12 +1041,15 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
                 }
             }
             None => {
-                // one fetch per peer: the fleet snapshot carries machine
-                // totals, not per-NIC counters, so the local one-shot's
-                // rate-diff second sweep has nothing to feed here (the
-                // dashboard's NIC section just doesn't render)
+                // NIC rates are a delta metric: two fetches a second
+                // apart arm then feed the diff, the same trick the local
+                // one-shot --sys runs (the first sweep only arms, so it
+                // goes through frames and its output is dropped)
+                let first = fetch_all();
+                frames(&first, &mut net_prevs);
+                std::thread::sleep(Duration::from_secs(1));
                 let results = fetch_all();
-                write_out(&draw(&results, &painter));
+                write_out(&draw(&results, &painter, &mut net_prevs));
                 return;
             }
         }
@@ -1302,11 +1348,39 @@ fn sys_frame(
 /// failed systemd units stay unknown (they live on the far host); the
 /// state waterlines count from the fetched table, which does carry the
 /// state letters.
-fn fleet_sys_frame(sample: &FleetSample, procs: &[Process]) -> render::SysFrame {
+fn fleet_sys_frame(
+    sample: &FleetSample,
+    procs: &[Process],
+    net_prev: &mut Option<(Vec<crate::platform::NicCounters>, Instant)>,
+) -> render::SysFrame {
+    // per-NIC rates: this sweep's cumulative counters minus the previous
+    // sweep's, over the elapsed wall time — the local sys_frame's diff,
+    // fed from the snapshot's counters instead of a local netstat
+    let mut nics: Vec<(String, f64, f64)> = Vec::new();
+    if let Some((prev, at)) = net_prev.as_ref() {
+        let elapsed = at.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            for c in &sample.nics {
+                if let Some(p) = prev.iter().find(|p| p.name == c.name) {
+                    nics.push((
+                        c.name.clone(),
+                        c.rx_bytes.saturating_sub(p.rx_bytes) as f64 / elapsed / 1024.0 / 1024.0,
+                        c.tx_bytes.saturating_sub(p.tx_bytes) as f64 / elapsed / 1024.0 / 1024.0,
+                    ));
+                }
+            }
+            nics.sort_by(|a, b| {
+                (b.1 + b.2)
+                    .partial_cmp(&(a.1 + a.2))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+    }
+    *net_prev = Some((sample.nics.clone(), Instant::now()));
     render::SysFrame {
         stats: sample.stats.clone(),
         mounts: sample.mounts.clone(),
-        nics: Vec::new(),
+        nics,
         procs: procs.len(),
         zombies: state_count(procs, &["Z"]),
         dstates: state_count(procs, &["D", "U"]),
@@ -6977,6 +7051,13 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                 mem_avail_mb: Some(2_000),
                 ..Default::default()
             },
+            nics: vec![crate::platform::NicCounters {
+                name: "eth0".into(),
+                rx_bytes: 1 << 20,
+                tx_bytes: 0,
+                rx_drops: 0,
+                tx_drops: 0,
+            }],
             net: Some((100, 200, 7)),
             mounts: vec![crate::platform::MountUsage {
                 target: "/data".into(),
@@ -6985,25 +7066,37 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             }],
         };
         let procs = vec![p(1, Some("Z")), p(2, Some("D")), p(3, Some("R"))];
-        let frame = fleet_sys_frame(&sample, &procs);
+        let mut prev = None;
+        let frame = fleet_sys_frame(&sample, &procs, &mut prev);
         assert_eq!(frame.procs, 3);
         assert_eq!(frame.zombies, 1);
         assert_eq!(frame.dstates, 1);
         assert_eq!(frame.stats.load1, Some(3.0));
         assert_eq!(frame.mounts.len(), 1);
-        // the fleet snapshot has no per-NIC counters and no reach into the
-        // far host's systemd — both sections honestly absent
+        // the first sweep only arms the NIC diff; the far host's systemd
+        // stays out of reach — that line honestly absent
         assert!(frame.nics.is_empty());
         assert!(frame.failed_units.is_empty());
+        // 2 MB arriving on eth0 over ~60 ms → a real rx rate on the next
+        // sweep
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let mut sample2 = sample.clone();
+        sample2.nics[0].rx_bytes += 2 * 1024 * 1024;
+        let frame = fleet_sys_frame(&sample2, &procs, &mut prev);
+        assert_eq!(frame.nics.len(), 1);
+        assert_eq!(frame.nics[0].0, "eth0");
+        assert!(frame.nics[0].1 > 1.0, "rx MB/s: {:?}", frame.nics);
         // a peer whose serve predates the system snapshot still renders:
         // empty stats, dashes in the text view, no panic
         let frame = fleet_sys_frame(
             &FleetSample {
                 stats: crate::platform::SystemStats::default(),
+                nics: Vec::new(),
                 net: None,
                 mounts: Vec::new(),
             },
             &[],
+            &mut None,
         );
         assert_eq!(frame.procs, 0);
         assert!(frame.stats.load1.is_none());
@@ -7173,6 +7266,11 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         assert_eq!(s.retrans_segs, Some(12345));
         assert_eq!(s.oom_kills, Some(2));
         assert_eq!(sample.net, Some((100, 200, 7))); // (rx, tx, drops folded)
+        // the per-NIC counters ride through for the fleet sys rate diff
+        assert_eq!(sample.nics.len(), 1);
+        assert_eq!(sample.nics[0].name, "eth0");
+        assert_eq!(sample.nics[0].rx_bytes, 100);
+        assert_eq!(sample.nics[0].rx_drops, 3);
         assert_eq!(sample.mounts[0].target, "/data");
         // the disk family rides through: the disk-busy sentinel reads it
         // fleet-side exactly as the local one does
@@ -7195,6 +7293,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                 load1: Some(9.0),
                 ..Default::default()
             },
+            nics: Vec::new(),
             net: None,
             mounts: Vec::new(),
         };

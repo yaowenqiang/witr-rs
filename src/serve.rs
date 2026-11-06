@@ -435,6 +435,20 @@ pub(crate) fn system_snapshot(
             })
             .collect::<Vec<_>>(),
         "net": net,
+        // per-NIC cumulative counters — a fleet --sys diffs them into
+        // rates (the totals above drive the machine sentinels; these drive
+        // the dashboard's NIC section, which the snapshot previously left
+        // starving)
+        "nics": nics
+            .iter()
+            .map(|n| serde_json::json!({
+                "name": n.name,
+                "rx_bytes": n.rx_bytes,
+                "tx_bytes": n.tx_bytes,
+                "rx_drops": n.rx_drops,
+                "tx_drops": n.tx_drops,
+            }))
+            .collect::<Vec<_>>(),
         "mounts": mounts
             .iter()
             .map(|m| serde_json::json!({
