@@ -271,6 +271,10 @@ struct TuiApp {
     /// and the in-flight background fetch (log tools take seconds)
     logs_for: Option<String>,
     logs_lines: Vec<String>,
+    /// The `-u` report's lines, when the Logs page was opened as a unit
+    /// report (Services Enter on a failed/childless unit) — rendered as a
+    /// block above the journal tail.
+    logs_report: Option<Vec<String>>,
     logs_scroll: u16,
     logs_rx: Option<std::sync::mpsc::Receiver<std::result::Result<Vec<String>, String>>>,
     /// what the Logs page was opened on — 'F' follow needs the container
@@ -984,6 +988,7 @@ impl TuiApp {
             event_sort_desc: true,
             logs_for: None,
             logs_lines: Vec::new(),
+            logs_report: None,
             logs_scroll: 0,
             logs_rx: None,
             logs_src: None,
@@ -1903,12 +1908,51 @@ impl TuiApp {
             return;
         };
         let pid = svc.pid.or_else(|| crate::platform::service_pid_of(&svc));
+        // a failed unit (or one without a visible main process) is exactly
+        // the one you'd want the report for — status line, restart count,
+        // last exit code, journal tail — so those open the Logs page with
+        // the report block riding on top. A healthy unit with a live main
+        // pid still jumps straight to the process detail page.
+        let failed = self
+            .platform
+            .unit_report(&svc.name)
+            .filter(|r| r.active_state.as_deref() == Some("failed"));
         match pid {
-            Some(pid) if self.procs.iter().any(|p| p.pid == pid) => {
+            Some(pid) if failed.is_none() && self.procs.iter().any(|p| p.pid == pid) => {
                 self.open_detail_page_for(pid);
             }
-            Some(pid) => self.status = format!("pid {pid} has exited — details unavailable"),
-            None => self.status = format!("{} is not running (no main pid)", svc.name),
+            _ => {
+                let report = failed.or_else(|| self.platform.unit_report(&svc.name));
+                let lines: Vec<String> = match &report {
+                    Some(r) => {
+                        let mut v = vec![format!(
+                            "state  {} / {} / {}",
+                            r.load_state.as_deref().unwrap_or("?"),
+                            r.active_state.as_deref().unwrap_or("?"),
+                            r.sub_state.as_deref().unwrap_or("?"),
+                        )];
+                        if let Some(n) = r.n_restarts.filter(|n| *n > 0) {
+                            v.push(format!(
+                                "restarts {n}{}",
+                                if n >= 3 { " — crash loop?" } else { "" }
+                            ));
+                        }
+                        if let Some(s) = &r.unit_file_state {
+                            v.push(format!("boot   {s}"));
+                        }
+                        if let Some(code) = &r.exit_code {
+                            let st = r.exit_status.map(|s| s.to_string()).unwrap_or_default();
+                            v.push(format!("last exit {code} {st}"));
+                        }
+                        v
+                    }
+                    None => vec!["(unit report unavailable — no systemd to ask)".into()],
+                };
+                self.open_logs(crate::logs::LogSource::SystemdUnit {
+                    unit: svc.name.clone(),
+                });
+                self.logs_report = Some(lines);
+            }
         }
     }
 
@@ -1919,6 +1963,7 @@ impl TuiApp {
         self.logs_for = Some(header);
         self.logs_src = Some(src.clone());
         self.logs_lines.clear();
+        self.logs_report = None;
         self.logs_scroll = 0;
         self.page = Page::Logs;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -6201,8 +6246,10 @@ fn ui_logs_page(app: &mut TuiApp, f: &mut Frame<'_>) {
     let outer = Block::bordered().border_style(Style::new().fg(GRAY));
     f.render_widget(&outer, f.area());
     let inner = outer.inner(f.area());
+    let report_h = app.logs_report.as_ref().map(|r| r.len() as u16).unwrap_or(0);
     let v = Layout::vertical([
         Constraint::Length(1), // header
+        Constraint::Length(report_h), // the -u report block (unit opens)
         Constraint::Length(1),
         Constraint::Min(6),    // log lines
         Constraint::Length(1), // footer
@@ -6217,13 +6264,30 @@ fn ui_logs_page(app: &mut TuiApp, f: &mut Frame<'_>) {
     ]);
     f.render_widget(Paragraph::new(header), v[0]);
 
+    // the -u report block: the Services tab's failed-unit opens ride the
+    // Logs page, report lines above the journal tail
+    if let Some(report) = &app.logs_report {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (i, l) in report.iter().enumerate() {
+            let style = if i == 0 {
+                Style::new().bold()
+            } else if l.starts_with("restarts") || l.starts_with("last exit") {
+                Style::new().fg(Color::Yellow)
+            } else {
+                Style::new()
+            };
+            lines.push(Line::from(styled(style, format!("  {l}"))));
+        }
+        f.render_widget(Paragraph::new(lines), v[1]);
+    }
+
     app.tab_rect = None;
-    app.table_rect = Some(v[2]);
-    app.detail_rect = Some(v[2]);
-    app.logs_pane_h = v[2].height;
+    app.table_rect = Some(v[3]);
+    app.detail_rect = Some(v[3]);
+    app.logs_pane_h = v[3].height;
 
     if app.logs_rx.is_some() {
-        placeholder(v[2], f, "  fetching logs… (journalctl / log show can take several seconds)");
+        placeholder(v[3], f, "  fetching logs… (journalctl / log show can take several seconds)");
     } else {
         let lines: Vec<Line<'static>> = app
             .logs_lines
@@ -9254,6 +9318,80 @@ mod tests {
         assert_eq!(app.tab, Tab::Events);
         on_key(&mut app, KeyCode::Char('6'));
         assert_eq!(app.tab, Tab::Services);
+    }
+
+    #[test]
+    fn services_enter_on_a_failed_unit_opens_the_unit_report() {
+        // a mock whose systemd reports lightdm failed: Enter on it opens
+        // the Logs page with the -u report block riding on top — the
+        // no-main-pid case the process detail page never served
+        struct FailedUnitPlatform;
+        impl crate::platform::Platform for FailedUnitPlatform {
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            fn capabilities(&self) -> crate::platform::Capabilities {
+                crate::platform::Capabilities { file_lookup: false, env: false }
+            }
+            fn list_processes(&self) -> crate::platform::PlatResult<Vec<crate::model::Process>> {
+                Ok(Vec::new())
+            }
+            fn detail(&self, brief: &crate::model::Process, _want_env: bool) -> crate::model::Process {
+                brief.clone()
+            }
+            fn port_to_sockets(&self, _port: u16) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn list_sockets(&self) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn file_to_pids(&self, _path: &str) -> crate::platform::PlatResult<Vec<i32>> {
+                Ok(Vec::new())
+            }
+            fn container_of(&self, _pid: i32) -> Option<crate::model::Source> {
+                None
+            }
+            fn service_source(&self, _procs: &[crate::model::Process]) -> Option<crate::model::Source> {
+                None
+            }
+            fn unit_report(&self, unit: &str) -> Option<crate::platform::UnitReport> {
+                Some(crate::platform::UnitReport {
+                    unit: unit.to_string(),
+                    load_state: Some("loaded".into()),
+                    active_state: Some("failed".into()),
+                    sub_state: Some("exit".into()),
+                    n_restarts: Some(5),
+                    unit_file_state: Some("enabled".into()),
+                    exit_status: Some(1),
+                    exit_code: Some("exited".into()),
+                    ..Default::default()
+                })
+            }
+        }
+        let mut app = TuiApp::new(Box::new(FailedUnitPlatform), Seed::default());
+        app.tab = Tab::Services;
+        app.service_view = vec![0];
+        app.services = vec![crate::model::Service {
+            manager: "systemd".into(),
+            name: "lightdm.service".into(),
+            state: "failed".into(),
+            desc: "Light Display Manager".into(),
+            pid: None,
+        }];
+        app.table_state.select(Some(0));
+        app.open_service_detail();
+        assert_eq!(app.page, Page::Logs, "the failed unit opens the report page");
+        let report = app.logs_report.as_ref().expect("report block set");
+        assert!(report[0].contains("loaded / failed / exit"), "{report:?}");
+        assert!(report.iter().any(|l| l.contains("restarts 5 — crash loop?")));
+        assert!(report.iter().any(|l| l.contains("last exit exited 1")));
+        // the journal slice follows the unit, not a pid
+        match &app.logs_src {
+            Some(crate::logs::LogSource::SystemdUnit { unit }) => {
+                assert_eq!(unit, "lightdm.service");
+            }
+            other => panic!("expected the unit journal source: {other:?}"),
+        }
     }
 
     #[test]

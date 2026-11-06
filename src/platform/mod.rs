@@ -508,10 +508,7 @@ pub fn parse_unit_report(unit: &str, text: &str) -> UnitReport {
     r
 }
 
-/// The `-u UNIT` report's data: one `systemctl show` sweep. None where
-/// there is no systemd to ask (other platforms, systemctl missing, not
-/// booted with systemd) or the unit doesn't exist.
-pub fn unit_report(unit: &str) -> Option<UnitReport> {
+fn systemd_unit_report(unit: &str) -> Option<UnitReport> {
     #[cfg(target_os = "linux")]
     {
         // unconditional on purpose — "run systemctl + parse the rows" is
@@ -883,6 +880,15 @@ pub trait Platform {
     /// by watchers that arm the sentinel, /metrics scrapes and the
     /// machine dashboards.
     fn failed_units(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// One systemd unit's report — the `-u UNIT` one-shot's data and the
+    /// Services tab's Enter-on-a-failed-unit view. `None` where there is
+    /// no systemd to ask (other platforms, systemctl missing, not booted
+    /// with systemd) or the unit doesn't exist.
+    fn unit_report(&self, unit: &str) -> Option<UnitReport> {
+        let _ = unit;
         None
     }
 

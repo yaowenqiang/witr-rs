@@ -110,7 +110,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **文件锁总览（`--locks`）**：不进界面，直接打印全系统文件锁——列 PID / OWNER / MODE / TYPE / PATH（按 pid 再按路径排序，属主灰显）。TUI Locks 页的 CLI 孪生：`--json` 出版本化信封（`lock_count` + `locks`），`--csv` / `--markdown` 同样支持。数据源与 Locks 页同一套（Linux `/proc/locks`、macOS `lsof` 锁标志）——"谁攥着这个文件不放"脚本里也能问。
 
-**systemd 单元报告（`-u UNIT` / `--unit`）**：`witr-rs -u nginx.service` 一条命令回答"这个单元现在什么状态、为什么挂过"——状态行（Load / Active / Sub 三段）、描述、主 pid（附 trace 提示）、重启计数（≥3 标注 "crash loop?"）、开机自启与否、**上次退出的码/信号**（失败单元欠你的"死因"），`--logs N` 附 journal 尾巴（`journalctl -u` 的单元切片，`--grep` 过滤）；`--json` 出版本化信封。退出码走巡检探针惯例：failed 为 1、干净为 0、单元不存在（或没有 systemd 可问）为 2——`witr-rs -u nginx.service || alert` 直接进巡检。systemd 单元名因发行版而异（ssh vs sshd），不存在即报 not-found 而不是猜。与 `--alert-failed-units` 哨兵成对：哨兵喊名字，`-u` 回答为什么。
+**systemd 单元报告（`-u UNIT` / `--unit`）**：`witr-rs -u nginx.service` 一条命令回答"这个单元现在什么状态、为什么挂过"——状态行（Load / Active / Sub 三段）、描述、主 pid（附 trace 提示）、重启计数（≥3 标注 "crash loop?"）、开机自启与否、**上次退出的码/信号**（失败单元欠你的"死因"），`--logs N` 附 journal 尾巴（`journalctl -u` 的单元切片，`--grep` 过滤）；`--json` 出版本化信封。退出码走巡检探针惯例：failed 为 1、干净为 0、单元不存在（或没有 systemd 可问）为 2——`witr-rs -u nginx.service || alert` 直接进巡检。systemd 单元名因发行版而异（ssh vs sshd），不存在即报 not-found 而不是猜。与 `--alert-failed-units` 哨兵成对：哨兵喊名字，`-u` 回答为什么。TUI 的 Services 页同款闭环：Enter 选中单元——健康且有主进程的照旧直跳进程详情页，**失败单元（或无主进程的单元）打开单元报告页**：报告块（状态 / 重启 / 退出码）叠在 journal 尾巴上方，`l` 照常接 journalctl -f 实时跟随、`r` 重抓。
 
 **僵尸进程速查（`--zombies`）**：`witr-rs --zombies` 列出全表 `<defunct>` 僵尸——列 PID / NAME / PARENT（父进程名，已退出则 `(gone)`）/ AGE（最老优先）——僵尸本身不耗资源，但成片的僵尸是父进程没 `wait()` 的信号。`--json` 出版本化信封（`zombie_count` + `zombies`），`--csv` / `--markdown` 同样支持；**发现僵尸时退出码 1**，无僵尸 0——`witr-rs --zombies || alert` 直接当巡检探针。
 

@@ -1417,6 +1417,13 @@ impl Platform for Linux {
         super::systemd_failed_units()
     }
 
+    /// One unit's report — the super helper runs one `systemctl show`
+    /// sweep and returns None where there's no systemd or the unit is
+    /// missing.
+    fn unit_report(&self, unit: &str) -> Option<super::UnitReport> {
+        super::systemd_unit_report(unit)
+    }
+
     /// The OOM killer's victims, from `journalctl -k` over the trailing
     /// window — the classic kernel line names pid and binary. Unreadable
     /// (no journalctl, no privilege) means `None` and the alert stays

@@ -4963,7 +4963,7 @@ fn main() {
     // unit's journal tail. Exit mirrors the patrol probes: 0 clean,
     // 1 failed, 2 missing.
     if let Some(unit) = &cli.unit {
-        let Some(r) = platform::unit_report(unit) else {
+        let Some(r) = platform::get().unit_report(unit) else {
             if cli.json {
                 let doc = serde_json::json!({
                     "schema_version": SCHEMA_VERSION,
