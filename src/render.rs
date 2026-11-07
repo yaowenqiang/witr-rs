@@ -1210,13 +1210,32 @@ pub fn render_csv(procs: &[Process]) -> String {
 /// pasting into an issue.
 pub fn render_markdown(procs: &[Process]) -> String {
     let now = crate::util::now_unix();
-    let mut out = String::from("| PID | PPID | USER | CPU% | RSS MB | STATE | AGE | NAME | COMMAND |\n");
-    out.push_str("|---:|---:|---|---:|---:|---|---|---|---|\n");
+    // fleet rows open with HOST, mirroring the CSV twin
+    let fleet = procs.iter().any(|p| p.host.is_some());
+    let mut out = String::from(if fleet {
+        "| HOST | PID | PPID | USER | CPU% | RSS MB | STATE | AGE | NAME | COMMAND |\n"
+    } else {
+        "| PID | PPID | USER | CPU% | RSS MB | STATE | AGE | NAME | COMMAND |\n"
+    });
+    out.push_str(if fleet {
+        "|---|---:|---:|---|---:|---:|---|---|---|---|\n"
+    } else {
+        "|---:|---:|---|---:|---:|---|---|---|---|\n"
+    });
     for p in procs {
         let r = listing_row(p, now);
         let dash = "-".to_string();
+        let host_cell = if fleet {
+            format!(
+                "| {} ",
+                p.host.as_deref().unwrap_or("").replace('|', "\\|")
+            )
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "{}| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            host_cell,
             r.pid,
             r.ppid.map(|x| x.to_string()).unwrap_or_else(|| dash.clone()),
             r.user,
@@ -3597,6 +3616,22 @@ mod tests {
             &p,
         );
         assert!(!out.contains("HOST"), "{out}");
+    }
+
+    #[test]
+    fn render_markdown_opens_with_host_on_fleet_rows() {
+        let mk = |pid: i32, host: Option<&str>| Process {
+            pid,
+            name: format!("p{pid}"),
+            host: host.map(|h| h.into()),
+            ..Default::default()
+        };
+        let fleet = vec![mk(1, Some("a")), mk(2, None)];
+        let md = render_markdown(&fleet);
+        assert!(md.starts_with("| HOST | PID |"), "{md}");
+        assert!(md.contains("| a | 1 |"), "{md}");
+        // local rows keep the classic header
+        assert!(render_markdown(&[mk(1, None)]).starts_with("| PID | PPID | USER |"));
     }
 
     #[test]

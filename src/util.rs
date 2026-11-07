@@ -246,6 +246,17 @@ fn split_userinfo(url: &str) -> (Option<String>, String) {
     (Some(token), format!("http://{host_path}"))
 }
 
+/// The URL's displayable host — scheme and any userinfo stripped
+/// (`http://sekret@10.0.0.7:9100/` → `10.0.0.7:9100`). The fleet rows'
+/// host label rides every CSV/JSON/markdown line, so it must never carry
+/// the bearer token.
+pub fn display_host(url: &str) -> String {
+    let (_, u) = split_userinfo(url);
+    u.trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
+}
+
 /// uid → username resolver with a lookup cache (including negative
 /// results): macOS system users are absent from /etc/passwd, so every uid
 /// costs one `id -un` process unless cached.
@@ -542,6 +553,21 @@ mod tests {
         let (p, deleted) = strip_deleted_suffix("/usr/bin/foo");
         assert_eq!(p, "/usr/bin/foo");
         assert!(!deleted);
+    }
+
+    #[test]
+    fn display_host_strips_scheme_and_token() {
+        assert_eq!(
+            display_host("http://sekret@10.0.0.7:9100"),
+            "10.0.0.7:9100"
+        );
+        assert_eq!(
+            display_host("http://sekret@10.0.0.7:9100/"),
+            "10.0.0.7:9100"
+        );
+        assert_eq!(display_host("http://host:9100"), "host:9100");
+        // the token must never survive into a display label
+        assert!(!display_host("http://sekret@host/").contains("sekret"));
     }
 
     #[test]

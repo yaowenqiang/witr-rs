@@ -864,9 +864,10 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
             .map(|b| {
                 let mut r = (b.clone(), fetch(b));
                 if multi {
+                    let label = crate::util::display_host(b);
                     if let Ok((ps, _)) = &mut r.1 {
                         for p in ps.iter_mut() {
-                            p.host = Some(b.clone());
+                            p.host = Some(label.clone());
                         }
                     }
                 }
@@ -903,6 +904,18 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
                 if let Ok((ps, _)) = result {
                     procs.extend(ps.iter().cloned());
                 }
+            }
+            // the machine-readable formats draw the exact board as rows:
+            // json keeps the versioned envelope (host rides every row),
+            // csv/markdown mirror the local twins' shapes
+            if cli.json {
+                return json_envelope(&fleet_ranked(&procs, metric, count));
+            }
+            if cli.csv {
+                return render::render_csv(&fleet_ranked(&procs, metric, count));
+            }
+            if cli.markdown {
+                return render::render_markdown(&fleet_ranked(&procs, metric, count));
             }
             render::render_top(&procs, metric, count, None, None, None, &painter)
         };
@@ -1856,6 +1869,38 @@ fn container_check_sweep() -> Vec<crate::model::Container> {
         }
     }
     cs
+}
+
+/// The ranked slice behind a fleet top board — the ordering render_top
+/// draws (value desc, host-then-pid ties), as owned rows so the
+/// machine-readable formats can print the exact board. Table-carried
+/// metrics only: the fleet fetch has no fd/conn/io probes.
+fn fleet_ranked(procs: &[Process], metric: cli::TopMetric, count: usize) -> Vec<Process> {
+    let now = util::now_unix();
+    let mut ranked: Vec<(f64, &Process)> = procs
+        .iter()
+        .filter_map(|pr| {
+            let v = match metric {
+                cli::TopMetric::Cpu => pr.cpu,
+                cli::TopMetric::Mem => pr.mem_kb.map(|kb| kb as f64),
+                cli::TopMetric::Age => {
+                    pr.started.map(|t| (now.saturating_sub(t)) as f64)
+                }
+                cli::TopMetric::Threads => pr.threads.map(|n| n as f64),
+                cli::TopMetric::Swap => pr.swap_kb.map(|kb| kb as f64),
+                _ => None,
+            }?;
+            Some((v, pr))
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.host.cmp(&b.1.host))
+            .then_with(|| a.1.pid.cmp(&b.1.pid))
+    });
+    ranked.truncate(count);
+    ranked.into_iter().map(|(_, p)| p.clone()).collect()
 }
 
 /// Count processes in the given single-letter kernel states — the
@@ -7136,6 +7181,36 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         // unarmed → no-op even over blazing containers
         let bare = cli::Cli::parse_from(["witr", "--check", "--alert-load", "4"]);
         assert!(container_check_lines(&bare, &cs).is_empty());
+    }
+
+    #[test]
+    fn fleet_ranked_orders_value_desc_with_host_ties_and_truncates() {
+        let p = |pid: i32, host: Option<&str>, cpu: Option<f64>| Process {
+            pid,
+            name: format!("p{pid}"),
+            host: host.map(|h| h.into()),
+            cpu,
+            ..Default::default()
+        };
+        let procs = vec![
+            p(1, Some("hostB"), Some(30.0)),
+            p(2, Some("hostA"), Some(30.0)),
+            p(3, Some("hostA"), Some(90.0)),
+            p(4, None, Some(5.0)),
+            p(5, Some("hostA"), None), // unmeasurable: drops out
+        ];
+        let ranked = fleet_ranked(&procs, cli::TopMetric::Cpu, 3);
+        let keys: Vec<String> = ranked
+            .iter()
+            .map(|r| format!("{}:{}/{}", r.cpu.unwrap_or(0.0), r.host.as_deref().unwrap_or("-"), r.pid))
+            .collect();
+        // value desc first; the 30/30 tie reads hostA pid2 before hostB pid1;
+        // count truncates to 3; the cpu-less row never ranks
+        assert_eq!(
+            keys,
+            vec!["90:hostA/3", "30:hostA/2", "30:hostB/1"],
+            "{keys:?}"
+        );
     }
 
     #[test]
