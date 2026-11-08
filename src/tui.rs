@@ -421,6 +421,10 @@ struct TuiApp {
     alert_disk_eta: Option<f64>,
     /// --alert-mem-eta: predicted time-to-empty horizon (hours)
     alert_mem_eta: Option<f64>,
+    /// --alert-inodes: mount inode usage threshold
+    alert_inodes: Option<u64>,
+    /// --alert-leak: per-process RSS growth threshold (MB)
+    alert_leak: Option<f64>,
     /// --alert-disk-busy: any-device %util threshold
     alert_disk_busy: Option<f64>,
     /// --alert-temp: hottest-sensor celsius threshold
@@ -661,6 +665,10 @@ pub struct Seed {
     pub alert_disk_eta: Option<f64>,
     /// --alert-mem-eta: predicted time-to-empty horizon (hours)
     pub alert_mem_eta: Option<f64>,
+    /// --alert-inodes: mount inode usage threshold
+    pub alert_inodes: Option<u64>,
+    /// --alert-leak: per-process RSS growth threshold (MB)
+    pub alert_leak: Option<f64>,
     /// --alert-disk-busy: any-device %util threshold
     pub alert_disk_busy: Option<f64>,
     /// --alert-temp: hottest-sensor celsius threshold
@@ -780,6 +788,8 @@ impl Seed {
         self.alert_disk = cli.alert_disk;
         self.alert_disk_eta = cli.alert_disk_eta;
         self.alert_mem_eta = cli.alert_mem_eta;
+        self.alert_inodes = cli.alert_inodes;
+        self.alert_leak = cli.alert_leak;
         self.alert_disk_busy = cli.alert_disk_busy;
         self.alert_temp = cli.alert_temp;
         self.alert_zombies = cli.alert_zombies;
@@ -932,6 +942,8 @@ impl TuiApp {
             alert_disk: seed.alert_disk,
             alert_disk_eta: seed.alert_disk_eta,
             alert_mem_eta: seed.alert_mem_eta,
+            alert_inodes: seed.alert_inodes,
+            alert_leak: seed.alert_leak,
             alert_disk_busy: seed.alert_disk_busy,
             alert_temp: seed.alert_temp,
             alert_zombies: seed.alert_zombies,
@@ -1230,6 +1242,8 @@ impl TuiApp {
         self.alert_disk = seed.alert_disk;
         self.alert_disk_eta = seed.alert_disk_eta;
         self.alert_mem_eta = seed.alert_mem_eta;
+        self.alert_inodes = seed.alert_inodes;
+        self.alert_leak = seed.alert_leak;
         self.alert_disk_busy = seed.alert_disk_busy;
         self.alert_temp = seed.alert_temp;
         self.alert_zombies = seed.alert_zombies;
@@ -1414,6 +1428,8 @@ impl TuiApp {
                     || self.alert_disk.is_some()
                     || self.alert_disk_eta.is_some()
                     || self.alert_mem_eta.is_some()
+                    || self.alert_inodes.is_some()
+                    || self.alert_leak.is_some()
                     || self.alert_disk_busy.is_some()
                     || self.alert_temp.is_some()
                     || self.alert_zombies.is_some()
@@ -1433,7 +1449,10 @@ impl TuiApp {
                 // watched)
                 if let Some(stats) = self.platform.system_stats() {
                     let interval = self.refresh.max(Duration::from_secs(1)).as_secs();
-                    let mounts = if self.alert_disk.is_some() || self.alert_disk_eta.is_some() {
+                    let mounts = if self.alert_disk.is_some()
+                        || self.alert_disk_eta.is_some()
+                        || self.alert_inodes.is_some()
+                    {
                         self.platform.mount_usage()
                     } else {
                         Vec::new()
@@ -1497,6 +1516,7 @@ impl TuiApp {
                         oom_kills: stats.oom_kills,
                         disk_eta_hours: self.alert_disk_eta,
                         mem_eta_hours: self.alert_mem_eta,
+                        inodes_limit: self.alert_inodes,
                         disk_busy_limit: self.alert_disk_busy,
                         temp_limit: self.alert_temp,
                         zombie_limit: self.alert_zombies,
@@ -1533,6 +1553,19 @@ impl TuiApp {
                             .into_iter()
                             .map(|(name, detail, rec)| (0, name, detail, rec)),
                     );
+                }
+                // the leak sentinel over the sampler's RSS window — the
+                // detail-page hint's own detector, threshold from the flag
+                if self.alert_leak.is_some() {
+                    let interval = self.refresh.max(Duration::from_secs(1)).as_secs();
+                    picks.extend(crate::history::leak_alert_picks(
+                        &self.hist,
+                        &self.procs,
+                        self.alert_leak.unwrap_or(20.0),
+                        interval as f64,
+                        interval,
+                        &mut self.sys_alert,
+                    ));
                 }
             }
             for (pid, name, detail, recovery) in picks.into_iter().chain(self.pending_alerts.drain(..)) {
@@ -10757,6 +10790,8 @@ mod tests {
                 alert_disk: None,
                 alert_disk_eta: None,
                 alert_mem_eta: None,
+                alert_inodes: None,
+                alert_leak: None,
                 alert_disk_busy: None,
                 alert_temp: None,
                 alert_zombies: None,

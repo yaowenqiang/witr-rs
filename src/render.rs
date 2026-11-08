@@ -2013,7 +2013,10 @@ pub fn grafana_dashboard() -> serde_json::Value {
         0, 61, 16, 8,
         "percent",
         Some(100.0),
-        &[("{{mount}}", "witr_machine_fs_used_percent")],
+        &[
+            ("{{mount}} space", "witr_machine_fs_used_percent"),
+            ("{{mount}} inodes", "witr_machine_fs_inode_used_percent"),
+        ],
     );
     add(
         "Temperature",
@@ -2250,6 +2253,14 @@ pub fn alert_rules_yaml() -> String {
             "warning",
             "Memory predicted to exhaust",
             "MemAvailable is predicted to run out in {{ $value }}h at the current drain rate — the trend behind --alert-mem-eta, the OOM omen before the floor breaks.",
+        ),
+        (
+            "WitrInodesExhausted",
+            "witr_machine_fs_inode_used_percent > 90",
+            "10m",
+            "warning",
+            "Inode table nearly full",
+            "{{ $labels.mount }} has over 90% of its inode table used for 10m — the flood-of-tiny-files failure; writes start failing while df still looks comfortable.",
         ),
     ];
     let mut out = String::from(
@@ -3720,6 +3731,8 @@ mod tests {
                 target: "/".into(),
                 total_mb: 51_200,
                 used_mb: 50_000,
+                inodes_used: Some(460_000),
+                inodes_total: Some(512_000),
             }],
             nics: vec![("eth0".into(), 12.5, 1.25), ("eth1".into(), 0.0, 0.0)],
             procs: 214,
@@ -3870,6 +3883,7 @@ mod tests {
             "witr_machine_oom_kills_total",
             "witr_machine_dstate_count",
             "witr_machine_failed_units",
+            "witr_machine_fs_inode_used_percent",
             "witr_container_cpu_percent",
             "witr_container_mem_total_bytes",
             "witr_machine_disk_eta_hours",
@@ -3924,6 +3938,7 @@ mod tests {
             "witr_machine_disk_busy_percent",
             "witr_machine_disk_iops",
             "witr_machine_fs_used_percent",
+            "witr_machine_fs_inode_used_percent",
             "witr_machine_temp_celsius",
         ] {
             assert!(

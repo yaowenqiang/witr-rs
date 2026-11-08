@@ -673,7 +673,41 @@ pub(crate) fn parse_df(out: &str) -> Vec<MountUsage> {
             target,
             total_mb: total_kb / 1024,
             used_mb: used_kb / 1024,
+            ..Default::default()
         });
+    }
+    out_rows
+}
+
+/// Parse POSIX `df -P -i -k` output → (mount point, inodes used, inodes
+/// total). Same shape as parse_df's rows — filesystem, two counts, a
+/// percent (GNU "IUse%" / BSD "%Used"), the mount point — so position
+/// parsing covers both. Inode columns ride `df -P` only when `-i` asks
+/// for them, hence the second sweep.
+#[cfg(any(unix, test))]
+pub(crate) fn parse_df_inodes(out: &str) -> Vec<(String, u64, u64)> {
+    let mut out_rows: Vec<(String, u64, u64)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in out.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // "Filesystem Inodes IUsed IFree IUse% Mounted on..."
+        if fields.len() < 6 {
+            continue;
+        }
+        if !fields[0].starts_with("/dev/") {
+            continue;
+        }
+        let Ok(total) = fields[1].parse::<u64>() else {
+            continue;
+        };
+        let Ok(used) = fields[2].parse::<u64>() else {
+            continue;
+        };
+        let target = fields[5].to_string();
+        if total == 0 || !seen.insert(target.clone()) {
+            continue;
+        }
+        out_rows.push((target, used, total));
     }
     out_rows
 }
@@ -786,6 +820,13 @@ pub struct MountUsage {
     pub target: String,
     pub total_mb: u64,
     pub used_mb: u64,
+    /// Inode table totals, when the platform sweeps them (a second
+    /// `df -Pi` pass on unix; None elsewhere — Windows NTFS keeps no
+    /// POSIX inode stats). The --alert-inodes sentinel and the
+    /// witr_machine_fs_inode_used_percent gauge read them; the classic
+    /// space sentinels ignore them.
+    pub inodes_total: Option<u64>,
+    pub inodes_used: Option<u64>,
 }
 
 /// Cumulative per-interface byte counters (read from boot / driver load).
@@ -844,7 +885,27 @@ pub trait Platform {
         {
             let out = crate::util::run_ok("df", &["-P", "-k"], std::time::Duration::from_secs(5))
                 .unwrap_or_default();
-            parse_df(&out)
+            let mut mounts = parse_df(&out);
+            // the inode sweep rides along (one extra df spawn): the
+            // --alert-inodes sentinel and the eta gauges read it; mounts
+            // the inode pass didn't see (network/pseudo rows already
+            // dropped above) keep None
+            let inodes = crate::util::run_ok(
+                "df",
+                &["-P", "-i", "-k"],
+                std::time::Duration::from_secs(5),
+            )
+            .map(|out| parse_df_inodes(&out))
+            .unwrap_or_default();
+            for m in mounts.iter_mut() {
+                if let Some((_, used, total)) =
+                    inodes.iter().find(|(t, _, _)| *t == m.target)
+                {
+                    m.inodes_used = Some(*used);
+                    m.inodes_total = Some(*total);
+                }
+            }
+            mounts
         }
         #[cfg(not(unix))]
         {
@@ -1156,6 +1217,23 @@ UnknownKeyFromAFutureSystemd=whatever
         );
         assert_eq!(r.main_pid, Some(4242));
         assert_eq!(r.exit_status, None);
+    }
+
+    #[test]
+    fn parse_df_inodes_reads_both_headers() {
+        // GNU df -P -i -k
+        let gnu = "Filesystem Inodes IUsed IFree IUse% Mounted on\n/dev/vda1 3276800 3072000 204800 94% /\n/dev/vdb 1000000 900000 100000 90% /data\ntmpfs 100000 5 99995 1% /tmp\n";
+        let rows = parse_df_inodes(gnu);
+        assert_eq!(
+            rows,
+            vec![("/".to_string(), 3_072_000, 3_276_800), ("/data".to_string(), 900_000, 1_000_000)]
+        );
+        // BSD df (macOS) names the percent column differently — positions
+        // decide, not headers
+        let bsd = "Filesystem Inodes IUsed IFree %Used Mounted on\n/dev/disk1s1 100 50 50 50% /\n";
+        assert_eq!(parse_df_inodes(bsd), vec![("/".to_string(), 50, 100)]);
+        // zero-total rows drop (btrfs parity rows and the like)
+        assert!(parse_df_inodes("Filesystem Inodes IUsed IFree IUse% Mounted on\n/dev/zero 0 0 0 0% /\n").is_empty());
     }
 
     #[test]

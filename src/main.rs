@@ -662,6 +662,7 @@ fn parse_system_snapshot(doc: &serde_json::Value) -> Option<FleetSample> {
                         target: m.get("target")?.as_str()?.to_string(),
                         total_mb: m.get("total_mb")?.as_u64()?,
                         used_mb: m.get("used_mb")?.as_u64()?,
+                        ..Default::default()
                     })
                 })
                 .collect()
@@ -833,6 +834,7 @@ fn fleet_alert_picks(
         oom_kills: sample.stats.oom_kills,
         disk_eta_hours: cli.alert_disk_eta,
         mem_eta_hours: cli.alert_mem_eta,
+        inodes_limit: cli.alert_inodes,
         disk_busy_limit: cli.alert_disk_busy,
         temp_limit: cli.alert_temp,
         zombie_limit: cli.alert_zombies,
@@ -1497,6 +1499,9 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         || cli.alert_mem_pct.is_some()
         || cli.alert_count.is_some()
         || cli.alert_disk.is_some()
+        || cli.alert_disk_eta.is_some()
+        || cli.alert_mem_eta.is_some()
+        || cli.alert_inodes.is_some()
         || cli.alert_net.is_some()
         || cli.alert_psi.is_some()
         || cli.alert_mem_avail_mb.is_some()
@@ -1958,6 +1963,23 @@ fn machine_check_lines(
     if let Some(limit) = cli.alert_count {
         if proc_count > limit as usize {
             out.push(format!("{proc_count} visible processes above {limit}"));
+        }
+    }
+    if let Some(limit) = cli.alert_inodes {
+        let mut over: Vec<String> = mounts
+            .iter()
+            .filter_map(|m| {
+                let (used, total) = (m.inodes_used?, m.inodes_total?);
+                (total > 0 && used * 100 / total > limit)
+                    .then(|| format!("{} {}%", m.target, used * 100 / total))
+            })
+            .collect();
+        over.sort();
+        if !over.is_empty() {
+            out.push(format!(
+                "inodes {} above {limit}% used",
+                over.join(", ")
+            ));
         }
     }
     if cli.alert_disk.is_some() {
@@ -5669,6 +5691,18 @@ fn main() {
                     &mut fd_counts,
                     &mut conn_counts,
                 );
+                // the leak sentinel rides the sampler's RSS window — its
+                // verdicts feed the same picks pipeline as every alert
+                if cli.alert_leak.is_some() {
+                    picks.extend(history::leak_alert_picks(
+                        &hist,
+                        &procs,
+                        cli.alert_leak.unwrap_or(20.0),
+                        interval as f64,
+                        interval,
+                        &mut sys_alert,
+                    ));
+                }
                 if !alert_ports.is_empty() {
                     let socks = platform.list_sockets().unwrap_or_default();
                     picks.extend(port_alert_picks(
@@ -5715,6 +5749,7 @@ fn main() {
                     || cli.alert_zombies.is_some()
                     || cli.alert_dstate.is_some()
                     || cli.alert_failed_units.is_some()
+                    || cli.alert_leak.is_some()
                 {
                     if let Some(stats) = platform.system_stats() {
                         let mounts = if cli.alert_disk.is_some() || cli.alert_disk_eta.is_some() {
@@ -5778,6 +5813,7 @@ fn main() {
                             oom_kills: stats.oom_kills,
                             disk_eta_hours: cli.alert_disk_eta,
                             mem_eta_hours: cli.alert_mem_eta,
+                            inodes_limit: cli.alert_inodes,
                             disk_busy_limit: cli.alert_disk_busy,
                             temp_limit: cli.alert_temp,
                             zombie_limit: cli.alert_zombies,
@@ -7046,6 +7082,8 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             "3",
             "--alert-failed-units",
             "1",
+            "--alert-inodes",
+            "85",
         ]);
         let stats = crate::platform::SystemStats {
             temp: Some(("acpitz".into(), 85.0)),
@@ -7064,6 +7102,13 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             ],
             ..Default::default()
         };
+        let mounts = vec![crate::platform::MountUsage {
+            target: "/data".into(),
+            total_mb: 10_000,
+            used_mb: 6_000,
+            inodes_used: Some(900_000),
+            inodes_total: Some(1_000_000),
+        }];
         let failed = vec![
             "ipmi.service".to_string(),
             "lightdm.service".to_string(),
@@ -7072,7 +7117,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         let lines = machine_check_lines(
             &cli,
             &stats,
-            &[],
+            &mounts,
             0,
             7,
             4,
@@ -7082,7 +7127,13 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             None,
             None,
         );
-        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("inodes /data 90% above 85%")),
+            "{lines:?}"
+        );
         assert!(
             lines.iter().any(|l| l.contains(
                 "3 systemd units failed above 1 — ipmi.service, lightdm.service, plymouth-quit.service"
@@ -7115,6 +7166,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             machine_check_lines(&cli, &quiet, &[], 0, 0, 0, &[], None, None, None, None)
                 .is_empty()
         );
+
     }
 
     #[test]
@@ -7239,6 +7291,8 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                 target: "/data".into(),
                 total_mb: 10_000,
                 used_mb: 6_000,
+                inodes_used: Some(900_000),
+                inodes_total: Some(1_000_000),
             }],
         };
         let procs = vec![p(1, Some("Z")), p(2, Some("D")), p(3, Some("R"))];
@@ -7428,6 +7482,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             target: "/data".into(),
             total_mb: 10_000,
             used_mb: 6_000,
+            ..Default::default()
         }];
         let doc = serde_json::json!({
             "schema_version": SCHEMA_VERSION,

@@ -525,6 +525,13 @@ pub struct SysAlertState {
     pub mem_eta_streak: u32,
     pub mem_eta_firing: bool,
     pub mem_eta_fired_secs: u32,
+    pub inodes_streak: u32,
+    pub inodes_firing: bool,
+    pub inodes_fired_secs: u32,
+    /// Per-process leak-sentinel state (the --alert-leak machinery): pid →
+    /// its own streak/latch. Process exits drop the entry; a returning
+    /// process re-arms from zero.
+    pub leak_seen: std::collections::HashMap<Pid, (u32, bool, u32)>,
     pub disk_busy_streak: u32,
     pub disk_busy_firing: bool,
     pub disk_busy_fired_secs: u32,
@@ -604,6 +611,11 @@ pub struct SysAlertLimits {
     /// of "the floor already broke". Needs the same trailing history the
     /// disk one accrues, so it's --watch/fleet territory, not --check.
     pub mem_eta_hours: Option<f64>,
+    /// --alert-inodes: fire when any mount's inode usage exceeds this
+    /// percent — the flood-of-tiny-files failure the space sentinels
+    /// can't see. `mounts` is the input (the df -Pi sweep fills the inode
+    /// fields); mounts reporting no inode stats sit out.
+    pub inodes_limit: Option<u64>,
     /// --alert-disk-busy: fire when any block device spends over this
     /// share of the refresh interval with IO in flight (the iostat %util
     /// twin). Answers "which disk is the bottleneck" — a question neither
@@ -864,6 +876,55 @@ pub fn mem_eta_picks(
     }
     let hist: std::vec::Vec<(f64, u64)> = state.mem_eta_hist.iter().copied().collect();
     disk_eta_of(&hist).filter(|(eta, _)| *eta < eta_limit)
+}
+
+/// The --alert-leak sentinel's tick: run the leak detector (the detail
+/// page's own machinery, parameterized threshold) across the live table
+/// and fold the edges through the per-process "5 samples + latch" state.
+/// Fires name the process and the growth; a process whose RSS curve
+/// flattens recovers; a process that exits drops its state (the exited
+/// event already told that story). `sample_secs` phrases the elapsed
+/// window; `interval_secs` is the alert cadence.
+pub fn leak_alert_picks(
+    hist: &History,
+    procs: &[crate::model::Process],
+    min_mb: f64,
+    sample_secs: f64,
+    interval_secs: u64,
+    state: &mut SysAlertState,
+) -> Vec<(crate::model::Pid, String, String, bool)> {
+    let mut out = Vec::new();
+    for p in procs {
+        if p.mem_kb.is_none() {
+            continue;
+        }
+        let seen = state.leak_seen.entry(p.pid).or_default();
+        let over = hist.leak_suspicion_at(p.pid, sample_secs, min_mb);
+        let edge = alert_cycle_repeat(
+            &mut seen.0,
+            &mut seen.1,
+            over.is_some(),
+            &mut seen.2,
+            None,
+            interval_secs,
+        );
+        let who = format!("{} (pid {})", p.name, p.pid);
+        match edge {
+            AlertEdge::Fire => {
+                let (_, msg) = over.unwrap_or((0.0, String::new()));
+                out.push((p.pid, who, format!("{msg} (threshold {min_mb:.0} MB)"), false));
+            }
+            AlertEdge::Recover => {
+                out.push((p.pid, who, "RSS growth flattened — leak suspicion cleared".into(), true));
+            }
+            AlertEdge::None => {}
+        }
+    }
+    // processes that left the table drop their state (a returning pid
+    // re-arms from zero)
+    let live: std::collections::HashSet<Pid> = procs.iter().map(|p| p.pid).collect();
+    state.leak_seen.retain(|pid, _| live.contains(pid));
+    out
 }
 
 /// One machine-wide alert edge: `(name, detail, is_recovery)` — name is
@@ -1166,6 +1227,7 @@ pub fn system_alert_picks(
         oom_kills: oom_kills_opt,
         disk_eta_hours,
         mem_eta_hours,
+        inodes_limit,
         disk_busy_limit,
         temp_limit,
         zombie_limit,
@@ -1194,6 +1256,7 @@ pub fn system_alert_picks(
     let oom_kills = *oom_kills_opt;
     let disk_eta_limit = *disk_eta_hours;
     let mem_eta_limit = *mem_eta_hours;
+    let inodes_limit = *inodes_limit;
     let disk_busy_limit = *disk_busy_limit;
     let temp_limit = *temp_limit;
     let zombie_limit = *zombie_limit;
@@ -1409,6 +1472,47 @@ pub fn system_alert_picks(
             out.push((
                 "system".to_string(),
                 format!("memory trend no longer heading under {eta_limit:.1}h"),
+                true,
+            ));
+        }
+    }
+    if let Some(limit) = inodes_limit {
+        let over: Vec<(&str, u64)> = mounts
+            .iter()
+            .filter_map(|m| {
+                let (used, total) = (m.inodes_used?, m.inodes_total?);
+                (total > 0 && used * 100 / total > limit).then(|| {
+                    (m.target.as_str(), used * 100 / total)
+                })
+            })
+            .collect();
+        let edge = alert_cycle_repeat(
+            &mut state.inodes_streak,
+            &mut state.inodes_firing,
+            !over.is_empty(),
+            &mut state.inodes_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            let named: Vec<String> = over
+                .iter()
+                .take(3)
+                .map(|(t, pct)| format!("{t} {pct}%"))
+                .collect();
+            out.push((
+                "system".to_string(),
+                format!(
+                    "inodes {} above {limit}% used — tiny files exhausted the inode table; writes fail while df looks fine, for {}s",
+                    named.join(", "),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("inode usage back under {limit}%"),
                 true,
             ));
         }
@@ -2609,6 +2713,20 @@ impl History {
     /// the time. `sample_secs` is the per-refresh interval, used only to
     /// phrase the elapsed time. Returns a human summary, None otherwise.
     pub fn leak_suspicion(&self, pid: Pid, sample_secs: f64) -> Option<String> {
+        self.leak_suspicion_at(pid, sample_secs, LEAK_MB)
+            .map(|(_, msg)| msg)
+    }
+
+    /// The leak detector with a caller-set growth floor (the --alert-leak
+    /// sentinel's threshold; the detail-page hint keeps the default).
+    /// Returns `(grew_mb, summary)` so the sentinel's detail can name the
+    /// number without re-parsing prose.
+    pub fn leak_suspicion_at(
+        &self,
+        pid: Pid,
+        sample_secs: f64,
+        min_mb: f64,
+    ) -> Option<(f64, String)> {
         let dq = self.mem_big.get(&pid)?;
         let tail_len = dq.len().min(LEAK_SAMPLES);
         if tail_len < 8 {
@@ -2619,7 +2737,7 @@ impl History {
         let first = tail[0] as f64;
         let last = *tail.last().unwrap() as f64;
         let grew_mb = (last - first) / 1024.0;
-        if grew_mb < LEAK_MB {
+        if grew_mb < min_mb {
             return None;
         }
         let ups = tail.windows(2).filter(|w| w[1] > w[0]).count();
@@ -2628,8 +2746,11 @@ impl History {
             return None;
         }
         let mins = (pairs as f64 * sample_secs) / 60.0;
-        Some(format!(
-            "RSS +{grew_mb:.1} MB over the last {mins:.0} min, steadily increasing — possible leak"
+        Some((
+            grew_mb,
+            format!(
+                "RSS +{grew_mb:.1} MB over the last {mins:.0} min, steadily increasing — possible leak"
+            ),
         ))
     }
 
@@ -3041,6 +3162,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3114,6 +3236,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3203,6 +3326,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3398,6 +3522,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3428,6 +3553,7 @@ mod tests {
             target: target.into(),
             total_mb: total,
             used_mb: used,
+            ..Default::default()
         };
         let limits = |disk_pct: Option<u64>, mounts: Vec<crate::platform::MountUsage>| {
             SysAlertLimits {
@@ -3457,6 +3583,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
             }
@@ -3528,6 +3655,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3593,6 +3721,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
         };
         // one kill lands (counter 5 → 6): the first tick only arms the
         // previous counter, then the kill sits in the window long enough
@@ -3682,11 +3811,111 @@ mod tests {
     }
 
     #[test]
+    fn inode_alert_fires_names_mount_and_recovers() {
+        let limits = |inodes_limit: Option<u64>,
+                      inodes: Option<(u64, u64)>|
+         -> SysAlertLimits {
+            let mounts = inodes
+                .map(|(used, total)| {
+                    vec![crate::platform::MountUsage {
+                        target: "/data".into(),
+                        total_mb: 10_000,
+                        used_mb: 6_000,
+                        inodes_used: Some(used),
+                        inodes_total: Some(total),
+                    }]
+                })
+                .unwrap_or_default();
+            SysAlertLimits {
+                load: None,
+                mem_pct: None,
+                count: None,
+                proc_count: 0,
+                mounts,
+                disk_pct: None,
+                net_limit: None,
+                net_rate: None,
+                psi_limit: None,
+                mem_avail_floor: None,
+                swap_pct_limit: None,
+                retrans_limit: None,
+                retrans_rate: None,
+                drop_limit: None,
+                drop_rate: None,
+                repeat: None,
+                disk_busy_limit: None,
+                temp_limit: None,
+                zombie_limit: None,
+                zombie_count: 0,
+                dstate_limit: None,
+                dstate_count: 0,
+                failed_limit: None,
+                failed_units: Vec::new(),
+                disk_eta_hours: None,
+                mem_eta_hours: None,
+                inodes_limit,
+                oom_limit: None,
+                oom_kills: None,
+            }
+        };
+        // no inode stats for the mount (platform didn't sweep them):
+        // silent even with the limit armed, and it must not count as
+        // "recovered" against a later firing
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                system_alert_picks(
+                    &crate::platform::SystemStats::default(),
+                    &mut state,
+                    &limits(Some(85), None),
+                    3
+                )
+                .is_empty()
+            );
+        }
+        let mut state = SysAlertState::default();
+        // 90% inodes over an 85% line: quiet for the arming samples…
+        for _ in 0..ALERT_CYCLES - 1 {
+            assert!(
+                system_alert_picks(
+                    &crate::platform::SystemStats::default(),
+                    &mut state,
+                    &limits(Some(85), Some((900_000, 1_000_000))),
+                    3
+                )
+                .is_empty()
+            );
+        }
+        let fires = system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(85), Some((900_000, 1_000_000))),
+            3,
+        );
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert!(
+            fires[0].1.contains("inodes /data 90% above 85%"),
+            "{}",
+            fires[0].1
+        );
+        // freed → recovery
+        let rec = system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(85), Some((500_000, 1_000_000))),
+            3,
+        );
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert!(rec[0].2, "{rec:?}");
+    }
+
+    #[test]
     fn system_alert_fires_when_disk_fill_is_imminent() {
         let mount = crate::platform::MountUsage {
             target: "/data".into(),
             total_mb: 10_000,
             used_mb: 6_000,
+            ..Default::default()
         };
         let limits = |eta: Option<f64>| SysAlertLimits {
             load: None,
@@ -3708,6 +3937,7 @@ mod tests {
             oom_kills: None,
             disk_eta_hours: eta,
             mem_eta_hours: None,
+            inodes_limit: None,
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -3799,6 +4029,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: eta,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3922,6 +4153,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3999,6 +4231,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4075,6 +4308,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4136,6 +4370,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4204,6 +4439,7 @@ mod tests {
             failed_units: Vec::new(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4279,6 +4515,7 @@ mod tests {
             failed_units: failed_units.iter().map(|u| u.to_string()).collect(),
             disk_eta_hours: None,
             mem_eta_hours: None,
+            inodes_limit: None,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4448,6 +4685,68 @@ mod tests {
         let small = h.cpu_chart(10, 4).unwrap();
         let bars = small.split_whitespace().next().unwrap();
         assert!(bars.chars().count() <= 4, "thinned to width 4: {small}");
+    }
+
+    #[test]
+    fn leak_alert_picks_fire_recover_and_parameterize_the_threshold() {
+        let mut h = History::new();
+        let mut p = proc(10, "/bin/leaky", None);
+        p.name = "leaky".into();
+        // 24 samples climbing 6000KB→16000KB in 30s ticks: +10MB over the
+        // window, monotonic — the detector's textbook case
+        for i in 0..24 {
+            p.mem_kb = Some(6_000 + i * 500);
+            h.update(&[p.clone()]);
+        }
+        let mut state = SysAlertState::default();
+        let procs = vec![p.clone()];
+        // threshold 15 MB: the +10MB curve stays under it — silent
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                leak_alert_picks(&h, &procs, 15.0, 30.0, 3, &mut state).is_empty(),
+                "under the threshold → silent"
+            );
+        }
+        // threshold 8 MB: arming samples, then one fire naming the process
+        // and the growth
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES - 1 {
+            let picks = leak_alert_picks(&h, &procs, 8.0, 30.0, 3, &mut state);
+            assert!(picks.is_empty(), "{picks:?}");
+        }
+        let picks = leak_alert_picks(&h, &procs, 8.0, 30.0, 3, &mut state);
+        assert_eq!(picks.len(), 1, "{picks:?}");
+        let (pid, who, detail, rec) = &picks[0];
+        assert_eq!(*pid, 10);
+        assert_eq!(who, "leaky (pid 10)");
+        assert!(detail.contains("possible leak"), "{detail}");
+        assert!(detail.contains("threshold 8 MB"), "{detail}");
+        assert!(!rec);
+        // latched
+        assert!(leak_alert_picks(&h, &procs, 8.0, 30.0, 3, &mut state).is_empty());
+        // the curve flattens → enough flat samples push the monotonic
+        // fraction under 70% and the detector goes quiet → recovery
+        let mut flat = proc(10, "/bin/leaky", None);
+        flat.name = "leaky".into();
+        flat.mem_kb = Some(16_000);
+        let procs = vec![flat.clone()];
+        let mut recs = Vec::new();
+        for _ in 0..12 {
+            // each tick feeds its flat sample into the window first — the
+            // detector judges the history, the sentinel judges the verdict
+            h.update(&[flat.clone()]);
+            let picks = leak_alert_picks(&h, &procs, 8.0, 30.0, 3, &mut state);
+            if !picks.is_empty() {
+                recs = picks;
+                break;
+            }
+        }
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert!(recs[0].3, "{recs:?}");
+        // the process exits → its state drops (a return re-arms from zero)
+        let procs: Vec<crate::model::Process> = Vec::new();
+        assert!(leak_alert_picks(&h, &procs, 8.0, 30.0, 3, &mut state).is_empty());
+        assert!(!state.leak_seen.contains_key(&10), "exited process forgotten");
     }
 
     #[test]

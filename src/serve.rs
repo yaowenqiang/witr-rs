@@ -455,6 +455,8 @@ pub(crate) fn system_snapshot(
                 "target": m.target,
                 "total_mb": m.total_mb,
                 "used_mb": m.used_mb,
+                "inodes_used": m.inodes_used,
+                "inodes_total": m.inodes_total,
             }))
             .collect::<Vec<_>>(),
     })
@@ -667,6 +669,25 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>, trends: &mut
             ));
         }
     }
+        // inode usage — the --alert-inodes sentinel's raw input (the df -Pi
+        // sweep rides the mount sweep; mounts without inode stats sit out)
+        let inode_rows: Vec<(&crate::platform::MountUsage, f64)> = mounts
+            .iter()
+            .filter_map(|m| {
+                let (used, total) = (m.inodes_used?, m.inodes_total?);
+                (total > 0).then(|| (m, used as f64 * 100.0 / total as f64))
+            })
+            .collect();
+        if !inode_rows.is_empty() {
+            out.push_str("# HELP witr_machine_fs_inode_used_percent Percent of each mount's inode table used\n");
+            out.push_str("# TYPE witr_machine_fs_inode_used_percent gauge\n");
+            for (m, pct) in &inode_rows {
+                out.push_str(&format!(
+                    "witr_machine_fs_inode_used_percent{{mount=\"{}\"}} {pct:.2}\n",
+                    label_escape(&m.target),
+                ));
+            }
+        }
     // trend predictions — the disk-eta / mem-eta sentinels' exact machinery
     // (least squares + significance gate), exported so a Grafana line can
     // draw "full in ~4h" without every dashboard re-deriving slopes from
@@ -1743,6 +1764,8 @@ mod tests {
                     target: "/data".into(),
                     total_mb: 10_000,
                     used_mb: 4_000,
+                    inodes_used: Some(400_000),
+                    inodes_total: Some(500_000),
                 }]
             }
         }

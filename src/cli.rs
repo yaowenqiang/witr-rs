@@ -238,6 +238,8 @@ impl Cli {
         self.alert_count = self.alert_count.or(cfg.alert_count);
         self.alert_disk = self.alert_disk.or(cfg.alert_disk);
         self.alert_disk_eta = self.alert_disk_eta.or(cfg.alert_disk_eta);
+        self.alert_inodes = self.alert_inodes.or(cfg.alert_inodes);
+        self.alert_leak = self.alert_leak.or(cfg.alert_leak);
         self.alert_mem_eta = self.alert_mem_eta.or(cfg.alert_mem_eta);
         self.alert_disk_busy = self.alert_disk_busy.or(cfg.alert_disk_busy);
         self.alert_temp = self.alert_temp.or(cfg.alert_temp);
@@ -854,6 +856,26 @@ pub struct Cli {
         )
     )]
     pub alert_disk_eta: Option<f64>,
+
+    #[arg(
+        long = "alert-inodes",
+        value_name = "PCT",
+        help = t(
+            "inode 耗尽哨兵:任一挂载点的 inode 使用占比连续 5 次采样超过该值即触发,详情点名挂载点——海量小文件写满 inode 表而 df 看着才 60% 的经典事故,空间哨兵对它视而不见。df -i 随挂载点扫描一并支付。TUI 和 --watch",
+            "Inode-exhaustion sentinel: fires when any mount's inode usage exceeds this percent for 5 consecutive samples, the detail naming the mount — the classic flood-of-tiny-files failure where df shows a comfortable 60% while writes fail everywhere; the space sentinels can't see it. The df -i sweep rides the mount sweep. TUI and --watch"
+        )
+    )]
+    pub alert_inodes: Option<u64>,
+
+    #[arg(
+        long = "alert-leak",
+        value_name = "MB",
+        help = t(
+            "内存泄漏哨兵:任一进程的 RSS 在近 10 分钟窗口内增长超过该 MB 数且 ≥70% 的采样段单调上升,连续 5 次判定成立即触发,详情点名进程与增长量——deviation 哨兵抓\"突然繁忙\",这个抓\"慢慢吃光\";详情页的泄漏疑点提示同一套判定,阈值默认 20MB。TUI 和 --watch",
+            "Memory-leak sentinel: fires when any process's RSS grew over this many MB across the trailing ~10-minute window while rising in ≥70% of the sample pairs, held for 5 consecutive verdicts — the detail names the process and the growth; the detail page's leak-suspicion hint is the same detector at its 20 MB default. TUI and --watch"
+        )
+    )]
+    pub alert_leak: Option<f64>,
 
     #[arg(
         long = "alert-mem-eta",

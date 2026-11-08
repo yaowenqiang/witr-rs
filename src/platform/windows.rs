@@ -90,6 +90,7 @@ fn parse_windows_mounts(text: &str) -> Vec<MountUsage> {
             target: target.to_string(),
             total_mb: total / 1024 / 1024,
             used_mb: used / 1024 / 1024,
+            ..Default::default()
         });
     }
     out
