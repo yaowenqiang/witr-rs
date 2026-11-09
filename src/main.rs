@@ -590,6 +590,11 @@ struct FleetSample {
     /// rates (totals live in `net`; these feed the dashboard's NIC rows).
     /// Empty from servers predating the field.
     nics: Vec<crate::platform::NicCounters>,
+    /// The far host's own failed-unit list — the snapshot carries it, so
+    /// the fleet --alert-failed-units sentinel judges remotely what the
+    /// local sweep could never see. Empty from servers predating the
+    /// field (an honest "nothing seen").
+    failed_units: Vec<String>,
     mounts: Vec<crate::platform::MountUsage>,
 }
 
@@ -629,6 +634,15 @@ fn parse_system_snapshot(doc: &serde_json::Value) -> Option<FleetSample> {
                         tx_drops: n.get("tx_drops").and_then(|v| v.as_u64()).unwrap_or(0),
                     })
                 })
+                .collect()
+        })
+        .unwrap_or_default();
+    let failed_units = s
+        .get("failed_units")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|u| u.as_str().map(|s| s.to_string()))
                 .collect()
         })
         .unwrap_or_default();
@@ -688,6 +702,7 @@ fn parse_system_snapshot(doc: &serde_json::Value) -> Option<FleetSample> {
         },
         net,
         nics,
+        failed_units,
         mounts,
     })
 }
@@ -723,6 +738,7 @@ fn fleet_machine_armed(cli: &cli::Cli) -> bool {
         || cli.alert_temp.is_some()
         || cli.alert_zombies.is_some()
         || cli.alert_dstate.is_some()
+        || cli.alert_failed_units.is_some()
         || cli.alert_net.is_some()
         || cli.alert_psi.is_some()
         || cli.alert_mem_avail_mb.is_some()
@@ -841,10 +857,10 @@ fn fleet_alert_picks(
         zombie_count: state_count(procs, &["Z"]),
         dstate_limit: cli.alert_dstate,
         dstate_count: state_count(procs, &["D", "U"]),
-        // the failed-unit sweep is the far host's systemctl — fleet mode
-        // deliberately stays blind to it
-        failed_limit: None,
-        failed_units: Vec::new(),
+        // the failed-unit list rides the snapshot (the far host sweeps
+        // its own systemctl per refresh) — the sentinel judges it here
+        failed_limit: cli.alert_failed_units,
+        failed_units: sample.failed_units.clone(),
         repeat: cli.alert_repeat,
     };
     history::system_alert_picks(&sample.stats, st, &limits, interval)
@@ -2154,9 +2170,9 @@ fn run_check_fleet(bases: &[String], cli: &cli::Cli) -> i32 {
                     procs.len(),
                     zombie_count,
                     dstate_count,
-                    // fleet checks stay blind to systemd: the units live
-                    // on the far host and the local sweep can't see them
-                    &[],
+                    // the snapshot carries the far host's own failed-unit
+                    // list — the check judges it here
+                    &sample.failed_units,
                     net_rate,
                     drop_rate,
                     retrans_rate,
@@ -7274,6 +7290,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             ..Default::default()
         };
         let sample = FleetSample {
+            failed_units: vec!["ipmi.service".into()],
             stats: crate::platform::SystemStats {
                 load1: Some(3.0),
                 mem_avail_mb: Some(2_000),
@@ -7322,6 +7339,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             &FleetSample {
                 stats: crate::platform::SystemStats::default(),
                 nics: Vec::new(),
+                failed_units: Vec::new(),
                 net: None,
                 mounts: Vec::new(),
             },
@@ -7486,7 +7504,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         }];
         let doc = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
-            "system": crate::serve::system_snapshot(&stats, &nics, &mounts, 42, 3),
+            "system": crate::serve::system_snapshot(&stats, &nics, &mounts, 42, 3, &["ipmi.service".to_string(), "lightdm.service".to_string()]),
             "processes": [],
         });
         let sample = parse_system_snapshot(&doc).expect("the system key parses");
@@ -7496,6 +7514,9 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         assert_eq!(s.psi.as_ref().map(|p| p.io_full), Some(5.0));
         assert_eq!(s.retrans_segs, Some(12345));
         assert_eq!(s.oom_kills, Some(2));
+        // the far host's own failed-unit list rides through for the fleet
+        // --alert-failed-units sentinel
+        assert_eq!(sample.failed_units, vec!["ipmi.service", "lightdm.service"]);
         assert_eq!(sample.net, Some((100, 200, 7))); // (rx, tx, drops folded)
         // the per-NIC counters ride through for the fleet sys rate diff
         assert_eq!(sample.nics.len(), 1);
@@ -7515,6 +7536,53 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
     }
 
     #[test]
+    fn fleet_failed_units_alert_judges_the_far_host_s_own_list() {
+        let cli = cli::Cli::parse_from([
+            "witr",
+            "--remote",
+            "http://h1:9100",
+            "--watch",
+            "3",
+            "--alert-failed-units",
+            "1",
+        ]);
+        let sample = FleetSample {
+            stats: crate::platform::SystemStats::default(),
+            nics: Vec::new(),
+            failed_units: vec!["ipmi.service".into(), "lightdm.service".into()],
+            net: None,
+            mounts: Vec::new(),
+        };
+        let mut st = history::SysAlertState::default();
+        let procs: Vec<Process> = Vec::new();
+        for _ in 0..history::ALERT_CYCLES - 1 {
+            assert!(
+                fleet_alert_picks(&cli, &sample, &procs, &mut st, 3).is_empty(),
+                "no fire before the window completes"
+            );
+        }
+        let picks = fleet_alert_picks(&cli, &sample, &procs, &mut st, 3);
+        assert_eq!(picks.len(), 1, "{picks:?}");
+        assert!(
+            picks[0]
+                .1
+                .contains("2 systemd units failed above 1 for 15s — ipmi.service, lightdm.service"),
+            "{}",
+            picks[0].1
+        );
+        // a peer predating the field (empty list) judges clean, not blind
+        let mut old_sample = sample.clone();
+        old_sample.failed_units = Vec::new();
+        let mut st2 = history::SysAlertState::default();
+        for _ in 0..history::ALERT_CYCLES {
+            assert!(
+                fleet_alert_picks(&cli, &old_sample, &procs, &mut st2, 3).is_empty(),
+                "empty list → clean, never fires"
+            );
+        }
+    }
+
+    #[test]
     fn fleet_sentinels_fire_per_host_with_local_machinery() {
         let cli = cli::Cli::parse_from([
             "witr", "--remote", "http://h1:9100", "--watch", "3", "--alert-load", "4",
@@ -7525,6 +7593,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                 ..Default::default()
             },
             nics: Vec::new(),
+            failed_units: Vec::new(),
             net: None,
             mounts: Vec::new(),
         };

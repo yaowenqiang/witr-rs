@@ -378,6 +378,7 @@ pub(crate) fn system_snapshot(
     mounts: &[crate::platform::MountUsage],
     proc_count: usize,
     zombie_count: usize,
+    failed_units: &[String],
 ) -> serde_json::Value {
     let pct = |u: Option<u64>, t: Option<u64>| match (u, t) {
         (Some(u), Some(t)) if t > 0 => Some((u * 100) / t),
@@ -421,6 +422,10 @@ pub(crate) fn system_snapshot(
         "oom_kills": stats.oom_kills,
         "proc_count": proc_count,
         "zombie_count": zombie_count,
+        // the far host's own failed-unit list — the fleet --alert-failed-units
+        // sentinel and fleet --sys read it here instead of assuming blindness;
+        // servers predating the field leave it empty (an honest "nothing seen")
+        "failed_units": failed_units,
         "disks": stats
             .disks
             .iter()
@@ -1258,8 +1263,13 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                     let stats = platform.system_stats();
                     let nics = platform.net_counters();
                     let mounts = platform.mount_usage();
-                    let system = stats
-                        .map(|s| system_snapshot(&s, &nics, &mounts, procs.len(), zombies));
+                    // one more systemctl sweep per refresh — the fleet
+                    // failed-units sentinel reads the far host's own list
+                    // (the same sweep the /metrics gauge pays per scrape)
+                    let failed = platform.failed_units().unwrap_or_default();
+                    let system = stats.map(|s| {
+                        system_snapshot(&s, &nics, &mounts, procs.len(), zombies, &failed)
+                    });
                     (procs, system)
                 };
                 let doc = serde_json::json!({
