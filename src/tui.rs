@@ -425,6 +425,10 @@ struct TuiApp {
     alert_inodes: Option<u64>,
     /// --alert-leak: per-process RSS growth threshold (MB)
     alert_leak: Option<f64>,
+    /// --alert-fd-leak: per-process fd growth threshold
+    alert_fd_leak: Option<f64>,
+    /// --alert-thr-leak: per-process thread growth threshold
+    alert_thr_leak: Option<f64>,
     /// --alert-disk-busy: any-device %util threshold
     alert_disk_busy: Option<f64>,
     /// --alert-temp: hottest-sensor celsius threshold
@@ -669,6 +673,10 @@ pub struct Seed {
     pub alert_inodes: Option<u64>,
     /// --alert-leak: per-process RSS growth threshold (MB)
     pub alert_leak: Option<f64>,
+    /// --alert-fd-leak: per-process fd growth threshold
+    pub alert_fd_leak: Option<f64>,
+    /// --alert-thr-leak: per-process thread growth threshold
+    pub alert_thr_leak: Option<f64>,
     /// --alert-disk-busy: any-device %util threshold
     pub alert_disk_busy: Option<f64>,
     /// --alert-temp: hottest-sensor celsius threshold
@@ -790,6 +798,8 @@ impl Seed {
         self.alert_mem_eta = cli.alert_mem_eta;
         self.alert_inodes = cli.alert_inodes;
         self.alert_leak = cli.alert_leak;
+        self.alert_fd_leak = cli.alert_fd_leak;
+        self.alert_thr_leak = cli.alert_thr_leak;
         self.alert_disk_busy = cli.alert_disk_busy;
         self.alert_temp = cli.alert_temp;
         self.alert_zombies = cli.alert_zombies;
@@ -944,6 +954,8 @@ impl TuiApp {
             alert_mem_eta: seed.alert_mem_eta,
             alert_inodes: seed.alert_inodes,
             alert_leak: seed.alert_leak,
+            alert_fd_leak: seed.alert_fd_leak,
+            alert_thr_leak: seed.alert_thr_leak,
             alert_disk_busy: seed.alert_disk_busy,
             alert_temp: seed.alert_temp,
             alert_zombies: seed.alert_zombies,
@@ -1244,6 +1256,8 @@ impl TuiApp {
         self.alert_mem_eta = seed.alert_mem_eta;
         self.alert_inodes = seed.alert_inodes;
         self.alert_leak = seed.alert_leak;
+        self.alert_fd_leak = seed.alert_fd_leak;
+        self.alert_thr_leak = seed.alert_thr_leak;
         self.alert_disk_busy = seed.alert_disk_busy;
         self.alert_temp = seed.alert_temp;
         self.alert_zombies = seed.alert_zombies;
@@ -1430,6 +1444,8 @@ impl TuiApp {
                     || self.alert_mem_eta.is_some()
                     || self.alert_inodes.is_some()
                     || self.alert_leak.is_some()
+                    || self.alert_fd_leak.is_some()
+                    || self.alert_thr_leak.is_some()
                     || self.alert_disk_busy.is_some()
                     || self.alert_temp.is_some()
                     || self.alert_zombies.is_some()
@@ -1554,18 +1570,36 @@ impl TuiApp {
                             .map(|(name, detail, rec)| (0, name, detail, rec)),
                     );
                 }
-                // the leak sentinel over the sampler's RSS window — the
-                // detail-page hint's own detector, threshold from the flag
-                if self.alert_leak.is_some() {
+                // the leak sentinels over the sampler's windows (RSS and
+                // thread counts accrue for the whole table; the fd one
+                // needs the full-table handle sweep fed first — paid only
+                // while armed, the --alert-fd precedent)
+                if self.alert_fd_leak.is_some() {
+                    if let Some(fds) = self.platform.fd_counts() {
+                        for (pid, n) in &fds {
+                            self.hist.record_fd(*pid, *n);
+                        }
+                    }
+                }
+                if self.alert_leak.is_some() || self.alert_fd_leak.is_some() || self.alert_thr_leak.is_some() {
                     let interval = self.refresh.max(Duration::from_secs(1)).as_secs();
-                    picks.extend(crate::history::leak_alert_picks(
-                        &self.hist,
-                        &self.procs,
-                        self.alert_leak.unwrap_or(20.0),
-                        interval as f64,
-                        interval,
-                        &mut self.sys_alert,
-                    ));
+                    for (kind, min) in [
+                        (crate::history::LeakKind::Mem, self.alert_leak),
+                        (crate::history::LeakKind::Fd, self.alert_fd_leak),
+                        (crate::history::LeakKind::Threads, self.alert_thr_leak),
+                    ] {
+                        if let Some(min) = min {
+                            picks.extend(crate::history::leak_alert_picks(
+                                &self.hist,
+                                &self.procs,
+                                kind,
+                                min,
+                                interval as f64,
+                                interval,
+                                &mut self.sys_alert,
+                            ));
+                        }
+                    }
                 }
             }
             for (pid, name, detail, recovery) in picks.into_iter().chain(self.pending_alerts.drain(..)) {
@@ -10792,6 +10826,8 @@ mod tests {
                 alert_mem_eta: None,
                 alert_inodes: None,
                 alert_leak: None,
+                alert_fd_leak: None,
+                alert_thr_leak: None,
                 alert_disk_busy: None,
                 alert_temp: None,
                 alert_zombies: None,

@@ -528,10 +528,10 @@ pub struct SysAlertState {
     pub inodes_streak: u32,
     pub inodes_firing: bool,
     pub inodes_fired_secs: u32,
-    /// Per-process leak-sentinel state (the --alert-leak machinery): pid →
-    /// its own streak/latch. Process exits drop the entry; a returning
-    /// process re-arms from zero.
-    pub leak_seen: std::collections::HashMap<Pid, (u32, bool, u32)>,
+    /// Per-process leak-sentinel state — keyed `(kind, pid)` because the
+    /// three siblings (mem/fd/threads) judge independently. Process exits
+    /// drop the entry; a returning process re-arms from zero.
+    pub leak_seen: std::collections::HashMap<(u8, Pid), (u32, bool, u32)>,
     pub disk_busy_streak: u32,
     pub disk_busy_firing: bool,
     pub disk_busy_fired_secs: u32,
@@ -878,28 +878,86 @@ pub fn mem_eta_picks(
     disk_eta_of(&hist).filter(|(eta, _)| *eta < eta_limit)
 }
 
-/// The --alert-leak sentinel's tick: run the leak detector (the detail
-/// page's own machinery, parameterized threshold) across the live table
-/// and fold the edges through the per-process "5 samples + latch" state.
-/// Fires name the process and the growth; a process whose RSS curve
-/// flattens recovers; a process that exits drops its state (the exited
-/// event already told that story). `sample_secs` phrases the elapsed
-/// window; `interval_secs` is the alert cadence.
+/// Which leak sibling drives the sentinel — three detectors, one
+/// "5 samples + latch" machinery. Mem needs the sampler's RSS window
+/// (always accruing); Threads rides the listing's thread counts (same);
+/// Fd needs the full-table fd sweep fed via [`History::record_fd`] —
+/// callers pay that sweep only while armed.
+#[derive(Clone, Copy, PartialEq)]
+pub enum LeakKind {
+    Mem,
+    Fd,
+    Threads,
+}
+
+impl LeakKind {
+    fn key(self) -> u8 {
+        match self {
+            LeakKind::Mem => 0,
+            LeakKind::Fd => 1,
+            LeakKind::Threads => 2,
+        }
+    }
+
+    fn unit(self) -> &'static str {
+        match self {
+            LeakKind::Mem => "MB",
+            LeakKind::Fd => "fds",
+            LeakKind::Threads => "threads",
+        }
+    }
+
+    /// The verdict for one process; None where the process can't be judged
+    /// (no RSS / no thread count / no fd window for it) or where the
+    /// detector says quiet.
+    fn verdict(
+        self,
+        hist: &History,
+        pid: Pid,
+        sample_secs: f64,
+        min: f64,
+    ) -> Option<(f64, String)> {
+        match self {
+            LeakKind::Mem => hist.leak_suspicion_at(pid, sample_secs, min),
+            LeakKind::Fd => hist.fd_suspicion_at(pid, sample_secs, min),
+            LeakKind::Threads => hist.thread_suspicion_at(pid, sample_secs, min),
+        }
+    }
+
+    /// Eligibility: a process the kind can't measure sits out (never
+    /// fires, never recovers).
+    fn measurable(self, p: &crate::model::Process) -> bool {
+        match self {
+            LeakKind::Mem => p.mem_kb.is_some(),
+            LeakKind::Fd => true, // the fd window is fed per-pid when armed
+            LeakKind::Threads => p.threads.is_some(),
+        }
+    }
+}
+
+/// The leak sentinels' tick (mem / fd / threads — the detail page's own
+/// three hints, parameterized thresholds): run the detector across the
+/// live table and fold the edges through the per-process "5 samples +
+/// latch" state. Fires name the process and the growth; a flattening
+/// curve recovers; an exited process drops its state (the exited event
+/// already told that story). `sample_secs` phrases the elapsed window;
+/// `interval_secs` is the alert cadence.
 pub fn leak_alert_picks(
     hist: &History,
     procs: &[crate::model::Process],
-    min_mb: f64,
+    kind: LeakKind,
+    min: f64,
     sample_secs: f64,
     interval_secs: u64,
     state: &mut SysAlertState,
 ) -> Vec<(crate::model::Pid, String, String, bool)> {
     let mut out = Vec::new();
     for p in procs {
-        if p.mem_kb.is_none() {
+        if !kind.measurable(p) {
             continue;
         }
-        let seen = state.leak_seen.entry(p.pid).or_default();
-        let over = hist.leak_suspicion_at(p.pid, sample_secs, min_mb);
+        let seen = state.leak_seen.entry((kind.key(), p.pid)).or_default();
+        let over = kind.verdict(hist, p.pid, sample_secs, min);
         let edge = alert_cycle_repeat(
             &mut seen.0,
             &mut seen.1,
@@ -912,10 +970,20 @@ pub fn leak_alert_picks(
         match edge {
             AlertEdge::Fire => {
                 let (_, msg) = over.unwrap_or((0.0, String::new()));
-                out.push((p.pid, who, format!("{msg} (threshold {min_mb:.0} MB)"), false));
+                out.push((
+                    p.pid,
+                    who,
+                    format!("{msg} (threshold {min:.0} {})", kind.unit()),
+                    false,
+                ));
             }
             AlertEdge::Recover => {
-                out.push((p.pid, who, "RSS growth flattened — leak suspicion cleared".into(), true));
+                out.push((
+                    p.pid,
+                    who,
+                    "growth flattened — leak suspicion cleared".into(),
+                    true,
+                ));
             }
             AlertEdge::None => {}
         }
@@ -923,7 +991,9 @@ pub fn leak_alert_picks(
     // processes that left the table drop their state (a returning pid
     // re-arms from zero)
     let live: std::collections::HashSet<Pid> = procs.iter().map(|p| p.pid).collect();
-    state.leak_seen.retain(|pid, _| live.contains(pid));
+    state
+        .leak_seen
+        .retain(|(kind_key, pid), _| *kind_key == kind.key() && live.contains(pid));
     out
 }
 
@@ -2809,6 +2879,19 @@ impl History {
     /// rising at least [`FD_LEAK_FRACTION`] of the time — the signature of
     /// a socket/fd-per-request path that never closes them.
     pub fn fd_suspicion(&self, pid: Pid, sample_secs: f64) -> Option<String> {
+        self.fd_suspicion_at(pid, sample_secs, FD_LEAK_GROWTH)
+            .map(|(_, msg)| msg)
+    }
+
+    /// The fd detector with a caller-set growth floor (the --alert-fd-leak
+    /// sentinel's threshold; the detail-page hint keeps the default).
+    /// Saturating: a shrinking count is not a leak.
+    pub fn fd_suspicion_at(
+        &self,
+        pid: Pid,
+        sample_secs: f64,
+        min_growth: f64,
+    ) -> Option<(f64, String)> {
         let dq = self.fd_big.get(&pid)?;
         let tail_len = dq.len().min(FD_LEAK_SAMPLES);
         if tail_len < 8 {
@@ -2816,9 +2899,8 @@ impl History {
         }
         let start = dq.len() - tail_len;
         let tail: Vec<u64> = dq.iter().skip(start).copied().collect();
-        // saturating: a shrinking count is not a leak (and u64 would panic)
         let grew = tail.last().unwrap().saturating_sub(tail[0]) as f64;
-        if grew < FD_LEAK_GROWTH {
+        if grew < min_growth {
             return None;
         }
         let ups = tail.windows(2).filter(|w| w[1] > w[0]).count();
@@ -2827,8 +2909,11 @@ impl History {
             return None;
         }
         let mins = (pairs as f64 * sample_secs) / 60.0;
-        Some(format!(
-            "+{grew:.0} fds over the last {mins:.0} min, steadily increasing — possible fd leak"
+        Some((
+            grew,
+            format!(
+                "+{grew:.0} fds over the last {mins:.0} min, steadily increasing — possible fd leak"
+            ),
         ))
     }
 
@@ -2837,6 +2922,19 @@ impl History {
     /// steadily). Growth is in threads, so [`THR_LEAK_GROWTH`] is far
     /// smaller than the fd window.
     pub fn thread_suspicion(&self, pid: Pid, sample_secs: f64) -> Option<String> {
+        self.thread_suspicion_at(pid, sample_secs, THR_LEAK_GROWTH)
+            .map(|(_, msg)| msg)
+    }
+
+    /// The thread detector with a caller-set growth floor (the
+    /// --alert-thr-leak sentinel's threshold). Growth is in threads, so a
+    /// meaningful threshold is far smaller than the fd one.
+    pub fn thread_suspicion_at(
+        &self,
+        pid: Pid,
+        sample_secs: f64,
+        min_growth: f64,
+    ) -> Option<(f64, String)> {
         let dq = self.thr_big.get(&pid)?;
         let tail_len = dq.len().min(THR_LEAK_SAMPLES);
         if tail_len < 8 {
@@ -2845,7 +2943,7 @@ impl History {
         let start = dq.len() - tail_len;
         let tail: Vec<u32> = dq.iter().skip(start).copied().collect();
         let grew = tail.last().unwrap().saturating_sub(tail[0]) as f64;
-        if grew < THR_LEAK_GROWTH {
+        if grew < min_growth {
             return None;
         }
         let ups = tail.windows(2).filter(|w| w[1] > w[0]).count();
@@ -2854,8 +2952,11 @@ impl History {
             return None;
         }
         let mins = (pairs as f64 * sample_secs) / 60.0;
-        Some(format!(
-            "+{grew:.0} threads over the last {mins:.0} min, steadily increasing — possible thread leak"
+        Some((
+            grew,
+            format!(
+                "+{grew:.0} threads over the last {mins:.0} min, steadily increasing — possible thread leak"
+            ),
         ))
     }
 
@@ -4688,6 +4789,60 @@ mod tests {
     }
 
     #[test]
+    fn leak_sentinels_cover_the_fd_and_thread_siblings() {
+        // threads: 24 samples climbing 10→50 (grew 40 over a 20 threshold)
+        let mut h = History::new();
+        let mut p = proc(7, "/bin/spawner", None);
+        p.name = "spawner".into();
+        for i in 0..24 {
+            p.threads = Some(10 + i * 2);
+            h.update(&[p.clone()]);
+        }
+        let procs = vec![p.clone()];
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES - 1 {
+            let picks = leak_alert_picks(&h, &procs, LeakKind::Threads, 20.0, 30.0, 3, &mut state);
+            assert!(picks.is_empty(), "{picks:?}");
+        }
+        let picks = leak_alert_picks(&h, &procs, LeakKind::Threads, 20.0, 30.0, 3, &mut state);
+        assert_eq!(picks.len(), 1, "{picks:?}");
+        assert!(picks[0].2.contains("possible thread leak"), "{}", picks[0].2);
+        assert!(picks[0].2.contains("threshold 20 threads"), "{}", picks[0].2);
+        // the two siblings judge independently — the mem sentinel (unarmed)
+        // never touched this state, and the threads state is keyed apart
+        assert!(state.leak_seen.contains_key(&(LeakKind::Threads.key(), 7)));
+
+        // fds: the window is fed via record_fd (the caller's armed sweep)
+        let mut h = History::new();
+        let mut p2 = proc(8, "/bin/leaking-fds", None);
+        p2.name = "fdhog".into();
+        let procs = vec![p2.clone()];
+        // the fd window is fed by the caller's armed sweep — 24 rising
+        // samples before the sentinel ever judges
+        for i in 0..24 {
+            h.record_fd(8, (100 + i * 30) as u64);
+        }
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES - 1 {
+            let picks = leak_alert_picks(&h, &procs, LeakKind::Fd, 64.0, 30.0, 3, &mut state);
+            assert!(picks.is_empty(), "{picks:?}");
+        }
+        let picks = leak_alert_picks(&h, &procs, LeakKind::Fd, 64.0, 30.0, 3, &mut state);
+        assert_eq!(picks.len(), 1, "{picks:?}");
+        assert!(picks[0].2.contains("possible fd leak"), "{}", picks[0].2);
+        assert!(picks[0].2.contains("threshold 64 fds"), "{}", picks[0].2);
+        // a process with no thread count sits out the thread sentinel
+        let nothr = proc(9, "/bin/plain", None);
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                leak_alert_picks(&h, std::slice::from_ref(&nothr), LeakKind::Threads, 1.0, 30.0, 3, &mut state)
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn leak_alert_picks_fire_recover_and_parameterize_the_threshold() {
         let mut h = History::new();
         let mut p = proc(10, "/bin/leaky", None);
@@ -4703,7 +4858,7 @@ mod tests {
         // threshold 15 MB: the +10MB curve stays under it — silent
         for _ in 0..ALERT_CYCLES + 2 {
             assert!(
-                leak_alert_picks(&h, &procs, 15.0, 30.0, 3, &mut state).is_empty(),
+                leak_alert_picks(&h, &procs, LeakKind::Mem, 15.0, 30.0, 3, &mut state).is_empty(),
                 "under the threshold → silent"
             );
         }
@@ -4711,10 +4866,10 @@ mod tests {
         // and the growth
         let mut state = SysAlertState::default();
         for _ in 0..ALERT_CYCLES - 1 {
-            let picks = leak_alert_picks(&h, &procs, 8.0, 30.0, 3, &mut state);
+            let picks = leak_alert_picks(&h, &procs, LeakKind::Mem, 8.0, 30.0, 3, &mut state);
             assert!(picks.is_empty(), "{picks:?}");
         }
-        let picks = leak_alert_picks(&h, &procs, 8.0, 30.0, 3, &mut state);
+        let picks = leak_alert_picks(&h, &procs, LeakKind::Mem, 8.0, 30.0, 3, &mut state);
         assert_eq!(picks.len(), 1, "{picks:?}");
         let (pid, who, detail, rec) = &picks[0];
         assert_eq!(*pid, 10);
@@ -4723,7 +4878,7 @@ mod tests {
         assert!(detail.contains("threshold 8 MB"), "{detail}");
         assert!(!rec);
         // latched
-        assert!(leak_alert_picks(&h, &procs, 8.0, 30.0, 3, &mut state).is_empty());
+        assert!(leak_alert_picks(&h, &procs, LeakKind::Mem, 8.0, 30.0, 3, &mut state).is_empty());
         // the curve flattens → enough flat samples push the monotonic
         // fraction under 70% and the detector goes quiet → recovery
         let mut flat = proc(10, "/bin/leaky", None);
@@ -4735,7 +4890,7 @@ mod tests {
             // each tick feeds its flat sample into the window first — the
             // detector judges the history, the sentinel judges the verdict
             h.update(&[flat.clone()]);
-            let picks = leak_alert_picks(&h, &procs, 8.0, 30.0, 3, &mut state);
+            let picks = leak_alert_picks(&h, &procs, LeakKind::Mem, 8.0, 30.0, 3, &mut state);
             if !picks.is_empty() {
                 recs = picks;
                 break;
@@ -4745,8 +4900,8 @@ mod tests {
         assert!(recs[0].3, "{recs:?}");
         // the process exits → its state drops (a return re-arms from zero)
         let procs: Vec<crate::model::Process> = Vec::new();
-        assert!(leak_alert_picks(&h, &procs, 8.0, 30.0, 3, &mut state).is_empty());
-        assert!(!state.leak_seen.contains_key(&10), "exited process forgotten");
+        assert!(leak_alert_picks(&h, &procs, LeakKind::Mem, 8.0, 30.0, 3, &mut state).is_empty());
+        assert!(!state.leak_seen.contains_key(&(LeakKind::Mem.key(), 10)), "exited process forgotten");
     }
 
     #[test]

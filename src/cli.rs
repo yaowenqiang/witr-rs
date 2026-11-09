@@ -240,6 +240,8 @@ impl Cli {
         self.alert_disk_eta = self.alert_disk_eta.or(cfg.alert_disk_eta);
         self.alert_inodes = self.alert_inodes.or(cfg.alert_inodes);
         self.alert_leak = self.alert_leak.or(cfg.alert_leak);
+        self.alert_fd_leak = self.alert_fd_leak.or(cfg.alert_fd_leak);
+        self.alert_thr_leak = self.alert_thr_leak.or(cfg.alert_thr_leak);
         self.alert_mem_eta = self.alert_mem_eta.or(cfg.alert_mem_eta);
         self.alert_disk_busy = self.alert_disk_busy.or(cfg.alert_disk_busy);
         self.alert_temp = self.alert_temp.or(cfg.alert_temp);
@@ -876,6 +878,26 @@ pub struct Cli {
         )
     )]
     pub alert_leak: Option<f64>,
+
+    #[arg(
+        long = "alert-fd-leak",
+        value_name = "N",
+        help = t(
+            "fd 泄漏哨兵:任一进程的打开 fd 数在近窗口内增长超过该数目且 ≥70% 采样段单调上升,连续 5 次判定成立即触发,详情点名进程与增长数——socket-per-request 不关闭的服务现形;armed 时每拍付一次全表 fd 扫描(--alert-fd 的先例)。TUI 和 --watch",
+            "fd-leak sentinel: fires when any process's open-fd count grew over this many across the trailing window while rising in ≥70% of the sample pairs, held for 5 consecutive verdicts — the socket-per-request service that never closes them surfaces; an armed run pays the full-table fd sweep each tick (the --alert-fd precedent). TUI and --watch"
+        )
+    )]
+    pub alert_fd_leak: Option<f64>,
+
+    #[arg(
+        long = "alert-thr-leak",
+        value_name = "N",
+        help = t(
+            "线程泄漏哨兵:任一进程的内核线程数在近窗口内增长超过该数目且 ≥70% 采样段单调上升,连续 5 次判定成立即触发——spawning-per-request 不回收的服务现形;线程数随表携带,零额外扫描。TUI 和 --watch",
+            "thread-leak sentinel: fires when any process's kernel thread count grew over this many across the trailing window while rising in ≥70% of the sample pairs — the spawn-per-request service without reaping surfaces; thread counts ride the listing, zero extra sweeps. TUI and --watch"
+        )
+    )]
+    pub alert_thr_leak: Option<f64>,
 
     #[arg(
         long = "alert-mem-eta",

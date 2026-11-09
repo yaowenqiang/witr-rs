@@ -756,6 +756,9 @@ fn reject_fleet_per_process_alerts(cli: &cli::Cli) {
         || cli.alert_conn.is_some()
         || cli.alert_threads.is_some()
         || cli.alert_net_per_proc.is_some()
+        || cli.alert_leak.is_some()
+        || cli.alert_fd_leak.is_some()
+        || cli.alert_thr_leak.is_some()
         || cli.alert_deviation.is_some()
         || !cli.alert_new_proc.is_empty()
         || !cli.alert_port.is_empty()
@@ -907,9 +910,11 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
                 | cli::TopMetric::Age
                 | cli::TopMetric::Threads
                 | cli::TopMetric::Swap
+                | cli::TopMetric::Gpu
+                | cli::TopMetric::GpuMem
         ) {
             eprintln!(
-                "--top {metric:?} across --remote hosts reads the fetched process tables; fd/conn/io/io-rate/net/gpu need local probes — use cpu/mem/age/threads/swap"
+                "--top {metric:?} across --remote hosts reads the fetched process tables; fd/conn/io/io-rate/net need local probes — use cpu/mem/age/threads/swap/gpu/gpu-mem (GPU columns ride the table where the peers have NVIDIA drivers)"
             );
             std::process::exit(4);
         }
@@ -1909,6 +1914,11 @@ fn fleet_ranked(procs: &[Process], metric: cli::TopMetric, count: usize) -> Vec<
                 }
                 cli::TopMetric::Threads => pr.threads.map(|n| n as f64),
                 cli::TopMetric::Swap => pr.swap_kb.map(|kb| kb as f64),
+                // GPU columns ride the table where the peers run
+                // nvidia-smi — the fleet board can rank them without any
+                // local probing
+                cli::TopMetric::Gpu => pr.gpu_sm_pct.map(|v| v as f64),
+                cli::TopMetric::GpuMem => pr.gpu_mem_mb.map(|mb| mb as f64),
                 _ => None,
             }?;
             Some((v, pr))
@@ -5707,17 +5717,33 @@ fn main() {
                     &mut fd_counts,
                     &mut conn_counts,
                 );
-                // the leak sentinel rides the sampler's RSS window — its
-                // verdicts feed the same picks pipeline as every alert
-                if cli.alert_leak.is_some() {
-                    picks.extend(history::leak_alert_picks(
-                        &hist,
-                        &procs,
-                        cli.alert_leak.unwrap_or(20.0),
-                        interval as f64,
-                        interval,
-                        &mut sys_alert,
-                    ));
+                // the leak sentinels ride the sampler's windows (RSS and
+                // thread counts accrue for the whole table; the fd one
+                // needs the full-table sweep fed first, paid only while
+                // armed) — verdicts feed the same picks pipeline
+                if cli.alert_fd_leak.is_some() {
+                    if let Some(fds) = platform.fd_counts() {
+                        for (pid, n) in &fds {
+                            hist.record_fd(*pid, *n);
+                        }
+                    }
+                }
+                for (kind, min) in [
+                    (history::LeakKind::Mem, cli.alert_leak),
+                    (history::LeakKind::Fd, cli.alert_fd_leak),
+                    (history::LeakKind::Threads, cli.alert_thr_leak),
+                ] {
+                    if let Some(min) = min {
+                        picks.extend(history::leak_alert_picks(
+                            &hist,
+                            &procs,
+                            kind,
+                            min,
+                            interval as f64,
+                            interval,
+                            &mut sys_alert,
+                        ));
+                    }
                 }
                 if !alert_ports.is_empty() {
                     let socks = platform.list_sockets().unwrap_or_default();
