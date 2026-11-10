@@ -5180,11 +5180,24 @@ fn main() {
         std::process::exit(if failed { 1 } else { 0 });
     }
 
+    if cli.failed && !cli.services {
+        eprintln!("--failed filters --services; add --services");
+        std::process::exit(4);
+    }
     // --services: the service manager's units (the Services tab's CLI
     // twin). One enumerate call per invocation — the table is meant for
     // humans and scripts, not polling loops.
     if cli.services {
         let mut svcs = platform::enumerate_services();
+        if cli.failed {
+            let failed: std::collections::HashSet<String> =
+                crate::platform::get()
+                    .failed_units()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+            svcs.retain(|s| failed.contains(&s.name));
+        }
         render::sort_services(&mut svcs);
         if cli.json {
             let doc = serde_json::json!({

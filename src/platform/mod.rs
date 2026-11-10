@@ -453,6 +453,146 @@ pub fn parse_failed_units(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// macOS twin of the unit report: `launchctl list` rows (pid / status /
+/// label) → the one whose label matches. launchd has no load/sub states —
+/// the honest mapping is pid-present = active, a nonzero last-exit status
+/// without a pid = failed, everything else = exited. The status number
+/// itself becomes the exit code (launchd keeps the last one).
+#[allow(dead_code)] // every parse fn is unit-tested on all platforms
+pub fn parse_launchctl_report(unit: &str, text: &str) -> Option<UnitReport> {
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        // a malformed row (the header included) skips, not fails — the
+        // `?` here would end the whole search on line one
+        let mut parts = line.split('\t').map(str::trim);
+        let pid = match parts.next() {
+            Some("-" | "") => None,
+            Some(s) => match s.parse::<Pid>() {
+                Ok(p) if p > 0 => Some(p),
+                _ => continue,
+            },
+            None => continue,
+        };
+        let Some(status) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(label) = parts.next() else {
+            continue;
+        };
+        if label != unit {
+            continue;
+        }
+        let (active_state, exit_status) = if pid.is_some() {
+            ("active", None)
+        } else if status > 0 {
+            ("failed", Some(status))
+        } else {
+            ("exited", None)
+        };
+        return Some(UnitReport {
+            unit: unit.to_string(),
+            load_state: Some("loaded".into()),
+            active_state: Some(active_state.into()),
+            sub_state: None,
+            description: None,
+            main_pid: pid,
+            n_restarts: None,
+            unit_file_state: None,
+            exit_status,
+            exit_code: (!pid.is_some()).then(|| "exited".to_string()),
+            since: None,
+        });
+    }
+    None
+}
+
+/// macOS failed labels: no pid and a nonzero last-exit status — the job
+/// died and launchd isn't running it again (or the caller never said
+/// KeepAlive).
+#[allow(dead_code)]
+pub fn parse_launchctl_failed(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let mut parts = l.split('\t').map(str::trim);
+            let pid = parts.next()?;
+            let status: u32 = parts.next()?.parse().ok()?;
+            let label = parts.next()?;
+            (pid == "-" && status > 0).then(|| label.to_string())
+        })
+        .collect()
+}
+
+/// Windows twin of the unit report: one Win32_Service JSON object (the
+/// `Name='...'` CIM filter answers zero or one) → the report. State
+/// lowercases into active_state, but a Stopped service with a nonzero
+/// ExitCode reads as failed — that's the SCM's own death record.
+#[allow(dead_code)]
+pub fn parse_scm_report(unit: &str, text: &str) -> Option<UnitReport> {
+    let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let s = match v {
+        serde_json::Value::Array(a) => a.into_iter().next()?,
+        obj @ serde_json::Value::Object(_) => obj,
+        _ => return None,
+    };
+    let get = |k: &str| s.get(k).and_then(|x| x.as_str()).unwrap_or_default();
+    let name = get("Name");
+    if name != unit {
+        return None;
+    }
+    let pid = s
+        .get("ProcessId")
+        .and_then(|x| x.as_i64())
+        .filter(|p| *p > 0)
+        .map(|p| p as Pid);
+    let state = get("State").to_lowercase();
+    let exit: u64 = s.get("ExitCode").and_then(|x| x.as_u64()).unwrap_or(0);
+    let active_state = if pid.is_some() && state == "running" {
+        "running".to_string()
+    } else if exit > 0 {
+        "failed".to_string()
+    } else {
+        state
+    };
+    Some(UnitReport {
+        unit: unit.to_string(),
+        load_state: Some("loaded".into()),
+        active_state: Some(active_state),
+        sub_state: None,
+        description: (!get("DisplayName").is_empty()).then(|| get("DisplayName").to_string()),
+        main_pid: pid,
+        n_restarts: None,
+        unit_file_state: (!get("StartMode").is_empty()).then(|| get("StartMode").to_string()),
+        exit_status: (exit > 0).then_some(exit as u32),
+        exit_code: (exit > 0).then(|| "exited".to_string()),
+        since: None,
+    })
+}
+
+/// Windows failed services: anything the SCM reports Stopped with a
+/// nonzero ExitCode — a stopped-by-hand service exits 0 and doesn't
+/// deserve a shouting.
+#[allow(dead_code)]
+pub fn parse_scm_failed(text: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+        return Vec::new();
+    };
+    let items = match v {
+        serde_json::Value::Array(a) => a,
+        obj @ serde_json::Value::Object(_) => vec![obj],
+        _ => return Vec::new(),
+    };
+    items
+        .iter()
+        .filter_map(|s| {
+            let get = |k: &str| s.get(k).and_then(|x| x.as_str()).unwrap_or_default();
+            let state = get("State").to_lowercase();
+            let exit = s.get("ExitCode").and_then(|x| x.as_u64()).unwrap_or(0);
+            (state != "running" && exit > 0).then(|| get("Name").to_string())
+        })
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
 /// One systemd unit's report — the `-u UNIT` one-shot's body: the status
 /// line pieces, the process hook (main pid), the restart count (crash
 /// loops), enablement, and the last exit's code/signal (the "why did it
@@ -1221,6 +1361,54 @@ UnknownKeyFromAFutureSystemd=whatever
         );
         assert_eq!(r.main_pid, Some(4242));
         assert_eq!(r.exit_status, None);
+    }
+
+    #[test]
+    fn launchctl_report_and_failed_read_the_list_rows() {
+        let text = "PID\tStatus\tLabel\n1234\t0\tcom.apple.Finder\n-\t127\tcom.apple.broken\n-\t0\tcom.apple.exited-clean\n";
+        // the crashed job: failed with the status as its exit code
+        let r = parse_launchctl_report("com.apple.broken", text).expect("found");
+        assert_eq!(r.active_state.as_deref(), Some("failed"));
+        assert_eq!(r.exit_status, Some(127));
+        assert_eq!(r.main_pid, None);
+        // the running job
+        let r = parse_launchctl_report("com.apple.Finder", text).expect("found");
+        assert_eq!(r.active_state.as_deref(), Some("active"));
+        assert_eq!(r.main_pid, Some(1234));
+        assert_eq!(r.exit_status, None);
+        // the clean exit is exited, not failed
+        let r = parse_launchctl_report("com.apple.exited-clean", text).expect("found");
+        assert_eq!(r.active_state.as_deref(), Some("exited"));
+        // unknown label → None
+        assert!(parse_launchctl_report("com.apple.nope", text).is_none());
+        // the failed list: only the crashed job
+        assert_eq!(parse_launchctl_failed(text), vec!["com.apple.broken"]);
+    }
+
+    #[test]
+    fn scm_report_and_failed_read_the_cim_rows() {
+        // a crashed service: Stopped with a nonzero ExitCode reads failed
+        let text = r#"{"Name":"Spooler","State":"Stopped","DisplayName":"Print Spooler","ProcessId":0,"StartMode":"Auto","ExitCode":1066}"#;
+        let r = parse_scm_report("Spooler", text).expect("found");
+        assert_eq!(r.active_state.as_deref(), Some("failed"));
+        assert_eq!(r.exit_status, Some(1066));
+        assert_eq!(r.unit_file_state.as_deref(), Some("Auto"));
+        assert_eq!(r.description.as_deref(), Some("Print Spooler"));
+        assert_eq!(r.main_pid, None);
+        // running with no pid yet still maps running
+        let r = parse_scm_report(
+            "WSearch",
+            r#"{"Name":"WSearch","State":"Running","DisplayName":"Windows Search","ProcessId":4242,"StartMode":"Auto","ExitCode":0}"#,
+        )
+        .expect("found");
+        assert_eq!(r.active_state.as_deref(), Some("running"));
+        assert_eq!(r.main_pid, Some(4242));
+        assert_eq!(r.exit_status, None);
+        // name mismatch → None
+        assert!(parse_scm_report("nope", text).is_none());
+        // the failed list: stopped-with-exit only; hand-stopped (0) skips
+        let list = r#"[{"Name":"Spooler","State":"Stopped","ExitCode":1066},{"Name":"w3svc","State":"Stopped","ExitCode":0},{"Name":"WSearch","State":"Running","ExitCode":0}]"#;
+        assert_eq!(parse_scm_failed(list), vec!["Spooler"]);
     }
 
     #[test]

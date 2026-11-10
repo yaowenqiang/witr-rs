@@ -974,6 +974,21 @@ impl Platform for MacOs {
     /// sampled only while the system page is open. CPU needs two calls
     /// (tick delta); the first reports memory/load only. No per-core list
     /// until the second call either.
+    /// The launchd twins: `launchctl list` is the only source — one sweep
+    /// answers the failed-unit list, the same rows answer one unit's
+    /// report. A nonzero last-exit status without a pid reads as failed.
+    fn failed_units(&self) -> Option<Vec<String>> {
+        let text =
+            crate::util::run_ok("launchctl", &["list"], std::time::Duration::from_secs(8))?;
+        Some(super::parse_launchctl_failed(&text))
+    }
+
+    fn unit_report(&self, unit: &str) -> Option<super::UnitReport> {
+        let text =
+            crate::util::run_ok("launchctl", &["list"], std::time::Duration::from_secs(8))?;
+        super::parse_launchctl_report(unit, &text)
+    }
+
     fn system_stats(&self) -> Option<SystemStats> {
         let mut out = SystemStats::default();
 

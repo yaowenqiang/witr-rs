@@ -369,6 +369,15 @@ pub struct Cli {
     )]
     pub unit: Option<String>,
 
+    #[arg(
+        long,
+        help = t(
+            "过滤 --services 只看失败的单元(Linux:systemctl 的 failed 清单;macOS:launchctl 的崩溃标签;Windows:SCM 的 Stopped+ExitCode)——巡检探针,无失败退出码 0",
+            "Filters --services down to failed units (Linux: the systemctl failed list; macOS: launchctl's crashed labels; Windows: the SCM's Stopped+ExitCode set) — a patrol probe, exit 0 when nothing failed"
+        )
+    )]
+    pub failed: bool,
+
     #[arg(short = 'j', long, help = t("输出机器可读的 JSON", "Machine-readable JSON"))]
     pub json: bool,
 

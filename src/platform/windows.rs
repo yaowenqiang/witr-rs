@@ -763,6 +763,44 @@ impl Platform for Windows {
     /// disks (cooked values — no delta state needed anywhere). Only
     /// sampled while the system page is open; load average doesn't exist
     /// on Windows.
+    /// The SCM twins: one CIM sweep answers the failed-unit list (Stopped
+    /// with a nonzero ExitCode — a hand-stopped service exits 0 and
+    /// doesn't deserve a shout), the filtered object answers one unit's
+    /// report with the SCM's own death record in ExitCode.
+    fn failed_units(&self) -> Option<Vec<String>> {
+        let script = "$ErrorActionPreference='SilentlyContinue'; \
+                      Get-CimInstance Win32_Service | \
+                      Where-Object { $_.State -ne 'Running' -and $_.ExitCode -ne 0 } | \
+                      Select-Object Name | \
+                      ConvertTo-Json -Compress";
+        let text = crate::util::run(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", script],
+            PS_TIMEOUT,
+        )
+        .ok()?;
+        Some(super::parse_scm_failed(&text))
+    }
+
+    fn unit_report(&self, unit: &str) -> Option<super::UnitReport> {
+        // strip quotes the CIM filter would choke on (service names with
+        // a ' are legal; doubling it is PowerShell's escape)
+        let safe = unit.replace('\'', "''");
+        let script = format!(
+            "$ErrorActionPreference='SilentlyContinue'; \
+             Get-CimInstance Win32_Service -Filter \"Name='{safe}'\" | \
+             Select-Object Name,State,DisplayName,ProcessId,StartMode,ExitCode | \
+             ConvertTo-Json -Compress"
+        );
+        let text = crate::util::run(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", &script],
+            PS_TIMEOUT,
+        )
+        .ok()?;
+        super::parse_scm_report(unit, &text)
+    }
+
     fn system_stats(&self) -> Option<SystemStats> {
         let script = concat!(
             "$os = Get-CimInstance Win32_OperatingSystem\n",
