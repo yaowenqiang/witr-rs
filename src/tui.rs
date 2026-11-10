@@ -423,6 +423,8 @@ struct TuiApp {
     alert_mem_eta: Option<f64>,
     /// --alert-inodes: mount inode usage threshold
     alert_inodes: Option<u64>,
+    /// --alert-gpu-mem-pct: per-GPU memory share threshold
+    alert_gpu_mem_pct: Option<u64>,
     /// --alert-leak: per-process RSS growth threshold (MB)
     alert_leak: Option<f64>,
     /// --alert-fd-leak: per-process fd growth threshold
@@ -671,6 +673,8 @@ pub struct Seed {
     pub alert_mem_eta: Option<f64>,
     /// --alert-inodes: mount inode usage threshold
     pub alert_inodes: Option<u64>,
+    /// --alert-gpu-mem-pct: per-GPU memory share threshold
+    pub alert_gpu_mem_pct: Option<u64>,
     /// --alert-leak: per-process RSS growth threshold (MB)
     pub alert_leak: Option<f64>,
     /// --alert-fd-leak: per-process fd growth threshold
@@ -797,6 +801,7 @@ impl Seed {
         self.alert_disk_eta = cli.alert_disk_eta;
         self.alert_mem_eta = cli.alert_mem_eta;
         self.alert_inodes = cli.alert_inodes;
+        self.alert_gpu_mem_pct = cli.alert_gpu_mem_pct;
         self.alert_leak = cli.alert_leak;
         self.alert_fd_leak = cli.alert_fd_leak;
         self.alert_thr_leak = cli.alert_thr_leak;
@@ -953,6 +958,7 @@ impl TuiApp {
             alert_disk_eta: seed.alert_disk_eta,
             alert_mem_eta: seed.alert_mem_eta,
             alert_inodes: seed.alert_inodes,
+            alert_gpu_mem_pct: seed.alert_gpu_mem_pct,
             alert_leak: seed.alert_leak,
             alert_fd_leak: seed.alert_fd_leak,
             alert_thr_leak: seed.alert_thr_leak,
@@ -1255,6 +1261,7 @@ impl TuiApp {
         self.alert_disk_eta = seed.alert_disk_eta;
         self.alert_mem_eta = seed.alert_mem_eta;
         self.alert_inodes = seed.alert_inodes;
+        self.alert_gpu_mem_pct = seed.alert_gpu_mem_pct;
         self.alert_leak = seed.alert_leak;
         self.alert_fd_leak = seed.alert_fd_leak;
         self.alert_thr_leak = seed.alert_thr_leak;
@@ -1533,6 +1540,8 @@ impl TuiApp {
                         disk_eta_hours: self.alert_disk_eta,
                         mem_eta_hours: self.alert_mem_eta,
                         inodes_limit: self.alert_inodes,
+                        gpu_mem_pct_limit: self.alert_gpu_mem_pct,
+                        gpus: stats.gpus.clone(),
                         disk_busy_limit: self.alert_disk_busy,
                         temp_limit: self.alert_temp,
                         zombie_limit: self.alert_zombies,
@@ -2543,6 +2552,35 @@ impl TuiApp {
         // pressure stall information (Linux PSI): some/full avg10 per
         // resource; full ≥10% paints red — everything stalled on that
         // resource is the "machine is dying" signature
+        // whole-GPU section — absent without NVIDIA hardware
+        if !stats.gpus.is_empty() {
+            lines.push(Line::from(styled(Style::new().bold(), "gpu")));
+            for g in stats.gpus.iter().take(4) {
+                let pct = g.mem_used_mb * 100 / g.mem_total_mb.max(1);
+                let style = if pct >= 90 {
+                    Style::new().fg(Color::Red)
+                } else if pct >= 75 {
+                    Style::new().fg(Color::Yellow)
+                } else {
+                    Style::new()
+                };
+                let util = g
+                    .util_pct
+                    .map(|u| format!(" · {u:.0}% util"))
+                    .unwrap_or_default();
+                let temp = g
+                    .temp_c
+                    .map(|c| format!("{c:.0}°C · "))
+                    .unwrap_or_default();
+                lines.push(Line::from(styled(
+                    style,
+                    format!(
+                        "  gpu {} ({}) {temp}{}/{} MB ({pct}%){util}",
+                        g.id, g.name, g.mem_used_mb, g.mem_total_mb
+                    ),
+                )));
+            }
+        }
         if let Some(psi) = &stats.psi {
             lines.push(Line::from(vec![
                 Span::styled("pressure", Style::new().bold()),
@@ -10825,6 +10863,7 @@ mod tests {
                 alert_disk_eta: None,
                 alert_mem_eta: None,
                 alert_inodes: None,
+                alert_gpu_mem_pct: None,
                 alert_leak: None,
                 alert_fd_leak: None,
                 alert_thr_leak: None,

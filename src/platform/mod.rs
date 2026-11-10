@@ -751,6 +751,10 @@ pub struct SystemStats {
     /// platform reports no vmstat — the --alert-oom sentinel diffs it into
     /// a trailing-window kill count.
     pub oom_kills: Option<u64>,
+    /// Whole-GPU readings (Linux with NVIDIA drivers; other platforms
+    /// leave it empty for now) — the --alert-gpu-mem-pct sentinel and the
+    /// machine gauges read it. Empty without nvidia-smi (probed once).
+    pub gpus: Vec<crate::gpu::GpuSample>,
     /// Per-block-device IO pulse (Linux /proc/diskstats diffed
     /// refresh-to-refresh — busy percent is the iostat %util twin;
     /// Windows Win32_PerfFormattedData_PerfDisk_PhysicalDisk, cooked

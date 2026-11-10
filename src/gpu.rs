@@ -62,6 +62,69 @@ pub fn parse_pmon(out: &str) -> GpuUsage {
     map
 }
 
+/// One GPU's machine-level reading — the whole device, not a process.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GpuSample {
+    /// Driver's index ("0", "1"...).
+    pub id: String,
+    pub name: String,
+    /// Whole-GPU SM utilization percent at sample time.
+    pub util_pct: Option<f64>,
+    pub mem_used_mb: u64,
+    pub mem_total_mb: u64,
+    /// The hotter of the readings nvidia-smi reports for the device.
+    pub temp_c: Option<f64>,
+}
+
+/// Machine-level sample: one `nvidia-smi --query-gpu` sweep. None once
+/// the probe has failed (cached like the pmon probe).
+pub fn machine_sample() -> Option<Vec<GpuSample>> {
+    static UNAVAILABLE: OnceLock<()> = OnceLock::new();
+    if UNAVAILABLE.get().is_some() {
+        return None;
+    }
+    use std::process::{Command, Stdio};
+    let out = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        let _ = UNAVAILABLE.set(());
+        return None;
+    }
+    Some(parse_query(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `--query-gpu` csv rows: `0, NVIDIA A100, 85, 4096, 81920, 67` — the
+/// name is the only field that can hold spaces, and it can't hold a
+/// comma, so splitting on commas and trimming each field is exact.
+pub fn parse_query(out: &str) -> Vec<GpuSample> {
+    let mut out_rows = Vec::new();
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if f.len() < 6 {
+            continue;
+        }
+        let num = |s: &str| s.parse::<f64>().ok();
+        out_rows.push(GpuSample {
+            id: f[0].to_string(),
+            name: f[1].to_string(),
+            util_pct: num(f[2]),
+            mem_used_mb: num(f[3]).unwrap_or(0.0) as u64,
+            mem_total_mb: num(f[4]).unwrap_or(0.0) as u64,
+            temp_c: num(f[5]),
+        });
+    }
+    out_rows
+}
+
 /// Fill the gpu_* fields of each process from one sample. No-op when the
 /// host has no usable nvidia-smi.
 pub fn enrich(procs: &mut [Process]) {
@@ -165,4 +228,22 @@ mod tests {
         assert_eq!(cell(&mk(Some(12), None)), "12%");
         assert_eq!(cell(&mk(None, None)), "-");
     }
+    #[test]
+    fn parse_query_reads_the_machine_rows() {
+        let rows = parse_query("0, NVIDIA A100, 85, 4096, 81920, 67\n1, GeForce RTX 3090, 12, 512, 24576, 54\n");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "0");
+        assert_eq!(rows[0].name, "NVIDIA A100");
+        assert_eq!(rows[0].util_pct, Some(85.0));
+        assert_eq!(rows[0].mem_used_mb, 4096);
+        assert_eq!(rows[0].mem_total_mb, 81_920);
+        assert_eq!(rows[0].temp_c, Some(67.0));
+        assert_eq!(rows[1].name, "GeForce RTX 3090");
+        // a dash for an unsupported reading parses as None
+        let rows = parse_query("0, Test GPU, , 100, 200, \n");
+        assert_eq!(rows[0].util_pct, None);
+        assert_eq!(rows[0].temp_c, None);
+        assert_eq!(rows[0].mem_used_mb, 100);
+    }
+
 }

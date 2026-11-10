@@ -1650,6 +1650,39 @@ pub fn render_sys(frame: &SysFrame, p: &Painter) -> String {
         };
         let _ = writeln!(out, "temp  {styled}");
     }
+    // whole-GPU row: busiest memory share first, util + capacity beside —
+    // absent without NVIDIA hardware (zero dead width)
+    if !frame.stats.gpus.is_empty() {
+        let mut gs: Vec<&crate::gpu::GpuSample> = frame.stats.gpus.iter().collect();
+        gs.sort_by(|a, b| {
+            let sa = a.mem_used_mb * 100 / a.mem_total_mb.max(1);
+            let sb = b.mem_used_mb * 100 / b.mem_total_mb.max(1);
+            sb.cmp(&sa)
+        });
+        let cells: Vec<String> = gs
+            .iter()
+            .take(4)
+            .map(|g| {
+                let pct = g.mem_used_mb * 100 / g.mem_total_mb.max(1);
+                let util = g
+                    .util_pct
+                    .map(|u| format!(" {u:.0}% util"))
+                    .unwrap_or_default();
+                let txt = format!(
+                    "gpu {} ({}) {} · {}/{} MB ({pct}%){util}",
+                    g.id, g.name, g.temp_c.map(|c| format!("{c:.0}°C")).unwrap_or_default(), g.mem_used_mb, g.mem_total_mb
+                );
+                if pct >= 90 {
+                    p.red(&txt)
+                } else if pct >= 75 {
+                    p.yellow(&txt)
+                } else {
+                    txt
+                }
+            })
+            .collect();
+        let _ = writeln!(out, "gpu   {}", cells.join("  "));
+    }
     if let Some(psi) = &frame.stats.psi {
         let line = psi.line();
         let worst = psi.worst_full();
@@ -2026,6 +2059,19 @@ pub fn grafana_dashboard() -> serde_json::Value {
         &[("{{sensor}}", "witr_machine_temp_celsius")],
     );
     add(
+        "GPU",
+        0, 77, 12, 8,
+        "percent",
+        Some(100.0),
+        &[
+            ("gpu {{gpu}} util", "witr_machine_gpu_utilization_percent"),
+            (
+                "gpu {{gpu}} mem",
+                "witr_machine_gpu_memory_used_bytes / witr_machine_gpu_memory_total_bytes * 100",
+            ),
+        ],
+    );
+    add(
         "Predicted hours to full / exhausted",
         0, 69, 24, 8,
         "none",
@@ -2253,6 +2299,14 @@ pub fn alert_rules_yaml() -> String {
             "warning",
             "Memory predicted to exhaust",
             "MemAvailable is predicted to run out in {{ $value }}h at the current drain rate — the trend behind --alert-mem-eta, the OOM omen before the floor breaks.",
+        ),
+        (
+            "WitrGpuMemoryNearLimit",
+            "witr_machine_gpu_memory_used_bytes / witr_machine_gpu_memory_total_bytes > 0.9",
+            "5m",
+            "warning",
+            "GPU memory near capacity",
+            "{{ $labels.name }} (gpu {{ $labels.gpu }}) sits over 90% of its own memory for 5m — the CUDA-alloc-failure doorstep, long before the host's RAM cares.",
         ),
         (
             "WitrInodesExhausted",
@@ -3717,6 +3771,14 @@ mod tests {
             temp: Some(("acpitz".into(), 54.0)),
             retrans_segs: Some(4242),
             oom_kills: Some(2),
+            gpus: vec![crate::gpu::GpuSample {
+                id: "0".into(),
+                name: "NVIDIA A100".into(),
+                util_pct: Some(85.0),
+                mem_used_mb: 40_960,
+                mem_total_mb: 81_920,
+                temp_c: Some(67.0),
+            }],
             disks: vec![crate::platform::DiskIoSample {
                 device: "vda".into(),
                 busy_pct: Some(87.4),
@@ -3757,6 +3819,12 @@ mod tests {
         assert!(text.contains("disk  /"), "fullest mount first: {text}");
         assert!(text.contains("net   eth0"));
         assert!(text.contains("temp  acpitz 54°C"));
+        // the gpu row: memory share first, temp + util beside; 50% share
+        // stays plain
+        assert!(
+            text.contains("gpu 0 (NVIDIA A100) 67°C · 40960/81920 MB (50%) 85% util"),
+            "{text}"
+        );
         assert!(text.contains("psi   cpu 1.2/0.0"));
         // per-device IO under the space bars: busiest device with busy%,
         // queue depth and the IOPS tail; past 80% busy it goes red
@@ -3884,6 +3952,7 @@ mod tests {
             "witr_machine_dstate_count",
             "witr_machine_failed_units",
             "witr_machine_fs_inode_used_percent",
+            "witr_machine_gpu_memory_total_bytes",
             "witr_container_cpu_percent",
             "witr_container_mem_total_bytes",
             "witr_machine_disk_eta_hours",
@@ -3940,6 +4009,8 @@ mod tests {
             "witr_machine_fs_used_percent",
             "witr_machine_fs_inode_used_percent",
             "witr_machine_temp_celsius",
+            "witr_machine_gpu_utilization_percent",
+            "witr_machine_gpu_memory_used_bytes",
         ] {
             assert!(
                 exprs.iter().any(|e| e.contains(probe)),

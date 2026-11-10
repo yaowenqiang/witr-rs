@@ -219,6 +219,42 @@ fn dashboard_html(platform: &dyn Platform, containers: &[crate::model::Container
             out.push_str(&tile("failed", v, None));
         }
     }
+    // whole-GPU tiles: the hottest memory share, only when hardware
+    // answers (zero dead width)
+    if !stats.gpus.is_empty() {
+        let mut gs: Vec<&crate::gpu::GpuSample> = stats.gpus.iter().collect();
+        gs.sort_by(|a, b| {
+            let sa = a.mem_used_mb * 100 / a.mem_total_mb.max(1);
+            let sb = b.mem_used_mb * 100 / b.mem_total_mb.max(1);
+            sb.cmp(&sa)
+        });
+        let g = gs[0];
+        let pct = g.mem_used_mb * 100 / g.mem_total_mb.max(1);
+        let cls = if pct >= 90 { "hot" } else if pct >= 75 { "warm" } else { "" };
+        out.push_str(&format!(
+            "<div class=\"tile\"><div class=\"k\">gpu {} · {}</div><div class=\"v\">{pct}<span style=\"font-size:12px\">% mem</span></div><div class=\"bar\"><i class=\"{cls}\" style=\"width:{pct}\"></i></div></div>",
+            esc(&g.id),
+            esc(&g.name),
+        ));
+    }
+    // whole-GPU tiles: the hottest memory share, only when hardware
+    // answers (zero dead width)
+    if !stats.gpus.is_empty() {
+        let mut gs: Vec<&crate::gpu::GpuSample> = stats.gpus.iter().collect();
+        gs.sort_by(|a, b| {
+            let sa = a.mem_used_mb * 100 / a.mem_total_mb.max(1);
+            let sb = b.mem_used_mb * 100 / b.mem_total_mb.max(1);
+            sb.cmp(&sa)
+        });
+        let g = gs[0];
+        let pct = g.mem_used_mb * 100 / g.mem_total_mb.max(1);
+        let cls = if pct >= 90 { "hot" } else if pct >= 75 { "warm" } else { "" };
+        out.push_str(&format!(
+            "<div class=\"tile\"><div class=\"k\">gpu {} · {}</div><div class=\"v\">{pct}<span style=\"font-size:12px\">% mem</span></div><div class=\"bar\"><i class=\"{cls}\" style=\"width:{pct}\"></i></div></div>",
+            esc(&g.id),
+            esc(&g.name),
+        ));
+    }
     out.push_str("</div>\n");
 
     let head = "<tr><th>PID</th><th>USER</th><th>NAME</th><th>COMMAND</th><th>VALUE</th></tr>";
@@ -530,8 +566,10 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>, trends: &mut
     // scrapes — the very first one reports nothing (same as the TUI's
     // first tick).
     let mut mem_avail: Option<u64> = None;
+    let mut gpus: Vec<crate::gpu::GpuSample> = Vec::new();
     if let Some(s) = platform.system_stats() {
         mem_avail = s.mem_avail_mb;
+        gpus = s.gpus.clone();
         if let Some(cpu) = s.cpu_percent {
             out.push_str("# HELP witr_machine_cpu_percent Total CPU busy percent across all cores\n");
             out.push_str("# TYPE witr_machine_cpu_percent gauge\n");
@@ -676,6 +714,51 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>, trends: &mut
     }
         // inode usage — the --alert-inodes sentinel's raw input (the df -Pi
         // sweep rides the mount sweep; mounts without inode stats sit out)
+        // whole-GPU readings — the device-side view the process rows can't
+        // give (utilization is the whole device; memory is its own pool)
+        if !gpus.is_empty() {
+            out.push_str("# HELP witr_machine_gpu_utilization_percent Whole-GPU SM utilization\n");
+            out.push_str("# TYPE witr_machine_gpu_utilization_percent gauge\n");
+            for g in &gpus {
+                if let Some(u) = g.util_pct {
+                    out.push_str(&format!(
+                        "witr_machine_gpu_utilization_percent{{gpu=\"{}\",name=\"{}\"}} {u:.2}\n",
+                        label_escape(&g.id),
+                        label_escape(&g.name),
+                    ));
+                }
+            }
+            out.push_str("# HELP witr_machine_gpu_memory_used_bytes GPU memory in use in bytes\n");
+            out.push_str("# TYPE witr_machine_gpu_memory_used_bytes gauge\n");
+            out.push_str("# HELP witr_machine_gpu_memory_total_bytes GPU memory capacity in bytes\n");
+            out.push_str("# TYPE witr_machine_gpu_memory_total_bytes gauge\n");
+            for g in &gpus {
+                let id = (label_escape(&g.id), label_escape(&g.name));
+                out.push_str(&format!(
+                    "witr_machine_gpu_memory_used_bytes{{gpu=\"{}\",name=\"{}\"}} {}\n",
+                    id.0,
+                    id.1,
+                    g.mem_used_mb * 1024 * 1024,
+                ));
+                out.push_str(&format!(
+                    "witr_machine_gpu_memory_total_bytes{{gpu=\"{}\",name=\"{}\"}} {}\n",
+                    id.0,
+                    id.1,
+                    g.mem_total_mb * 1024 * 1024,
+                ));
+            }
+            out.push_str("# HELP witr_machine_gpu_temp_celsius GPU temperature\n");
+            out.push_str("# TYPE witr_machine_gpu_temp_celsius gauge\n");
+            for g in &gpus {
+                if let Some(c) = g.temp_c {
+                    out.push_str(&format!(
+                        "witr_machine_gpu_temp_celsius{{gpu=\"{}\",name=\"{}\"}} {c:.2}\n",
+                        label_escape(&g.id),
+                        label_escape(&g.name),
+                    ));
+                }
+            }
+        }
         let inode_rows: Vec<(&crate::platform::MountUsage, f64)> = mounts
             .iter()
             .filter_map(|m| {

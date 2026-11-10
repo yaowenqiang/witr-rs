@@ -528,6 +528,9 @@ pub struct SysAlertState {
     pub inodes_streak: u32,
     pub inodes_firing: bool,
     pub inodes_fired_secs: u32,
+    pub gpu_streak: u32,
+    pub gpu_firing: bool,
+    pub gpu_fired_secs: u32,
     /// Per-process leak-sentinel state — keyed `(kind, pid)` because the
     /// three siblings (mem/fd/threads) judge independently. Process exits
     /// drop the entry; a returning process re-arms from zero.
@@ -616,6 +619,13 @@ pub struct SysAlertLimits {
     /// can't see. `mounts` is the input (the df -Pi sweep fills the inode
     /// fields); mounts reporting no inode stats sit out.
     pub inodes_limit: Option<u64>,
+    /// --alert-gpu-mem-pct: fire when any GPU's memory usage exceeds
+    /// this percent of its own capacity — the OOM-on-device sentinel
+    /// (a CUDA alloc fails long before the host's RAM cares). `gpus` is
+    /// the input; empty (no NVIDIA driver) sits out.
+    pub gpu_mem_pct_limit: Option<u64>,
+    /// This sample's whole-GPU readings.
+    pub gpus: Vec<crate::gpu::GpuSample>,
     /// --alert-disk-busy: fire when any block device spends over this
     /// share of the refresh interval with IO in flight (the iostat %util
     /// twin). Answers "which disk is the bottleneck" — a question neither
@@ -1298,6 +1308,8 @@ pub fn system_alert_picks(
         disk_eta_hours,
         mem_eta_hours,
         inodes_limit,
+        gpu_mem_pct_limit,
+        gpus,
         disk_busy_limit,
         temp_limit,
         zombie_limit,
@@ -1327,6 +1339,7 @@ pub fn system_alert_picks(
     let disk_eta_limit = *disk_eta_hours;
     let mem_eta_limit = *mem_eta_hours;
     let inodes_limit = *inodes_limit;
+    let gpu_mem_pct_limit = *gpu_mem_pct_limit;
     let disk_busy_limit = *disk_busy_limit;
     let temp_limit = *temp_limit;
     let zombie_limit = *zombie_limit;
@@ -1542,6 +1555,49 @@ pub fn system_alert_picks(
             out.push((
                 "system".to_string(),
                 format!("memory trend no longer heading under {eta_limit:.1}h"),
+                true,
+            ));
+        }
+    }
+    if let Some(limit) = gpu_mem_pct_limit {
+        let over: Vec<(String, String, u64)> = gpus
+            .iter()
+            .filter(|g| g.mem_total_mb > 0 && g.mem_used_mb * 100 / g.mem_total_mb > limit)
+            .map(|g| {
+                (
+                    g.id.clone(),
+                    g.name.clone(),
+                    g.mem_used_mb * 100 / g.mem_total_mb,
+                )
+            })
+            .collect();
+        let edge = alert_cycle_repeat(
+            &mut state.gpu_streak,
+            &mut state.gpu_firing,
+            !over.is_empty(),
+            &mut state.gpu_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            let named: Vec<String> = over
+                .iter()
+                .take(3)
+                .map(|(id, name, pct)| format!("gpu {id} ({name}) {pct}%"))
+                .collect();
+            out.push((
+                "system".to_string(),
+                format!(
+                    "GPU memory {} above {limit}% of capacity — a device-side OOM (CUDA alloc failure) hits before the host's RAM ever cares, for {}s",
+                    named.join(", "),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("GPU memory back under {limit}% of capacity"),
                 true,
             ));
         }
@@ -3264,6 +3320,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -3338,6 +3396,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -3428,6 +3488,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -3624,6 +3686,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -3685,6 +3749,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
             }
@@ -3757,6 +3823,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -3823,6 +3891,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
         };
         // one kill lands (counter 5 → 6): the first tick only arms the
         // previous counter, then the kill sits in the window long enough
@@ -3912,6 +3982,102 @@ mod tests {
     }
 
     #[test]
+    fn gpu_alert_fires_names_device_and_recovers() {
+        let gpu = |used: u64, total: u64| crate::gpu::GpuSample {
+            id: "0".into(),
+            name: "NVIDIA A100".into(),
+            util_pct: Some(85.0),
+            mem_used_mb: used,
+            mem_total_mb: total,
+            temp_c: Some(67.0),
+        };
+        let limits = |gpu_limit: Option<u64>, gpus: Vec<crate::gpu::GpuSample>| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
+            repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
+            dstate_limit: None,
+            dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
+            disk_eta_hours: None,
+            mem_eta_hours: None,
+            inodes_limit: None,
+            gpu_mem_pct_limit: gpu_limit,
+            gpus,
+            oom_limit: None,
+            oom_kills: None,
+        };
+        // no GPUs (driver absent) → silent even armed, never a recovery
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                system_alert_picks(
+                    &crate::platform::SystemStats::default(),
+                    &mut state,
+                    &limits(Some(90), Vec::new()),
+                    3
+                )
+                .is_empty()
+            );
+        }
+        let mut state = SysAlertState::default();
+        // 95% of capacity over a 90% line: arming samples, then one fire
+        // naming device and share
+        let hot = vec![gpu(76_000, 80_000)];
+        for _ in 0..ALERT_CYCLES - 1 {
+            assert!(
+                system_alert_picks(
+                    &crate::platform::SystemStats::default(),
+                    &mut state,
+                    &limits(Some(90), hot.clone()),
+                    3
+                )
+                .is_empty()
+            );
+        }
+        let fires = system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(90), hot),
+            3,
+        );
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert!(
+            fires[0]
+                .1
+                .contains("GPU memory gpu 0 (NVIDIA A100) 95% above 90%"),
+            "{}",
+            fires[0].1
+        );
+        // freed → recovery
+        let rec = system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(90), vec![gpu(40_000, 80_000)]),
+            3,
+        );
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert!(rec[0].2, "{rec:?}");
+    }
+
+    #[test]
     fn inode_alert_fires_names_mount_and_recovers() {
         let limits = |inodes_limit: Option<u64>,
                       inodes: Option<(u64, u64)>|
@@ -3955,6 +4121,8 @@ mod tests {
                 disk_eta_hours: None,
                 mem_eta_hours: None,
                 inodes_limit,
+                gpu_mem_pct_limit: None,
+                gpus: Vec::new(),
                 oom_limit: None,
                 oom_kills: None,
             }
@@ -4039,6 +4207,8 @@ mod tests {
             disk_eta_hours: eta,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -4131,6 +4301,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: eta,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4255,6 +4427,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4333,6 +4507,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4410,6 +4586,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4472,6 +4650,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4541,6 +4721,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4617,6 +4799,8 @@ mod tests {
             disk_eta_hours: None,
             mem_eta_hours: None,
             inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };

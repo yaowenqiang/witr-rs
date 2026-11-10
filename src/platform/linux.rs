@@ -1354,6 +1354,11 @@ impl Platform for Linux {
         if let Some(vm) = read_ok(Path::new("/proc/vmstat")) {
             out.oom_kills = parse_vmstat_oom(&vm);
         }
+        // whole-GPU readings ride the same sweep (one nvidia-smi call;
+        // absent driver = cached probe = empty vec, sections hide)
+        if let Some(gpus) = crate::gpu::machine_sample() {
+            out.gpus = gpus;
+        }
         // per-device IO: diff this sweep's counters against the previous
         // call's — busy% is io_ticks delta over elapsed wall time (the
         // iostat %util, clamped at 100: NVMe's parallelism can hold more

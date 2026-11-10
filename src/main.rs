@@ -854,6 +854,12 @@ fn fleet_alert_picks(
         disk_eta_hours: cli.alert_disk_eta,
         mem_eta_hours: cli.alert_mem_eta,
         inodes_limit: cli.alert_inodes,
+        // the GPU sentinel is hardware-local: the snapshot doesn't carry
+        // device readings (an armed --alert-gpu-mem-pct in fleet mode
+        // simply stays quiet for that sentinel — the machine sentinels
+        // judge normally)
+        gpu_mem_pct_limit: None,
+        gpus: Vec::new(),
         disk_busy_limit: cli.alert_disk_busy,
         temp_limit: cli.alert_temp,
         zombie_limit: cli.alert_zombies,
@@ -1531,6 +1537,7 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         || cli.alert_nic_drop.is_some()
         || cli.alert_oom.is_some()
         || cli.alert_disk_busy.is_some()
+        || cli.alert_gpu_mem_pct.is_some()
         || cli.alert_temp.is_some()
         || cli.alert_zombies.is_some()
         || cli.alert_dstate.is_some()
@@ -2098,6 +2105,27 @@ fn machine_check_lines(
             .collect();
         if !over.is_empty() {
             out.push(format!("disk IO {} above {limit}% busy", over.join(", ")));
+        }
+    }
+    if let Some(limit) = cli.alert_gpu_mem_pct {
+        let over: Vec<String> = stats
+            .gpus
+            .iter()
+            .filter(|g| g.mem_total_mb > 0 && g.mem_used_mb * 100 / g.mem_total_mb > limit)
+            .map(|g| {
+                format!(
+                    "gpu {} ({}) {}%",
+                    g.id,
+                    g.name,
+                    g.mem_used_mb * 100 / g.mem_total_mb
+                )
+            })
+            .collect();
+        if !over.is_empty() {
+            out.push(format!(
+                "GPU memory {} above {limit}% of capacity",
+                over.join(", ")
+            ));
         }
     }
     if let Some(limit) = cli.alert_temp {
@@ -5787,6 +5815,7 @@ fn main() {
                     || cli.alert_disk_eta.is_some()
                     || cli.alert_mem_eta.is_some()
                     || cli.alert_disk_busy.is_some()
+                    || cli.alert_gpu_mem_pct.is_some()
                     || cli.alert_temp.is_some()
                     || cli.alert_zombies.is_some()
                     || cli.alert_dstate.is_some()
@@ -5856,6 +5885,8 @@ fn main() {
                             disk_eta_hours: cli.alert_disk_eta,
                             mem_eta_hours: cli.alert_mem_eta,
                             inodes_limit: cli.alert_inodes,
+                            gpu_mem_pct_limit: cli.alert_gpu_mem_pct,
+                            gpus: stats.gpus.clone(),
                             disk_busy_limit: cli.alert_disk_busy,
                             temp_limit: cli.alert_temp,
                             zombie_limit: cli.alert_zombies,
@@ -7126,9 +7157,19 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             "1",
             "--alert-inodes",
             "85",
+            "--alert-gpu-mem-pct",
+            "75",
         ]);
         let stats = crate::platform::SystemStats {
             temp: Some(("acpitz".into(), 85.0)),
+            gpus: vec![crate::gpu::GpuSample {
+                id: "0".into(),
+                name: "NVIDIA A100".into(),
+                util_pct: Some(85.0),
+                mem_used_mb: 78_000,
+                mem_total_mb: 81_920,
+                temp_c: Some(67.0),
+            }],
             disks: vec![
                 crate::platform::DiskIoSample {
                     device: "vda".into(),
@@ -7169,7 +7210,13 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             None,
             None,
         );
-        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert_eq!(lines.len(), 7, "{lines:?}");
+        assert!(
+            lines.iter().any(|l| {
+                l.contains("GPU memory gpu 0 (NVIDIA A100) 95% above 75%")
+            }),
+            "{lines:?}"
+        );
         assert!(
             lines
                 .iter()

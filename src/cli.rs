@@ -239,6 +239,7 @@ impl Cli {
         self.alert_disk = self.alert_disk.or(cfg.alert_disk);
         self.alert_disk_eta = self.alert_disk_eta.or(cfg.alert_disk_eta);
         self.alert_inodes = self.alert_inodes.or(cfg.alert_inodes);
+        self.alert_gpu_mem_pct = self.alert_gpu_mem_pct.or(cfg.alert_gpu_mem_pct);
         self.alert_leak = self.alert_leak.or(cfg.alert_leak);
         self.alert_fd_leak = self.alert_fd_leak.or(cfg.alert_fd_leak);
         self.alert_thr_leak = self.alert_thr_leak.or(cfg.alert_thr_leak);
@@ -868,6 +869,16 @@ pub struct Cli {
         )
     )]
     pub alert_inodes: Option<u64>,
+
+    #[arg(
+        long = "alert-gpu-mem-pct",
+        value_name = "PCT",
+        help = t(
+            "GPU 显存哨兵:任一 GPU 的显存占用占自身容量的比例连续 5 次采样超过该值即触发,详情点名 GPU 与占比——设备侧 OOM(CUDA 分配失败)在宿主机内存还宽裕时就先爆;nvidia-smi 缺席时哨兵无声。TUI 和 --watch",
+            "GPU memory sentinel: fires when any GPU's memory usage exceeds this percent of its own capacity for 5 consecutive samples, the detail naming the GPU and the share — a device-side OOM (CUDA alloc failure) hits long before the host's RAM cares; silent without nvidia-smi. TUI and --watch"
+        )
+    )]
+    pub alert_gpu_mem_pct: Option<u64>,
 
     #[arg(
         long = "alert-leak",
