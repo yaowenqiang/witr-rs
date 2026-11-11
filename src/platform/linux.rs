@@ -330,6 +330,65 @@ fn parse_vmstat_oom(text: &str) -> Option<u64> {
     })
 }
 
+/// The deleted-but-held walk (Linux): every /proc/<pid>/fd link whose
+/// target ends in " (deleted)" stats through to the inode for a real
+/// size, deduped by (device, inode) — two processes holding the same
+/// deleted file count its bytes once, both named. Size desc; a hold
+/// whose stat fails (permission, gone) skips silently.
+// unix-only body: the dev/ino dedup reads MetadataExt, which doesn't
+// exist off unix (linux.rs compiles on every target — flat module tree)
+#[cfg(target_os = "linux")]
+fn deleted_files_walk() -> Vec<super::DeletedFile> {
+    use std::collections::HashSet;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+
+    let mut out: Vec<super::DeletedFile> = Vec::new();
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Ok(pid) = name.to_string_lossy().parse::<Pid>() else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        let proc_name = std::fs::read_to_string(entry.path().join("comm"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let target = target.to_string_lossy().to_string();
+            let Some(path) = target.strip_suffix(" (deleted)") else {
+                continue;
+            };
+            let Ok(md) = std::fs::metadata(PathBuf::from(&fd.path())) else {
+                continue;
+            };
+            if !seen.insert((md.dev(), md.ino())) {
+                continue;
+            }
+            out.push(super::DeletedFile {
+                pid,
+                name: if proc_name.is_empty() {
+                    "?".into()
+                } else {
+                    proc_name.clone()
+                },
+                path: path.to_string(),
+                size_mb: md.size() / 1024 / 1024,
+            });
+        }
+    }
+    out.sort_by_key(|d| std::cmp::Reverse(d.size_mb));
+    out
+}
+
 /// /proc/diskstats rows for real block devices — `(device, io_ticks_ms,
 /// reads, writes, in_flight)`. Loop/ram/floppy pseudo-devices are skipped
 /// (they never hold interesting IO); partitions are dropped by the
@@ -1414,6 +1473,16 @@ impl Platform for Linux {
         read_ok(Path::new("/proc/net/dev"))
             .map(|t| parse_net_dev(&t))
             .unwrap_or_default()
+    }
+
+    /// The deleted-but-held file walk: readlink every /proc/<pid>/fd link,
+    /// stat the ones the kernel marked "(deleted)", dedup by (dev, inode)
+    /// so two holders of one file count its bytes once. Sorted size desc.
+    fn deleted_files(&self) -> Vec<super::DeletedFile> {
+        #[cfg(target_os = "linux")]
+        return deleted_files_walk();
+        #[cfg(not(target_os = "linux"))]
+        return Vec::new();
     }
 
     /// The systemd failed-unit list — the super helper asks

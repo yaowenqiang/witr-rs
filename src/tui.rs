@@ -425,6 +425,8 @@ struct TuiApp {
     alert_inodes: Option<u64>,
     /// --alert-gpu-mem-pct: per-GPU memory share threshold
     alert_gpu_mem_pct: Option<u64>,
+    /// --alert-deleted-gb: held-deleted space threshold (GB)
+    alert_deleted_gb: Option<f64>,
     /// --alert-leak: per-process RSS growth threshold (MB)
     alert_leak: Option<f64>,
     /// --alert-fd-leak: per-process fd growth threshold
@@ -675,6 +677,8 @@ pub struct Seed {
     pub alert_inodes: Option<u64>,
     /// --alert-gpu-mem-pct: per-GPU memory share threshold
     pub alert_gpu_mem_pct: Option<u64>,
+    /// --alert-deleted-gb: held-deleted space threshold (GB)
+    pub alert_deleted_gb: Option<f64>,
     /// --alert-leak: per-process RSS growth threshold (MB)
     pub alert_leak: Option<f64>,
     /// --alert-fd-leak: per-process fd growth threshold
@@ -802,6 +806,7 @@ impl Seed {
         self.alert_mem_eta = cli.alert_mem_eta;
         self.alert_inodes = cli.alert_inodes;
         self.alert_gpu_mem_pct = cli.alert_gpu_mem_pct;
+        self.alert_deleted_gb = cli.alert_deleted_gb;
         self.alert_leak = cli.alert_leak;
         self.alert_fd_leak = cli.alert_fd_leak;
         self.alert_thr_leak = cli.alert_thr_leak;
@@ -959,6 +964,7 @@ impl TuiApp {
             alert_mem_eta: seed.alert_mem_eta,
             alert_inodes: seed.alert_inodes,
             alert_gpu_mem_pct: seed.alert_gpu_mem_pct,
+            alert_deleted_gb: seed.alert_deleted_gb,
             alert_leak: seed.alert_leak,
             alert_fd_leak: seed.alert_fd_leak,
             alert_thr_leak: seed.alert_thr_leak,
@@ -1262,6 +1268,7 @@ impl TuiApp {
         self.alert_mem_eta = seed.alert_mem_eta;
         self.alert_inodes = seed.alert_inodes;
         self.alert_gpu_mem_pct = seed.alert_gpu_mem_pct;
+        self.alert_deleted_gb = seed.alert_deleted_gb;
         self.alert_leak = seed.alert_leak;
         self.alert_fd_leak = seed.alert_fd_leak;
         self.alert_thr_leak = seed.alert_thr_leak;
@@ -1450,6 +1457,7 @@ impl TuiApp {
                     || self.alert_disk_eta.is_some()
                     || self.alert_mem_eta.is_some()
                     || self.alert_inodes.is_some()
+                    || self.alert_deleted_gb.is_some()
                     || self.alert_leak.is_some()
                     || self.alert_fd_leak.is_some()
                     || self.alert_thr_leak.is_some()
@@ -1541,6 +1549,12 @@ impl TuiApp {
                         mem_eta_hours: self.alert_mem_eta,
                         inodes_limit: self.alert_inodes,
                         gpu_mem_pct_limit: self.alert_gpu_mem_pct,
+                        deleted_gb_limit: self.alert_deleted_gb,
+                        deleted_files: if self.alert_deleted_gb.is_some() {
+                            self.platform.deleted_files()
+                        } else {
+                            Vec::new()
+                        },
                         gpus: stats.gpus.clone(),
                         disk_busy_limit: self.alert_disk_busy,
                         temp_limit: self.alert_temp,
@@ -10864,6 +10878,7 @@ mod tests {
                 alert_mem_eta: None,
                 alert_inodes: None,
                 alert_gpu_mem_pct: None,
+                alert_deleted_gb: None,
                 alert_leak: None,
                 alert_fd_leak: None,
                 alert_thr_leak: None,

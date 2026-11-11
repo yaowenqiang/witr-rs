@@ -860,6 +860,10 @@ fn fleet_alert_picks(
         // judge normally)
         gpu_mem_pct_limit: None,
         gpus: Vec::new(),
+        // the deleted-file walk is the local /proc — fleet mode doesn't
+        // carry it (GPU stays None too: device readings are hardware-local)
+        deleted_gb_limit: None,
+        deleted_files: Vec::new(),
         disk_busy_limit: cli.alert_disk_busy,
         temp_limit: cli.alert_temp,
         zombie_limit: cli.alert_zombies,
@@ -1538,6 +1542,7 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         || cli.alert_oom.is_some()
         || cli.alert_disk_busy.is_some()
         || cli.alert_gpu_mem_pct.is_some()
+        || cli.alert_deleted_gb.is_some()
         || cli.alert_temp.is_some()
         || cli.alert_zombies.is_some()
         || cli.alert_dstate.is_some()
@@ -1733,10 +1738,16 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
     } else {
         Vec::new()
     };
+    let deleted_files = if cli.alert_deleted_gb.is_some() {
+        platform.deleted_files()
+    } else {
+        Vec::new()
+    };
     let mut machine_lines = machine_check_lines(
         cli,
         &stats,
         &mounts,
+        &deleted_files,
         procs.len(),
         zombie_count,
         dstate_count,
@@ -1966,6 +1977,7 @@ fn machine_check_lines(
     cli: &cli::Cli,
     stats: &crate::platform::SystemStats,
     mounts: &[crate::platform::MountUsage],
+    deleted_files: &[crate::platform::DeletedFile],
     proc_count: usize,
     zombie_count: usize,
     dstate_count: usize,
@@ -2107,6 +2119,21 @@ fn machine_check_lines(
             out.push(format!("disk IO {} above {limit}% busy", over.join(", ")));
         }
     }
+    if let Some(limit) = cli.alert_deleted_gb {
+        let total_mb: u64 = deleted_files.iter().map(|d| d.size_mb).sum();
+        if (total_mb as f64 / 1024.0) > limit {
+            let named: Vec<String> = deleted_files
+                .iter()
+                .take(3)
+                .map(|d| format!("{} (pid {})", d.path, d.pid))
+                .collect();
+            out.push(format!(
+                "deleted-but-held files: {:.1} GB above {limit} GB — {}",
+                total_mb as f64 / 1024.0,
+                named.join(", ")
+            ));
+        }
+    }
     if let Some(limit) = cli.alert_gpu_mem_pct {
         let over: Vec<String> = stats
             .gpus
@@ -2205,6 +2232,7 @@ fn run_check_fleet(bases: &[String], cli: &cli::Cli) -> i32 {
                     cli,
                     &sample.stats,
                     &sample.mounts,
+                    &[],
                     procs.len(),
                     zombie_count,
                     dstate_count,
@@ -5023,6 +5051,32 @@ fn main() {
         std::process::exit(if rows.is_empty() { 0 } else { 1 });
     }
 
+    // --deleted: open-but-deleted files — the "df full, du disagrees"
+    // answer. Exit 1 when any exist so scripts can branch directly.
+    if cli.deleted {
+        let platform = platform::get();
+        let rows = render::collect_deleted(&platform.deleted_files());
+        if cli.json {
+            let total_mb: u64 = rows.iter().map(|r| r.size_mb).sum();
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "deleted_count": rows.len(),
+                "reclaimable_mb": total_mb,
+                "deleted": rows,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if cli.csv {
+            write_out(&render::render_deleted_csv(&rows));
+        } else if cli.markdown {
+            write_out(&render::render_deleted_markdown(&rows));
+        } else {
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            write_out(&render::render_deleted(&rows, &painter));
+        }
+        std::process::exit(if rows.is_empty() { 0 } else { 1 });
+    }
+
     // --dstate: processes stuck in uninterruptible wait — the --zombies
     // twin for the storage-hang signature. Exit 1 when any exist so
     // scripts can branch directly.
@@ -5829,6 +5883,7 @@ fn main() {
                     || cli.alert_mem_eta.is_some()
                     || cli.alert_disk_busy.is_some()
                     || cli.alert_gpu_mem_pct.is_some()
+                    || cli.alert_deleted_gb.is_some()
                     || cli.alert_temp.is_some()
                     || cli.alert_zombies.is_some()
                     || cli.alert_dstate.is_some()
@@ -5899,6 +5954,12 @@ fn main() {
                             mem_eta_hours: cli.alert_mem_eta,
                             inodes_limit: cli.alert_inodes,
                             gpu_mem_pct_limit: cli.alert_gpu_mem_pct,
+                            deleted_gb_limit: cli.alert_deleted_gb,
+                            deleted_files: if cli.alert_deleted_gb.is_some() {
+                                platform.deleted_files()
+                            } else {
+                                Vec::new()
+                            },
                             gpus: stats.gpus.clone(),
                             disk_busy_limit: cli.alert_disk_busy,
                             temp_limit: cli.alert_temp,
@@ -7172,6 +7233,8 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             "85",
             "--alert-gpu-mem-pct",
             "75",
+            "--alert-deleted-gb",
+            "2",
         ]);
         let stats = crate::platform::SystemStats {
             temp: Some(("acpitz".into(), 85.0)),
@@ -7210,10 +7273,17 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             "lightdm.service".to_string(),
             "plymouth-quit.service".to_string(),
         ];
+        let deleted = vec![crate::platform::DeletedFile {
+            pid: 900,
+            name: "rsyslogd".into(),
+            path: "/var/log/journal.log".into(),
+            size_mb: 6 * 1024,
+        }];
         let lines = machine_check_lines(
             &cli,
             &stats,
             &mounts,
+            &deleted,
             0,
             7,
             4,
@@ -7223,7 +7293,15 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             None,
             None,
         );
-        assert_eq!(lines.len(), 7, "{lines:?}");
+        assert_eq!(lines.len(), 8, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(
+                    "deleted-but-held files: 6.0 GB above 2 GB — /var/log/journal.log (pid 900)"
+                )),
+            "{lines:?}"
+        );
         assert!(
             lines.iter().any(|l| {
                 l.contains("GPU memory gpu 0 (NVIDIA A100) 95% above 75%")
@@ -7265,8 +7343,21 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         // under every line → nothing to report
         let quiet = crate::platform::SystemStats::default();
         assert!(
-            machine_check_lines(&cli, &quiet, &[], 0, 0, 0, &[], None, None, None, None)
-                .is_empty()
+            machine_check_lines(
+                &cli,
+                &quiet,
+                &[],
+                &[],
+                0,
+                0,
+                0,
+                &[],
+                None,
+                None,
+                None,
+                None
+            )
+            .is_empty()
         );
 
     }

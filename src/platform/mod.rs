@@ -593,6 +593,20 @@ pub fn parse_scm_failed(text: &str) -> Vec<String> {
         .collect()
 }
 
+
+/// One open-but-deleted file — the "df says full, du disagrees" answer.
+/// The space is unreclaimable until the holding process lets go.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DeletedFile {
+    pub pid: Pid,
+    /// Holding process name.
+    pub name: String,
+    /// The path as the process opened it (the kernel appends " (deleted)"
+    /// to the link target; stripped here).
+    pub path: String,
+    pub size_mb: u64,
+}
+
 /// One systemd unit's report — the `-u UNIT` one-shot's body: the status
 /// line pieces, the process hook (main pid), the restart count (crash
 /// loops), enablement, and the last exit's code/signal (the "why did it
@@ -1076,7 +1090,7 @@ pub trait Platform {
         None
     }
 
-    /// Names of systemd units sitting in failed state — the
+/// Names of systemd units sitting in failed state — the
     /// --alert-failed-units sentinel's raw input and the
     /// `witr_machine_failed_units` gauge's. `None` where there is no
     /// systemd to ask (macOS/Windows, systemctl missing, not booted with
@@ -1095,6 +1109,16 @@ pub trait Platform {
     fn unit_report(&self, unit: &str) -> Option<UnitReport> {
         let _ = unit;
         None
+    }
+
+    /// Open-but-deleted files with their sizes — the classic "df full,
+    /// du disagrees" diagnosis (log rotation failures, unlinked databases,
+    /// swapped-out-and-deleted temp files). Empty where there is no
+    /// /proc fd table (non-Linux). The walk is one readlink pass per fd
+    /// plus a stat per deleted one — the fd sweep's cost class, paid by
+    /// --deleted, armed --alert-deleted-gb watchers and /metrics scrapes.
+    fn deleted_files(&self) -> Vec<DeletedFile> {
+        Vec::new()
     }
 
     /// All sockets whose local port equals `port` (any proto), with owning

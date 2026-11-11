@@ -240,6 +240,7 @@ impl Cli {
         self.alert_disk_eta = self.alert_disk_eta.or(cfg.alert_disk_eta);
         self.alert_inodes = self.alert_inodes.or(cfg.alert_inodes);
         self.alert_gpu_mem_pct = self.alert_gpu_mem_pct.or(cfg.alert_gpu_mem_pct);
+        self.alert_deleted_gb = self.alert_deleted_gb.or(cfg.alert_deleted_gb);
         self.alert_leak = self.alert_leak.or(cfg.alert_leak);
         self.alert_fd_leak = self.alert_fd_leak.or(cfg.alert_fd_leak);
         self.alert_thr_leak = self.alert_thr_leak.or(cfg.alert_thr_leak);
@@ -377,6 +378,25 @@ pub struct Cli {
         )
     )]
     pub failed: bool,
+
+    #[arg(
+        long,
+        help = t(
+            "列出已删除但仍被进程攥着的文件(尺寸降序,总计可回收量)——\"df 满、du 不满\"的经典谜题一条命令解:日志轮转失败、未卸载数据库临时文件都躲在这。发现即退出码 1,干净则 0;--csv / --markdown / --json 同样支持",
+            "List open-but-deleted files still held by processes (size desc, with the reclaimable total) — the classic \"df full, du disagrees\" puzzle in one command: failed log rotations and unlinked database temp files all hide here. Exit 1 when any exist, 0 clean; --csv / --markdown / --json work too"
+        )
+    )]
+    pub deleted: bool,
+
+    #[arg(
+        long = "alert-deleted-gb",
+        value_name = "GB",
+        help = t(
+            "已删除占用哨兵:被攥着的已删除文件总量(GB)连续 5 次采样超过该值即触发,详情点名最大的几个——日志轮转失败的累积信号,df 已经在疼而 du 找不到凶手。Linux。TUI 和 --watch",
+            "Deleted-hold sentinel: fires when the total held-deleted space exceeds this many GB for 5 consecutive samples, the detail naming the biggest holders — the accumulating signature of a failed log rotation; df already hurts while du can't find the culprit. Linux. TUI and --watch"
+        )
+    )]
+    pub alert_deleted_gb: Option<f64>,
 
     #[arg(short = 'j', long, help = t("输出机器可读的 JSON", "Machine-readable JSON"))]
     pub json: bool,

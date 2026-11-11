@@ -521,6 +521,115 @@ pub fn render_zombies_markdown(rows: &[ZombieRow]) -> String {
     out
 }
 
+/// One `--deleted` row: an open-but-deleted file.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeletedRow {
+    pub pid: Pid,
+    pub name: String,
+    /// Path as opened (the " (deleted)" marker stripped).
+    pub path: String,
+    pub size_mb: u64,
+}
+
+/// Filter the platform's deleted-file walk into rows, size desc — the
+/// walk already sorts; this is the display contract (and the json shape).
+pub fn collect_deleted(rows: &[crate::platform::DeletedFile]) -> Vec<DeletedRow> {
+    rows.iter()
+        .map(|d| DeletedRow {
+            pid: d.pid,
+            name: d.name.clone(),
+            path: d.path.clone(),
+            size_mb: d.size_mb,
+        })
+        .collect()
+}
+
+/// `--deleted` text table: PID / NAME / SIZE / PATH, biggest first.
+pub fn render_deleted(rows: &[DeletedRow], p: &Painter) -> String {
+    if rows.is_empty() {
+        return "no deleted-but-held files — clean\n".to_string();
+    }
+    let pid_w = rows
+        .iter()
+        .map(|r| r.pid.to_string().len())
+        .max()
+        .unwrap_or(3)
+        .max(3);
+    let name_w = rows
+        .iter()
+        .map(|r| r.name.len())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 32);
+    let size_w = rows
+        .iter()
+        .map(|r| crate::util::fmt_bytes(r.size_mb * 1024 * 1024).len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let total_mb: u64 = rows.iter().map(|r| r.size_mb).sum();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:>pid_w$}  {:<name_w$}  {:>size_w$}  PATH",
+        "PID", "NAME", "SIZE"
+    );
+    for r in rows {
+        let size = crate::util::fmt_bytes(r.size_mb * 1024 * 1024);
+        let _ = writeln!(
+            out,
+            "{:>pid_w$}  {:<name_w$}  {}  {}",
+            r.pid,
+            r.name,
+            p.yellow(&size),
+            r.path
+        );
+    }
+    let total = crate::util::fmt_bytes(total_mb * 1024 * 1024);
+    let _ = writeln!(
+        out,
+        "{}",
+        p.yellow(&format!(
+            "{} file{} holding {total} — reclaimable by restarting the holder{}",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+            if total_mb >= 1024 { " (restart first, ask questions later)" } else { "" }
+        ))
+    );
+    out
+}
+
+/// `--deleted --csv`.
+pub fn render_deleted_csv(rows: &[DeletedRow]) -> String {
+    let mut out = String::from("pid,name,size_mb,path\n");
+    for r in rows {
+        out.push_str(&format!(
+            "{},{},{},{}\n",
+            r.pid,
+            csv_field(&r.name),
+            r.size_mb,
+            csv_field(&r.path),
+        ));
+    }
+    out
+}
+
+/// `--deleted --markdown`.
+pub fn render_deleted_markdown(rows: &[DeletedRow]) -> String {
+    let mut out = String::from("| PID | NAME | SIZE | PATH |\n|---:|---|---:|---|\n");
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} |",
+            r.pid,
+            r.name,
+            crate::util::fmt_bytes(r.size_mb * 1024 * 1024),
+            r.path
+        );
+    }
+    out
+}
+
 /// One `--dstate` row: a process stuck in uninterruptible wait — the
 /// --alert-dstate sentinel's lister twin.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2301,6 +2410,14 @@ pub fn alert_rules_yaml() -> String {
             "MemAvailable is predicted to run out in {{ $value }}h at the current drain rate — the trend behind --alert-mem-eta, the OOM omen before the floor breaks.",
         ),
         (
+            "WitrDeletedSpaceHeld",
+            "witr_machine_deleted_reclaimable_bytes > 1073741824",
+            "10m",
+            "warning",
+            "Deleted files still holding space",
+            "Open-but-deleted files hold {{ $value | humanizeBytes }} — the failed-log-rotation signature; df feels it, du can't find it. Restart the holders to reclaim.",
+        ),
+        (
             "WitrGpuMemoryNearLimit",
             "witr_machine_gpu_memory_used_bytes / witr_machine_gpu_memory_total_bytes > 0.9",
             "5m",
@@ -3953,6 +4070,7 @@ mod tests {
             "witr_machine_failed_units",
             "witr_machine_fs_inode_used_percent",
             "witr_machine_gpu_memory_total_bytes",
+            "witr_machine_deleted_reclaimable_bytes",
             "witr_container_cpu_percent",
             "witr_container_mem_total_bytes",
             "witr_machine_disk_eta_hours",

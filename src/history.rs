@@ -531,6 +531,9 @@ pub struct SysAlertState {
     pub gpu_streak: u32,
     pub gpu_firing: bool,
     pub gpu_fired_secs: u32,
+    pub deleted_streak: u32,
+    pub deleted_firing: bool,
+    pub deleted_fired_secs: u32,
     /// Per-process leak-sentinel state — keyed `(kind, pid)` because the
     /// three siblings (mem/fd/threads) judge independently. Process exits
     /// drop the entry; a returning process re-arms from zero.
@@ -626,6 +629,11 @@ pub struct SysAlertLimits {
     pub gpu_mem_pct_limit: Option<u64>,
     /// This sample's whole-GPU readings.
     pub gpus: Vec<crate::gpu::GpuSample>,
+    /// --alert-deleted-gb: fire when the held-deleted total exceeds this
+    /// many GB — the failed-log-rotation signature df feels and du can't
+    /// find. `deleted_files` is the input (the /proc walk, Linux only).
+    pub deleted_gb_limit: Option<f64>,
+    pub deleted_files: Vec<crate::platform::DeletedFile>,
     /// --alert-disk-busy: fire when any block device spends over this
     /// share of the refresh interval with IO in flight (the iostat %util
     /// twin). Answers "which disk is the bottleneck" — a question neither
@@ -1310,6 +1318,8 @@ pub fn system_alert_picks(
         inodes_limit,
         gpu_mem_pct_limit,
         gpus,
+        deleted_gb_limit,
+        deleted_files,
         disk_busy_limit,
         temp_limit,
         zombie_limit,
@@ -1340,6 +1350,7 @@ pub fn system_alert_picks(
     let mem_eta_limit = *mem_eta_hours;
     let inodes_limit = *inodes_limit;
     let gpu_mem_pct_limit = *gpu_mem_pct_limit;
+    let deleted_gb_limit = *deleted_gb_limit;
     let disk_busy_limit = *disk_busy_limit;
     let temp_limit = *temp_limit;
     let zombie_limit = *zombie_limit;
@@ -1555,6 +1566,47 @@ pub fn system_alert_picks(
             out.push((
                 "system".to_string(),
                 format!("memory trend no longer heading under {eta_limit:.1}h"),
+                true,
+            ));
+        }
+    }
+    if let Some(limit) = deleted_gb_limit {
+        let total_mb: u64 = deleted_files.iter().map(|d| d.size_mb).sum();
+        let over = (total_mb as f64 / 1024.0) > limit;
+        let edge = alert_cycle_repeat(
+            &mut state.deleted_streak,
+            &mut state.deleted_firing,
+            over,
+            &mut state.deleted_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            let named: Vec<String> = deleted_files
+                .iter()
+                .take(3)
+                .map(|d| {
+                    format!(
+                        "{} (pid {})",
+                        d.path,
+                        d.pid
+                    )
+                })
+                .collect();
+            out.push((
+                "system".to_string(),
+                format!(
+                    "deleted-but-held files: {:.1} GB above {limit} GB — df feels it, du can't find it; restart the holders ({}…), for {}s",
+                    total_mb as f64 / 1024.0,
+                    named.join(", "),
+                    ALERT_CYCLES as u64 * interval_secs.max(1)
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("deleted-but-held space back under {limit} GB"),
                 true,
             ));
         }
@@ -3322,6 +3374,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -3398,6 +3452,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -3490,6 +3546,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -3688,6 +3746,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -3751,6 +3811,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
             }
@@ -3825,6 +3887,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -3893,6 +3957,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
         };
         // one kill lands (counter 5 → 6): the first tick only arms the
         // previous counter, then the kill sits in the window long enough
@@ -3982,6 +4048,104 @@ mod tests {
     }
 
     #[test]
+    fn deleted_alert_fires_names_holder_and_recovers() {
+        let deleted = |mb: u64| {
+            vec![crate::platform::DeletedFile {
+                pid: 900,
+                name: "rsyslogd".into(),
+                path: "/var/log/journal.log".into(),
+                size_mb: mb,
+            }]
+        };
+        let limits = |limit: Option<f64>, files: Vec<crate::platform::DeletedFile>| {
+            SysAlertLimits {
+                load: None,
+                mem_pct: None,
+                count: None,
+                proc_count: 0,
+                mounts: Vec::new(),
+                disk_pct: None,
+                net_limit: None,
+                net_rate: None,
+                psi_limit: None,
+                mem_avail_floor: None,
+                swap_pct_limit: None,
+                retrans_limit: None,
+                retrans_rate: None,
+                drop_limit: None,
+                drop_rate: None,
+                repeat: None,
+                disk_busy_limit: None,
+                temp_limit: None,
+                zombie_limit: None,
+                zombie_count: 0,
+                dstate_limit: None,
+                dstate_count: 0,
+                failed_limit: None,
+                failed_units: Vec::new(),
+                disk_eta_hours: None,
+                mem_eta_hours: None,
+                inodes_limit: None,
+                gpu_mem_pct_limit: None,
+                gpus: Vec::new(),
+                deleted_gb_limit: limit,
+                deleted_files: files,
+                oom_limit: None,
+                oom_kills: None,
+            }
+        };
+        // silent when unarmed
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                system_alert_picks(
+                    &crate::platform::SystemStats::default(),
+                    &mut state,
+                    &limits(None, deleted(6 * 1024)),
+                    3
+                )
+                .is_empty()
+            );
+        }
+        // 6GB held over a 2GB line: arming samples, then one fire naming
+        // the holder
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES - 1 {
+            assert!(
+                system_alert_picks(
+                    &crate::platform::SystemStats::default(),
+                    &mut state,
+                    &limits(Some(2.0), deleted(6 * 1024)),
+                    3
+                )
+                .is_empty()
+            );
+        }
+        let fires = system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(2.0), deleted(6 * 1024)),
+            3,
+        );
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert!(
+            fires[0].1.contains("deleted-but-held files: 6.0 GB above 2 GB"),
+            "{}",
+            fires[0].1
+        );
+        assert!(fires[0].1.contains("/var/log/journal.log (pid 900)"), "{}", fires[0].1);
+        // the holder let go → recovery
+        let rec = system_alert_picks(
+            &crate::platform::SystemStats::default(),
+            &mut state,
+            &limits(Some(2.0), deleted(100)),
+            3,
+        );
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert!(rec[0].2, "{rec:?}");
+    }
+
+    #[test]
     fn gpu_alert_fires_names_device_and_recovers() {
         let gpu = |used: u64, total: u64| crate::gpu::GpuSample {
             id: "0".into(),
@@ -4021,6 +4185,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: gpu_limit,
             gpus,
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4123,6 +4289,8 @@ mod tests {
                 inodes_limit,
                 gpu_mem_pct_limit: None,
                 gpus: Vec::new(),
+                deleted_gb_limit: None,
+                deleted_files: Vec::new(),
                 oom_limit: None,
                 oom_kills: None,
             }
@@ -4209,6 +4377,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -4303,6 +4473,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4429,6 +4601,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4509,6 +4683,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4588,6 +4764,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4652,6 +4830,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4723,6 +4903,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };
@@ -4801,6 +4983,8 @@ mod tests {
             inodes_limit: None,
             gpu_mem_pct_limit: None,
             gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
             oom_limit: None,
             oom_kills: None,
         };

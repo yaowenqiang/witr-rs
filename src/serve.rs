@@ -714,6 +714,15 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>, trends: &mut
     }
         // inode usage — the --alert-inodes sentinel's raw input (the df -Pi
         // sweep rides the mount sweep; mounts without inode stats sit out)
+        // deleted-but-held space — the --alert-deleted-gb sentinel's raw
+        // input; the walk is one readlink pass per fd (fd-sweep cost)
+        {
+            let deleted = platform.deleted_files();
+            let total_mb: u64 = deleted.iter().map(|d| d.size_mb).sum();
+            out.push_str("# HELP witr_machine_deleted_reclaimable_bytes Space held by open-but-deleted files\n");
+            out.push_str("# TYPE witr_machine_deleted_reclaimable_bytes gauge\n");
+            out.push_str(&format!("witr_machine_deleted_reclaimable_bytes {}\n", total_mb * 1024 * 1024));
+        }
         // whole-GPU readings — the device-side view the process rows can't
         // give (utilization is the whole device; memory is its own pool)
         if !gpus.is_empty() {
