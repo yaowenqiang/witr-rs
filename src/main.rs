@@ -2674,6 +2674,20 @@ impl EventLog {
     }
 }
 
+/// The per-tick state waterlines a recording carries in its machine
+/// row — zombies and stuck-in-D come from the process table, the
+/// failed-unit count from the service manager (Linux; other platforms
+/// stay 0 rather than pay a PowerShell per tick), and the mem-eta
+/// prediction from the recorder's own trend window (significance-gated,
+/// so it appears once enough ticks accrue — the sentinel's number,
+/// written down for offline replay).
+struct RecordWaterlines {
+    zombies: usize,
+    dstates: usize,
+    failed_units: usize,
+    mem_eta_hours: Option<f64>,
+}
+
 struct RecordWriter {
     file: Option<std::fs::File>,
     jsonl: bool,
@@ -2743,7 +2757,7 @@ impl RecordWriter {
         let mut written = 0u64;
         if !jsonl {
             let header = "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps,gpu_sm,\
-                 sys_load1,sys_mem_pct,sys_procs,sys_net_bps";
+                 sys_load1,sys_mem_pct,sys_procs,sys_net_bps,sys_zombies,sys_dstates,sys_failed_units,sys_mem_eta_hours";
             writeln!(f, "{header}")?;
             written = header.len() as u64 + 1;
         }
@@ -2756,6 +2770,7 @@ impl RecordWriter {
         hist: &history::History,
         stats: Option<&crate::platform::SystemStats>,
         net_bps: Option<f64>,
+        waterlines: &RecordWaterlines,
     ) {
         self.rotate_if_over_cap();
         let Some(file) = self.file.as_mut() else {
@@ -2847,7 +2862,7 @@ impl RecordWriter {
             };
             let _ = writeln!(
                 file,
-                "{},_system,-,system,{},{},,,,{},{},{},{}",
+                "{},_system,-,system,{},{},,,,{},{},{},{},{},{},{},{}",
                 ts,
                 s.cpu_percent.map(|c| format!("{c:.1}")).unwrap_or_default(),
                 s.mem_used_mb.map(|mb| mb.to_string()).unwrap_or_default(),
@@ -2855,6 +2870,13 @@ impl RecordWriter {
                 mem_pct.map(|p| p.to_string()).unwrap_or_default(),
                 procs.len(),
                 net_bps.map(|b| format!("{b:.0}")).unwrap_or_default(),
+                waterlines.zombies,
+                waterlines.dstates,
+                waterlines.failed_units,
+                waterlines
+                    .mem_eta_hours
+                    .map(|h| format!("{h:.2}"))
+                    .unwrap_or_default(),
             );
         }
     }
@@ -2870,6 +2892,12 @@ pub(crate) struct SysPoint {
     pub(crate) load1: Option<f64>,
     pub(crate) procs: usize,
     pub(crate) net_bps: Option<f64>,
+    /// The state waterlines + the mem-eta prediction, when the recording
+    /// carries them (files from before v0.53 read as None).
+    pub(crate) zombies: usize,
+    pub(crate) dstates: usize,
+    pub(crate) failed_units: usize,
+    pub(crate) mem_eta_hours: Option<f64>,
 }
 
 /// Collect the machine samples from a record file's text (either format —
@@ -2907,6 +2935,12 @@ pub(crate) fn parse_record_system(text: &str) -> Result<Vec<SysPoint>, String> {
                     .and_then(|i| f.get(i))
                     .and_then(|v| v.trim().parse().ok())
                     .unwrap_or(0);
+                let int = |name: &str| -> usize {
+                    col(name)
+                        .and_then(|i| f.get(i))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0)
+                };
                 out.push(SysPoint {
                     at: f[t].trim().parse().unwrap_or(0),
                     cpu: num(cpu),
@@ -2914,6 +2948,11 @@ pub(crate) fn parse_record_system(text: &str) -> Result<Vec<SysPoint>, String> {
                     load1: num(load),
                     procs: procs_n,
                     net_bps: num(net),
+                    // older files lack the columns → 0/None, honest blanks
+                    zombies: int("sys_zombies"),
+                    dstates: int("sys_dstates"),
+                    failed_units: int("sys_failed_units"),
+                    mem_eta_hours: num(col("sys_mem_eta_hours")),
                 });
             }
             if out.is_empty() {
@@ -2943,6 +2982,13 @@ pub(crate) fn parse_record_system(text: &str) -> Result<Vec<SysPoint>, String> {
                 .and_then(|x| x.as_u64())
                 .unwrap_or(0) as usize,
             net_bps: sys.get("net_bps").and_then(|x| x.as_f64()),
+            zombies: sys.get("zombies").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+            dstates: sys.get("dstates").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+            failed_units: sys
+                .get("failed_units")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0) as usize,
+            mem_eta_hours: sys.get("mem_eta_hours").and_then(|x| x.as_f64()),
         });
     }
     if out.is_empty() {
@@ -5641,6 +5687,9 @@ fn main() {
             // docker/podman/nerdctl on PATH; killing the child on drop is
             // the stream struct's job)
             let container_stream = history::spawn_container_events();
+            // the recorder's own trend window: mem-eta needs 10+ minutes
+            // of MemAvailable samples before the gate trusts a prediction
+            let mut rec_eta = history::SysAlertState::default();
             let mut recorder = match &cli.record {
                 Some(path) => match RecordWriter::create_with_cap(
                     path,
@@ -5792,7 +5841,20 @@ fn main() {
                         .fold((0u64, 0u64), |(rx, tx), n| (rx + n.rx_bytes, tx + n.tx_bytes));
                     let net_bps =
                         history::machine_net_rate(total, &mut sys_alert).map(|mbps| mbps * 1048576.0);
-                    w.append(&procs, &hist, stats.as_ref(), net_bps);
+                    let waterlines = RecordWaterlines {
+                    zombies: state_count(&procs, &["Z"]),
+                    dstates: state_count(&procs, &["D", "U"]),
+                    failed_units: if platform.name() == "linux" {
+                        platform.failed_units().unwrap_or_default().len()
+                    } else {
+                        0
+                    },
+                    mem_eta_hours: stats.as_ref().and_then(|s| s.mem_avail_mb).and_then(|a| {
+                        history::mem_eta_picks(&mut rec_eta, Some(a), f64::INFINITY)
+                            .map(|(h, _)| h)
+                    }),
+                };
+                w.append(&procs, &hist, stats.as_ref(), net_bps, &waterlines);
                 }
                 // --alert-net-per-proc: feed this tick's ss sweep into the
                 // persistent history so per-pid rates exist to compare
@@ -6828,8 +6890,8 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         let mut w = RecordWriter::create_with_cap(path.to_str().unwrap(), Some(1)).unwrap();
         let hist = history::History::new();
         let procs = vec![proc(3, "worker", None, None)];
-        w.append(&procs, &hist, None, None);
-        w.append(&procs, &hist, None, None);
+        w.append(&procs, &hist, None, None, &RecordWaterlines { zombies: 0, dstates: 0, failed_units: 0, mem_eta_hours: None });
+        w.append(&procs, &hist, None, None, &RecordWaterlines { zombies: 0, dstates: 0, failed_units: 0, mem_eta_hours: None });
         let rotated = path.with_file_name(format!(
             "{}.1",
             path.file_name().unwrap().to_str().unwrap()
@@ -6890,19 +6952,33 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             mem_total_mb: Some(16384),
             ..Default::default()
         };
-        w.append(&procs, &hist, Some(&stats), None);
+        w.append(&procs, &hist, Some(&stats), None, &RecordWaterlines { zombies: 0, dstates: 0, failed_units: 0, mem_eta_hours: None });
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
             "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps,gpu_sm,\
-             sys_load1,sys_mem_pct,sys_procs,sys_net_bps"
+             sys_load1,sys_mem_pct,sys_procs,sys_net_bps,sys_zombies,sys_dstates,sys_failed_units,sys_mem_eta_hours"
         );
         assert_eq!(lines.len(), 3, "header + process row + _system row");
         let row = lines[1];
         // first sample: no cpu/io deltas yet → empty cells; rss 2048 KiB → 2
+        // (process rows keep the original 13 columns — the waterlines live
+        // on the _system row only)
         let fields: Vec<&str> = row.split(',').collect();
         assert_eq!(fields.len(), 13, "{row}");
+        // the machine row carries the new waterline columns too
+        let sys_row = lines[2];
+        let sys_fields: Vec<&str> = sys_row.split(',').collect();
+        assert_eq!(
+            (sys_fields[13], sys_fields[14], sys_fields[15]),
+            ("0", "0", "0"),
+            "the waterline columns ride the _system row: {sys_row}"
+        );
+        assert_eq!(
+            sys_fields[16], "",
+            "no eta until the trend gate trusts: {sys_row}"
+        );
         assert_eq!((fields[1], fields[2], fields[3]), ("3", "-", "worker"), "{row}");
         assert_eq!(fields[4], "", "no cpu delta on the first sample: {row}");
         assert_eq!(fields[5], "2", "2048 KiB → 2 MB rss: {row}");
@@ -6914,11 +6990,18 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         // the machine's own row: load, mem pct (4096/16384 = 25) and the
         // visible count land in the sys_* columns; no net rate on tick one
         let sys: Vec<&str> = lines[2].split(',').collect();
-        assert_eq!(sys.len(), 13, "{}", lines[2]);
+        assert_eq!(sys.len(), 17, "{}", lines[2]);
         assert_eq!(sys[1], "_system");
         assert_eq!(sys[4], "", "machine cpu is a delta — empty on tick one");
         assert_eq!(sys[5], "4096", "used MB rides the rss column");
         assert_eq!((sys[9], sys[10], sys[11], sys[12]), ("1.25", "25", "1", ""), "{}", lines[2]);
+        assert_eq!(
+            (sys[13], sys[14], sys[15]),
+            ("0", "0", "0"),
+            "the waterline columns ride along: {}",
+            lines[2]
+        );
+        assert_eq!(sys[16], "", "no eta until the trend gate trusts: {}", lines[2]);
         std::fs::remove_file(&path).ok();
     }
 
@@ -6935,8 +7018,8 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             mem_total_mb: Some(16384),
             ..Default::default()
         };
-        w.append(&procs, &hist, Some(&stats), Some(8_388_608.0)); // 8 MB/s
-        w.append(&procs, &hist, Some(&stats), None);
+        w.append(&procs, &hist, Some(&stats), Some(8_388_608.0), &RecordWaterlines { zombies: 0, dstates: 0, failed_units: 0, mem_eta_hours: None }); // 8 MB/s
+        w.append(&procs, &hist, Some(&stats), None, &RecordWaterlines { zombies: 0, dstates: 0, failed_units: 0, mem_eta_hours: None });
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
         let pts = parse_record_system(&text).unwrap();
@@ -6976,8 +7059,16 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
     #[test]
     fn plot_html_embeds_one_chart_per_series() {
         let pts = vec![
-            SysPoint { at: 1_700_000_100, cpu: Some(12.5), mem_pct: Some(40.0), load1: Some(0.5), procs: 210, net_bps: Some(1_048_576.0) },
-            SysPoint { at: 1_700_000_160, cpu: Some(25.0), mem_pct: Some(50.0), load1: Some(1.0), procs: 220, net_bps: None },
+            SysPoint { at: 1_700_000_100, cpu: Some(12.5), mem_pct: Some(40.0), load1: Some(0.5), procs: 210, net_bps: Some(1_048_576.0),
+            zombies: 0,
+            dstates: 0,
+            failed_units: 0,
+            mem_eta_hours: None },
+            SysPoint { at: 1_700_000_160, cpu: Some(25.0), mem_pct: Some(50.0), load1: Some(1.0), procs: 220, net_bps: None,
+            zombies: 0,
+            dstates: 0,
+            failed_units: 0,
+            mem_eta_hours: None },
         ];
         let html = plot_html(&pts, &[]);
         assert!(html.starts_with("<!doctype html>"));
@@ -7003,6 +7094,10 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             load1: Some(cpu / 10.0),
             procs: 200 + cpu as usize,
             net_bps: Some(1_000_000.0 + cpu),
+            zombies: 0,
+            dstates: 0,
+            failed_units: 0,
+            mem_eta_hours: None,
         };
         let a = ("before.csv".to_string(), vec![mk(10.0, 1_700_000_000), mk(20.0, 1_700_000_060)]);
         // file b starts later and runs longer — the overlay still lines both
@@ -7034,8 +7129,8 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             mem_total_mb: Some(32768),
             ..Default::default()
         };
-        w.append(&procs, &hist, Some(&stats), Some(2_000_000.0));
-        w.append(&procs, &hist, None, None);
+        w.append(&procs, &hist, Some(&stats), Some(2_000_000.0), &RecordWaterlines { zombies: 0, dstates: 0, failed_units: 0, mem_eta_hours: None });
+        w.append(&procs, &hist, None, None, &RecordWaterlines { zombies: 0, dstates: 0, failed_units: 0, mem_eta_hours: None });
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one envelope per tick, no header");

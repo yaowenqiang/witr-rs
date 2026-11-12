@@ -36,7 +36,7 @@ const GRAY: Color = Color::Rgb(88, 88, 88);
 const MID: Color = Color::Rgb(118, 118, 118);
 const ACCENT: Color = Color::Rgb(95, 95, 215);
 /// how many series the Samples page cycles through (↑/↓)
-const SAMPLE_SERIES: usize = 5;
+const SAMPLE_SERIES: usize = 9;
 
 /// One sparkline row for `values`: downsampled to `width` block cells
 /// (per-cell max, so peaks survive shrinking), gaps (None) as a space.
@@ -2199,10 +2199,30 @@ impl TuiApp {
                 "MB/s",
                 pts.iter().map(|p| p.net_bps.map(|b| b / 1048576.0)).collect(),
             ),
-            _ => (
+            4 => (
                 "processes",
                 "",
                 pts.iter().map(|p| Some(p.procs as f64)).collect(),
+            ),
+            5 => (
+                "zombies",
+                "",
+                pts.iter().map(|p| Some(p.zombies as f64)).collect(),
+            ),
+            6 => (
+                "stuck in D",
+                "",
+                pts.iter().map(|p| Some(p.dstates as f64)).collect(),
+            ),
+            7 => (
+                "failed units",
+                "",
+                pts.iter().map(|p| Some(p.failed_units as f64)).collect(),
+            ),
+            _ => (
+                "mem eta (h)",
+                "h",
+                pts.iter().map(|p| p.mem_eta_hours).collect(),
             ),
         }
     }
@@ -11262,6 +11282,10 @@ mod tests {
             load1: Some(1.0),
             procs: 200,
             net_bps: Some(1_048_576.0),
+            zombies: 0,
+            dstates: 0,
+            failed_units: 0,
+            mem_eta_hours: None,
         };
         app.samples = vec![pt(1_700_000_100, Some(10.0)), pt(1_700_000_160, Some(20.0))];
         app.samples_source = "/tmp/rec.csv".into();
@@ -11281,12 +11305,12 @@ mod tests {
         on_key(&mut app, KeyCode::Char('G'));
         assert_eq!(app.samples_cursor, 1);
 
-        // series cycling wraps over the five chartable series
-        app.samples_series = 4;
+        // series cycling wraps over the nine chartable series
+        app.samples_series = 8;
         on_key(&mut app, KeyCode::Down);
         assert_eq!(app.samples_series % SAMPLE_SERIES, 0);
         on_key(&mut app, KeyCode::Char('k'));
-        assert_eq!(app.samples_series % SAMPLE_SERIES, 4);
+        assert_eq!(app.samples_series % SAMPLE_SERIES, 8);
 
         // the page text: source, count, series label and the cursor readout
         let text = app
@@ -11297,8 +11321,26 @@ mod tests {
             .join("\n");
         assert!(text.contains("/tmp/rec.csv"), "{text}");
         assert!(text.contains("2 samples"), "{text}");
-        assert!(text.contains("processes"), "series 4 % 5 is the process count: {text}");
-        assert!(text.contains("procs 200"), "{text}");
+        app.samples_series = 4;
+        let text4 = app
+            .samples_page_lines(80)
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text4.contains("processes"), "series 4 % 9 is the process count: {text4}");
+        assert!(text4.contains("procs 200"), "{text4}");
+        // the ninth series is the mem-eta prediction (None until the gate
+        // trusts — the spark renders empty, the label still names it)
+        app.samples_series = 8;
+        let text = app
+            .samples_page_lines(80)
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("mem eta (h)"), "{text}");
+        assert!(text.contains("procs 200"), "the cursor readout stays: {text}");
 
         // switching to the cpu series shows its label and cursor value
         app.samples_series = 0;
