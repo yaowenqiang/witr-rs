@@ -6019,6 +6019,16 @@ fn main() {
                                         c.throttled_usec = Some(p.throttled_usec);
                                         c.oom_kills = Some(p.oom_kills);
                                         c.io_read_bytes = Some(p.io_read);
+                                        c.io_by_device = Some(
+                                            p.io_by_device
+                                                .iter()
+                                                .map(|(device, r, w)| crate::model::ContainerDeviceIo {
+                                                    device: device.clone(),
+                                                    read_bytes: *r,
+                                                    write_bytes: *w,
+                                                })
+                                                .collect(),
+                                        );
                                         c.io_write_bytes = Some(p.io_write);
                                     }
                                 }
@@ -7384,6 +7394,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             io_write_bytes: None,
             throttled_usec: None,
             oom_kills: None,
+            io_by_device: None,
         };
         let cli = cli::Cli::parse_from([
             "witr",

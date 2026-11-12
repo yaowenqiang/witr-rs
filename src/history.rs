@@ -5435,6 +5435,7 @@ mod tests {
             io_write_bytes: None,
             throttled_usec: None,
             oom_kills: None,
+            io_by_device: None,
         };
         let mut st = ContainerThresholds::default();
         // hot container + a quiet one + one without a limit (can't be
@@ -5514,6 +5515,7 @@ mod tests {
             mem_total_mb: None,
     throttled_usec: None,
     oom_kills: None,
+    io_by_device: None,
     compose: None,
     io_read_bytes: None,
     io_write_bytes: None,

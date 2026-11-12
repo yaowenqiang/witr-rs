@@ -997,6 +997,16 @@ fn refresh_container_snapshot() -> Vec<crate::model::Container> {
                     c.throttled_usec = Some(p.throttled_usec);
                     c.oom_kills = Some(p.oom_kills);
                     c.io_read_bytes = Some(p.io_read);
+                    c.io_by_device = Some(
+                        p.io_by_device
+                            .iter()
+                            .map(|(device, r, w)| crate::model::ContainerDeviceIo {
+                                device: device.clone(),
+                                read_bytes: *r,
+                                write_bytes: *w,
+                            })
+                            .collect(),
+                    );
                     c.io_write_bytes = Some(p.io_write);
                 }
                 if let Some(&(cpu, used, total)) = stats
@@ -1183,6 +1193,30 @@ fn render_container_metrics(out: &mut String, containers: &[crate::model::Contai
                 label_escape(&c.id),
                 label_escape(&c.name),
             ));
+        }
+        // per-device attribution — the "which container hammers which
+        // disk" series (cumulative like the totals; rate() them per
+        // device). Absent where the platform can't attribute.
+        if let Some(devs) = &c.io_by_device {
+            for d in devs {
+                container_family_meta(out, &mut said, "device_io_bytes_total");
+                out.push_str(&format!(
+                    "witr_container_device_io_bytes_total{{runtime=\"{}\",id=\"{}\",name=\"{}\",device=\"{}\",direction=\"read\"}} {}\n",
+                    label_escape(&c.runtime),
+                    label_escape(&c.id),
+                    label_escape(&c.name),
+                    label_escape(&d.device),
+                    d.read_bytes,
+                ));
+                out.push_str(&format!(
+                    "witr_container_device_io_bytes_total{{runtime=\"{}\",id=\"{}\",name=\"{}\",device=\"{}\",direction=\"write\"}} {}\n",
+                    label_escape(&c.runtime),
+                    label_escape(&c.id),
+                    label_escape(&c.name),
+                    label_escape(&d.device),
+                    d.write_bytes,
+                ));
+            }
         }
     }
 }
@@ -2057,6 +2091,7 @@ mod tests {
             io_write_bytes: None,
             throttled_usec: None,
             oom_kills: Some(1),
+            io_by_device: None,
         };
         let html = dashboard_html(&DashPlatform, &[web.clone()]);
         assert!(html.contains("http-equiv=\"refresh\""), "auto-refresh meta tag");
@@ -2147,6 +2182,7 @@ mod tests {
             io_write_bytes: None,
             throttled_usec: None,
             oom_kills: None,
+            io_by_device: None,
         };
         let mut web = c("abc123def456fullid", "web");
         // everything the sweeps merged in: stats + cgroup pressure

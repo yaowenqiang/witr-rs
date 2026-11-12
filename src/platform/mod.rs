@@ -113,6 +113,7 @@ pub fn parse_container_line(line: &str, runtime: &str) -> Option<Container> {
         pod: None,
         restarts: None,
         cpu_pct: None,
+        io_by_device: None,
         mem_used_mb: None,
         mem_total_mb: None,
         compose: compose_project_of(&v),
@@ -235,6 +236,11 @@ pub struct ContainerPressure {
     /// of the whole cgroup (the container's own numbers, not the host's).
     pub io_read: u64,
     pub io_write: u64,
+    /// Per-device cumulative (rbytes, wbytes) — the io.stat lines carry
+    /// `major:minor`, resolved to kernel device names via /proc/diskstats.
+    /// The "which container hammers which disk" answer; empty where the
+    /// devices didn't map.
+    pub io_by_device: Vec<(String, u64, u64)>,
 }
 
 /// Read the pressure signals for every container that has at least one

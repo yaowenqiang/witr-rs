@@ -480,6 +480,66 @@ fn parse_io_stat(text: &str) -> (u64, u64) {
     (read, write)
 }
 
+/// cgroup io.stat → per-device (name, rbytes, wbytes), the `major:minor`
+/// prefixes resolved through the diskstats name map. Devices that don't
+/// map (dm-crypt anonymous pools and friends) keep the raw `major:minor`
+/// string — the attribution is still true, just less pretty.
+fn parse_io_stat_devices(
+    text: &str,
+    names: &std::collections::HashMap<(u64, u64), String>,
+) -> Vec<(String, u64, u64)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let Some(devt) = it.next() else {
+            continue;
+        };
+        let Some((maj, min)) = devt.split_once(':') else {
+            continue;
+        };
+        let (Ok(maj), Ok(min)) = (maj.parse::<u64>(), min.parse::<u64>()) else {
+            continue;
+        };
+        let grab = |key: &str| -> u64 {
+            it.clone()
+                .find_map(|tok| tok.strip_prefix(key))
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let (r, w) = (grab("rbytes="), grab("wbytes="));
+        if r == 0 && w == 0 {
+            continue;
+        }
+        let name = names
+            .get(&(maj, min))
+            .cloned()
+            .unwrap_or_else(|| devt.to_string());
+        out.push((name, r, w));
+    }
+    out
+}
+
+/// /proc/diskstats → (major, minor) → name — every row, partitions
+/// included: a container's io.stat can name either the whole device or a
+/// partition, and attribution needs the exact match, not the family.
+fn device_name_map() -> std::collections::HashMap<(u64, u64), String> {
+    let mut map = std::collections::HashMap::new();
+    let Some(text) = read_ok(Path::new("/proc/diskstats")) else {
+        return map;
+    };
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 3 {
+            continue;
+        }
+        let (Ok(maj), Ok(min)) = (f[0].parse::<u64>(), f[1].parse::<u64>()) else {
+            continue;
+        };
+        map.insert((maj, min), f[2].to_string());
+    }
+    map
+}
+
 /// memory.events' `oom_kill <n>` line → n. Exact-prefix match — memory
 /// events also carries a bare `oom` counter (hits without kills) that
 /// must not satisfy this.
@@ -518,6 +578,7 @@ pub fn container_pressure_cgroup() -> std::collections::HashMap<String, super::C
         let key: String = id.chars().take(12).collect();
         cg_paths.entry(key).or_insert_with(|| path.trim().to_string());
     }
+    let disk_names = device_name_map();
     let mut out = std::collections::HashMap::new();
     for (id, path) in cg_paths {
         let root = Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
@@ -527,10 +588,21 @@ pub fn container_pressure_cgroup() -> std::collections::HashMap<String, super::C
         let oom_kills = read_ok(&root.join("memory.events"))
             .and_then(|t| parse_memory_events_oom(&t))
             .unwrap_or(0);
-        let (io_read, io_write) = read_ok(&root.join("io.stat"))
-            .map(|t| parse_io_stat(&t))
+        let io_text = read_ok(&root.join("io.stat"));
+        let (io_read, io_write) = io_text
+            .as_deref()
+            .map(parse_io_stat)
             .unwrap_or((0, 0));
-        if throttled_usec > 0 || oom_kills > 0 || io_read > 0 || io_write > 0 {
+        let io_by_device = io_text
+            .as_deref()
+            .map(|t| parse_io_stat_devices(t, &disk_names))
+            .unwrap_or_default();
+        if throttled_usec > 0
+            || oom_kills > 0
+            || io_read > 0
+            || io_write > 0
+            || !io_by_device.is_empty()
+        {
             out.insert(
                 id,
                 super::ContainerPressure {
@@ -538,6 +610,7 @@ pub fn container_pressure_cgroup() -> std::collections::HashMap<String, super::C
                     oom_kills,
                     io_read,
                     io_write,
+                    io_by_device,
                 },
             );
         }
@@ -2061,6 +2134,21 @@ fn classify_cgroup(path: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_io_stat_devices_names_the_devices() {
+        let names = std::collections::HashMap::from([
+            ((8u64, 0u64), "vda".to_string()),
+            ((253u64, 1u64), "dm-1".to_string()),
+        ]);
+        let text = "8:0 rbytes=1024 wbytes=2048 rios=1 wios=2\n253:9 rbytes=10 wbytes=20 rios=0 wios=0\n253:2 rbytes=0 wbytes=0\n(unknown)\n";
+        let rows = parse_io_stat_devices(text, &names);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        // mapped to the kernel name; zero-io rows and (unknown) junk skip
+        assert_eq!(rows[0], ("vda".to_string(), 1024, 2048));
+        // unmapped keeps the raw major:minor
+        assert_eq!(rows[1], ("253:9".to_string(), 10, 20));
+    }
 
     #[test]
     fn parse_oom_victim_names_the_dead_process() {

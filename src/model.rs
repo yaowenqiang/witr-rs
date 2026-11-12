@@ -191,6 +191,20 @@ pub struct Container {
     pub io_read_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_write_bytes: Option<u64>,
+    /// Per-device cumulative disk I/O (cgroup io.stat lines matched to
+    /// kernel device names) — the "which container hammers which disk"
+    /// answer, Linux with cgroup v2 only. None where the platform can't
+    /// attribute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_by_device: Option<Vec<ContainerDeviceIo>>,
+}
+
+/// One container's cumulative I/O against one device.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ContainerDeviceIo {
+    pub device: String,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
 }
 
 /// One service-manager unit: a systemd unit (Linux), a launchd job (macOS)
@@ -472,6 +486,7 @@ mod tests {
             mem_total_mb: None,
     throttled_usec: None,
     oom_kills: None,
+    io_by_device: None,
     compose: None,
     io_read_bytes: None,
     io_write_bytes: None,

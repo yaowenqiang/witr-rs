@@ -1768,6 +1768,16 @@ impl TuiApp {
                     c.throttled_usec = Some(p.throttled_usec);
                     c.oom_kills = Some(p.oom_kills);
                     c.io_read_bytes = Some(p.io_read);
+                    c.io_by_device = Some(
+                        p.io_by_device
+                            .iter()
+                            .map(|(device, r, w)| crate::model::ContainerDeviceIo {
+                                device: device.clone(),
+                                read_bytes: *r,
+                                write_bytes: *w,
+                            })
+                            .collect(),
+                    );
                     c.io_write_bytes = Some(p.io_write);
                 }
             }
@@ -10302,6 +10312,7 @@ mod tests {
             mem_total_mb: None,
     throttled_usec: None,
     oom_kills: None,
+    io_by_device: None,
     compose: None,
     io_read_bytes: None,
     io_write_bytes: None,
@@ -10348,6 +10359,7 @@ mod tests {
                 mem_total_mb: None,
         throttled_usec: None,
         oom_kills: None,
+        io_by_device: None,
         compose: None,
         io_read_bytes: None,
         io_write_bytes: None,
@@ -10368,6 +10380,7 @@ mod tests {
                 mem_total_mb: None,
         throttled_usec: None,
         oom_kills: None,
+        io_by_device: None,
         compose: None,
         io_read_bytes: None,
         io_write_bytes: None,
@@ -10490,6 +10503,7 @@ mod tests {
             mem_total_mb: None,
     throttled_usec: None,
     oom_kills: None,
+    io_by_device: None,
     compose: None,
     io_read_bytes: None,
     io_write_bytes: None,
