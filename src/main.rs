@@ -1430,7 +1430,9 @@ fn fleet_sys_frame(
         procs: procs.len(),
         zombies: state_count(procs, &["Z"]),
         dstates: state_count(procs, &["D", "U"]),
-        failed_units: Vec::new(),
+        // the far host's own failed-unit list rides the snapshot — the
+        // red line renders per host like every other reading here
+        failed_units: sample.failed_units.clone(),
     }
 }
 
@@ -7603,10 +7605,11 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         assert_eq!(frame.dstates, 1);
         assert_eq!(frame.stats.load1, Some(3.0));
         assert_eq!(frame.mounts.len(), 1);
-        // the first sweep only arms the NIC diff; the far host's systemd
-        // stays out of reach — that line honestly absent
+        // the first sweep only arms the NIC diff
         assert!(frame.nics.is_empty());
-        assert!(frame.failed_units.is_empty());
+        // the far host's own failed-unit list rides the snapshot — the
+        // red line renders per host
+        assert_eq!(frame.failed_units, vec!["ipmi.service"]);
         // 2 MB arriving on eth0 over ~60 ms → a real rx rate on the next
         // sweep
         std::thread::sleep(std::time::Duration::from_millis(60));
