@@ -631,9 +631,12 @@ pub struct SysAlertLimits {
     pub gpus: Vec<crate::gpu::GpuSample>,
     /// --alert-deleted-gb: fire when the held-deleted total exceeds this
     /// many GB — the failed-log-rotation signature df feels and du can't
-    /// find. `deleted_files` is the input (the /proc walk, Linux only).
+    /// find. `deleted_files` names the biggest holders; `deleted_total_mb`
+    /// is the judged total (the local walk's sum, or the snapshot's —
+    /// fleet only carries the total plus the top holders).
     pub deleted_gb_limit: Option<f64>,
     pub deleted_files: Vec<crate::platform::DeletedFile>,
+    pub deleted_total_mb: u64,
     /// --alert-disk-busy: fire when any block device spends over this
     /// share of the refresh interval with IO in flight (the iostat %util
     /// twin). Answers "which disk is the bottleneck" — a question neither
@@ -1320,6 +1323,7 @@ pub fn system_alert_picks(
         gpus,
         deleted_gb_limit,
         deleted_files,
+        deleted_total_mb,
         disk_busy_limit,
         temp_limit,
         zombie_limit,
@@ -1351,6 +1355,7 @@ pub fn system_alert_picks(
     let inodes_limit = *inodes_limit;
     let gpu_mem_pct_limit = *gpu_mem_pct_limit;
     let deleted_gb_limit = *deleted_gb_limit;
+    let deleted_total_mb = *deleted_total_mb;
     let disk_busy_limit = *disk_busy_limit;
     let temp_limit = *temp_limit;
     let zombie_limit = *zombie_limit;
@@ -1571,7 +1576,7 @@ pub fn system_alert_picks(
         }
     }
     if let Some(limit) = deleted_gb_limit {
-        let total_mb: u64 = deleted_files.iter().map(|d| d.size_mb).sum();
+        let total_mb = deleted_total_mb;
         let over = (total_mb as f64 / 1024.0) > limit;
         let edge = alert_cycle_repeat(
             &mut state.deleted_streak,
@@ -3376,6 +3381,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3454,6 +3460,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3548,6 +3555,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3748,6 +3756,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3813,6 +3822,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
             }
@@ -3889,6 +3899,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };
@@ -3959,6 +3970,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
         };
         // one kill lands (counter 5 → 6): the first tick only arms the
         // previous counter, then the kill sits in the window long enough
@@ -4089,7 +4101,8 @@ mod tests {
                 gpu_mem_pct_limit: None,
                 gpus: Vec::new(),
                 deleted_gb_limit: limit,
-                deleted_files: files,
+                deleted_files: files.clone(),
+                deleted_total_mb: files.iter().map(|d| d.size_mb).sum(),
                 oom_limit: None,
                 oom_kills: None,
             }
@@ -4187,6 +4200,7 @@ mod tests {
             gpus,
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4291,6 +4305,7 @@ mod tests {
                 gpus: Vec::new(),
                 deleted_gb_limit: None,
                 deleted_files: Vec::new(),
+            deleted_total_mb: 0,
                 oom_limit: None,
                 oom_kills: None,
             }
@@ -4379,6 +4394,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -4475,6 +4491,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4603,6 +4620,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4685,6 +4703,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4766,6 +4785,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4832,6 +4852,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4905,6 +4926,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };
@@ -4985,6 +5007,7 @@ mod tests {
             gpus: Vec::new(),
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
+            deleted_total_mb: 0,
             oom_limit: None,
             oom_kills: None,
         };

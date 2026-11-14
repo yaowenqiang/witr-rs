@@ -595,6 +595,10 @@ struct FleetSample {
     /// local sweep could never see. Empty from servers predating the
     /// field (an honest "nothing seen").
     failed_units: Vec<String>,
+    /// Held-deleted space total + the biggest holders, per the far host's
+    /// own walk — the fleet --alert-deleted-gb sentinel's input.
+    deleted_reclaimable_mb: u64,
+    deleted_files: Vec<crate::platform::DeletedFile>,
     mounts: Vec<crate::platform::MountUsage>,
 }
 
@@ -643,6 +647,42 @@ fn parse_system_snapshot(doc: &serde_json::Value) -> Option<FleetSample> {
         .map(|arr| {
             arr.iter()
                 .filter_map(|u| u.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let gpus = s
+        .get("gpus")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|g| {
+                    Some(crate::gpu::GpuSample {
+                        id: g.get("id")?.as_str()?.to_string(),
+                        name: g.get("name")?.as_str()?.to_string(),
+                        util_pct: g.get("util_pct").and_then(|v| v.as_f64()),
+                        mem_used_mb: g.get("mem_used_mb").and_then(|v| v.as_u64())?,
+                        mem_total_mb: g.get("mem_total_mb").and_then(|v| v.as_u64())?,
+                        temp_c: g.get("temp_c").and_then(|v| v.as_f64()),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let deleted_reclaimable_mb =
+        s.get("deleted_reclaimable_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+    let deleted_files = s
+        .get("deleted_files")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| {
+                    Some(crate::platform::DeletedFile {
+                        pid: d.get("pid")?.as_i64()? as Pid,
+                        name: d.get("name")?.as_str()?.to_string(),
+                        path: d.get("path")?.as_str()?.to_string(),
+                        size_mb: d.get("size_mb")?.as_u64()?,
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -698,11 +738,14 @@ fn parse_system_snapshot(doc: &serde_json::Value) -> Option<FleetSample> {
             retrans_segs: u("retrans_segs"),
             oom_kills: u("oom_kills"),
             disks,
+            gpus,
             ..Default::default()
         },
         net,
         nics,
         failed_units,
+        deleted_reclaimable_mb,
+        deleted_files,
         mounts,
     })
 }
@@ -854,16 +897,14 @@ fn fleet_alert_picks(
         disk_eta_hours: cli.alert_disk_eta,
         mem_eta_hours: cli.alert_mem_eta,
         inodes_limit: cli.alert_inodes,
-        // the GPU sentinel is hardware-local: the snapshot doesn't carry
-        // device readings (an armed --alert-gpu-mem-pct in fleet mode
-        // simply stays quiet for that sentinel — the machine sentinels
-        // judge normally)
-        gpu_mem_pct_limit: None,
-        gpus: Vec::new(),
-        // the deleted-file walk is the local /proc — fleet mode doesn't
-        // carry it (GPU stays None too: device readings are hardware-local)
-        deleted_gb_limit: None,
-        deleted_files: Vec::new(),
+        // the far host's whole-GPU readings and its held-deleted story
+        // both ride the snapshot — the sentinels judge them here like
+        // every machine reading
+        gpu_mem_pct_limit: cli.alert_gpu_mem_pct,
+        gpus: sample.stats.gpus.clone(),
+        deleted_gb_limit: cli.alert_deleted_gb,
+        deleted_files: sample.deleted_files.clone(),
+        deleted_total_mb: sample.deleted_reclaimable_mb,
         disk_busy_limit: cli.alert_disk_busy,
         temp_limit: cli.alert_temp,
         zombie_limit: cli.alert_zombies,
@@ -5996,6 +6037,14 @@ fn main() {
                         } else {
                             None
                         };
+                        let (deleted_files, deleted_total_mb) =
+                            if cli.alert_deleted_gb.is_some() {
+                                let files = platform.deleted_files();
+                                let total = files.iter().map(|d| d.size_mb).sum();
+                                (files, total)
+                            } else {
+                                (Vec::new(), 0)
+                            };
                         let limits = history::SysAlertLimits {
                             load: cli.alert_load,
                             mem_pct: cli.alert_mem_pct,
@@ -6019,11 +6068,8 @@ fn main() {
                             inodes_limit: cli.alert_inodes,
                             gpu_mem_pct_limit: cli.alert_gpu_mem_pct,
                             deleted_gb_limit: cli.alert_deleted_gb,
-                            deleted_files: if cli.alert_deleted_gb.is_some() {
-                                platform.deleted_files()
-                            } else {
-                                Vec::new()
-                            },
+                            deleted_files: deleted_files.clone(),
+                            deleted_total_mb,
                             gpus: stats.gpus.clone(),
                             disk_busy_limit: cli.alert_disk_busy,
                             temp_limit: cli.alert_temp,
@@ -7576,6 +7622,8 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         };
         let sample = FleetSample {
             failed_units: vec!["ipmi.service".into()],
+            deleted_reclaimable_mb: 0,
+            deleted_files: Vec::new(),
             stats: crate::platform::SystemStats {
                 load1: Some(3.0),
                 mem_avail_mb: Some(2_000),
@@ -7626,6 +7674,8 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                 stats: crate::platform::SystemStats::default(),
                 nics: Vec::new(),
                 failed_units: Vec::new(),
+                deleted_reclaimable_mb: 0,
+                deleted_files: Vec::new(),
                 net: None,
                 mounts: Vec::new(),
             },
@@ -7773,6 +7823,14 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                 read_iops: Some(120.0),
                 write_iops: Some(45.0),
             }],
+            gpus: vec![crate::gpu::GpuSample {
+                id: "0".into(),
+                name: "NVIDIA A100".into(),
+                util_pct: Some(85.0),
+                mem_used_mb: 40_960,
+                mem_total_mb: 81_920,
+                temp_c: Some(67.0),
+            }],
             ..Default::default()
         };
         let nics = vec![crate::platform::NicCounters {
@@ -7790,7 +7848,13 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         }];
         let doc = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
-            "system": crate::serve::system_snapshot(&stats, &nics, &mounts, 42, 3, &["ipmi.service".to_string(), "lightdm.service".to_string()]),
+            "system": crate::serve::system_snapshot(&stats, &nics, &mounts, 42, 3, &["ipmi.service".to_string(), "lightdm.service".to_string()],
+                &[crate::platform::DeletedFile {
+                    pid: 900,
+                    name: "rsyslogd".into(),
+                    path: "/var/log/journal.log".into(),
+                    size_mb: 6 * 1024,
+                }]),
             "processes": [],
         });
         let sample = parse_system_snapshot(&doc).expect("the system key parses");
@@ -7803,6 +7867,14 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         // the far host's own failed-unit list rides through for the fleet
         // --alert-failed-units sentinel
         assert_eq!(sample.failed_units, vec!["ipmi.service", "lightdm.service"]);
+        // the GPU readings and the deleted-hold story ride through for the
+        // fleet --sys cockpit and their fleet sentinels
+        assert_eq!(sample.deleted_reclaimable_mb, 6 * 1024);
+        assert_eq!(sample.deleted_files.len(), 1);
+        assert_eq!(sample.deleted_files[0].path, "/var/log/journal.log");
+        assert_eq!(sample.stats.gpus.len(), 1);
+        assert_eq!(sample.stats.gpus[0].name, "NVIDIA A100");
+        assert_eq!(sample.stats.gpus[0].mem_total_mb, 81_920);
         assert_eq!(sample.net, Some((100, 200, 7))); // (rx, tx, drops folded)
         // the per-NIC counters ride through for the fleet sys rate diff
         assert_eq!(sample.nics.len(), 1);
@@ -7822,6 +7894,67 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
     }
 
     #[test]
+    fn fleet_gpu_and_deleted_sentinels_judge_the_far_host_s_own_readings() {
+        let cli = cli::Cli::parse_from([
+            "witr",
+            "--remote",
+            "http://h1:9100",
+            "--watch",
+            "3",
+            "--alert-gpu-mem-pct",
+            "90",
+            "--alert-deleted-gb",
+            "2",
+        ]);
+        let sample = FleetSample {
+            stats: crate::platform::SystemStats {
+                gpus: vec![crate::gpu::GpuSample {
+                    id: "0".into(),
+                    name: "NVIDIA A100".into(),
+                    util_pct: Some(95.0),
+                    mem_used_mb: 78_000,
+                    mem_total_mb: 81_920,
+                    temp_c: Some(67.0),
+                }],
+                ..Default::default()
+            },
+            nics: Vec::new(),
+            failed_units: Vec::new(),
+            deleted_reclaimable_mb: 6 * 1024,
+            deleted_files: vec![crate::platform::DeletedFile {
+                pid: 900,
+                name: "rsyslogd".into(),
+                path: "/var/log/journal.log".into(),
+                size_mb: 6 * 1024,
+            }],
+            net: None,
+            mounts: Vec::new(),
+        };
+        let mut st = history::SysAlertState::default();
+        let procs: Vec<Process> = Vec::new();
+        for _ in 0..history::ALERT_CYCLES - 1 {
+            assert!(
+                fleet_alert_picks(&cli, &sample, &procs, &mut st, 3).is_empty(),
+                "no fire before the window completes"
+            );
+        }
+        let picks = fleet_alert_picks(&cli, &sample, &procs, &mut st, 3);
+        assert_eq!(picks.len(), 2, "{picks:?}");
+        assert!(
+            picks.iter().any(|(_, d, _)| d.contains(
+                "GPU memory gpu 0 (NVIDIA A100) 95% above 90%"
+            )),
+            "{picks:?}"
+        );
+        assert!(
+            picks.iter().any(|(_, d, _)| d.contains(
+                "deleted-but-held files: 6.0 GB above 2 GB"
+            )),
+            "{picks:?}"
+        );
+    }
+
+    #[test]
     fn fleet_failed_units_alert_judges_the_far_host_s_own_list() {
         let cli = cli::Cli::parse_from([
             "witr",
@@ -7836,6 +7969,13 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             stats: crate::platform::SystemStats::default(),
             nics: Vec::new(),
             failed_units: vec!["ipmi.service".into(), "lightdm.service".into()],
+            deleted_reclaimable_mb: 6 * 1024,
+            deleted_files: vec![crate::platform::DeletedFile {
+                pid: 900,
+                name: "rsyslogd".into(),
+                path: "/var/log/journal.log".into(),
+                size_mb: 6 * 1024,
+            }],
             net: None,
             mounts: Vec::new(),
         };
@@ -7880,6 +8020,8 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             },
             nics: Vec::new(),
             failed_units: Vec::new(),
+            deleted_reclaimable_mb: 0,
+            deleted_files: Vec::new(),
             net: None,
             mounts: Vec::new(),
         };

@@ -1527,6 +1527,14 @@ impl TuiApp {
                     } else {
                         None
                     };
+                    let (deleted_files, deleted_total_mb) =
+                        if self.alert_deleted_gb.is_some() {
+                            let files = self.platform.deleted_files();
+                            let total = files.iter().map(|d| d.size_mb).sum();
+                            (files, total)
+                        } else {
+                            (Vec::new(), 0)
+                        };
                     let limits = crate::history::SysAlertLimits {
                         load: self.alert_load,
                         mem_pct: self.alert_mem_pct,
@@ -1550,11 +1558,8 @@ impl TuiApp {
                         inodes_limit: self.alert_inodes,
                         gpu_mem_pct_limit: self.alert_gpu_mem_pct,
                         deleted_gb_limit: self.alert_deleted_gb,
-                        deleted_files: if self.alert_deleted_gb.is_some() {
-                            self.platform.deleted_files()
-                        } else {
-                            Vec::new()
-                        },
+                        deleted_files: deleted_files.clone(),
+                        deleted_total_mb,
                         gpus: stats.gpus.clone(),
                         disk_busy_limit: self.alert_disk_busy,
                         temp_limit: self.alert_temp,

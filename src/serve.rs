@@ -415,6 +415,7 @@ pub(crate) fn system_snapshot(
     proc_count: usize,
     zombie_count: usize,
     failed_units: &[String],
+    deleted_files: &[crate::platform::DeletedFile],
 ) -> serde_json::Value {
     let pct = |u: Option<u64>, t: Option<u64>| match (u, t) {
         (Some(u), Some(t)) if t > 0 => Some((u * 100) / t),
@@ -462,6 +463,41 @@ pub(crate) fn system_snapshot(
         // sentinel and fleet --sys read it here instead of assuming blindness;
         // servers predating the field leave it empty (an honest "nothing seen")
         "failed_units": failed_units,
+        // whole-GPU readings ride inside stats — the fleet --alert-gpu-
+        // mem-pct sentinel and the cockpit's gpu row read them here
+        "gpus": stats
+            .gpus
+            .iter()
+            .map(|g| {
+                serde_json::json!({
+                    "id": g.id,
+                    "name": g.name,
+                    "util_pct": g.util_pct,
+                    "mem_used_mb": g.mem_used_mb,
+                    "mem_total_mb": g.mem_total_mb,
+                    "temp_c": g.temp_c,
+                })
+            })
+            .collect::<Vec<_>>(),
+        // the deleted-hold story: the total drives the fleet sentinel, the
+        // biggest few holders name it (the walk is the same one the
+        // /metrics gauge pays per scrape)
+        "deleted_reclaimable_mb": deleted_files
+            .iter()
+            .map(|d| d.size_mb)
+            .sum::<u64>(),
+        "deleted_files": deleted_files
+            .iter()
+            .take(3)
+            .map(|d| {
+                serde_json::json!({
+                    "pid": d.pid,
+                    "name": d.name,
+                    "path": d.path,
+                    "size_mb": d.size_mb,
+                })
+            })
+            .collect::<Vec<_>>(),
         "disks": stats
             .disks
             .iter()
@@ -1393,8 +1429,17 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                     // failed-units sentinel reads the far host's own list
                     // (the same sweep the /metrics gauge pays per scrape)
                     let failed = platform.failed_units().unwrap_or_default();
+                    let deleted = platform.deleted_files();
                     let system = stats.map(|s| {
-                        system_snapshot(&s, &nics, &mounts, procs.len(), zombies, &failed)
+                        system_snapshot(
+                            &s,
+                            &nics,
+                            &mounts,
+                            procs.len(),
+                            zombies,
+                            &failed,
+                            &deleted,
+                        )
                     });
                     (procs, system)
                 };
