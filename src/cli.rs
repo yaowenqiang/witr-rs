@@ -389,6 +389,18 @@ pub struct Cli {
     pub deleted: bool,
 
     #[arg(
+        long,
+        value_name = "Z",
+        num_args = 0..=1,
+        default_missing_value = "3.5",
+        help = t(
+            "舰队离群检测:对每台 --remote 主机的各指标(load / cpu / 内存 / swap / 磁盘占用 / 磁盘忙 / 已删除占用 / GPU 显存)计算相对舰队中位数的稳健 z-score(Iglewicz–Hoaglin,MAD 抗离群自身污染),|z| ≥ 阈值(默认 3.5)即点名——\"20 台同角色机器,哪台不对劲\";单机阈值永远抓不到配置漂移与静默失控。少于 3 台上报的指标跳过。发现离群退出码 1",
+            "Fleet outlier detection: computes each --remote host's robust z-score against the fleet median per metric (load / cpu / memory / swap / disk usage / disk busy / deleted hold / GPU memory — Iglewicz–Hoaglin, MAD resists pollution by the outlier itself), naming hosts at or over the threshold (default 3.5) — \"twenty identical machines: which one is off\"; per-machine thresholds never catch config drift or silent runaway. Metrics with fewer than three reporters skip. Exit 1 when any outlier"
+        )
+    )]
+    pub outliers: Option<f64>,
+
+    #[arg(
         long = "alert-deleted-gb",
         value_name = "GB",
         help = t(

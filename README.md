@@ -102,6 +102,8 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **舰队哨兵（`--remote` × `--watch` × `--alert-*`）**：告警语汇的最后一站——跨机器。`/api/ps` 信封带上**机器快照**（`system` 键：load / cpu / 内存 / swap / PSI / retrans / oom 计数 / 进程数与僵尸计数 + NIC 累计计数 + 挂载点扫描（含 inode）+ 每盘 IO（busy% / IOPS / 队列深度）+ 远端自己的 systemd 失败单元清单 + GPU 全套读数 + 被攥着的已删除文件（总量与最大持有者）——整机哨兵要判的全部字段），`--remote ... --watch 5 --alert-load 4 --alert-psi 20` 每个 tick 拉全 fleet 后**逐主机**判定机器级哨兵（每主机独立 streak/闩锁/disk-eta 趋势窗口），告警点名主机：`⚠ [host2] system — load average 5.20 above 4`；`--events-log` 条目多带 `host` 字段（本地事件没有该字段，回放兼容），`--alert-exec` / `--alert-webhook` 照常触发（detail 带 `[host]` 前缀）。旧版 `--serve` 没有快照键的主机自动解除哨兵（表格照常渲染）。`--check --remote a,b,c --alert-load 4` 是舰队一次性体检（每台两次拉取隔 1s 出速率，违规逐行点名主机，任一违规退出码 1）——cron 舰队巡检一条命令。进程级阈值要探测本机（fd/conn/io），舰队模式明确拒绝而不是半工作；**`--top` 也有舰队形态**——`--remote http://TOKEN@a:9100,http://TOKEN@b:9100 --top cpu` 把各主机的进程表合并成一张跨机器榜单（HOST 列点名归属，同值并列按主机再按 pid 排稳），随表携带的指标（cpu / mem / age / threads / swap / gpu / gpu-mem——GPU 列在服务端有 NVIDIA 驱动时随表携带）开箱即用，`--count` / `--watch N` / `--times` / `--json` / `--csv` / `--markdown` 全部照常（机器可读格式打印同一张榜的行：json 保持版本化信封、每行带 host，csv/markdown 与本地孪生同形；host 标签剥去 scheme 与令牌，只有主机名：端口）——`--watch 5` 就是全机房实时热榜；需要本机探测的指标（fd / conn / io / io-rate / net）明确报错并点名可用集合，不再静默吞旗标打印整表。多主机的 `--csv` / `--json` 行内也带 host 列/字段（分区横幅从来只对人可读，脚本要的是列）。**`--sys` 同样有舰队形态**——机器快照本就随 `/api/ps` 信封走，`--remote a,b,c --sys` 把每台机器的整机仪表盘一次拉齐（`--watch 5` 即全机房驾驶舱），状态水位从抓到的进程表统计；快照随带每 NIC 累计计数，网卡区按两次抓取差分出速率（`--watch` 跨拍差分、一次性隔 1 秒双抓，与本地同款技巧）；失败单元行也逐主机点亮、GPU 行随快照读数出现（远端 serve 把自己的清单与 GPU 读数塞进快照）；`--json` 出 `hosts` 数组（每项带 `host` 键，本机 `--sys --json` 的平铺字段形状不变），`--csv` / `--markdown` 逐主机分节。
 
+**舰队离群检测（`--outliers [Z]`）**：舰队与它自己比较——对每台 `--remote` 主机的各指标（load / cpu / 内存 / swap / 磁盘占用 / 磁盘忙 / 已删除占用 / GPU 显存）计算相对**舰队中位数**的稳健 z-score（Iglewicz–Hoaglin：中位数与 MAD——经典 σ 会被离群自身撑大，五台机器的舰队里什么都不会显得异常；MAD 不会）。|z| ≥ 阈值（默认 3.5）的主机按偏离程度降序点名，附数值、舰队中位数与 z；抓取失败的对端跳过并列出；上报主机不足 3 台的指标静默跳过。发现离群退出码 1——整个机房的巡检探针；`--json` 出版本化信封。这是与其他所有舰队面**不同的问题**：不问"每台机器怎么样"，问"**哪台不对劲**"。
+
 **配置热重载（SIGHUP）**：`kill -HUP $(pidof witr-rs)` 无需重启即重读配置——TUI 立即重折算全部旋钮（采样间隔、排序、告警阈值、静默/首见名单、通知开关；**关注列表与告警状态保留**——调整阈值不丢已触发的告警闩锁），无头 `--watch` 同效（下一个 tick 生效）。语义与启动一致：命令行旗标始终压过配置文件，重载只动文件里改的值。改 config.toml 不用再杀进程。
 
 **端口总览（`--ports`）**：不进界面，直接打印当前全部 LISTEN 端口——列 端口 / 协议 / 属主（同端口多属主逗号并列，共享端口的两个进程一眼可见），按端口排序。TUI Ports 总览页（`o`）的 CLI 孪生：`--json` 出版本化信封（`listener_count` + `listeners`），`--csv` 出 port,proto,owners 三列——"这台机器上现在谁在对外服务"一条命令答完。配 **`--watch N`** 常驻刷新（清屏重绘，Ctrl-C 退出，`--times N` 给时长上界；机器可读格式保持一次性输出——轮询的消费方自己控制节奏）。
@@ -367,6 +369,7 @@ witr-rs --remote http://10.0.0.7:9100 --watch 2 # 远端表格常驻刷新
 witr-rs --remote http://a:9100 --remote http://b:9100 --watch 5 --alert-load 4 --alert-psi 20 # 舰队哨兵：逐主机判定，告警点名主机
 witr-rs --remote http://a:9100 --remote http://b:9100 --top cpu -n 20 --watch 5  # 舰队进程榜：全机房谁在吃 CPU，一张表（--csv 行内带 host）
 witr-rs --remote http://a:9100 --remote http://b:9100 --sys --watch 5  # 舰队驾驶舱：每台机器的整机仪表盘一屏拉齐
+witr-rs --remote a,b,c,d,e --outliers  # 舰队离群检测：哪台不对劲（稳健 z-score 对舰队中位数；退出码 1——巡检探针）
 witr-rs --check --remote http://a:9100 --remote http://b:9100 --alert-load 4 # 舰队一次性体检：任一违规退出码 1
 witr-rs --plot-events events.jsonl  # 事件落盘画成自包含 HTML 甘特图（生命周期条 + 告警标记 + system 泳道）
 witr-rs --watch 10 --alert-container # 无头容器哨兵：容器退出/OOM、Pod CrashLoopBackOff 即喊（边缘触发只报一次）

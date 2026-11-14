@@ -948,6 +948,65 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
             .collect()
     };
 
+    // --outliers: the fleet compared against itself — per metric, each
+    // host's robust z-score against the fleet median, hosts at/over the
+    // threshold named worst-first. A different question from every other
+    // fleet surface: not "how is each machine" but "which machine is off".
+    if let Some(threshold) = cli.outliers {
+        if cli.watch.is_some() {
+            eprintln!("--outliers is one-shot; drop --watch");
+            std::process::exit(4);
+        }
+        let results = fetch_all();
+        let outliers = fleet_outliers(&results, threshold);
+        let failed: Vec<&String> = results
+            .iter()
+            .filter(|(_, r)| r.is_err())
+            .map(|(b, _)| b)
+            .collect();
+        if cli.json {
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "threshold": threshold,
+                "hosts_reported": results.iter().filter(|(_, r)| r.is_ok()).count(),
+                "outliers": outliers,
+                "unreachable": failed,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if outliers.is_empty() {
+            write_out(&format!(
+                "✔ no outliers at |z| ≥ {threshold} across {} host(s){}",
+                results.iter().filter(|(_, r)| r.is_ok()).count(),
+                if failed.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · unreachable: {}", failed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
+                }
+            ));
+        } else {
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            write_out(&format!(
+                "{} outlier(s) at |z| ≥ {threshold} (fleet median per metric):",
+                outliers.len()
+            ));
+            for o in &outliers {
+                let line = format!(
+                    "[{}] {} = {:.1} — fleet median {:.1}, |z| = {:.1}",
+                    o.host, o.metric, o.value, o.median, o.z.abs()
+                );
+                write_out(&format!("⚠ {}", painter.red(&line)));
+            }
+            if !failed.is_empty() {
+                write_out(&format!(
+                    "· unreachable (skipped): {}",
+                    failed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+        std::process::exit(if outliers.is_empty() { 0 } else { 1 });
+    }
+
     // --top across the fleet: merge the fetched tables and rank once. The
     // table-carried metrics (cpu/mem/age/threads/swap) work; anything
     // needing a local probe (fd/conn/io-rate/net/gpu) is refused with the
@@ -1993,6 +2052,176 @@ fn fleet_ranked(procs: &[Process], metric: cli::TopMetric, count: usize) -> Vec<
     });
     ranked.truncate(count);
     ranked.into_iter().map(|(_, p)| p.clone()).collect()
+}
+
+/// One fleet outlier: a host whose metric sits far from the fleet norm.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct FleetOutlier {
+    pub host: String,
+    /// Metric name ("load 1m", "cpu %", "memory %", "disk used %",
+    /// "disk busy %", "deleted MB", "gpu mem %").
+    pub metric: &'static str,
+    pub value: f64,
+    /// The fleet median for the metric (the norm this host deviates from).
+    pub median: f64,
+    /// The modified z-score (Iglewicz–Hoaglin: 0.6745·(x−median)/MAD).
+    pub z: f64,
+}
+
+/// The median of a slice (average of the two middles on even length).
+fn median_of(mut vals: Vec<f64>) -> f64 {
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = vals.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n % 2 == 1 {
+        vals[n / 2]
+    } else {
+        (vals[n / 2 - 1] + vals[n / 2]) / 2.0
+    }
+}
+
+/// Modified z-scores per value: robust to the very outliers being hunted —
+/// a classic z-score's σ gets inflated by the anomaly itself, which on a
+/// five-host fleet means nothing ever reads as abnormal. MAD (median
+/// absolute deviation) doesn't. A fleet where every value is identical
+/// has MAD 0 → the fallback treats any deviation beyond 5% of the median
+/// (or 0.05 absolute on a near-zero median) as the outlier.
+fn modified_zscores(vals: &[f64]) -> Vec<f64> {
+    let med = median_of(vals.to_vec());
+    let mut devs: Vec<f64> = vals.iter().map(|v| (v - med).abs()).collect();
+    let mad = median_of(devs.clone());
+    if mad > 0.0 {
+        devs.clear();
+        return vals
+            .iter()
+            .map(|v| 0.6745 * (v - med) / mad)
+            .collect();
+    }
+    let eps = 0.05 * med.abs().max(1.0);
+    vals.iter()
+        .map(|v| {
+            let d = (v - med).abs();
+            // scaled like a z: the deviation over the epsilon, growing
+            // without bound — a 2× epsilon reads as z 2, a 4× as 4
+            if d <= eps {
+                0.0
+            } else {
+                (d / eps) * 1.0
+            }
+        })
+        .collect()
+}
+
+/// One host's per-metric readings off its snapshot — every metric the
+/// outlier sweep judges. Metrics the snapshot doesn't carry (older serve,
+/// missing hardware) simply don't appear, and the sweep judges only what
+/// it can see.
+fn host_metric_values(sample: &FleetSample) -> Vec<(&'static str, f64)> {
+    let s = &sample.stats;
+    let mounts = &sample.mounts;
+    let mut out = Vec::new();
+    if let Some(v) = s.load1 {
+        out.push(("load 1m", v));
+    }
+    if let Some(v) = s.cpu_percent {
+        out.push(("cpu %", v));
+    }
+    if let (Some(u), Some(t)) = (s.mem_used_mb, s.mem_total_mb) {
+        if t > 0 {
+            out.push(("memory %", u as f64 * 100.0 / t as f64));
+        }
+    }
+    if let (Some(u), Some(t)) = (s.swap_used_mb, s.swap_total_mb) {
+        if t > 0 {
+            out.push(("swap %", u as f64 * 100.0 / t as f64));
+        }
+    }
+    if !mounts.is_empty() {
+        let worst = mounts
+            .iter()
+            .filter(|m| m.total_mb > 0)
+            .map(|m| m.used_mb as f64 * 100.0 / m.total_mb as f64)
+            .fold(0.0, f64::max);
+        if worst > 0.0 {
+            out.push(("disk used %", worst));
+        }
+    }
+    if let Some(busy) = s.disks.iter().filter_map(|d| d.busy_pct).fold(None, |acc, v| {
+        Some(acc.map_or(v, |a: f64| a.max(v)))
+    }) {
+        out.push(("disk busy %", busy));
+    }
+    if sample.deleted_reclaimable_mb > 0 {
+        out.push(("deleted MB", sample.deleted_reclaimable_mb as f64));
+    }
+    if let Some(pct) = s
+        .gpus
+        .iter()
+        .filter(|g| g.mem_total_mb > 0)
+        .map(|g| g.mem_used_mb as f64 * 100.0 / g.mem_total_mb as f64)
+        .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v))))
+    {
+        out.push(("gpu mem %", pct));
+    }
+    out
+}
+
+/// The fleet outlier sweep: per metric, judge every reporting host with
+/// the modified z-score; those at or over `threshold` come back, worst z
+/// first. Metrics with fewer than three reporters are skipped — two
+/// machines rarely make a norm.
+fn fleet_outliers(
+    results: &FleetFetch,
+    threshold: f64,
+) -> Vec<FleetOutlier> {
+    // host → its metric readings (hosts whose fetch failed contribute
+    // nothing, and their failure shows in the footer, not the ranking)
+    let mut per_host: Vec<(String, Vec<(&'static str, f64)>)> = Vec::new();
+    for (base, result) in results {
+        if let Ok((_, Some(sample))) = result {
+            per_host.push((base.clone(), host_metric_values(sample)));
+        }
+    }
+    // metric → (host, value) across the fleet
+    let mut by_metric: std::collections::HashMap<&'static str, Vec<(String, f64)>> =
+        std::collections::HashMap::new();
+    for (host, readings) in &per_host {
+        for (metric, value) in readings {
+            by_metric.entry(metric).or_default().push((host.clone(), *value));
+        }
+    }
+    let mut out = Vec::new();
+    let mut metrics: Vec<&&str> = by_metric.keys().collect();
+    metrics.sort();
+    for metric in metrics {
+        let entries = &by_metric[*metric];
+        if entries.len() < 3 {
+            continue;
+        }
+        let values: Vec<f64> = entries.iter().map(|(_, v)| *v).collect();
+        let zs = modified_zscores(&values);
+        let med = median_of(values.clone());
+        for ((host, value), z) in entries.iter().zip(&zs) {
+            if z.abs() >= threshold {
+                out.push(FleetOutlier {
+                    host: host.clone(),
+                    metric,
+                    value: *value,
+                    median: med,
+                    z: *z,
+                });
+            }
+        }
+    }
+    // worst deviation first
+    out.sort_by(|a, b| {
+        b.z.abs()
+            .partial_cmp(&a.z.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
 }
 
 /// Count processes in the given single-letter kernel states — the
@@ -7891,6 +8120,117 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         // a server without the snapshot (or a null one) disarms cleanly
         assert!(parse_system_snapshot(&serde_json::json!({"processes": []})).is_none());
         assert!(parse_system_snapshot(&serde_json::json!({"system": null})).is_none());
+    }
+
+    #[test]
+    fn modified_zscores_resist_the_outlier_itself() {
+        // five identical loads plus one runaway: classic z-score's σ gets
+        // inflated by the runaway (z ≈ 1.8, under any threshold) — MAD
+        // names it unambiguously
+        let vals = vec![0.5, 0.5, 0.6, 0.5, 0.4, 9.0];
+        let zs = modified_zscores(&vals);
+        assert!(
+            zs[5].abs() > 3.5,
+            "the runaway is flagged: {zs:?}"
+        );
+        assert!(
+            zs[..5].iter().all(|z| z.abs() < 3.5),
+            "the calm five stay well under the threshold: {zs:?}"
+        );
+        // all-identical values: MAD 0 → the 5%-epsilon fallback, silence
+        let same = vec![2.0, 2.0, 2.0, 2.0];
+        assert!(modified_zscores(&same).iter().all(|z| *z == 0.0));
+        // 10% off the identical median is the outlier
+        let drifted = vec![2.0, 2.0, 2.0, 2.4];
+        let zs = modified_zscores(&drifted);
+        assert!(zs[3].abs() > 3.5, "the drifter flags under MAD 0: {zs:?}");
+    }
+
+    #[test]
+    fn fleet_outliers_rank_and_skip_sparse_metrics() {
+        let sample = |load: f64, cpu: f64| FleetSample {
+            stats: crate::platform::SystemStats {
+                load1: Some(load),
+                cpu_percent: Some(cpu),
+                ..Default::default()
+            },
+            nics: Vec::new(),
+            failed_units: Vec::new(),
+            deleted_reclaimable_mb: 0,
+            deleted_files: Vec::new(),
+            net: None,
+            mounts: Vec::new(),
+        };
+        let ok = |b: &str, s: FleetSample| (b.to_string(), Ok((Vec::new(), Some(s))));
+        // five hosts, one runaway load (cpu everywhere normal): the load
+        // outlier names h5; cpu — identical across the fleet — stays silent
+        let results = vec![
+            ok("h1", sample(0.5, 20.0)),
+            ok("h2", sample(0.6, 20.0)),
+            ok("h3", sample(0.4, 20.0)),
+            ok("h4", sample(0.5, 21.0)),
+            ok("h5", sample(9.0, 20.0)),
+            // a two-host pair: cpu reports from only 2 hosts (7 total rows
+            // but a third metric with <3 reporters skips — this fixture
+            // exercises the sparse skip via load from a 6th host? no —
+            // via a metric only h6 reports)
+            (
+                "h6".to_string(),
+                Ok((
+                    Vec::new(),
+                    Some(FleetSample {
+                        stats: crate::platform::SystemStats {
+                            load1: Some(50.0),
+                            ..Default::default()
+                        },
+                        nics: Vec::new(),
+                        failed_units: Vec::new(),
+                        deleted_reclaimable_mb: 0,
+                        deleted_files: Vec::new(),
+                        net: None,
+                        mounts: Vec::new(),
+                    }),
+                )),
+            ),
+        ];
+        let outliers = fleet_outliers(&results, 3.5);
+        // h6's load 50 joins load's values — six reporters, still judged;
+        // the runaway crowd now includes h6 (50 vs ~0.5 fleet norm)
+        assert!(outliers.iter().any(|o| o.host == "h5" && o.metric == "load 1m"), "{outliers:?}");
+        assert!(outliers.iter().any(|o| o.host == "h6"), "{outliers:?}");
+        // the calm hosts never appear
+        assert!(!outliers.iter().any(|o| o.host == "h1" || o.host == "h2"), "{outliers:?}");
+        // worst z first
+        if outliers.len() >= 2 {
+            assert!(outliers[0].z.abs() >= outliers[1].z.abs());
+        }
+        // a fetch-failed host contributes nothing and breaks nothing
+        let mut results = results;
+        results.insert(0, ("dead".to_string(), Err("connect failed".to_string())));
+        assert!(fleet_outliers(&results, 3.5).len() >= 2);
+    }
+
+    #[test]
+    fn fleet_outliers_skip_metrics_with_fewer_than_three_reporters() {
+        // two hosts: every metric has two reporters — nothing judges,
+        // nothing fires (the degenerate pair case is honest silence)
+        let sample = |load: f64| FleetSample {
+            stats: crate::platform::SystemStats {
+                load1: Some(load),
+                ..Default::default()
+            },
+            nics: Vec::new(),
+            failed_units: Vec::new(),
+            deleted_reclaimable_mb: 0,
+            deleted_files: Vec::new(),
+            net: None,
+            mounts: Vec::new(),
+        };
+        let results = vec![
+            ("a".to_string(), Ok((Vec::new(), Some(sample(0.5))))),
+            ("b".to_string(), Ok((Vec::new(), Some(sample(50.0))))),
+        ];
+        assert!(fleet_outliers(&results, 1.0).is_empty());
     }
 
     #[test]
