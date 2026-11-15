@@ -42,7 +42,9 @@ pub fn inspect(exe: &str) -> BinaryIdentity {
     }
 }
 
-fn hash_file(path: &str) -> Option<String> {
+/// sha256 of one file (lowercase hex), streaming 1 MiB at a time. Used by
+/// the detail view and the --alert-exe-changed sentinel.
+pub fn hash_file(path: &str) -> Option<String> {
     let mut f = std::fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];

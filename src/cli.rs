@@ -241,6 +241,8 @@ impl Cli {
         self.alert_inodes = self.alert_inodes.or(cfg.alert_inodes);
         self.alert_gpu_mem_pct = self.alert_gpu_mem_pct.or(cfg.alert_gpu_mem_pct);
         self.alert_deleted_gb = self.alert_deleted_gb.or(cfg.alert_deleted_gb);
+        self.alert_exe_changed = self.alert_exe_changed || cfg.alert_exe_changed.unwrap_or(false);
+        self.alert_new_remote = self.alert_new_remote || cfg.alert_new_remote.unwrap_or(false);
         self.alert_leak = self.alert_leak.or(cfg.alert_leak);
         self.alert_fd_leak = self.alert_fd_leak.or(cfg.alert_fd_leak);
         self.alert_thr_leak = self.alert_thr_leak.or(cfg.alert_thr_leak);
@@ -409,6 +411,24 @@ pub struct Cli {
         )
     )]
     pub alert_deleted_gb: Option<f64>,
+
+    #[arg(
+        long,
+        help = t(
+            "二进制替换哨兵:同一 exe 路径的内容(sha256)变化即触发,详情点名路径与新旧哈希前缀——挖矿木马替换二进制、持久化后门覆盖合法服务的第一现场。首见路径静默建基线,之后每拍只 stat(mtime 未变零成本);unreadable 跳过。TUI 和 --watch",
+            "Binary-replacement sentinel: fires when an exe path's content (sha256) changes, the detail naming the path and both hash prefixes — the first scene of a miner swapping binaries or a backdoor overwriting a legit service. First-seen paths arm silently; afterwards each tick is just a stat (zero cost while mtime holds); unreadable skips. TUI and --watch"
+        )
+    )]
+    pub alert_exe_changed: bool,
+
+    #[arg(
+        long,
+        help = t(
+            "新外联哨兵:进程首次连出某个新远程地址即触发,详情点名地址——数据外传与 C2 回连的第一现场。首轮静默建基线(已连接的都是常态);回环地址不计;每 pid 基线上限 512 个地址(浏览器型进程诚实封顶)。armed 时每拍付一次 ss 扫描(--alert-net-per-proc 的先例)。TUI 和 --watch",
+            "New-remote sentinel: fires the first time a process connects to a remote address it has never used — the first scene of data exfiltration or C2 callback. The first sweep builds the baseline silently (already-connected is the norm); loopback never counts; each pid's baseline caps at 512 addresses (browser-class processes cap honestly). An armed run pays one ss sweep per tick (the --alert-net-per-proc precedent). TUI and --watch"
+        )
+    )]
+    pub alert_new_remote: bool,
 
     #[arg(short = 'j', long, help = t("输出机器可读的 JSON", "Machine-readable JSON"))]
     pub json: bool,

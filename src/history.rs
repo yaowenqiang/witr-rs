@@ -538,6 +538,17 @@ pub struct SysAlertState {
     /// three siblings (mem/fd/threads) judge independently. Process exits
     /// drop the entry; a returning process re-arms from zero.
     pub leak_seen: std::collections::HashMap<(u8, Pid), (u32, bool, u32)>,
+    /// The exe-change sentinel's baseline: exe path → (mtime secs, sha256).
+    /// A path whose mtime moved re-hashes; a different hash is the
+    /// replacement signal. Paths no longer running are dropped per tick.
+    pub exe_watched: std::collections::HashMap<String, (i64, String)>,
+    /// The new-remote sentinel's per-pid baseline of seen remote IPs.
+    /// Capped per pid (a browser talking to hundreds of hosts must not
+    /// grow this forever — the cap suppresses, honestly).
+    pub remote_seen: std::collections::HashMap<Pid, std::collections::HashSet<String>>,
+    /// The new-remote sentinel's first sweep builds the baseline silently;
+    /// only arrivals after it fire.
+    pub remote_armed: bool,
     pub disk_busy_streak: u32,
     pub disk_busy_firing: bool,
     pub disk_busy_fired_secs: u32,
@@ -1015,6 +1026,125 @@ pub fn leak_alert_picks(
     state
         .leak_seen
         .retain(|(kind_key, pid), _| *kind_key == kind.key() && live.contains(pid));
+    out
+}
+
+/// The --alert-exe-changed sentinel's tick: the replacement signal. Each
+/// distinct exe path is hashed once on first sight (the arming sweep —
+/// hundreds of binaries, read once), then only stat-ed per tick; a moved
+/// mtime triggers a re-hash, and a different hash IS the alert: the
+/// binary behind a running identity was replaced. Touches without
+/// content change (a re-link, a copy preserving bytes) update the stamp
+/// silently. Every failure (unreadable, vanished) skips.
+pub fn exe_change_picks(
+    procs: &[crate::model::Process],
+    state: &mut SysAlertState,
+) -> Vec<(crate::model::Pid, String, String, bool)> {
+    let mut out = Vec::new();
+    let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in procs {
+        let Some(exe) = p.exe.as_deref() else {
+            continue;
+        };
+        live.insert(exe.to_string());
+        let Ok(md) = std::fs::metadata(exe) else {
+            continue;
+        };
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        match state.exe_watched.get(exe) {
+            None => {
+                // first sight arms silently — the fleet of known binaries
+                // never fires
+                if let Some(hash) = crate::binary_id::hash_file(exe) {
+                    state.exe_watched.insert(exe.to_string(), (mtime, hash));
+                }
+            }
+            Some((stamp, hash)) if *stamp == mtime => {}
+            Some((_, old_hash)) => {
+                match crate::binary_id::hash_file(exe) {
+                    Some(new_hash) if new_hash != *old_hash => {
+                        let short = |h: &str| h.chars().take(12).collect::<String>();
+                        out.push((
+                            p.pid,
+                            format!("{} (pid {})", p.name, p.pid),
+                            format!(
+                                "executable replaced: {} was {} now {} — same identity, different bytes",
+                                exe,
+                                short(old_hash),
+                                short(&new_hash)
+                            ),
+                            false,
+                        ));
+                        state.exe_watched.insert(exe.to_string(), (mtime, new_hash));
+                    }
+                    Some(new_hash) => {
+                        // bytes unchanged (a touch): just move the stamp
+                        state.exe_watched.insert(exe.to_string(), (mtime, new_hash));
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    // paths no longer running drop from the baseline (a return re-arms)
+    state.exe_watched.retain(|path, _| live.contains(path));
+    out
+}
+
+/// The --alert-new-remote sentinel's cap: a browser talking to hundreds
+/// of hosts must not grow its baseline forever — beyond this many seen
+/// remotes, a pid's new arrivals stop alerting (honest suppression).
+const REMOTE_SEEN_CAP: usize = 512;
+
+/// The --alert-new-remote sentinel's tick: the first-contact signal. One
+/// ss sweep's ESTABLISHED sockets, attributed to pids, against each pid's
+/// seen-remote baseline — loopback never counts, and the very first sweep
+/// builds the baseline silently (everything already connected is the
+/// norm, not an event). Each genuinely new remote ip fires once.
+pub fn new_remote_picks(
+    sockets: &[crate::model::Socket],
+    procs: &[crate::model::Process],
+    state: &mut SysAlertState,
+) -> Vec<(crate::model::Pid, String, String, bool)> {
+    let mut out = Vec::new();
+    let names: std::collections::HashMap<Pid, String> = procs
+        .iter()
+        .map(|p| (p.pid, p.name.clone()))
+        .collect();
+    for s in sockets {
+        if s.state != "ESTABLISHED" {
+            continue;
+        }
+        let (Some(pid), Some(peer)) = (s.pid, s.peer_addr.as_ref()) else {
+            continue;
+        };
+        // loopback is not an "outbound contact"
+        if peer.starts_with("127.") || peer == "::1" || peer.starts_with("0.") {
+            continue;
+        }
+        let seen = state.remote_seen.entry(pid).or_default();
+        if seen.len() >= REMOTE_SEEN_CAP && !seen.contains(peer) {
+            continue;
+        }
+        if seen.insert(peer.clone()) && state.remote_armed {
+            let who = names.get(&pid).cloned().unwrap_or_else(|| format!("pid {pid}"));
+            out.push((
+                pid,
+                who,
+                format!("new remote contact {peer} — first time this process connects there"),
+                false,
+            ));
+        }
+    }
+    // dead pids drop their baselines
+    let live: std::collections::HashSet<Pid> = procs.iter().map(|p| p.pid).collect();
+    state.remote_seen.retain(|pid, _| live.contains(pid));
+    state.remote_armed = true;
     out
 }
 
@@ -5177,6 +5307,81 @@ mod tests {
         let small = h.cpu_chart(10, 4).unwrap();
         let bars = small.split_whitespace().next().unwrap();
         assert!(bars.chars().count() <= 4, "thinned to width 4: {small}");
+    }
+
+    #[test]
+    fn exe_change_sentinel_detects_the_swap() {
+        // a real temp file as the exe: write v1, arm silently, rewrite v2
+        // with a moved mtime, and the replacement fires naming both hashes
+        let dir = std::env::temp_dir().join(format!("witr-exe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("svc.bin");
+        std::fs::write(&exe, b"original binary bytes").unwrap();
+        let exe_str = exe.to_string_lossy().to_string();
+        let mut p = proc(11, "svc", None);
+        p.name = "svc".into();
+        p.exe = Some(exe_str.clone());
+        let procs = vec![p.clone()];
+        let mut state = SysAlertState::default();
+        // arming: first sight never fires
+        assert!(exe_change_picks(&procs, &mut state).is_empty());
+        assert!(state.exe_watched.contains_key(&exe_str));
+        // same mtime, rewritten content: still silent (mtime holds, the
+        // cheap path skips entirely)
+        std::fs::write(&exe, b"original binary bytes").unwrap();
+        assert!(exe_change_picks(&procs, &mut state).is_empty());
+        // replaced: new bytes AND a moved mtime (the write resets mtime
+        // to now, so the explicit set lands after it)
+        std::fs::write(&exe, b"MINEDbinarybytes!!").unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&exe).unwrap();
+        f.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        )
+        .unwrap();
+        let picks = exe_change_picks(&procs, &mut state);
+        assert_eq!(picks.len(), 1, "{picks:?}");
+        assert!(picks[0].2.contains("executable replaced"), "{}", picks[0].2);
+        assert!(picks[0].2.contains(exe_str.as_str()), "{}", picks[0].2);
+        assert!(picks[0].2.contains("different bytes"), "{}", picks[0].2);
+        // re-armed on the new hash: a repeat run stays silent
+        assert!(exe_change_picks(&procs, &mut state).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_remote_sentinel_baselines_then_fires_on_first_contact() {
+        let sock = |pid: i32, peer: &str| crate::model::Socket {
+            proto: "tcp".into(),
+            local_addr: "10.0.0.1".into(),
+            local_port: 44444,
+            peer_addr: Some(peer.into()),
+            peer_port: Some(443),
+            state: "ESTABLISHED".into(),
+            pid: Some(pid),
+        };
+        let p = |pid: i32| crate::model::Process {
+            pid,
+            name: format!("p{pid}"),
+            ..Default::default()
+        };
+        let procs = vec![p(7)];
+        let mut state = SysAlertState::default();
+        // the first sweep builds the baseline silently (already-connected
+        // is the norm)
+        let socks = vec![sock(7, "52.1.2.3"), sock(7, "52.1.2.4")];
+        assert!(new_remote_picks(&socks, &procs, &mut state).is_empty());
+        // loopback never counts (no baseline entry, no fire)
+        let socks = vec![sock(7, "127.0.0.1:3306")];
+        assert!(new_remote_picks(&socks, &procs, &mut state).is_empty());
+        // a genuinely new remote fires once
+        let socks = vec![sock(7, "185.66.66.66")];
+        let picks = new_remote_picks(&socks, &procs, &mut state);
+        assert_eq!(picks.len(), 1, "{picks:?}");
+        assert!(picks[0].2.contains("new remote contact 185.66.66.66"), "{}", picks[0].2);
+        // known remotes never re-fire
+        let socks = vec![sock(7, "52.1.2.3"), sock(7, "185.66.66.66")];
+        assert!(new_remote_picks(&socks, &procs, &mut state).is_empty());
+        // the pid exits → its baseline drops
     }
 
     #[test]

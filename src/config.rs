@@ -59,6 +59,8 @@ pub struct Config {
     pub alert_inodes: Option<u64>,
     pub alert_gpu_mem_pct: Option<u64>,
     pub alert_deleted_gb: Option<f64>,
+    pub alert_exe_changed: Option<bool>,
+    pub alert_new_remote: Option<bool>,
     pub alert_leak: Option<f64>,
     pub alert_fd_leak: Option<f64>,
     pub alert_thr_leak: Option<f64>,
@@ -383,6 +385,14 @@ fn set_alert(key: &str, value: &str, cfg: &mut Config) -> Result<(), String> {
         "alert_inodes" => int(&mut cfg.alert_inodes),
         "alert_gpu_mem_pct" => int(&mut cfg.alert_gpu_mem_pct),
         "alert_deleted_gb" => num(&mut cfg.alert_deleted_gb),
+        "alert_exe_changed" => value
+            .parse::<bool>()
+            .map(|v| cfg.alert_exe_changed = Some(v))
+            .map_err(|_| format!("{key} {value:?} is not true/false")),
+        "alert_new_remote" => value
+            .parse::<bool>()
+            .map(|v| cfg.alert_new_remote = Some(v))
+            .map_err(|_| format!("{key} {value:?} is not true/false")),
         "alert_leak" => num(&mut cfg.alert_leak),
         "alert_fd_leak" => num(&mut cfg.alert_fd_leak),
         "alert_thr_leak" => num(&mut cfg.alert_thr_leak),

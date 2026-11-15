@@ -802,6 +802,8 @@ fn reject_fleet_per_process_alerts(cli: &cli::Cli) {
         || cli.alert_leak.is_some()
         || cli.alert_fd_leak.is_some()
         || cli.alert_thr_leak.is_some()
+        || cli.alert_exe_changed
+        || cli.alert_new_remote
         || cli.alert_deviation.is_some()
         || !cli.alert_new_proc.is_empty()
         || !cli.alert_port.is_empty()
@@ -6136,6 +6138,11 @@ fn main() {
                         hist.update_net(&sweep);
                     }
                 }
+                // the security sentinels: binary replacement (stat per
+                // tick, hash only on an mtime move) and first-contact
+                // remotes (one ss sweep, paid only while armed — the
+                // net-per-proc precedent)
+
                 let mut picks = watch_alert_picks(
                     platform.as_ref(),
                     &cli,
@@ -6173,6 +6180,17 @@ fn main() {
                             &mut sys_alert,
                         ));
                     }
+                }
+                // the security sentinels: binary replacement (stat per
+                // tick, hash only on an mtime move) and first-contact
+                // remotes (one ss sweep, paid only while armed — the
+                // net-per-proc precedent)
+                if cli.alert_exe_changed {
+                    picks.extend(history::exe_change_picks(&procs, &mut sys_alert));
+                }
+                if cli.alert_new_remote {
+                    let socks = platform.list_all_sockets().unwrap_or_default();
+                    picks.extend(history::new_remote_picks(&socks, &procs, &mut sys_alert));
                 }
                 if !alert_ports.is_empty() {
                     let socks = platform.list_sockets().unwrap_or_default();
@@ -6222,6 +6240,8 @@ fn main() {
                     || cli.alert_zombies.is_some()
                     || cli.alert_dstate.is_some()
                     || cli.alert_failed_units.is_some()
+                    || cli.alert_exe_changed
+                    || cli.alert_new_remote
                     || cli.alert_leak.is_some()
                 {
                     if let Some(stats) = platform.system_stats() {

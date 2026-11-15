@@ -427,6 +427,9 @@ struct TuiApp {
     alert_gpu_mem_pct: Option<u64>,
     /// --alert-deleted-gb: held-deleted space threshold (GB)
     alert_deleted_gb: Option<f64>,
+    /// --alert-exe-changed / --alert-new-remote: the security sentinels
+    alert_exe_changed: bool,
+    alert_new_remote: bool,
     /// --alert-leak: per-process RSS growth threshold (MB)
     alert_leak: Option<f64>,
     /// --alert-fd-leak: per-process fd growth threshold
@@ -679,6 +682,9 @@ pub struct Seed {
     pub alert_gpu_mem_pct: Option<u64>,
     /// --alert-deleted-gb: held-deleted space threshold (GB)
     pub alert_deleted_gb: Option<f64>,
+    /// --alert-exe-changed / --alert-new-remote: the security sentinels
+    pub alert_exe_changed: bool,
+    pub alert_new_remote: bool,
     /// --alert-leak: per-process RSS growth threshold (MB)
     pub alert_leak: Option<f64>,
     /// --alert-fd-leak: per-process fd growth threshold
@@ -807,6 +813,8 @@ impl Seed {
         self.alert_inodes = cli.alert_inodes;
         self.alert_gpu_mem_pct = cli.alert_gpu_mem_pct;
         self.alert_deleted_gb = cli.alert_deleted_gb;
+        self.alert_exe_changed = cli.alert_exe_changed;
+        self.alert_new_remote = cli.alert_new_remote;
         self.alert_leak = cli.alert_leak;
         self.alert_fd_leak = cli.alert_fd_leak;
         self.alert_thr_leak = cli.alert_thr_leak;
@@ -965,6 +973,8 @@ impl TuiApp {
             alert_inodes: seed.alert_inodes,
             alert_gpu_mem_pct: seed.alert_gpu_mem_pct,
             alert_deleted_gb: seed.alert_deleted_gb,
+            alert_exe_changed: seed.alert_exe_changed,
+            alert_new_remote: seed.alert_new_remote,
             alert_leak: seed.alert_leak,
             alert_fd_leak: seed.alert_fd_leak,
             alert_thr_leak: seed.alert_thr_leak,
@@ -1269,6 +1279,8 @@ impl TuiApp {
         self.alert_inodes = seed.alert_inodes;
         self.alert_gpu_mem_pct = seed.alert_gpu_mem_pct;
         self.alert_deleted_gb = seed.alert_deleted_gb;
+        self.alert_exe_changed = seed.alert_exe_changed;
+        self.alert_new_remote = seed.alert_new_remote;
         self.alert_leak = seed.alert_leak;
         self.alert_fd_leak = seed.alert_fd_leak;
         self.alert_thr_leak = seed.alert_thr_leak;
@@ -1459,6 +1471,8 @@ impl TuiApp {
                     || self.alert_inodes.is_some()
                     || self.alert_deleted_gb.is_some()
                     || self.alert_leak.is_some()
+                    || self.alert_exe_changed
+                    || self.alert_new_remote
                     || self.alert_fd_leak.is_some()
                     || self.alert_thr_leak.is_some()
                     || self.alert_disk_busy.is_some()
@@ -1628,6 +1642,22 @@ impl TuiApp {
                             ));
                         }
                     }
+                }
+                // the security sentinels: binary replacement and
+                // first-contact remotes
+                if self.alert_exe_changed {
+                    picks.extend(crate::history::exe_change_picks(
+                        &self.procs,
+                        &mut self.sys_alert,
+                    ));
+                }
+                if self.alert_new_remote {
+                    let socks = self.platform.list_all_sockets().unwrap_or_default();
+                    picks.extend(crate::history::new_remote_picks(
+                        &socks,
+                        &self.procs,
+                        &mut self.sys_alert,
+                    ));
                 }
             }
             for (pid, name, detail, recovery) in picks.into_iter().chain(self.pending_alerts.drain(..)) {
@@ -10918,6 +10948,8 @@ mod tests {
                 alert_inodes: None,
                 alert_gpu_mem_pct: None,
                 alert_deleted_gb: None,
+                alert_exe_changed: false,
+                alert_new_remote: false,
                 alert_leak: None,
                 alert_fd_leak: None,
                 alert_thr_leak: None,
