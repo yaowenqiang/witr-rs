@@ -1,5 +1,6 @@
 mod ancestry;
 mod audit;
+mod doctor;
 mod binary_id;
 mod cli;
 mod config;
@@ -5449,6 +5450,25 @@ fn main() {
         } else {
             let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
             write_out(&render::render_locks_table(&locks, &painter));
+        }
+        std::process::exit(0);
+    }
+
+    // --doctor: the environment self-check — every optional capability
+    // probed live, with the reason it's missing and what goes silent.
+    // Informational: exit 0 regardless (--json for scripts).
+    if cli.doctor {
+        let checks = doctor::run_checks();
+        if cli.json {
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "checks": checks,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else {
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            write_out(&doctor::render_checks(&checks, &painter));
         }
         std::process::exit(0);
     }

@@ -384,6 +384,15 @@ pub struct Cli {
     #[arg(
         long,
         help = t(
+            "环境自检:逐项探测每个可选能力(systemd / journalctl / ss / nvidia-smi / 容器运行时 / kubectl / git / 权限 / cgroup v2)——可用的打勾、缺失的说明原因并列出因此沉默的旗标。信息性命令,退出码恒 0;--json 出机读版。\"GPU 列为什么是空的\"这类问题一条命令见分晓",
+            "The environment self-check: probes every optional capability live (systemd / journalctl / ss / nvidia-smi / container runtimes / kubectl / git / privileges / cgroup v2) — available ones ticked, missing ones explained with the flags that go silent without them. Informational, exit 0 always; --json emits the machine-readable version. \"Why is the GPU column empty\" — one command answers"
+        )
+    )]
+    pub doctor: bool,
+
+    #[arg(
+        long,
+        help = t(
             "列出已删除但仍被进程攥着的文件(尺寸降序,总计可回收量)——\"df 满、du 不满\"的经典谜题一条命令解:日志轮转失败、未卸载数据库临时文件都躲在这。发现即退出码 1,干净则 0;--csv / --markdown / --json 同样支持",
             "List open-but-deleted files still held by processes (size desc, with the reclaimable total) — the classic \"df full, du disagrees\" puzzle in one command: failed log rotations and unlinked database temp files all hide here. Exit 1 when any exist, 0 clean; --csv / --markdown / --json work too"
         )
