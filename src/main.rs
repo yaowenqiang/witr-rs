@@ -4124,8 +4124,15 @@ fn main() {
         eprintln!("--on-start watches a target; give a process name, --pid, --port or --file");
         std::process::exit(4);
     }
-    if cli.sockets && cli.snap.is_none() {
-        eprintln!("--sockets extends --snap; add --snap [FILE]");
+    if cli.sockets
+        && cli.snap.is_none()
+        && cli.baseline_save.is_none()
+        && cli.baseline.is_none()
+        && cli.alert_baseline.is_none()
+    {
+        eprintln!(
+            "--sockets extends --snap, --baseline-save, --baseline or --alert-baseline; add one of them"
+        );
         std::process::exit(4);
     }
     // --alert-port values parse up front (bad ports exit 4 here, not a
@@ -5454,6 +5461,105 @@ fn main() {
         std::process::exit(0);
     }
 
+    // --baseline-save: the security baseline — process identities (the
+    // name|exe|user triples, pid-free so it survives reboots), listeners
+    // (with --sockets) and the service set. The norm --baseline/--alert-
+    // baseline judge against.
+    if let Some(path) = &cli.baseline_save {
+        let platform = platform::get();
+        let procs = match platform.list_processes() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cannot list processes: {e}");
+                std::process::exit(5);
+            }
+        };
+        let listeners = if cli.sockets {
+            let socks = platform.list_sockets().unwrap_or_default();
+            snapshot::to_listeners(&socks, &procs)
+        } else {
+            Vec::new()
+        };
+        let services: Vec<String> = platform::enumerate_services()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        match snapshot::save_baseline(path, &procs, &listeners, &services) {
+            Ok(()) => write_out(&format!(
+                "baseline saved: {} identities · {} listener(s){} · {} service(s) → {path}",
+                procs.len(),
+                listeners.len(),
+                if cli.sockets { String::new() } else { " (add --sockets for port tracking)".to_string() },
+                services.len(),
+            )),
+            Err(e) => {
+                eprintln!("--baseline-save {path}: {e}");
+                std::process::exit(5);
+            }
+        }
+        std::process::exit(0);
+    }
+
+    // --baseline FILE: check the live state against a saved baseline.
+    // Anything not in the baseline is an intruder until proven otherwise.
+    if let Some(path) = &cli.baseline {
+        let platform = platform::get();
+        let procs = match platform.list_processes() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cannot list processes: {e}");
+                std::process::exit(5);
+            }
+        };
+        let now_listeners = if cli.sockets {
+            let socks = platform.list_sockets().unwrap_or_default();
+            snapshot::to_listeners(&socks, &procs)
+        } else {
+            Vec::new()
+        };
+        let baseline = match snapshot::load_baseline(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("--baseline {path}: {e}");
+                std::process::exit(4);
+            }
+        };
+        let now_services: Vec<String> = platform::enumerate_services()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let failed: Vec<String> = platform::get()
+            .failed_units()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|u| now_services.contains(u))
+            .collect();
+        let drift = snapshot::baseline_drift(
+            &baseline,
+            &procs,
+            &now_listeners,
+            &now_services,
+            &failed,
+        );
+        if cli.json {
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "drift_count": drift.len(),
+                "drift": drift,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if drift.is_empty() {
+            write_out("✔ live state matches the baseline");
+        } else {
+            for line in &drift {
+                write_out(&format!("⚠ {line}"));
+            }
+            write_out(&format!("{} drift entr(ies)", drift.len()));
+        }
+        std::process::exit(if drift.is_empty() { 0 } else { 1 });
+    }
+
     // --doctor: the environment self-check — every optional capability
     // probed live, with the reason it's missing and what goes silent.
     // Informational: exit 0 regardless (--json for scripts).
@@ -5984,6 +6090,21 @@ fn main() {
             // the recorder's own trend window: mem-eta needs 10+ minutes
             // of MemAvailable samples before the gate trusts a prediction
             let mut rec_eta = history::SysAlertState::default();
+            // the --alert-baseline norm: loaded once (compare failures
+            // would repeat forever — one loud exit-code-4 message instead)
+            let baseline: Option<(Vec<Process>, Vec<snapshot::Listener>, Vec<String>)> =
+                match &cli.alert_baseline {
+                    Some(path) => match snapshot::load_baseline(path) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            eprintln!("--alert-baseline {path}: {e}");
+                            std::process::exit(4);
+                        }
+                    },
+                    None => None,
+                };
+            let mut baseline_reported: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let mut recorder = match &cli.record {
                 Some(path) => match RecordWriter::create_with_cap(
                     path,
@@ -6212,6 +6333,34 @@ fn main() {
                     let socks = platform.list_all_sockets().unwrap_or_default();
                     picks.extend(history::new_remote_picks(&socks, &procs, &mut sys_alert));
                 }
+                // the baseline-drift sentinel: the saved norm is judged per
+                // tick — new identities and new listeners fire once each
+                if cli.alert_baseline.is_some() {
+                    let now_listeners = if cli.sockets {
+                        let socks = platform.list_sockets().unwrap_or_default();
+                        snapshot::to_listeners(&socks, &procs)
+                    } else {
+                        Vec::new()
+                    };
+                    let now_services: Vec<String> = platform::enumerate_services()
+                        .iter()
+                        .map(|s| s.name.clone())
+                        .collect();
+                    let Some(base) = baseline.as_ref() else {
+                        continue;
+                    };
+                    for line in snapshot::baseline_drift(
+                        base,
+                        &procs,
+                        &now_listeners,
+                        &now_services,
+                        &[],
+                    ) {
+                        if baseline_reported.insert(line.clone()) {
+                            picks.push((0, "baseline".into(), line, false));
+                        }
+                    }
+                }
                 if !alert_ports.is_empty() {
                     let socks = platform.list_sockets().unwrap_or_default();
                     picks.extend(port_alert_picks(
@@ -6262,6 +6411,7 @@ fn main() {
                     || cli.alert_failed_units.is_some()
                     || cli.alert_exe_changed
                     || cli.alert_new_remote
+                    || cli.alert_baseline.is_some()
                     || cli.alert_leak.is_some()
                 {
                     if let Some(stats) = platform.system_stats() {

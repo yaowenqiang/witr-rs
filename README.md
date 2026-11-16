@@ -102,6 +102,8 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **舰队哨兵（`--remote` × `--watch` × `--alert-*`）**：告警语汇的最后一站——跨机器。`/api/ps` 信封带上**机器快照**（`system` 键：load / cpu / 内存 / swap / PSI / retrans / oom 计数 / 进程数与僵尸计数 + NIC 累计计数 + 挂载点扫描（含 inode）+ 每盘 IO（busy% / IOPS / 队列深度）+ 远端自己的 systemd 失败单元清单 + GPU 全套读数 + 被攥着的已删除文件（总量与最大持有者）——整机哨兵要判的全部字段），`--remote ... --watch 5 --alert-load 4 --alert-psi 20` 每个 tick 拉全 fleet 后**逐主机**判定机器级哨兵（每主机独立 streak/闩锁/disk-eta 趋势窗口），告警点名主机：`⚠ [host2] system — load average 5.20 above 4`；`--events-log` 条目多带 `host` 字段（本地事件没有该字段，回放兼容），`--alert-exec` / `--alert-webhook` 照常触发（detail 带 `[host]` 前缀）。旧版 `--serve` 没有快照键的主机自动解除哨兵（表格照常渲染）。`--check --remote a,b,c --alert-load 4` 是舰队一次性体检（每台两次拉取隔 1s 出速率，违规逐行点名主机，任一违规退出码 1）——cron 舰队巡检一条命令。进程级阈值要探测本机（fd/conn/io），舰队模式明确拒绝而不是半工作；**`--top` 也有舰队形态**——`--remote http://TOKEN@a:9100,http://TOKEN@b:9100 --top cpu` 把各主机的进程表合并成一张跨机器榜单（HOST 列点名归属，同值并列按主机再按 pid 排稳），随表携带的指标（cpu / mem / age / threads / swap / gpu / gpu-mem——GPU 列在服务端有 NVIDIA 驱动时随表携带）开箱即用，`--count` / `--watch N` / `--times` / `--json` / `--csv` / `--markdown` 全部照常（机器可读格式打印同一张榜的行：json 保持版本化信封、每行带 host，csv/markdown 与本地孪生同形；host 标签剥去 scheme 与令牌，只有主机名：端口）——`--watch 5` 就是全机房实时热榜；需要本机探测的指标（fd / conn / io / io-rate / net）明确报错并点名可用集合，不再静默吞旗标打印整表。多主机的 `--csv` / `--json` 行内也带 host 列/字段（分区横幅从来只对人可读，脚本要的是列）。**`--sys` 同样有舰队形态**——机器快照本就随 `/api/ps` 信封走，`--remote a,b,c --sys` 把每台机器的整机仪表盘一次拉齐（`--watch 5` 即全机房驾驶舱），状态水位从抓到的进程表统计；快照随带每 NIC 累计计数，网卡区按两次抓取差分出速率（`--watch` 跨拍差分、一次性隔 1 秒双抓，与本地同款技巧）；失败单元行也逐主机点亮、GPU 行随快照读数出现（远端 serve 把自己的清单与 GPU 读数塞进快照）；`--json` 出 `hosts` 数组（每项带 `host` 键，本机 `--sys --json` 的平铺字段形状不变），`--csv` / `--markdown` 逐主机分节。
 
+**安全基线（`--baseline-save` / `--baseline` / `--alert-baseline`）**：安全线的续作——把"常态"存下来，偏离即信号。`--baseline-save base.json` 保存进程身份集（name|exe|user 三元，pid 无关、跨重启可比）+ 监听端口集（配 `--sockets`）+ 服务单元名；`--baseline base.json` 对照体检：新出现的进程身份、消失的身份、新/消失的监听端口、新服务与失败的服务逐行点名——**不在基线里的东西，默认按入侵者处理**。任何漂移退出码 1（巡检探针），`--json` 出机读版；旧 `--snap` 文件可直接当基线读（服务集为空）。`--watch 5 --alert-baseline base.json` 是常态守护：新身份与新端口即喊（每身份/端口一次，消失不报——退出事件另有其账）。
+
 **环境自检（`--doctor`）**：逐项探测每个可选能力并回答三件事——可用吗、为什么不可用、哪些旗标因此沉默。检查项：root 权限、systemd（存在性与运行状态分开探测——`is-system-running` 在 degraded 开机上恰好失败，这台机器教出来的）、journalctl 可读性、ss、cgroup v2、nvidia-smi、容器运行时（docker/podman/nerdctl 逐个试）、kubectl、git。✔/✗ 逐行打标，缺失项附 "silent:" 行点名因此静默的旗标（"GPU 列为什么是空的"一条命令见分晓）。信息性命令退出码恒 0；`--json` 出机读版。
 
 **舰队离群检测（`--outliers [Z]`）**：舰队与它自己比较——对每台 `--remote` 主机的各指标（load / cpu / 内存 / swap / 磁盘占用 / 磁盘忙 / 已删除占用 / GPU 显存）计算相对**舰队中位数**的稳健 z-score（Iglewicz–Hoaglin：中位数与 MAD——经典 σ 会被离群自身撑大，五台机器的舰队里什么都不会显得异常；MAD 不会）。|z| ≥ 阈值（默认 3.5）的主机按偏离程度降序点名，附数值、舰队中位数与 z；抓取失败的对端跳过并列出；上报主机不足 3 台的指标静默跳过。发现离群退出码 1——整个机房的巡检探针；`--json` 出版本化信封。这是与其他所有舰队面**不同的问题**：不问"每台机器怎么样"，问"**哪台不对劲**"。
@@ -356,7 +358,8 @@ witr-rs --dstate              # D 态速查（存储/NFS 挂起时 CPU 空闲而
 witr-rs --conns               # 全机非 LISTEN 连接表：本地/对端/状态/属主（回环对端自动归因；--watch N 常驻）
 witr-rs --services            # 服务管理器单元列表（systemd/launchd/SCM；运行中的排前面）
 witr-rs --services --failed   # 只看失败的单元（三平台；巡检探针）
-witr-rs --doctor              # 环境自检：哪些能力可用、缺的为什么、哪些旗标沉默（恒 0）
+witr-rs --baseline-save base.json --sockets  # 保存安全基线：进程身份 + 端口 + 服务（常态快照）
+witr-rs --baseline base.json  # 对照体检：新身份/新端口/失败服务逐行点名（漂移退出码 1）
 witr-rs -u nginx.service --logs 50 --grep error  # systemd 单元报告：状态 + 上次退出码 + journal 尾巴（failed 退出码 1——巡检探针）
 witr-rs --watch 5 --alert-load 8 --alert-mem-pct 90 # 机器级 watchdog：load / 内存百分比超阈值告警
 witr-rs --watch 5 --alert-count 800 # 机器级 watchdog：可见进程数超 800 告警（fork 炸弹哨兵）

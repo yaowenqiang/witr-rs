@@ -137,6 +137,134 @@ pub fn load(path: &str) -> Result<(Vec<Process>, Vec<Listener>), String> {
     Ok((snap.processes, snap.listeners))
 }
 
+/// Save a security baseline: the process table (compared by identity, not
+/// pid — a baseline must survive reboots), the listener set and the
+/// service-manager's unit names. A v3 shape: the v2 snapshot envelope plus
+/// a `services` array.
+pub fn save_baseline(
+    path: &str,
+    procs: &[Process],
+    listeners: &[Listener],
+    services: &[String],
+) -> std::io::Result<()> {
+    let doc = serde_json::json!({
+        "snapshot_version": 3,
+        "saved_at": crate::util::now_unix(),
+        "processes": procs,
+        "listeners": listeners,
+        "services": services,
+    });
+    let json = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
+    std::fs::write(path, json)
+}
+
+/// A loaded baseline: the process table, the listener set and the service
+/// names (empty for v1/v2 snapshot files — a baseline can start from an
+/// existing --snap).
+pub type Baseline = (Vec<Process>, Vec<Listener>, Vec<String>);
+
+/// Load a baseline (or an ordinary snapshot — v1/v2 files read with an
+/// empty service set, so a baseline can start from an existing --snap).
+pub fn load_baseline(
+    path: &str,
+) -> Result<Baseline, String> {
+    let (procs, listeners) = load(path)?;
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let services: Vec<String> = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| {
+            v.get("services").and_then(|s| s.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    Ok((procs, listeners, services))
+}
+
+/// The identity keys of a process table — the baseline comparison's unit
+/// (pid-free, so it survives reboots).
+pub fn identity_set(procs: &[Process]) -> std::collections::HashSet<String> {
+    procs
+        .iter()
+        .map(crate::util::identity_key)
+        .collect()
+}
+
+/// Compare the live state against a baseline: report lines for new
+/// process identities, vanished identities, new/vanished listeners and
+/// new/failed services. Pure — the callers sweep, this judges.
+pub fn baseline_drift(
+    baseline: &(
+        Vec<Process>,
+        Vec<Listener>,
+        Vec<String>,
+    ),
+    now_procs: &[Process],
+    now_listeners: &[Listener],
+    now_services: &[String],
+    failed_services: &[String],
+) -> Vec<String> {
+    let (base_procs, base_listeners, base_services) = baseline;
+    let mut out = Vec::new();
+
+    let base_ids = identity_set(base_procs);
+    let now_ids = identity_set(now_procs);
+    let mut new_ids: Vec<&String> = now_ids.difference(&base_ids).collect();
+    new_ids.sort();
+    for id in new_ids {
+        let who = now_procs
+            .iter()
+            .find(|p| crate::util::identity_key(p) == *id)
+            .map(|p| format!("{} (pid {}, user {})", p.name, p.pid, p.user.as_deref().unwrap_or("-")))
+            .unwrap_or_default();
+        out.push(format!("new process identity: {who} [{id}]"));
+    }
+    let mut gone_ids: Vec<&String> = base_ids.difference(&now_ids).collect();
+    gone_ids.sort();
+    for id in gone_ids {
+        out.push(format!("process identity gone from the table: [{id}]"));
+    }
+
+    let key_listener =
+        |l: &Listener| format!("{} {}", l.proto, l.port);
+    let base_listen: std::collections::HashSet<String> =
+        base_listeners.iter().map(key_listener).collect();
+    for l in now_listeners {
+        let k = key_listener(l);
+        if !base_listen.contains(&k) {
+            let who = l.who.join(", ");
+            let owners = if who.is_empty() {
+                String::new()
+            } else {
+                format!(" ({who})")
+            };
+            out.push(format!("new listener: {} {}{}", l.proto, l.port, owners));
+        }
+    }
+    let now_listen: std::collections::HashSet<String> =
+        now_listeners.iter().map(key_listener).collect();
+    for l in base_listeners {
+        let k = key_listener(l);
+        if !now_listen.contains(&k) {
+            out.push(format!("listener gone: {} {}", l.proto, l.port));
+        }
+    }
+
+    for s in now_services {
+        if !base_services.contains(s) {
+            out.push(format!("new service: {s}"));
+        }
+    }
+    for s in failed_services {
+        if base_services.contains(s) {
+            out.push(format!("service failed: {s}"));
+        }
+    }
+    out
+}
+
 /// Directory the auto snapshots live in: `<config dir>/snapshots`
 /// (split out with an explicit home for tests — pure, see
 /// [`Config::path_under`]).
@@ -503,6 +631,73 @@ pub fn render(entries: &[DiffEntry]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn baseline_round_trips_and_judges_drift() {
+        let p = |pid: i32, name: &str| Process {
+            pid,
+            name: name.into(),
+            user: Some("root".into()),
+            ..Default::default()
+        };
+        let procs = vec![p(1, "systemd"), p(42, "nginx")];
+        let listeners = vec![Listener {
+            proto: "tcp".into(),
+            port: 80,
+            who: vec!["nginx (pid 42)".into()],
+            binds: Vec::new(),
+        }];
+        let services = vec!["nginx.service".to_string(), "ssh.service".to_string()];
+        let path = std::env::temp_dir().join(format!("witr-baseline-{}.json", std::process::id()));
+        save_baseline(path.to_str().unwrap(), &procs, &listeners, &services).unwrap();
+        let (loaded_procs, loaded_listeners, loaded_services) =
+            load_baseline(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded_procs.len(), 2);
+        assert_eq!(loaded_listeners.len(), 1);
+        assert_eq!(loaded_services, services);
+        std::fs::remove_file(&path).ok();
+
+        // drift judgment: a new identity, a new listener and a failed
+        // service all name themselves; clean state judges empty
+        // the intruder also opened a new port
+        let mut now_listeners = listeners.clone();
+        now_listeners.push(Listener {
+            proto: "tcp".into(),
+            port: 4444,
+            who: vec!["xmrig (pid 99)".into()],
+            binds: Vec::new(),
+        });
+        let drift = baseline_drift(
+            &(procs.clone(), listeners.clone(), services.clone()),
+            &[
+                p(1, "systemd"),
+                p(42, "nginx"),
+                p(99, "xmrig"), // the intruder
+            ],
+            &now_listeners,
+            &services,
+            &["nginx.service".to_string()], // the baseline service now failed
+        );
+        assert_eq!(drift.len(), 3, "{drift:?}");
+        assert!(
+            drift.iter()
+                .any(|l| l.contains("new process identity") && l.contains("xmrig"))
+        );
+        assert!(
+            drift.iter()
+                .any(|l| l.contains("new listener: tcp 4444 (xmrig (pid 99))"))
+        );
+        assert!(drift.iter().any(|l| l.contains("service failed: nginx.service")));
+        // clean live state → no drift
+        let clean = baseline_drift(
+            &(procs.clone(), listeners.clone(), services.clone()),
+            &procs,
+            &listeners,
+            &services,
+            &[],
+        );
+        assert!(clean.is_empty(), "{clean:?}");
+    }
+
     use super::*;
 
     fn proc(pid: i32, name: &str, exe: Option<&str>, user: Option<&str>, cmd: &str) -> Process {

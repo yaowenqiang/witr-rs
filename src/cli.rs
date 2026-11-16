@@ -391,6 +391,36 @@ pub struct Cli {
     pub doctor: bool,
 
     #[arg(
+        long = "baseline-save",
+        value_name = "FILE",
+        help = t(
+            "保存安全基线:进程身份集(name|exe|user 三元,跨重启可比)+ 监听端口集 + 服务单元名存为 JSON——配 --sockets 一并记录端口;--baseline FILE 的常态参照。退出码恒 0",
+            "Save a security baseline: the process identity set (name|exe|user triples, comparable across reboots) + the listener set + service unit names as JSON — pair with --sockets to record ports; the norm --baseline FILE judges against. Exit 0 always"
+        )
+    )]
+    pub baseline_save: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = t(
+            "对照安全基线体检:新出现的进程身份、消失的身份、新/消失的监听端口、新服务与失败的服务逐行点名——\"不在基线里的东西,默认按入侵者处理\"。任何漂移退出码 1,干净 0;--json 出机读版。配 --sockets 保存的基线才含端口对比",
+            "Check live state against a security baseline: new process identities, vanished ones, new/vanished listeners, new and failed services named line by line — anything not in the baseline is an intruder until proven otherwise. Exit 1 on any drift, 0 clean; --json emits the machine-readable version. Baselines saved with --sockets include the port comparison"
+        )
+    )]
+    pub baseline: Option<String>,
+
+    #[arg(
+        long = "alert-baseline",
+        value_name = "FILE",
+        help = t(
+            "基线漂移哨兵:--watch 下逐拍对照基线,新出现的进程身份或新监听端口即触发(每身份/端口一次)——常态之外皆为信号。消失不报(退出事件已另有其账);基线文件随 --baseline-save 生成。TUI 和 --watch",
+            "The baseline-drift sentinel: while --watch runs, each tick is judged against the baseline — a new process identity or a new listening port fires once (per identity/port). Vanishing doesn't fire (exit events have their own bookkeeping); the baseline file comes from --baseline-save. TUI and --watch"
+        )
+    )]
+    pub alert_baseline: Option<String>,
+
+    #[arg(
         long,
         help = t(
             "列出已删除但仍被进程攥着的文件(尺寸降序,总计可回收量)——\"df 满、du 不满\"的经典谜题一条命令解:日志轮转失败、未卸载数据库临时文件都躲在这。发现即退出码 1,干净则 0;--csv / --markdown / --json 同样支持",
