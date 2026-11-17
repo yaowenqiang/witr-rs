@@ -430,6 +430,8 @@ struct TuiApp {
     /// --alert-exe-changed / --alert-new-remote: the security sentinels
     alert_exe_changed: bool,
     alert_new_remote: bool,
+    /// --state-file: the sentinel state's restart-surviving slice, loaded
+    /// on start and written on exit
     /// --alert-leak: per-process RSS growth threshold (MB)
     alert_leak: Option<f64>,
     /// --alert-fd-leak: per-process fd growth threshold
@@ -685,6 +687,14 @@ pub struct Seed {
     /// --alert-exe-changed / --alert-new-remote: the security sentinels
     pub alert_exe_changed: bool,
     pub alert_new_remote: bool,
+    /// --state-file: the sentinel state's restart-surviving slice, loaded
+    /// on start and written on exit (interactive sessions benefit from
+    /// the same continuity the watchdog gets)
+    pub state_file: Option<String>,
+    /// The slot `event_loop` hands the session's sentinel state back
+    /// through (Arc from main; written at exit, read after run returns).
+    pub exit_state_slot:
+        Option<std::sync::Arc<std::sync::Mutex<Option<crate::history::SysAlertState>>>>,
     /// --alert-leak: per-process RSS growth threshold (MB)
     pub alert_leak: Option<f64>,
     /// --alert-fd-leak: per-process fd growth threshold
@@ -736,6 +746,80 @@ pub struct Seed {
     /// doesn't apply (replay-only entry points).
     pub reseed: Option<Box<dyn Fn() -> Seed>>,
 }
+impl Clone for Seed {
+    /// Manual because `reseed` (the SIGHUP hot-reload closure) isn't
+    /// cloneable — the clone hands the sentinel state slot to `run` on
+    /// the interactive path, where a fresh closure is rebuilt from the
+    /// pre-apply snapshot anyway; the slot overrides it there.
+    fn clone(&self) -> Self {
+        Seed {
+            name: self.name.clone(),
+            pid: self.pid,
+            port: self.port,
+            container: self.container.clone(),
+            file: self.file.clone(),
+            skipped: self.skipped.clone(),
+            events_log: self.events_log.clone(),
+            replayed: self.replayed.clone(),
+            replay_follow: self.replay_follow.clone(),
+            samples: self.samples.clone(),
+            samples_source: self.samples_source.clone(),
+            notify: self.notify,
+            watch: self.watch.clone(),
+            since: self.since,
+            refresh_secs: self.refresh_secs,
+            sort: self.sort.clone(),
+            paused: self.paused,
+            alert_cpu: self.alert_cpu,
+            alert_mem: self.alert_mem,
+            alert_fd: self.alert_fd,
+            alert_io: self.alert_io,
+            alert_conn: self.alert_conn,
+            alert_threads: self.alert_threads,
+            alert_net_per_proc: self.alert_net_per_proc,
+            alert_deviation: self.alert_deviation,
+            alert_port: self.alert_port.clone(),
+            alert_repeat: self.alert_repeat,
+            alert_load: self.alert_load,
+            alert_mem_pct: self.alert_mem_pct,
+            alert_count: self.alert_count,
+            alert_disk: self.alert_disk,
+            alert_disk_eta: self.alert_disk_eta,
+            alert_mem_eta: self.alert_mem_eta,
+            alert_inodes: self.alert_inodes,
+            alert_gpu_mem_pct: self.alert_gpu_mem_pct,
+            alert_deleted_gb: self.alert_deleted_gb,
+            alert_exe_changed: self.alert_exe_changed,
+            alert_new_remote: self.alert_new_remote,
+            state_file: self.state_file.clone(),
+            exit_state_slot: self.exit_state_slot.clone(),
+            alert_leak: self.alert_leak,
+            alert_fd_leak: self.alert_fd_leak,
+            alert_thr_leak: self.alert_thr_leak,
+            alert_disk_busy: self.alert_disk_busy,
+            alert_temp: self.alert_temp,
+            alert_zombies: self.alert_zombies,
+            alert_dstate: self.alert_dstate,
+            alert_container_cpu: self.alert_container_cpu,
+            alert_container_mem_pct: self.alert_container_mem_pct,
+            alert_failed_units: self.alert_failed_units,
+            alert_net: self.alert_net,
+            alert_psi: self.alert_psi,
+            alert_mem_avail_mb: self.alert_mem_avail_mb,
+            alert_swap_pct: self.alert_swap_pct,
+            alert_retrans: self.alert_retrans,
+            alert_nic_drop: self.alert_nic_drop,
+            alert_oom: self.alert_oom,
+            alert_exec: self.alert_exec.clone(),
+            alert_webhook: self.alert_webhook.clone(),
+            alert_silence: self.alert_silence.clone(),
+            alert_new_proc: self.alert_new_proc.clone(),
+            notes: self.notes.clone(),
+            reseed: None,
+        }
+    }
+}
+
 
 impl Seed {
     /// First target of each type wins, extras are reported (mirrors the Go
@@ -8621,6 +8705,7 @@ fn parse_metric_filter(s: &str) -> Option<MetricFilter> {
 }
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()> {
+    let exit_slot = seed.exit_state_slot.clone();
     let mut app = TuiApp::new(crate::platform::get(), seed);
     // brief-process poller: spawns and dies between the regular ticks
     // would be invisible otherwise (not on Windows — no cheap pid sweep)
@@ -8635,6 +8720,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()>
             match event::read()? {
                 CEvent::Key(key) => {
                     if key.kind == KeyEventKind::Press && !on_key(&mut app, key.code) {
+                        if let Some(slot) = &exit_slot {
+                            *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(app.sys_alert.clone());
+                        }
                         return Ok(());
                     }
                 }
@@ -8664,6 +8753,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, seed: Seed) -> Result<()>
 /// Entry point: alternate screen + raw mode + mouse capture, restored on
 /// every exit path. `seed` pre-selects the CLI target (Go witr parity).
 pub fn run(seed: Seed) -> Result<()> {
+    let state_file = seed.state_file.clone();
+    let exit_slot = seed.exit_state_slot.clone();
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), event::EnableMouseCapture);
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -8675,6 +8766,18 @@ pub fn run(seed: Seed) -> Result<()> {
     };
     let _ = execute!(std::io::stdout(), event::DisableMouseCapture);
     ratatui::restore();
+    // the --state-file slice persists across interactive sessions too:
+    // the session's sentinel state comes back through the slot, written
+    // after the terminal restore in plain sync code
+    if let (Some(path), Some(slot)) = (&state_file, &exit_slot) {
+        if let Some(state) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let persisted = state.to_persisted();
+            if let Ok(json) = serde_json::to_string(&persisted) {
+                let _ =
+                    crate::util::write_atomic(std::path::Path::new(path), &json);
+            }
+        }
+    }
     out
 }
 
@@ -10969,6 +11072,8 @@ mod tests {
                 alert_deleted_gb: None,
                 alert_exe_changed: false,
                 alert_new_remote: false,
+                state_file: None,
+                exit_state_slot: None,
                 alert_leak: None,
                 alert_fd_leak: None,
                 alert_thr_leak: None,

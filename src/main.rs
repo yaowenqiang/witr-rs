@@ -5268,6 +5268,8 @@ fn main() {
         let cli_for_reload = cli_base.clone();
         let seed = tui::Seed {
             events_log: cli.events_log.clone(),
+            state_file: cli.state_file.clone(),
+            exit_state_slot: Some(std::sync::Arc::new(std::sync::Mutex::new(None))),
             replayed,
             samples,
             samples_source,
@@ -5288,9 +5290,20 @@ fn main() {
             )
             .with_knobs(&cli, &cfg)
         };
-        if let Err(e) = tui::run(seed) {
+        let exit_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        // seed 拿走克隆;main 持原件读回
+        let mut seed_for_slot = seed.clone();
+        seed_for_slot.exit_state_slot = Some(exit_slot.clone());
+        if let Err(e) = tui::run(seed_for_slot) {
             eprintln!("tui error: {}", e);
             std::process::exit(5);
+        }
+        // the session's sentinel state → the --state-file (same write as the watchdog)
+        if let (Some(path), Some(slot)) = (&cli.state_file, exit_slot.lock().unwrap_or_else(|e| e.into_inner()).take()) {
+            let persisted = slot.to_persisted();
+            if let Ok(json) = serde_json::to_string(&persisted) {
+                let _ = crate::util::write_atomic(std::path::Path::new(path), &json);
+            }
         }
         std::process::exit(0);
     }
@@ -6022,6 +6035,8 @@ fn main() {
         if interactive {
             let seed = tui::Seed {
                 events_log: cli.events_log.clone(),
+                state_file: cli.state_file.clone(),
+                exit_state_slot: Some(std::sync::Arc::new(std::sync::Mutex::new(None))),
                 notify: cli.notify || cfg.notify.unwrap_or(false),
                 replayed,
                 samples,
@@ -6055,9 +6070,19 @@ fn main() {
                 alert_threads: cli.alert_threads,
                 ..tui::Seed::default()
             };
-            if let Err(e) = tui::run(seed) {
+            let exit_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let mut seed_for_slot = seed.clone();
+            seed_for_slot.exit_state_slot = Some(exit_slot.clone());
+            if let Err(e) = tui::run(seed_for_slot) {
                 eprintln!("tui error: {}", e);
                 std::process::exit(5);
+            }
+            // the session's sentinel state → the --state-file (same write as the watchdog)
+            if let (Some(path), Some(slot)) = (&cli.state_file, exit_slot.lock().unwrap_or_else(|e| e.into_inner()).take()) {
+                let persisted = slot.to_persisted();
+                if let Ok(json) = serde_json::to_string(&persisted) {
+                    let _ = crate::util::write_atomic(std::path::Path::new(path), &json);
+                }
             }
             std::process::exit(0);
         }
