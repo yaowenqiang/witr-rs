@@ -318,7 +318,7 @@ witr-rs --csv                 # 全表 CSV（RFC-4180 转义；--markdown 贴文
 witr-rs --watch 5 --record load.csv # 每 5s 把整张进程表追加进 CSV 时间序列
 witr-rs --watch 5 --record load.csv --record-max-mb 200 # 同上，超 200MB 滚动为 load.csv.1（长跑 watchdog 磁盘有上界）
 witr-rs --watch 5 --record load.jsonl # 同款时间序列，NDJSON 信封（ppid/state/age 顺路带上）
-witr-rs --plot load.csv        # 录制文件画成自包含 HTML 时序图（离线可看的五张 SVG 曲线）
+witr-rs --plot load.csv        # 录制文件画成自包含 HTML 时序图（离线可看的九张 SVG 曲线：cpu / 内存 / load / 网络 / 进程数 + 僵尸 / D 态 / 失败单元 / 内存耗尽预测——v0.53 起录制携带的水位列全部可画）
 witr-rs --samples load.csv     # 录制文件导入 TUI Samples 页（sparkline + ←→ 光标逐时刻读数）
 witr-rs --tree --json         # 全表嵌套 JSON（子进程挂 children，孤儿/ppid 环升级为根）
 witr-rs --report-html status.html   # 自包含单文件 HTML 报告（CPU/内存条 + Top 榜 + 全表）

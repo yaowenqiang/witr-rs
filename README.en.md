@@ -320,7 +320,7 @@ witr-rs --csv                 # whole table as CSV (RFC-4180 escaping; --markdow
 witr-rs --watch 5 --record load.csv # append the whole table to a CSV every 5s
 witr-rs --watch 5 --record load.csv --record-max-mb 200 # same, rotating to load.csv.1 past 200MB (a months-long watchdog stays disk-bounded)
 witr-rs --watch 5 --record load.jsonl # same time series, NDJSON envelopes (ppid/state/age included)
-witr-rs --plot load.csv        # render the recording into a self-contained HTML time-series chart (five offline SVG curves + top-process cpu% heatmap)
+witr-rs --plot load.csv        # render the recording into a self-contained HTML time-series chart (nine offline SVG curves: cpu / memory / load / network / process count + zombies / stuck-in-D / failed units / mem-eta — every waterline column recordings carry since v0.53 is plottable + top-process cpu% heatmap)
 witr-rs --plot-events events.jsonl  # render the event log into a self-contained HTML gantt (lifecycle bars + alert markers + system lane)
 witr-rs --samples load.csv     # import the recording into the TUI Samples page (sparklines + ←→ cursor readout)
 witr-rs --tree --json         # whole table as nested JSON (children under parents)

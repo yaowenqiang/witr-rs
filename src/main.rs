@@ -3530,6 +3530,12 @@ fn plot_html(points: &[SysPoint], proc_samples: &[ProcSample]) -> String {
             "MB/s",
             col(|p| p.net_bps.map(|b| b / 1048576.0)),
         ),
+        // the waterline columns (v0.53 recordings) — a recording replays
+        // the machine story, drift included
+        ("zombies", "", col(|p| Some(p.zombies as f64))),
+        ("stuck in D", "", col(|p| Some(p.dstates as f64))),
+        ("failed units", "", col(|p| Some(p.failed_units as f64))),
+        ("mem eta (h)", "h", col(|p| p.mem_eta_hours)),
     ] {
         charts.push_str(&svg_series(name, unit, &series, t0, t1));
     }
@@ -7544,8 +7550,14 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             "{}",
             html.get(..120).unwrap_or("")
         );
-        assert_eq!(html.matches("<svg").count(), 5, "cpu/mem/load/net/processes");
-        assert_eq!(html.matches("<polyline").count(), 5);
+        assert_eq!(
+            html.matches("<svg").count(),
+            8,
+            "cpu/mem/load/net/processes/zombies/dstates/failed — the eta series is
+             all-None in this fixture (no gate-trusted prediction) and a chart
+             of nothing is omitted"
+        );
+        assert_eq!(html.matches("<polyline").count(), 8);
         assert!(html.contains("network"), "the MB/s conversion is labelled");
         // every chart carries its last-value label
         assert!(html.contains("25.0 %"), "cpu last label");

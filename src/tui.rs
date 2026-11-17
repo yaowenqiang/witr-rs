@@ -4027,6 +4027,25 @@ impl TuiApp {
                     _ => kv("I/O", "0 B/s".into()),
                 }
             },
+            // per-device attribution — which physical disk each device
+            // line maps to (cgroup io.stat matched to /proc/diskstats)
+            {
+                match c.io_by_device.as_ref().and_then(|devs| {
+                    devs.iter()
+                        .max_by_key(|d| d.read_bytes.saturating_add(d.write_bytes))
+                }) {
+                    Some(d) => Line::from(vec![
+                        styled(Style::new().fg(MID), format!("{:<9}", "dev I/O")),
+                        Span::raw(format!(
+                            "{}: {} read / {} written (cumulative)",
+                            d.device,
+                            crate::util::fmt_bytes(d.read_bytes),
+                            crate::util::fmt_bytes(d.write_bytes)
+                        )),
+                    ]),
+                    None => kv("dev I/O", "—".into()),
+                }
+            },
         ]
     }
 
