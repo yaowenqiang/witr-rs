@@ -104,6 +104,8 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **安全基线（`--baseline-save` / `--baseline` / `--alert-baseline`）**：安全线的续作——把"常态"存下来，偏离即信号。`--baseline-save base.json` 保存进程身份集（name|exe|user 三元，pid 无关、跨重启可比）+ 监听端口集（配 `--sockets`）+ 服务单元名；`--baseline base.json` 对照体检：新出现的进程身份、消失的身份、新/消失的监听端口、新服务与失败的服务逐行点名——**不在基线里的东西，默认按入侵者处理**。任何漂移退出码 1（巡检探针），`--json` 出机读版；旧 `--snap` 文件可直接当基线读（服务集为空）。`--watch 5 --alert-baseline base.json` 是常态守护：新身份与新端口即喊（每身份/端口一次，消失不报——退出事件另有其账）。
 
+**哨兵状态持久化（`--state-file FILE`）**：months-long watchdog 的真实痛点——重启即失忆：内存耗尽预测要重新积累十分钟、exe 替换基线要重新哈希全表、OOM 计数锚点丢失导致重启后的第一次差分出假尖峰。`--state-file state.json` 每拍**原子写**（临时文件 + rename，崩溃中途留下的只有上一拍状态）eta 趋势窗口、exe 基线与 OOM 锚点，启动时读回——重启即续跑，不再重新积累。**pid 键控的状态刻意不持久**（泄漏闩锁、外联基线）——pid 跨重启无意义，安全哨兵从零重新武装是诚实行为。恢复时打一行恢复摘要；文件不可读则从零开始并说明；写入失败自动禁用（不再重复报错）。
+
 **环境自检（`--doctor`）**：逐项探测每个可选能力并回答三件事——可用吗、为什么不可用、哪些旗标因此沉默。检查项：root 权限、systemd（存在性与运行状态分开探测——`is-system-running` 在 degraded 开机上恰好失败，这台机器教出来的）、journalctl 可读性、ss、cgroup v2、nvidia-smi、容器运行时（docker/podman/nerdctl 逐个试）、kubectl、git。✔/✗ 逐行打标，缺失项附 "silent:" 行点名因此静默的旗标（"GPU 列为什么是空的"一条命令见分晓）。信息性命令退出码恒 0；`--json` 出机读版。
 
 **舰队离群检测（`--outliers [Z]`）**：舰队与它自己比较——对每台 `--remote` 主机的各指标（load / cpu / 内存 / swap / 磁盘占用 / 磁盘忙 / 已删除占用 / GPU 显存）计算相对**舰队中位数**的稳健 z-score（Iglewicz–Hoaglin：中位数与 MAD——经典 σ 会被离群自身撑大，五台机器的舰队里什么都不会显得异常；MAD 不会）。|z| ≥ 阈值（默认 3.5）的主机按偏离程度降序点名，附数值、舰队中位数与 z；抓取失败的对端跳过并列出；上报主机不足 3 台的指标静默跳过。发现离群退出码 1——整个机房的巡检探针；`--json` 出版本化信封。这是与其他所有舰队面**不同的问题**：不问"每台机器怎么样"，问"**哪台不对劲**"。
@@ -333,7 +335,7 @@ witr-rs --watch 10 --alert-inodes 80 --alert-leak 50  # inode 耗尽 + 内存泄
 witr-rs --watch 10 --alert-fd-leak 64 --alert-thr-leak 16  # fd / 线程泄漏哨兵：socket-per-request 不关闭 / 每请求起线程不回收
 witr-rs --watch 10 --alert-gpu-mem-pct 90  # GPU 显存哨兵：CUDA 分配失败门前喊（点名 GPU 与占比）
 witr-rs --watch 30 --alert-deleted-gb 2  # 已删除占用哨兵：日志轮转失败 df 在疼 du 找不到凶手（点名持有者）
-witr-rs --watch 10 --alert-exe-changed --alert-new-remote  # 安全哨兵：二进制被替换 / 进程首次连出新地址（持久化与外传的第一现场）  # fd / 线程泄漏哨兵：socket-per-request 不关闭 / 每请求起线程不回收
+witr-rs --watch 10 --alert-exe-changed --alert-new-remote --state-file state.json  # 安全哨兵 + 状态持久化：重启即续跑（趋势窗口、exe 基线、OOM 锚点都在）  # fd / 线程泄漏哨兵：socket-per-request 不关闭 / 每请求起线程不回收
 witr-rs --alert-fd 4096 --alert-io 100 # fd 数 / 磁盘 IO 速率阈值告警（同 CPU 告警机制）
 witr-rs --alert-conn 200      # 每进程 ESTABLISHED 连接数阈值告警（TUI 与 --watch 同效）
 witr-rs --alert-threads 400   # 每进程内核线程数阈值告警（线程泄漏哨兵，TUI 与 --watch 同效）

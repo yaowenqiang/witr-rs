@@ -469,6 +469,16 @@ pub struct Cli {
     )]
     pub alert_new_remote: bool,
 
+    #[arg(
+        long = "state-file",
+        value_name = "FILE",
+        help = t(
+            "哨兵状态持久化:eta 趋势窗口、exe 替换基线与 OOM 计数锚点每拍原子写入该文件,启动时读回——months-long watchdog 重启不再丢十分钟的趋势积累、不再重哈希全表、不再因 OOM 锚点丢失产生假尖峰。pid 键控的状态(泄漏闩锁、外联基线)不持久——pid 跨重启无意义,安全哨兵在重启后从零重新武装是诚实行为",
+            "Sentinel state persistence: the eta trend windows, the exe-replacement baseline and the OOM counter anchor are atomically written to this file each tick and read back on start — a months-long watchdog restart no longer loses ten minutes of trend accrual, no longer re-hashes the whole binary table, no longer false-spikes from a lost OOM anchor. pid-keyed state (leak latches, remote baselines) deliberately doesn't persist — pids churn across restarts, and the security sentinels re-arming from zero is the honest behavior"
+        )
+    )]
+    pub state_file: Option<String>,
+
     #[arg(short = 'j', long, help = t("输出机器可读的 JSON", "Machine-readable JSON"))]
     pub json: bool,
 

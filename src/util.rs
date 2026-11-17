@@ -257,6 +257,16 @@ pub fn display_host(url: &str) -> String {
         .to_string()
 }
 
+/// Write text to `path` atomically: write to a sibling temp file, then
+/// rename over the target. A crash mid-write leaves the old file intact —
+/// the state-file's guarantee (a watchdog restart always finds either the
+/// previous state or the current one, never a torn half).
+pub fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// uid → username resolver with a lookup cache (including negative
 /// results): macOS system users are absent from /etc/passwd, so every uid
 /// costs one `id -un` process unless cached.

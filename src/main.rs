@@ -6096,6 +6096,7 @@ fn main() {
             // the recorder's own trend window: mem-eta needs 10+ minutes
             // of MemAvailable samples before the gate trusts a prediction
             let mut rec_eta = history::SysAlertState::default();
+
             // the --alert-baseline norm: loaded once (compare failures
             // would repeat forever — one loud exit-code-4 message instead)
             let baseline: Option<(Vec<Process>, Vec<snapshot::Listener>, Vec<String>)> =
@@ -6153,6 +6154,32 @@ fn main() {
             let mut port_owner: HashMap<u16, String> = HashMap::new();
             // --alert-load / --alert-mem-pct: one machine-wide state
             let mut sys_alert = history::SysAlertState::default();
+            // --state-file: the sentinel state's restart-surviving slice
+            // (eta windows, exe baseline, OOM anchor) — loaded once here,
+            // written atomically each tick (a crash mid-write leaves the
+            // previous state intact; a watchdog restart resumes instead
+            // of re-accruing)
+            let mut state_file: Option<String> = cli.state_file.clone();
+            if let Some(path) = &state_file {
+                match std::fs::read_to_string(path) {
+                    Ok(text) => match serde_json::from_str::<history::PersistedState>(&text) {
+                        Ok(persisted) => {
+                            sys_alert.restore_persisted(&persisted);
+                            write_out(&format!(
+                                "state restored from {path} ({} eta sample(s), {} exe baseline entr(ies))",
+                                persisted.mem_eta_hist.len() + persisted.disk_eta_hist.iter().map(|(_, d)| d.len()).sum::<usize>(),
+                                persisted.exe_watched.len(),
+                            ));
+                        }
+                        Err(e) => {
+                            eprintln!("--state-file {path}: unreadable ({e}) — starting fresh");
+                        }
+                    },
+                    Err(_) => {
+                        write_out(&format!("state file {path} starts fresh"));
+                    }
+                }
+            }
             // --alert-new-proc: first-sighting tracker (armed per session)
             let mut new_proc = history::NewProcWatch::parse(&cli.alert_new_proc)
                 .ok()
@@ -6338,6 +6365,15 @@ fn main() {
                 if cli.alert_new_remote {
                     let socks = platform.list_all_sockets().unwrap_or_default();
                     picks.extend(history::new_remote_picks(&socks, &procs, &mut sys_alert));
+                }
+                if let Some(path) = state_file.as_deref() {
+                    let persisted = sys_alert.to_persisted();
+                    if let Ok(json) = serde_json::to_string(&persisted) {
+                        if let Err(e) = crate::util::write_atomic(std::path::Path::new(path), &json) {
+                            eprintln!("--state-file {path}: write failed ({e}) — disabling");
+                            state_file = None;
+                        }
+                    }
                 }
                 // the baseline-drift sentinel: the saved norm is judged per
                 // tick — new identities and new listeners fire once each

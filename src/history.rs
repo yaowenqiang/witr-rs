@@ -1148,6 +1148,62 @@ pub fn new_remote_picks(
     out
 }
 
+/// The serializable slice of the sentinel state — what a `--state-file`
+/// carries across watchdog restarts. Deliberately small: pid-keyed maps
+/// (leak latches, remote baselines) don't survive a restart because pids
+/// churn — the security sentinels re-arm from zero there, honestly. What
+/// DOES survive is the expensive-to-rebuild knowledge: the eta trend
+/// windows (a restart no longer costs ten minutes of re-accrual before
+/// the gate trusts a prediction again), the exe-replacement baseline
+/// (no full-table re-hash on restart) and the OOM counter anchor (no
+/// false spike from kills accumulated before the restart).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct PersistedState {
+    /// mount → its trailing window (the disk-eta gate's per-mount history)
+    pub disk_eta_hist: Vec<(String, Vec<(f64, u64)>)>,
+    pub mem_eta_hist: Vec<(f64, u64)>,
+    /// exe path → (mtime secs, sha256).
+    pub exe_watched: Vec<(String, i64, String)>,
+    pub oom_prev: Option<u64>,
+}
+
+impl SysAlertState {
+    /// The restart-surviving slice of this state.
+    pub fn to_persisted(&self) -> PersistedState {
+        PersistedState {
+            disk_eta_hist: self
+                .disk_eta_hist
+                .iter()
+                .map(|(m, dq)| (m.clone(), dq.iter().copied().collect()))
+                .collect(),
+            mem_eta_hist: self.mem_eta_hist.iter().copied().collect(),
+            exe_watched: self
+                .exe_watched
+                .iter()
+                .map(|(p, (m, h))| (p.clone(), *m, h.clone()))
+                .collect(),
+            oom_prev: self.oom_prev,
+        }
+    }
+
+    /// Fold a persisted slice back in. Timestamps are wall-clock seconds,
+    /// so the eta windows' age survives the restart honestly — the gate
+    /// sees the same trailing window it would have without the restart.
+    pub fn restore_persisted(&mut self, p: &PersistedState) {
+        self.disk_eta_hist = p
+            .disk_eta_hist
+            .iter()
+            .map(|(m, dq)| (m.clone(), dq.iter().copied().collect()))
+            .collect();
+        self.mem_eta_hist = p.mem_eta_hist.iter().copied().collect();
+        for (path, mtime, hash) in &p.exe_watched {
+            self.exe_watched
+                .insert(path.clone(), (*mtime, hash.clone()));
+        }
+        self.oom_prev = p.oom_prev;
+    }
+}
+
 /// One machine-wide alert edge: `(name, detail, is_recovery)` — name is
 /// always `"system"` (the machine has no pid); recoveries read
 /// `<metric> back under <limit>`.
@@ -5307,6 +5363,105 @@ mod tests {
         let small = h.cpu_chart(10, 4).unwrap();
         let bars = small.split_whitespace().next().unwrap();
         assert!(bars.chars().count() <= 4, "thinned to width 4: {small}");
+    }
+
+    fn gpu_limits_with_mem_eta(
+        mem_eta: Option<f64>,
+    ) -> SysAlertLimits {
+        SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
+            repeat: None,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
+            dstate_limit: None,
+            dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
+            disk_eta_hours: None,
+            mem_eta_hours: mem_eta,
+            inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
+            deleted_total_mb: 0,
+            oom_limit: None,
+            oom_kills: None,
+        }
+    }
+
+    #[test]
+    fn persisted_state_survives_a_restart() {
+        // a state mid-knowledge: eta windows seeded, an exe baseline
+        // entered, an OOM anchor set
+        let mut state = SysAlertState::default();
+        let now = crate::util::now_unix() as f64;
+        state.mem_eta_hist = (0..40)
+            .map(|i| {
+                let t = now - (40 - i) as f64 * 30.0;
+                (t, (4_000.0 - i as f64 * 50.0) as u64)
+            })
+            .collect();
+        state
+            .disk_eta_hist
+            .insert("/data".into(), (0..40).map(|i| (now - i as f64, 1_000)).collect());
+        state
+            .exe_watched
+            .insert("/usr/sbin/nginx".into(), (1_700_000_000, "abc123def456".into()));
+        state.oom_prev = Some(5);
+
+        let persisted = state.to_persisted();
+        let json = serde_json::to_string(&persisted).unwrap();
+        // the restart: a fresh state folding the persisted slice back
+        let mut restarted = SysAlertState::default();
+        let back: PersistedState = serde_json::from_str(&json).unwrap();
+        restarted.restore_persisted(&back);
+
+        // the eta gate sees the same window it would have without the
+        // restart: the prediction survives
+        // the persisted window predicts on the restarted state — the
+        // arming streak completes on the FIRST tick batch, where a fresh
+        // state would need another ten minutes of samples first
+        let mut picks = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            picks = system_alert_picks(
+                &crate::platform::SystemStats {
+                    mem_avail_mb: Some(2_000),
+                    ..Default::default()
+                },
+                &mut restarted,
+                &gpu_limits_with_mem_eta(Some(1.0)),
+                3,
+            );
+            if !picks.is_empty() {
+                break;
+            }
+        }
+        assert!(!picks.is_empty(), "the persisted trend still predicts: {picks:?}");
+        assert!(picks[0].1.contains("memory draining fast"), "{}", picks[0].1);
+        // the exe baseline survives: same path → same hash on record, no
+        // re-hash of the real file
+        assert_eq!(
+            restarted.exe_watched.get("/usr/sbin/nginx").map(|(_, h)| h.as_str()),
+            Some("abc123def456")
+        );
+        assert_eq!(restarted.oom_prev, Some(5));
     }
 
     #[test]
