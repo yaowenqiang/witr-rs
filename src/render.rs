@@ -1532,6 +1532,11 @@ pub struct SysFrame {
     pub zombies: usize,
     pub dstates: usize,
     pub failed_units: Vec<String>,
+    /// Open-but-deleted files (the df-full-du-disagrees answer) — the
+    /// line shows only when the total is nonzero. Fleet frames carry the
+    /// snapshot's top holders + total; local frames carry the walk.
+    pub deleted_files: Vec<crate::platform::DeletedFile>,
+    pub deleted_total_mb: u64,
 }
 
 impl SysFrame {
@@ -1651,6 +1656,29 @@ pub fn render_sys(frame: &SysFrame, p: &Painter) -> String {
             p.yellow(&suffix)
         );
     }
+    // deleted-but-held files — the df-full-du-disagrees answer; yellow
+    // while it's small, red once it's a gigabyte class problem
+    if frame.deleted_total_mb > 0 {
+        let total = crate::util::fmt_bytes(frame.deleted_total_mb * 1024 * 1024);
+        let named: Vec<String> = frame
+            .deleted_files
+            .iter()
+            .take(2)
+            .map(|d| format!("{} (pid {})", d.path, d.pid))
+            .collect();
+        let line = format!(
+            "deleted {} file(s) holding {total} — {}{}",
+            frame.deleted_files.len(),
+            named.join(", "),
+            if frame.deleted_files.len() > named.len() { "…" } else { "" }
+        );
+        let styled = if frame.deleted_total_mb >= 1024 {
+            p.red(&line)
+        } else {
+            p.yellow(&line)
+        };
+        let _ = writeln!(out, "{}", styled);
+    }
     // failed systemd units — the sentinel's raw list, red while pending
     if !frame.failed_units.is_empty() {
         let named: Vec<String> = frame.failed_units.iter().take(3).cloned().collect();
@@ -1680,8 +1708,17 @@ pub fn render_sys(frame: &SysFrame, p: &Painter) -> String {
             .take(6)
             .map(|m| {
                 let pct = m.used_mb as f64 / m.total_mb.max(1) as f64 * 100.0;
+                // inode share rides the same cell only when it's also
+                // running hot — the flood-of-tiny-files signature df
+                // percent can't show
+                let inodes = match (m.inodes_used, m.inodes_total) {
+                    (Some(u), Some(t)) if t > 0 && u * 100 / t >= 80 => {
+                        format!(" inodes {}", u * 100 / t)
+                    }
+                    _ => String::new(),
+                };
                 let txt = format!(
-                    "{} {}/{} {:.0}%",
+                    "{} {}/{} {:.0}%{inodes}",
                     m.target,
                     crate::util::fmt_bytes(m.used_mb * 1024 * 1024),
                     crate::util::fmt_bytes(m.total_mb * 1024 * 1024),
@@ -3918,6 +3955,13 @@ mod tests {
             zombies: 2,
             dstates: 1,
             failed_units: vec!["ipmi.service".into(), "lightdm.service".into(), "plymouth-quit.service".into()],
+            deleted_files: vec![crate::platform::DeletedFile {
+                pid: 900,
+                name: "rsyslogd".into(),
+                path: "/var/log/journal.log".into(),
+                size_mb: 512,
+            }],
+            deleted_total_mb: 512,
         };
         let text = render_sys(&frame, &painter);
         assert!(text.contains("cpu   37.2%"), "{text}");
@@ -3936,6 +3980,14 @@ mod tests {
         assert!(text.contains("disk  /"), "fullest mount first: {text}");
         assert!(text.contains("net   eth0"));
         assert!(text.contains("temp  acpitz 54°C"));
+        // the disk cell shows the inode share once it runs hot (fixture:
+        // 90% of the inode table used) — the tiny-files signature df % can't show
+        assert!(text.contains("inodes 89"), "{text}");
+        // the deleted line: 512 MB held — yellow (below the GB-class red)
+        assert!(
+            text.contains("deleted 1 file(s) holding 512.0M — /var/log/journal.log (pid 900)"),
+            "{text}"
+        );
         // the gpu row: memory share first, temp + util beside; 50% share
         // stays plain
         assert!(
@@ -4012,6 +4064,8 @@ mod tests {
             zombies: 0,
             dstates: 0,
             failed_units: Vec::new(),
+            deleted_files: Vec::new(),
+            deleted_total_mb: 0,
         };
         let text = render_sys(&frame, &painter);
         assert!(text.contains("cpu   -"));

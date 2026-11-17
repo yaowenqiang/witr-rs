@@ -1457,6 +1457,8 @@ fn sys_frame(
     let zombies = state_count(procs, &["Z"]);
     let dstates = state_count(procs, &["D", "U"]);
     let failed_units = platform.failed_units().unwrap_or_default();
+    let deleted_files = platform.deleted_files();
+    let deleted_total_mb = deleted_files.iter().map(|d| d.size_mb).sum();
     let mounts = platform.mount_usage();
     let counters = platform.net_counters();
     let mut nics: Vec<(String, f64, f64)> = Vec::new();
@@ -1488,6 +1490,8 @@ fn sys_frame(
         zombies,
         dstates,
         failed_units,
+        deleted_files,
+        deleted_total_mb,
     }
 }
 
@@ -1536,6 +1540,8 @@ fn fleet_sys_frame(
         // the far host's own failed-unit list rides the snapshot — the
         // red line renders per host like every other reading here
         failed_units: sample.failed_units.clone(),
+        deleted_files: sample.deleted_files.clone(),
+        deleted_total_mb: sample.deleted_reclaimable_mb,
     }
 }
 
