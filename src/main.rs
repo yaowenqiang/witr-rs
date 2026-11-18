@@ -870,6 +870,8 @@ fn fleet_rates(
 }
 
 type FleetFetch = Vec<(String, Result<(Vec<Process>, Option<FleetSample>), String>)>;
+/// (host, pid) → the previous sweep's cumulative io bytes (the fleet io-rate diff's baseline).
+type HashIo = std::collections::HashMap<(String, Pid), (u64, u64)>;
 
 fn fleet_alert_picks(
     cli: &cli::Cli,
@@ -1036,7 +1038,7 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
         let painter = render::Painter::new(color);
         let count = cli.count.unwrap_or(15);
         let draw = |results: &FleetFetch,
-                    prev_io: Option<&std::collections::HashMap<(String, Pid), (u64, u64)>>,
+                    prev_io: Option<&HashIo>,
                     elapsed: f64|
          -> String {
             let mut procs: Vec<Process> = Vec::new();
@@ -1079,7 +1081,7 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
             Some(secs) => {
                 let interval = secs.max(1);
                 install_sigint_flag();
-                let mut prev_io: Option<std::collections::HashMap<(String, Pid), (u64, u64)>> = None;
+                let mut prev_io: Option<HashIo> = None;
                 let label = bases.join(" · ");
                 let mut ticks = 0u64;
                 loop {
@@ -1095,14 +1097,11 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
                     }
                     // io-rate diffs against the previous tick's fetch
                     // (the first tick arms only, like the local board)
-                    let mut tick_prev = None;
-                    let elapsed_io = if metric == cli::TopMetric::IoRate {
-                        tick_prev = Some(fleet_io_prev(&results));
-                        interval as f64
-                    } else {
-                        0.0
-                    };
-                    write_out(&draw(&results, tick_prev.as_ref(), elapsed_io));
+                    let elapsed_io = interval as f64;
+                    write_out(&draw(&results, prev_io.as_ref(), elapsed_io));
+                    if metric == cli::TopMetric::IoRate {
+                        prev_io = Some(fleet_io_prev(&results));
+                    }
                     ticks += 1;
                     if cli.times.is_some_and(|n| ticks >= n.max(1)) {
                         return;
@@ -2073,10 +2072,8 @@ fn container_check_sweep() -> Vec<crate::model::Container> {
 /// (host, pid) → the previous sweep's cumulative io bytes — the fleet
 /// io-rate diff's baseline. Keyed by host+pid: the same pid on two
 /// machines is two processes.
-fn fleet_io_prev(
-    results: &FleetFetch,
-) -> std::collections::HashMap<(String, Pid), (u64, u64)> {
-    let mut out = std::collections::HashMap::new();
+fn fleet_io_prev(results: &FleetFetch) -> HashIo {
+    let mut out = HashIo::new();
     for (base, result) in results {
         if let Ok((ps, _)) = result {
             for p in ps {
@@ -2097,11 +2094,7 @@ fn fleet_io_prev(
 
 /// Per-pid io rates (bytes/s) diffed against `prev` — the fleet io-rate
 /// board's values, written into the rows the ranking draws.
-fn fleet_io_rates(
-    prev: &std::collections::HashMap<(String, Pid), (u64, u64)>,
-    results: &FleetFetch,
-    elapsed: f64,
-) -> std::collections::HashMap<(String, Pid), (f64, f64)> {
+fn fleet_io_rates(prev: &HashIo, results: &FleetFetch, elapsed: f64) -> std::collections::HashMap<(String, Pid), (f64, f64)> {
     let mut out = std::collections::HashMap::new();
     if elapsed <= 0.0 {
         return out;
