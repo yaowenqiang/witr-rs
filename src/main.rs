@@ -1025,20 +1025,40 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
                 | cli::TopMetric::Swap
                 | cli::TopMetric::Gpu
                 | cli::TopMetric::GpuMem
+                | cli::TopMetric::Io
         ) {
             eprintln!(
-                "--top {metric:?} across --remote hosts reads the fetched process tables; fd/conn/io/io-rate/net need local probes — use cpu/mem/age/threads/swap/gpu/gpu-mem (GPU columns ride the table where the peers have NVIDIA drivers)"
+                "--top {metric:?} across --remote hosts reads the fetched process tables; fd/conn/net need local probes — use cpu/mem/age/threads/swap/gpu/gpu-mem/io (cumulative io rides the table; io-rate diffs two fetches)"
             );
             std::process::exit(4);
         }
         let color = !no_color && std::io::stdout().is_terminal();
         let painter = render::Painter::new(color);
         let count = cli.count.unwrap_or(15);
-        let draw = |results: &FleetFetch| -> String {
+        let draw = |results: &FleetFetch,
+                    prev_io: Option<&std::collections::HashMap<(String, Pid), (u64, u64)>>,
+                    elapsed: f64|
+         -> String {
             let mut procs: Vec<Process> = Vec::new();
             for (_, result) in results {
                 if let Ok((ps, _)) = result {
                     procs.extend(ps.iter().cloned());
+                }
+            }
+            // the io-rate board needs its diffed values: fold the per-pid
+            // rates into the rows' cumulative io fields (host+pid keyed),
+            // so ranking and rendering see bytes/s like the local board
+            if metric == cli::TopMetric::IoRate {
+                if let Some(prev) = prev_io {
+                    let rates = fleet_io_rates(prev, results, elapsed);
+                    for p in procs.iter_mut() {
+                        if let Some((r, w)) =
+                            rates.get(&(p.host.clone().unwrap_or_default(), p.pid))
+                        {
+                            p.io_read_bytes = Some(*r as u64);
+                            p.io_write_bytes = Some(*w as u64);
+                        }
+                    }
                 }
             }
             // the machine-readable formats draw the exact board as rows:
@@ -1059,6 +1079,7 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
             Some(secs) => {
                 let interval = secs.max(1);
                 install_sigint_flag();
+                let mut prev_io: Option<std::collections::HashMap<(String, Pid), (u64, u64)>> = None;
                 let label = bases.join(" · ");
                 let mut ticks = 0u64;
                 loop {
@@ -1072,7 +1093,16 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
                             bases.len()
                         ));
                     }
-                    write_out(&draw(&results));
+                    // io-rate diffs against the previous tick's fetch
+                    // (the first tick arms only, like the local board)
+                    let mut tick_prev = None;
+                    let elapsed_io = if metric == cli::TopMetric::IoRate {
+                        tick_prev = Some(fleet_io_prev(&results));
+                        interval as f64
+                    } else {
+                        0.0
+                    };
+                    write_out(&draw(&results, tick_prev.as_ref(), elapsed_io));
                     ticks += 1;
                     if cli.times.is_some_and(|n| ticks >= n.max(1)) {
                         return;
@@ -1083,8 +1113,18 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
                 }
             }
             None => {
+                // one-shot io-rate: two fetches a second apart (the local
+                // board's trick) — the first arms the per-pid baseline
+                let (prev_io, elapsed_io) = if metric == cli::TopMetric::IoRate {
+                    let first = fetch_all();
+                    let prev = fleet_io_prev(&first);
+                    std::thread::sleep(Duration::from_secs(1));
+                    (Some(prev), 1.0)
+                } else {
+                    (None, 0.0)
+                };
                 let results = fetch_all();
-                write_out(&draw(&results));
+                write_out(&draw(&results, prev_io.as_ref(), elapsed_io));
                 return;
             }
         }
@@ -2030,6 +2070,65 @@ fn container_check_sweep() -> Vec<crate::model::Container> {
 /// draws (value desc, host-then-pid ties), as owned rows so the
 /// machine-readable formats can print the exact board. Table-carried
 /// metrics only: the fleet fetch has no fd/conn/io probes.
+/// (host, pid) → the previous sweep's cumulative io bytes — the fleet
+/// io-rate diff's baseline. Keyed by host+pid: the same pid on two
+/// machines is two processes.
+fn fleet_io_prev(
+    results: &FleetFetch,
+) -> std::collections::HashMap<(String, Pid), (u64, u64)> {
+    let mut out = std::collections::HashMap::new();
+    for (base, result) in results {
+        if let Ok((ps, _)) = result {
+            for p in ps {
+                if p.io_read_bytes.is_some() || p.io_write_bytes.is_some() {
+                    out.insert(
+                        (base.clone(), p.pid),
+                        (
+                            p.io_read_bytes.unwrap_or(0),
+                            p.io_write_bytes.unwrap_or(0),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Per-pid io rates (bytes/s) diffed against `prev` — the fleet io-rate
+/// board's values, written into the rows the ranking draws.
+fn fleet_io_rates(
+    prev: &std::collections::HashMap<(String, Pid), (u64, u64)>,
+    results: &FleetFetch,
+    elapsed: f64,
+) -> std::collections::HashMap<(String, Pid), (f64, f64)> {
+    let mut out = std::collections::HashMap::new();
+    if elapsed <= 0.0 {
+        return out;
+    }
+    for (base, result) in results {
+        if let Ok((ps, _)) = result {
+            for p in ps {
+                let key = (base.clone(), p.pid);
+                if let Some((pr, pw)) = prev.get(&key) {
+                    let r = p
+                        .io_read_bytes
+                        .unwrap_or(0)
+                        .saturating_sub(*pr) as f64
+                        / elapsed;
+                    let w = p
+                        .io_write_bytes
+                        .unwrap_or(0)
+                        .saturating_sub(*pw) as f64
+                        / elapsed;
+                    out.insert(key, (r, w));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn fleet_ranked(procs: &[Process], metric: cli::TopMetric, count: usize) -> Vec<Process> {
     let now = util::now_unix();
     let mut ranked: Vec<(f64, &Process)> = procs
@@ -2048,6 +2147,15 @@ fn fleet_ranked(procs: &[Process], metric: cli::TopMetric, count: usize) -> Vec<
                 // local probing
                 cli::TopMetric::Gpu => pr.gpu_sm_pct.map(|v| v as f64),
                 cli::TopMetric::GpuMem => pr.gpu_mem_mb.map(|mb| mb as f64),
+                // cumulative io rides the listing (the peers enrich it);
+                // the io-rate board bakes diffed bytes/s into the same
+                // fields before ranking, so one arm serves both
+                cli::TopMetric::Io | cli::TopMetric::IoRate => {
+                    let r = pr.io_read_bytes.unwrap_or(0);
+                    let w = pr.io_write_bytes.unwrap_or(0);
+                    (pr.io_read_bytes.is_some() || pr.io_write_bytes.is_some())
+                        .then_some((r + w) as f64)
+                }
                 _ => None,
             }?;
             Some((v, pr))
@@ -8089,12 +8197,21 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             cpu,
             ..Default::default()
         };
+        // the io twin: cumulative r+w ranks, table-carried
+        let mut io_host = p(6, Some("hostA"), None);
+        io_host.io_read_bytes = Some(1000);
+        io_host.io_write_bytes = Some(3000);
+        let mut io_big = p(7, Some("hostB"), None);
+        io_big.io_read_bytes = Some(90_000);
+        io_big.io_write_bytes = Some(10_000);
         let procs = vec![
             p(1, Some("hostB"), Some(30.0)),
             p(2, Some("hostA"), Some(30.0)),
             p(3, Some("hostA"), Some(90.0)),
             p(4, None, Some(5.0)),
             p(5, Some("hostA"), None), // unmeasurable: drops out
+            io_host,
+            io_big,
         ];
         let ranked = fleet_ranked(&procs, cli::TopMetric::Cpu, 3);
         let keys: Vec<String> = ranked
@@ -8108,6 +8225,19 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             vec!["90:hostA/3", "30:hostA/2", "30:hostB/1"],
             "{keys:?}"
         );
+        // the io twin ranks the same way (cumulative r+w)
+        let io_ranked = fleet_ranked(&procs, cli::TopMetric::Io, 2);
+        let io_keys: Vec<String> = io_ranked
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}/{}",
+                    r.host.as_deref().unwrap_or("-"),
+                    r.pid
+                )
+            })
+            .collect();
+        assert_eq!(io_keys, vec!["hostB/7", "hostA/6"], "{io_keys:?}");
     }
 
     #[test]
