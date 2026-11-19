@@ -790,6 +790,7 @@ fn fleet_machine_armed(cli: &cli::Cli) -> bool {
         || cli.alert_retrans.is_some()
         || cli.alert_nic_drop.is_some()
         || cli.alert_oom.is_some()
+        || cli.alert_baseline.is_some()
 }
 
 fn reject_fleet_per_process_alerts(cli: &cli::Cli) {
@@ -870,6 +871,7 @@ fn fleet_rates(
 }
 
 type FleetFetch = Vec<(String, Result<(Vec<Process>, Option<FleetSample>), String>)>;
+type FleetFetchEntry = (String, Result<(Vec<Process>, Option<FleetSample>), String>);
 /// (host, pid) → the previous sweep's cumulative io bytes (the fleet io-rate diff's baseline).
 type HashIo = std::collections::HashMap<(String, Pid), (u64, u64)>;
 
@@ -1272,6 +1274,22 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
         // one alert state per host — streaks, latches and the disk-eta
         // trend windows stay independent per machine
         let mut states: HashMap<String, history::SysAlertState> = HashMap::new();
+        // the --alert-baseline norm: loaded once, judged per host (the
+        // /api/ps processes carry name/exe/user — identity comparison is
+        // exactly what the local judge does)
+        let baseline: Option<(Vec<Process>, Vec<snapshot::Listener>, Vec<String>)> =
+            match &cli.alert_baseline {
+                Some(path) => match snapshot::load_baseline(path) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        eprintln!("--alert-baseline {path}: {e}");
+                        std::process::exit(4);
+                    }
+                },
+                None => None,
+            };
+        let mut baseline_reported: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         let mut last_err: HashMap<String, String> = HashMap::new();
         install_sigint_flag();
         let label = bases.join(" · ");
@@ -1299,6 +1317,43 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
                         }
                         // the fleet sentinels: same machinery as the local
                         // --watch loop, one state per host, alerts name it
+                        if let Some((base_procs, _, _base_services)) = &baseline {
+                            // the security baseline judges the fetched
+                            // table per host: new identities fire once
+                            // each (vanishing doesn't — exit events have
+                            // their own bookkeeping)
+                            let now_ids = snapshot::identity_set(procs);
+                            let base_ids = snapshot::identity_set(base_procs);
+                            let mut new_ids: Vec<&String> =
+                                now_ids.difference(&base_ids).collect();
+                            new_ids.sort();
+                            for id in new_ids {
+                                if !baseline_reported.insert((base.clone(), id.clone())) {
+                                    continue;
+                                }
+                                let who = procs
+                                    .iter()
+                                    .find(|p| crate::util::identity_key(p) == **id)
+                                    .map(|p| {
+                                        format!(
+                                            "{} (pid {}, user {})",
+                                            p.name,
+                                            p.pid,
+                                            p.user.as_deref().unwrap_or("-")
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                emit_fleet_pick(
+                                    cli,
+                                    base,
+                                    "baseline",
+                                    &format!("new process identity: {who} [{id}]"),
+                                    false,
+                                    json_stream,
+                                    events_file.as_mut(),
+                                );
+                            }
+                        }
                         if fleet_machine_armed(cli) {
                             let Some(sample) = sample else {
                                 continue; // server predates the system key
@@ -8623,6 +8678,74 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             ("b".to_string(), Ok((Vec::new(), Some(sample(50.0))))),
         ];
         assert!(fleet_outliers(&results, 1.0).is_empty());
+    }
+
+    #[test]
+    fn fleet_baseline_flags_new_identities_per_host() {
+        // one baseline with systemd+nginx as the norm; two hosts fetched —
+        // h1 runs exactly the norm, h2 runs an extra identity: only h2's
+        // extra fires, named with the host prefix
+        let base_procs = vec![
+            proc(1, "systemd", None, None),
+            proc(42, "nginx", None, None),
+        ];
+        let baseline = (
+            base_procs.clone(),
+            Vec::<snapshot::Listener>::new(),
+            vec!["nginx.service".to_string()],
+        );
+        let mk = |host: &str, pids: &[(i32, &str)]| -> FleetFetchEntry {
+            let procs: Vec<Process> = pids
+                .iter()
+                .map(|(pid, name)| proc(*pid, name, None, None))
+                .collect();
+            (
+                host.to_string(),
+                Ok((
+                    procs,
+                    Some(FleetSample {
+                        stats: crate::platform::SystemStats::default(),
+                        nics: Vec::new(),
+                        failed_units: Vec::new(),
+                        deleted_reclaimable_mb: 0,
+                        deleted_files: Vec::new(),
+                        net: None,
+                        mounts: Vec::new(),
+                    }),
+                )),
+            )
+        };
+        let results = vec![
+            mk("h1", &[(1, "systemd"), (42, "nginx")]),
+            mk("h2", &[(1, "systemd"), (42, "nginx"), (99, "xmrig")]),
+        ];
+        // judge per host like the loop does: identity sets against the norm
+        let mut reported: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut fires = Vec::new();
+        for (base, result) in &results {
+            let Ok((procs, _)) = result else { continue };
+            let now_ids = snapshot::identity_set(procs);
+            let base_ids = snapshot::identity_set(&baseline.0);
+            let mut new_ids: Vec<&String> = now_ids.difference(&base_ids).collect();
+            new_ids.sort();
+            for id in new_ids {
+                if !reported.insert((base.clone(), id.clone())) {
+                    continue;
+                }
+                fires.push(format!("[{base}] new process identity: {id}"));
+            }
+        }
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert!(fires[0].contains("[h2]") && fires[0].contains("xmrig"), "{fires:?}");
+        // a second pass reports nothing (the dedup set holds)
+        for (base, result) in &results {
+            let Ok((procs, _)) = result else { continue };
+            let now_ids = snapshot::identity_set(procs);
+            for id in now_ids.difference(&snapshot::identity_set(&baseline.0)) {
+                assert!(!reported.insert((base.clone(), id.clone())));
+            }
+        }
     }
 
     #[test]

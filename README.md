@@ -108,6 +108,8 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **环境自检（`--doctor`）**：逐项探测每个可选能力并回答三件事——可用吗、为什么不可用、哪些旗标因此沉默。检查项：root 权限、systemd（存在性与运行状态分开探测——`is-system-running` 在 degraded 开机上恰好失败，这台机器教出来的）、journalctl 可读性、ss、cgroup v2、nvidia-smi、容器运行时（docker/podman/nerdctl 逐个试）、kubectl、git。✔/✗ 逐行打标，缺失项附 "silent:" 行点名因此静默的旗标（"GPU 列为什么是空的"一条命令见分晓）。信息性命令退出码恒 0；`--json` 出机读版。
 
+**舰队基线（`--remote × --alert-baseline`）**：安全线的舰队形态——基线文件随 `--watch` 逐拍对照**每台对端的进程身份集**（`/api/ps` 的进程表自带 name/exe/user,与本地同一套身份三元）,某台跑出基线之外的新身份即点名主机:`⚠ [h2] new process identity: xmrig (pid 99 …)`。每身份每主机一次;消失不报(退出事件另有其账);监听端口与服务的基线对比仅本机形态(`/api/ports` 与服务清单不在舰队拉取里)。发现新身份退出码 1(一次性形态),`--watch` 哨兵照常。
+
 **舰队离群检测（`--outliers [Z]`）**：舰队与它自己比较——对每台 `--remote` 主机的各指标（load / cpu / 内存 / swap / 磁盘占用 / 磁盘忙 / 已删除占用 / GPU 显存）计算相对**舰队中位数**的稳健 z-score（Iglewicz–Hoaglin：中位数与 MAD——经典 σ 会被离群自身撑大，五台机器的舰队里什么都不会显得异常；MAD 不会）。|z| ≥ 阈值（默认 3.5）的主机按偏离程度降序点名，附数值、舰队中位数与 z；抓取失败的对端跳过并列出；上报主机不足 3 台的指标静默跳过。发现离群退出码 1——整个机房的巡检探针；`--json` 出版本化信封。这是与其他所有舰队面**不同的问题**：不问"每台机器怎么样"，问"**哪台不对劲**"。
 
 **配置热重载（SIGHUP）**：`kill -HUP $(pidof witr-rs)` 无需重启即重读配置——TUI 立即重折算全部旋钮（采样间隔、排序、告警阈值、静默/首见名单、通知开关；**关注列表与告警状态保留**——调整阈值不丢已触发的告警闩锁），无头 `--watch` 同效（下一个 tick 生效）。语义与启动一致：命令行旗标始终压过配置文件，重载只动文件里改的值。改 config.toml 不用再杀进程。
@@ -335,7 +337,8 @@ witr-rs --watch 10 --alert-inodes 80 --alert-leak 50  # inode 耗尽 + 内存泄
 witr-rs --watch 10 --alert-fd-leak 64 --alert-thr-leak 16  # fd / 线程泄漏哨兵：socket-per-request 不关闭 / 每请求起线程不回收
 witr-rs --watch 10 --alert-gpu-mem-pct 90  # GPU 显存哨兵：CUDA 分配失败门前喊（点名 GPU 与占比）
 witr-rs --watch 30 --alert-deleted-gb 2  # 已删除占用哨兵：日志轮转失败 df 在疼 du 找不到凶手（点名持有者）
-witr-rs --watch 10 --alert-exe-changed --alert-new-remote --state-file state.json  # 安全哨兵 + 状态持久化：重启即续跑（趋势窗口、exe 基线、OOM 锚点都在）  # fd / 线程泄漏哨兵：socket-per-request 不关闭 / 每请求起线程不回收
+witr-rs --watch 10 --alert-exe-changed --alert-new-remote --state-file state.json  # 安全哨兵 + 状态持久化：重启即续跑（趋势窗口、exe 基线、OOM 锚点都在）
+witr-rs --watch 10 --remote a,b,c --alert-baseline base.json  # 舰队基线：哪台机器跑出了常态之外的新进程（点名主机与身份）  # fd / 线程泄漏哨兵：socket-per-request 不关闭 / 每请求起线程不回收
 witr-rs --alert-fd 4096 --alert-io 100 # fd 数 / 磁盘 IO 速率阈值告警（同 CPU 告警机制）
 witr-rs --alert-conn 200      # 每进程 ESTABLISHED 连接数阈值告警（TUI 与 --watch 同效）
 witr-rs --alert-threads 400   # 每进程内核线程数阈值告警（线程泄漏哨兵，TUI 与 --watch 同效）
