@@ -391,6 +391,15 @@ pub struct Cli {
     pub doctor: bool,
 
     #[arg(
+        long,
+        help = t(
+            "systemd timers 巡检清单:每个计时器的下次/上次触发(原生 systemd 措辞)、已过时长与激活的服务——\"该跑没跑\",从未触发的计时器黄色标出 never fired。--json / --csv / --markdown 同样支持",
+            "The systemd timers patrol list: next/last trigger (raw systemd phrasing), elapsed since, and the activated service per timer — \"did it run when it should\"; a timer that never fired is flagged yellow as never fired. --json / --csv / --markdown work too"
+        )
+    )]
+    pub timers: bool,
+
+    #[arg(
         long = "baseline-save",
         value_name = "FILE",
         help = t(

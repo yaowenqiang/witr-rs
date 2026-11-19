@@ -1558,6 +1558,17 @@ impl Platform for Linux {
         return Vec::new();
     }
 
+    /// The systemd timers patrol list (see `parse_timers` for the row
+    /// shape). None where there's no systemd.
+    fn list_timers(&self) -> Option<Vec<super::TimerRow>> {
+        let text = crate::util::run_ok(
+            "systemctl",
+            &["list-timers", "--no-pager", "--all"],
+            std::time::Duration::from_secs(8),
+        )?;
+        Some(super::parse_timers(&text))
+    }
+
     /// The systemd failed-unit list — the super helper asks
     /// `systemctl --failed` and returns None where there's no systemd.
     fn failed_units(&self) -> Option<Vec<String>> {

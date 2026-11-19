@@ -447,6 +447,79 @@ fn systemd_failed_units() -> Option<Vec<String>> {
 /// leading `●` marks queued jobs; anything systemd prints beyond the first
 /// field is description the sentinel doesn't need.
 #[allow(dead_code)] // every parse fn is unit-tested on all platforms
+/// One systemd timer's patrol row — the `--timers` listing's body: when
+/// it next fires, when it last did, and what it activates. `next`/`left`/
+/// `last`/`passed` ride as the raw systemd phrasing (parseable enough for
+/// scripts, readable for humans); `last` is None for a timer that never
+/// fired — the "该跑没跑" suspect.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TimerRow {
+    pub unit: String,
+    pub next: String,
+    pub left: String,
+    pub last: Option<String>,
+    pub passed: String,
+    pub activates: String,
+}
+
+/// Parse `systemctl list-timers --no-pager --all`. The data rows can't be
+/// cut by header column positions (multi-token values like NEXT's
+/// weekday/date/time/timezone quad and PASSED's "1min 12s ago" spill past
+/// their columns — systemd only guarantees 1-2 spaces between values).
+/// Instead the rows are read from the RIGHT, where the tokens are known:
+/// ACTIVATES is last, UNIT second-to-last (`.timer`-suffixed), the PASSED
+/// run ends at UNIT, LAST starts at a weekday token (Mon..Sun) scanning
+/// left from there, NEXT is the first four tokens, LEFT whatever sits
+/// between NEXT and LAST. A never-fired timer has no weekday token and
+/// reads with `last: None`.
+#[allow(dead_code)] // every parse fn is unit-tested on all platforms
+pub fn parse_timers(text: &str) -> Vec<TimerRow> {
+    const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let mut out = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 3 {
+            continue;
+        }
+        let activates = f[f.len() - 1].to_string();
+        let unit = f[f.len() - 2].to_string();
+        if !unit.ends_with(".timer") {
+            continue; // header row and stray lines
+        }
+        // LAST's weekday anchor: scan left from UNIT for Mon..Sun
+        let Some(wd) = f[..f.len() - 2]
+            .iter()
+            .rposition(|t| WEEKDAYS.contains(t))
+        else {
+            // never fired (or a shape we don't read): unit only
+            out.push(TimerRow {
+                unit,
+                next: String::new(),
+                left: String::new(),
+                last: None,
+                passed: String::new(),
+                activates,
+            });
+            continue;
+        };
+        // LAST is exactly four tokens (weekday, date, time, timezone);
+        // PASSED is whatever sits between it and UNIT ("1min 12s ago")
+        let last = Some(f[wd..wd + 4].join(" "));
+        let next = f[..4.min(wd)].join(" ");
+        let left = f[4.min(wd)..wd].join(" ");
+        let passed = f[wd + 4..f.len() - 2].join(" ");
+        out.push(TimerRow {
+            unit,
+            next,
+            left,
+            last,
+            passed,
+            activates,
+        });
+    }
+    out
+}
+
 pub fn parse_failed_units(text: &str) -> Vec<String> {
     text.lines()
         .filter(|l| !l.trim().is_empty())
@@ -1108,6 +1181,12 @@ pub trait Platform {
         None
     }
 
+    /// The systemd timers patrol list — next/last elapse per timer, the
+    /// "该跑没跑" visibility. None off Linux / without systemd.
+    fn list_timers(&self) -> Option<Vec<TimerRow>> {
+        None
+    }
+
     /// One systemd unit's report — the `-u UNIT` one-shot's data and the
     /// Services tab's Enter-on-a-failed-unit view. `None` where there is
     /// no systemd to ask (other platforms, systemctl missing, not booted
@@ -1356,6 +1435,28 @@ sys-devices-loaded.device loaded active plugged stub\
         // failed stands out (the tab paints it red)
         assert_eq!(ss[2].state, "failed");
         assert!(ss.iter().all(|s| s.pid.is_none()), "systemd resolves pids lazily");
+    }
+
+            #[test]
+    fn timers_parse_reads_the_real_list_columns() {
+        // verbatim data rows from this box's systemctl list-timers
+        let text = "Thu 2026-11-19 16:30:00 CST   8min Thu 2026-11-19 16:20:01 CST 1min 12s ago sysstat-collect.timer        sysstat-collect.service\nFri 2026-11-20 00:00:00 CST     7h Thu 2026-11-19 00:00:01 CST      16h ago logrotate.timer              logrotate.service\nSun 2026-11-22 01:00:00 CST 2 days Sun 2026-11-15 01:00:01 CST   4 days ago raid-check.timer              raid-check.service\n";
+        let rows = parse_timers(text);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0].unit, "sysstat-collect.timer");
+        assert_eq!(rows[0].next, "Thu 2026-11-19 16:30:00 CST");
+        assert_eq!(rows[0].left, "8min");
+        assert_eq!(rows[0].last.as_deref(), Some("Thu 2026-11-19 16:20:01 CST"));
+        assert_eq!(rows[0].passed, "1min 12s ago");
+        assert_eq!(rows[0].activates, "sysstat-collect.service");
+        // multi-token LEFT/PASSED cut cleanly ("2 days", "4 days ago")
+        assert_eq!(rows[2].left, "2 days");
+        assert_eq!(rows[2].passed, "4 days ago");
+        // never-fired: no weekday token → last None
+        let rows = parse_timers("- - n/a - broken.timer broken.service\n");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].unit, "broken.timer");
+        assert_eq!(rows[0].last, None);
     }
 
     #[test]

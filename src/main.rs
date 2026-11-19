@@ -5759,6 +5759,70 @@ fn main() {
         std::process::exit(0);
     }
 
+    // --timers: the systemd timers patrol list — next/last elapse per
+    // timer, the "该跑没跑" visibility (a timer that never fired shows
+    // last = n/a).
+    if cli.timers {
+        let Some(rows) = platform::get().list_timers() else {
+            eprintln!("--timers: no systemd to ask");
+            std::process::exit(4);
+        };
+        if cli.json {
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "timer_count": rows.len(),
+                "timers": rows,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if cli.csv {
+            write_out("unit,next,left,last,passed,activates\n");
+            for r in &rows {
+                write_out(&format!(
+                    "{},{},{},{},{},{}\n",
+                    render::csv_field(&r.unit),
+                    render::csv_field(&r.next),
+                    render::csv_field(&r.left),
+                    render::csv_field(r.last.as_deref().unwrap_or("")),
+                    render::csv_field(&r.passed),
+                    render::csv_field(&r.activates),
+                ));
+            }
+        } else if cli.markdown {
+            write_out("| UNIT | NEXT | LEFT | LAST | PASSED | ACTIVATES |\n|---|---|---|---|---|---|\n");
+            for r in &rows {
+                write_out(&format!(
+                    "| {} | {} | {} | {} | {} | {} |\n",
+                    r.unit,
+                    r.next,
+                    r.left,
+                    r.last.as_deref().unwrap_or("n/a"),
+                    r.passed,
+                    r.activates
+                ));
+            }
+        } else {
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            let painter = &painter;
+            write_out(&format!(
+                "{:<24}  {:<26}  {:>8}  {:<26}  {:>10}  {}",
+                "UNIT", "NEXT", "LEFT", "LAST", "PASSED", "ACTIVATES"
+            ));
+            write_out("");
+            for r in &rows {
+                let last = match &r.last {
+                    Some(l) => l.clone(),
+                    None => painter.yellow("never fired"),
+                };
+                write_out(&format!(
+                    "{:<24}  {:<26}  {:>8}  {:<26}  {:>10}  {}",
+                    r.unit, r.next, r.left, last, r.passed, r.activates
+                ));
+            }
+        }
+        std::process::exit(0);
+    }
+
     // -u UNIT: a systemd unit's report — status line, main pid, restart
     // count, enablement, last exit code/signal, with --logs appending the
     // unit's journal tail. Exit mirrors the patrol probes: 0 clean,
@@ -8693,14 +8757,14 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             Vec::<snapshot::Listener>::new(),
             vec!["nginx.service".to_string()],
         );
-        let mk = |host: &str, pids: &[(i32, &str)]| -> FleetFetchEntry {
+        let mk = |host: &str, pids: &[(i32, &str)]| {
             let procs: Vec<Process> = pids
                 .iter()
                 .map(|(pid, name)| proc(*pid, name, None, None))
                 .collect();
             (
                 host.to_string(),
-                Ok((
+                Ok::<(Vec<Process>, Option<FleetSample>), String>((
                     procs,
                     Some(FleetSample {
                         stats: crate::platform::SystemStats::default(),
