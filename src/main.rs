@@ -871,7 +871,6 @@ fn fleet_rates(
 }
 
 type FleetFetch = Vec<(String, Result<(Vec<Process>, Option<FleetSample>), String>)>;
-type FleetFetchEntry = (String, Result<(Vec<Process>, Option<FleetSample>), String>);
 /// (host, pid) → the previous sweep's cumulative io bytes (the fleet io-rate diff's baseline).
 type HashIo = std::collections::HashMap<(String, Pid), (u64, u64)>;
 
