@@ -243,6 +243,7 @@ impl Cli {
         self.alert_deleted_gb = self.alert_deleted_gb.or(cfg.alert_deleted_gb);
         self.alert_exe_changed = self.alert_exe_changed || cfg.alert_exe_changed.unwrap_or(false);
         self.alert_new_remote = self.alert_new_remote || cfg.alert_new_remote.unwrap_or(false);
+        self.alert_timers_stale = self.alert_timers_stale.or(cfg.alert_timers_stale);
         self.alert_leak = self.alert_leak.or(cfg.alert_leak);
         self.alert_fd_leak = self.alert_fd_leak.or(cfg.alert_fd_leak);
         self.alert_thr_leak = self.alert_thr_leak.or(cfg.alert_thr_leak);
@@ -477,6 +478,16 @@ pub struct Cli {
         )
     )]
     pub alert_new_remote: bool,
+
+    #[arg(
+        long = "alert-timers-stale",
+        value_name = "FACTOR",
+        help = t(
+            "计时器失拍哨兵:OnUnitActiveSec 型计时器的上次触发距今超过 FACTOR 个周期即触发,详情点名最严重的计时器与其超出倍数——\"该跑没跑\":每分钟采集的计时器若 3 小时没跑,16 倍失拍一目了然。OnCalendar 型计时器无法从 systemd 读出周期,如实跳过。TUI 和 --watch",
+            "Timer-staleness sentinel: fires when an OnUnitActiveSec-type timer's last trigger is older than FACTOR multiples of its period, the detail naming the worst offender and its overrun — a per-minute collection timer going 3 hours without running is a 16× miss visible at a glance. OnCalendar-type timers' periods aren't readable from systemd; they honestly sit out. TUI and --watch"
+        )
+    )]
+    pub alert_timers_stale: Option<f64>,
 
     #[arg(
         long = "state-file",

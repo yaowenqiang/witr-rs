@@ -6616,6 +6616,17 @@ fn main() {
                     let socks = platform.list_all_sockets().unwrap_or_default();
                     picks.extend(history::new_remote_picks(&socks, &procs, &mut sys_alert));
                 }
+                // the timers-staleness sentinel: OnUnitActiveSec-type
+                // timers whose last run outran FACTOR periods
+                if let Some(factor) = cli.alert_timers_stale {
+                    if let Some(timers) = platform.list_timers() {
+                        picks.extend(
+                            history::timers_stale_picks(&timers, factor, &mut sys_alert)
+                                .into_iter()
+                                .map(|(name, d, rec)| (0, name, d, rec)),
+                        );
+                    }
+                }
                 if let Some(path) = state_file.as_deref() {
                     let persisted = sys_alert.to_persisted();
                     if let Ok(json) = serde_json::to_string(&persisted) {
@@ -6703,6 +6714,7 @@ fn main() {
                     || cli.alert_failed_units.is_some()
                     || cli.alert_exe_changed
                     || cli.alert_new_remote
+                    || cli.alert_timers_stale.is_some()
                     || cli.alert_baseline.is_some()
                     || cli.alert_leak.is_some()
                 {

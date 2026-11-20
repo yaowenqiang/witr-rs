@@ -61,6 +61,7 @@ pub struct Config {
     pub alert_deleted_gb: Option<f64>,
     pub alert_exe_changed: Option<bool>,
     pub alert_new_remote: Option<bool>,
+    pub alert_timers_stale: Option<f64>,
     pub alert_leak: Option<f64>,
     pub alert_fd_leak: Option<f64>,
     pub alert_thr_leak: Option<f64>,
@@ -393,6 +394,7 @@ fn set_alert(key: &str, value: &str, cfg: &mut Config) -> Result<(), String> {
             .parse::<bool>()
             .map(|v| cfg.alert_new_remote = Some(v))
             .map_err(|_| format!("{key} {value:?} is not true/false")),
+        "alert_timers_stale" => num(&mut cfg.alert_timers_stale),
         "alert_leak" => num(&mut cfg.alert_leak),
         "alert_fd_leak" => num(&mut cfg.alert_fd_leak),
         "alert_thr_leak" => num(&mut cfg.alert_thr_leak),

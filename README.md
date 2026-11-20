@@ -106,7 +106,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **哨兵状态持久化（`--state-file FILE`）**：months-long watchdog 的真实痛点——重启即失忆：内存耗尽预测要重新积累十分钟、exe 替换基线要重新哈希全表、OOM 计数锚点丢失导致重启后的第一次差分出假尖峰。`--state-file state.json` 每拍**原子写**（临时文件 + rename，崩溃中途留下的只有上一拍状态）eta 趋势窗口、exe 基线与 OOM 锚点，启动时读回——重启即续跑，不再重新积累。**pid 键控的状态刻意不持久**（泄漏闩锁、外联基线）——pid 跨重启无意义，安全哨兵从零重新武装是诚实行为。恢复时打一行恢复摘要；文件不可读则从零开始并说明；写入失败自动禁用（不再重复报错）。
 
-**systemd timers 巡检（`--timers`）**：每个计时器的下次/上次触发、剩余与已过时长、激活的服务——"该跑没跑"的可见性,从未触发的计时器黄色标出 `never fired`。`--json` / `--csv` / `--markdown` 同源输出。
+**计时器失拍哨兵（`--alert-timers-stale FACTOR`）**：OnUnitActiveSec 型计时器的上次触发距今超过 FACTOR 个周期即触发，详情点名最严重的计时器与其超出倍数（"每分钟采集的计时器 3 小时没跑 = 16 倍失拍"一目了然）；OnCalendar 型计时器 systemd 读不出周期，如实跳过。配合 **`--timers`** 巡检清单使用。：每个计时器的下次/上次触发、剩余与已过时长、激活的服务——"该跑没跑"的可见性,从未触发的计时器黄色标出 `never fired`。`--json` / `--csv` / `--markdown` 同源输出。
 
 **环境自检（`--doctor`）**：逐项探测每个可选能力并回答三件事——可用吗、为什么不可用、哪些旗标因此沉默。检查项：root 权限、systemd（存在性与运行状态分开探测——`is-system-running` 在 degraded 开机上恰好失败，这台机器教出来的）、journalctl 可读性、ss、cgroup v2、nvidia-smi、容器运行时（docker/podman/nerdctl 逐个试）、kubectl、git。✔/✗ 逐行打标，缺失项附 "silent:" 行点名因此静默的旗标（"GPU 列为什么是空的"一条命令见分晓）。信息性命令退出码恒 0；`--json` 出机读版。
 
@@ -368,6 +368,7 @@ witr-rs --services --failed   # 只看失败的单元（三平台；巡检探针
 witr-rs --baseline-save base.json --sockets  # 保存安全基线：进程身份 + 端口 + 服务（常态快照）
 witr-rs --baseline base.json  # 对照体检：新身份/新端口/失败服务逐行点名（漂移退出码 1）
 witr-rs --timers              # systemd timers 巡检：下次/上次触发、已过时长（never fired 黄色标出）
+witr-rs --watch 30 --alert-timers-stale 2  # 计时器失拍哨兵：每分钟采集的计时器 3 小时没跑 = 16 倍失拍（点名最严重者）
 witr-rs --doctor              # 环境自检：哪些能力可用、缺的为什么、哪些旗标沉默（恒 0）
 witr-rs -u nginx.service --logs 50 --grep error  # systemd 单元报告：状态 + 上次退出码 + journal 尾巴（failed 退出码 1——巡检探针）
 witr-rs --watch 5 --alert-load 8 --alert-mem-pct 90 # 机器级 watchdog：load / 内存百分比超阈值告警

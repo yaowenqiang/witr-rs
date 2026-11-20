@@ -459,6 +459,8 @@ struct TuiApp {
     alert_oom: Option<u64>,
     /// streak/firing state for the machine-wide alerts
     sys_alert: crate::history::SysAlertState,
+    /// --alert-timers-stale: periods-overrun factor
+    alert_timers_stale: Option<f64>,
     /// shared container/pod edge detector memory (first sighting arms, no
     /// alerts) — the same core the headless `--alert-container` loop runs
     container_edges: crate::history::ContainerEdges,
@@ -691,6 +693,8 @@ pub struct Seed {
     /// on start and written on exit (interactive sessions benefit from
     /// the same continuity the watchdog gets)
     pub state_file: Option<String>,
+    /// --alert-timers-stale: periods-overrun factor
+    pub alert_timers_stale: Option<f64>,
     /// The slot `event_loop` hands the session's sentinel state back
     /// through (Arc from main; written at exit, read after run returns).
     pub exit_state_slot:
@@ -791,7 +795,6 @@ impl Clone for Seed {
             alert_deleted_gb: self.alert_deleted_gb,
             alert_exe_changed: self.alert_exe_changed,
             alert_new_remote: self.alert_new_remote,
-            state_file: self.state_file.clone(),
             exit_state_slot: self.exit_state_slot.clone(),
             alert_leak: self.alert_leak,
             alert_fd_leak: self.alert_fd_leak,
@@ -814,6 +817,8 @@ impl Clone for Seed {
             alert_webhook: self.alert_webhook.clone(),
             alert_silence: self.alert_silence.clone(),
             alert_new_proc: self.alert_new_proc.clone(),
+            state_file: self.state_file.clone(),
+            alert_timers_stale: self.alert_timers_stale,
             notes: self.notes.clone(),
             reseed: None,
         }
@@ -897,6 +902,7 @@ impl Seed {
         self.alert_inodes = cli.alert_inodes;
         self.alert_gpu_mem_pct = cli.alert_gpu_mem_pct;
         self.alert_deleted_gb = cli.alert_deleted_gb;
+        self.alert_timers_stale = cli.alert_timers_stale;
         self.alert_exe_changed = cli.alert_exe_changed;
         self.alert_new_remote = cli.alert_new_remote;
         self.alert_leak = cli.alert_leak;
@@ -1075,6 +1081,7 @@ impl TuiApp {
             alert_nic_drop: seed.alert_nic_drop,
             alert_oom: seed.alert_oom,
             sys_alert: crate::history::SysAlertState::default(),
+            alert_timers_stale: seed.alert_timers_stale,
             container_edges: crate::history::ContainerEdges::default(),
             container_thresholds: crate::history::ContainerThresholds::default(),
             alert_container_cpu: seed.alert_container_cpu,
@@ -1363,6 +1370,7 @@ impl TuiApp {
         self.alert_inodes = seed.alert_inodes;
         self.alert_gpu_mem_pct = seed.alert_gpu_mem_pct;
         self.alert_deleted_gb = seed.alert_deleted_gb;
+        self.alert_timers_stale = seed.alert_timers_stale;
         self.alert_exe_changed = seed.alert_exe_changed;
         self.alert_new_remote = seed.alert_new_remote;
         self.alert_leak = seed.alert_leak;
@@ -1557,6 +1565,7 @@ impl TuiApp {
                     || self.alert_leak.is_some()
                     || self.alert_exe_changed
                     || self.alert_new_remote
+                    || self.alert_timers_stale.is_some()
                     || self.alert_fd_leak.is_some()
                     || self.alert_thr_leak.is_some()
                     || self.alert_disk_busy.is_some()
@@ -1742,6 +1751,22 @@ impl TuiApp {
                         &self.procs,
                         &mut self.sys_alert,
                     ));
+                }
+
+                // the timers-staleness sentinel: OnUnitActiveSec timers
+                // whose last run outran FACTOR periods
+                if let Some(factor) = self.alert_timers_stale {
+                    if let Some(timers) = self.platform.list_timers() {
+                        picks.extend(
+                            crate::history::timers_stale_picks(
+                                &timers,
+                                factor,
+                                &mut self.sys_alert,
+                            )
+                            .into_iter()
+                            .map(|(name, d, rec)| (0, name, d, rec)),
+                        );
+                    }
                 }
             }
             for (pid, name, detail, recovery) in picks.into_iter().chain(self.pending_alerts.drain(..)) {
@@ -11070,6 +11095,7 @@ mod tests {
                 alert_inodes: None,
                 alert_gpu_mem_pct: None,
                 alert_deleted_gb: None,
+                alert_timers_stale: None,
                 alert_exe_changed: false,
                 alert_new_remote: false,
                 state_file: None,

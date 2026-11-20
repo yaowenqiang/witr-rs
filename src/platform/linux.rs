@@ -1566,7 +1566,49 @@ impl Platform for Linux {
             &["list-timers", "--no-pager", "--all"],
             std::time::Duration::from_secs(8),
         )?;
-        Some(super::parse_timers(&text))
+        let mut rows = super::parse_timers(&text);
+        // one batched `show` fills in the OnUnitActiveSec periods (the
+        // monotonic-type timers the staleness sentinel judges); blocks are
+        // blank-line separated, each carrying Id= and the properties
+        let units: Vec<&str> = rows.iter().map(|r| r.unit.as_str()).collect();
+        let show = crate::util::run_ok(
+            "systemctl",
+            &[
+                "show",
+                "load",
+                &units.join(" "),
+                "--no-pager",
+                "-p",
+                "Id",
+                "-p",
+                "OnUnitActiveUSec",
+            ],
+            std::time::Duration::from_secs(8),
+        );
+        if let Some(show) = show {
+            let mut periods: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            let mut current = String::new();
+            for line in show.lines() {
+                if line.is_empty() {
+                    current.clear();
+                    continue;
+                }
+                if let Some(id) = line.strip_prefix("Id=") {
+                    current = id.to_string();
+                } else if let Some(us) = line.strip_prefix("OnUnitActiveUSec=") {
+                    if let Ok(us) = us.trim().parse::<u64>() {
+                        if us > 0 {
+                            periods.insert(current.clone(), us / 1_000_000);
+                        }
+                    }
+                }
+            }
+            for r in rows.iter_mut() {
+                r.period_secs = periods.get(&r.unit).copied();
+            }
+        }
+        Some(rows)
     }
 
     /// The systemd failed-unit list — the super helper asks

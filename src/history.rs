@@ -549,6 +549,10 @@ pub struct SysAlertState {
     /// The new-remote sentinel's first sweep builds the baseline silently;
     /// only arrivals after it fire.
     pub remote_armed: bool,
+    /// The timers-staleness sentinel's streak/latch.
+    pub timers_streak: u32,
+    pub timers_firing: bool,
+    pub timers_fired_secs: u32,
     pub disk_busy_streak: u32,
     pub disk_busy_firing: bool,
     pub disk_busy_fired_secs: u32,
@@ -1201,6 +1205,108 @@ impl SysAlertState {
                 .insert(path.clone(), (*mtime, hash.clone()));
         }
         self.oom_prev = p.oom_prev;
+    }
+}
+
+/// systemd's humanized durations ("1min 12s", "16h", "4 days",
+/// "3h 48min") → seconds. Tokens are number+unit ("16h") or bare numbers
+/// followed by a unit token ("2 days"); the units systemd uses for these
+/// columns are s/min/h/d/week/month/year with plural forms.
+fn parse_systemd_duration_secs(text: &str) -> u64 {
+    let mut secs = 0u64;
+    let mut pending: Option<f64> = None;
+    for tok in text.split_whitespace() {
+        let lower = tok.to_lowercase();
+        // pure number: remember as the multiplier for the NEXT unit token
+        if let Ok(n) = lower.parse::<f64>() {
+            pending = Some(n);
+            continue;
+        }
+        // number glued to a unit ("12s", "48min")
+        let (num_str, unit) = {
+            let idx = lower.find(|c: char| !c.is_ascii_digit() && c != '.');
+            match idx {
+                Some(i) => (&lower[..i], &lower[i..]),
+                None => (lower.as_str(), ""),
+            }
+        };
+        let n = num_str.parse::<f64>().ok().or(pending);
+        let mult = match unit.trim_end_matches('s') {
+            "sec" | "" => 1.0,
+            "min" | "m" => 60.0,
+            "h" | "hour" => 3600.0,
+            "d" | "day" => 86400.0,
+            "w" | "week" => 604_800.0,
+            "month" => 2_629_800.0,
+            "y" | "year" => 31_557_600.0,
+            _ => 0.0,
+        };
+        if let Some(n) = n {
+            secs += (n * mult) as u64;
+        }
+        pending = None;
+    }
+    secs
+}
+
+/// The --alert-timers-stale sentinel's tick: any timer with a known
+/// monotonic period whose last trigger is older than
+/// `factor`×period — "the timer missed its beat". OnCalendar-type
+/// timers (no period) and never-fired timers (no weekday anchor) sit
+/// out; the misses are named worst-overdue first.
+pub fn timers_stale_picks(
+    timers: &[crate::platform::TimerRow],
+    factor: f64,
+    state: &mut SysAlertState,
+) -> Vec<(String, String, bool)> {
+    let mut worst: Option<(f64, &crate::platform::TimerRow)> = None;
+    let mut count = 0usize;
+    for t in timers {
+        let (Some(passed_words), Some(period)) = (&t.last.as_ref().map(|_| ()), t.period_secs)
+        else {
+            continue;
+        };
+        let _ = passed_words;
+        // the elapsed time: systemd's PASSED column is words; re-read from
+        // the row's last-trigger phrase
+        let Some(passed) = Some(parse_systemd_duration_secs(&t.passed)) else {
+            continue;
+        };
+        if period == 0 || (passed as f64) < period as f64 * factor {
+            continue;
+        }
+        count += 1;
+        let overdue = passed as f64 / period as f64;
+        if worst.is_none_or(|(w, _)| overdue > w) {
+            worst = Some((overdue, t));
+        }
+    }
+    let over = count > 0;
+    let edge = alert_cycle_repeat(
+        &mut state.timers_streak,
+        &mut state.timers_firing,
+        over,
+        &mut state.timers_fired_secs,
+        None,
+        3,
+    );
+    if edge == AlertEdge::Fire {
+        let mut out_detail = format!(
+            "{count} timer(s) missed their beat (last run over {factor:.1}× period)"
+        );
+        if let Some((times, t)) = worst {
+            out_detail.push_str(&format!(
+                " — worst: {} last ran {} ago ({:.1}× period)",
+                t.unit, t.passed, times
+            ));
+        }
+        vec![(
+            "system".to_string(),
+            out_detail,
+            false,
+        )]
+    } else {
+        Vec::new()
     }
 }
 

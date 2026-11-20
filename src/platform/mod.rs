@@ -460,6 +460,11 @@ pub struct TimerRow {
     pub last: Option<String>,
     pub passed: String,
     pub activates: String,
+    /// The OnUnitActiveSec period in seconds — None for OnCalendar-type
+    /// timers (calendar schedules aren't parsed) or when systemd doesn't
+    /// report one. The --alert-timers-stale sentinel judges only timers
+    /// with a known period.
+    pub period_secs: Option<u64>,
 }
 
 /// Parse `systemctl list-timers --no-pager --all`. The data rows can't be
@@ -499,6 +504,7 @@ pub fn parse_timers(text: &str) -> Vec<TimerRow> {
                 last: None,
                 passed: String::new(),
                 activates,
+                period_secs: None,
             });
             continue;
         };
@@ -515,6 +521,7 @@ pub fn parse_timers(text: &str) -> Vec<TimerRow> {
             last,
             passed,
             activates,
+            period_secs: None,
         });
     }
     out
