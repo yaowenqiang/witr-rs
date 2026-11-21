@@ -22,6 +22,7 @@ use ratatui::{
 };
 
 use crate::model::{Container, LockEntry, Pid, Process, Socket, TargetSpec};
+use crate::snapshot;
 use crate::pipeline;
 use crate::platform::Platform;
 
@@ -459,6 +460,9 @@ struct TuiApp {
     alert_oom: Option<u64>,
     /// streak/firing state for the machine-wide alerts
     sys_alert: crate::history::SysAlertState,
+    /// --alert-baseline: the loaded norm + the already-reported lines
+    baseline: Option<(Vec<Process>, Vec<snapshot::Listener>, Vec<String>)>,
+    baseline_reported: std::collections::HashSet<String>,
     /// --alert-timers-stale: periods-overrun factor
     alert_timers_stale: Option<f64>,
     /// shared container/pod edge detector memory (first sighting arms, no
@@ -693,6 +697,9 @@ pub struct Seed {
     /// on start and written on exit (interactive sessions benefit from
     /// the same continuity the watchdog gets)
     pub state_file: Option<String>,
+    /// --alert-baseline FILE: the security norm judged every tick (the
+    /// same file --baseline-save writes)
+    pub alert_baseline: Option<String>,
     /// --alert-timers-stale: periods-overrun factor
     pub alert_timers_stale: Option<f64>,
     /// The slot `event_loop` hands the session's sentinel state back
@@ -757,6 +764,7 @@ impl Clone for Seed {
     /// pre-apply snapshot anyway; the slot overrides it there.
     fn clone(&self) -> Self {
         Seed {
+            alert_baseline: self.alert_baseline.clone(),
             name: self.name.clone(),
             pid: self.pid,
             port: self.port,
@@ -1081,7 +1089,12 @@ impl TuiApp {
             alert_nic_drop: seed.alert_nic_drop,
             alert_oom: seed.alert_oom,
             sys_alert: crate::history::SysAlertState::default(),
-            alert_timers_stale: seed.alert_timers_stale,
+            baseline: seed.alert_baseline.as_ref().and_then(|path| {
+                snapshot::load_baseline(path)
+                    .map_err(|e| eprintln!("--alert-baseline {path}: {e}"))
+                    .ok()
+            }),
+            baseline_reported: std::collections::HashSet::new(),            alert_timers_stale: seed.alert_timers_stale,
             container_edges: crate::history::ContainerEdges::default(),
             container_thresholds: crate::history::ContainerThresholds::default(),
             alert_container_cpu: seed.alert_container_cpu,
@@ -1766,6 +1779,34 @@ impl TuiApp {
                             .into_iter()
                             .map(|(name, d, rec)| (0, name, d, rec)),
                         );
+                    }
+                }
+
+                // the baseline-drift sentinel: the loaded norm judged per
+                // tick — new identities fire once each
+                if let Some((base_procs, _, _)) = &self.baseline {
+                    let now_ids = snapshot::identity_set(&self.procs);
+                    let base_ids = snapshot::identity_set(base_procs);
+                    let mut new_ids: Vec<&String> = now_ids.difference(&base_ids).collect();
+                    new_ids.sort();
+                    for id in new_ids {
+                        if !self.baseline_reported.insert(id.clone()) {
+                            continue;
+                        }
+                        let who = self
+                            .procs
+                            .iter()
+                            .find(|p| crate::util::identity_key(p) == **id)
+                            .map(|p| {
+                                format!(
+                                    "{} (pid {}, user {})",
+                                    p.name,
+                                    p.pid,
+                                    p.user.as_deref().unwrap_or("-")
+                                )
+                            })
+                            .unwrap_or_default();
+                        picks.push((0, "baseline".into(), format!("new process identity: {who} [{id}]"), false));
                     }
                 }
             }
@@ -9652,6 +9693,83 @@ mod tests {
     }
 
     #[test]
+    fn tui_baseline_sentinel_names_new_identities_once() {
+        struct NormPlatform;
+        impl crate::platform::Platform for NormPlatform {
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            fn capabilities(&self) -> crate::platform::Capabilities {
+                crate::platform::Capabilities { file_lookup: false, env: false }
+            }
+            fn list_processes(&self) -> crate::platform::PlatResult<Vec<crate::model::Process>> {
+                let p = |pid: i32, name: &str| crate::model::Process {
+                    pid,
+                    name: name.into(),
+                    ..Default::default()
+                };
+                Ok(vec![p(1, "systemd"), p(42, "nginx"), p(99, "xmrig")])
+            }
+            fn detail(&self, brief: &crate::model::Process, _want_env: bool) -> crate::model::Process {
+                brief.clone()
+            }
+            fn port_to_sockets(&self, _port: u16) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn list_sockets(&self) -> crate::platform::PlatResult<Vec<crate::model::Socket>> {
+                Ok(Vec::new())
+            }
+            fn file_to_pids(&self, _path: &str) -> crate::platform::PlatResult<Vec<i32>> {
+                Ok(Vec::new())
+            }
+            fn container_of(&self, _pid: i32) -> Option<crate::model::Source> {
+                None
+            }
+            fn service_source(&self, _procs: &[crate::model::Process]) -> Option<crate::model::Source> {
+                None
+            }
+        }
+        // the norm file: systemd + nginx only (as an ordinary snapshot —
+        // the v1/v2 shapes read as baselines with an empty service set)
+        let dir = std::env::temp_dir().join(format!("witr-tui-base-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("base.json");
+        let norm = vec![
+            crate::model::Process { pid: 1, name: "systemd".into(), ..Default::default() },
+            crate::model::Process { pid: 42, name: "nginx".into(), ..Default::default() },
+        ];
+        crate::snapshot::save(path.to_str().unwrap(), &norm, &[]).unwrap();
+
+        let seed = Seed {
+            alert_baseline: Some(path.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let mut app = TuiApp::new(Box::new(NormPlatform), seed);
+        // baseline loaded at construction
+        assert!(app.baseline.is_some(), "norm loaded");
+        app.procs = app.platform.list_processes().unwrap_or_default();
+
+        // the refresh's baseline judge: xmrig is outside the norm → one
+        // pick naming pid and identity; a repeat pass dedups
+        let mut picks = Vec::new();
+        for _ in 0..2 {
+            let now_ids = snapshot::identity_set(&app.procs);
+            let base_ids = snapshot::identity_set(app.baseline.as_ref().unwrap().0.as_slice());
+            let mut new_ids: Vec<&String> = now_ids.difference(&base_ids).collect();
+            new_ids.sort();
+            for id in new_ids {
+                if !app.baseline_reported.insert(id.clone()) {
+                    continue;
+                }
+                picks.push(id.clone());
+            }
+        }
+        assert_eq!(picks.len(), 1, "{picks:?}");
+        assert!(picks[0].contains("xmrig"), "{picks:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn services_enter_on_a_failed_unit_opens_the_unit_report() {
         // a mock whose systemd reports lightdm failed: Enter on it opens
         // the Logs page with the -u report block riding on top — the
@@ -11061,6 +11179,7 @@ mod tests {
         let app = TuiApp::new(
             crate::platform::get(),
             Seed {
+                alert_baseline: None,
                 name: Some("definitely-not-a-process-name-zz".into()),
                 pid: None,
                 port: Some(8080),
