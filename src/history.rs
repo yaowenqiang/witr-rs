@@ -1249,11 +1249,19 @@ fn parse_systemd_duration_secs(text: &str) -> u64 {
     secs
 }
 
-/// The --alert-timers-stale sentinel's tick: any timer with a known
-/// monotonic period whose last trigger is older than
-/// `factor`×period — "the timer missed its beat". OnCalendar-type
-/// timers (no period) and never-fired timers (no weekday anchor) sit
-/// out; the misses are named worst-overdue first.
+/// The --alert-timers-stale sentinel's tick, two halves:
+///
+/// - OnUnitActiveSec-type timers (period known): last trigger older than
+///   `factor`×period — the monotonic beat was missed.
+/// - never-fired timers (LAST = n/a, no weekday anchor): infinitely
+///   stale by definition — an OnCalendar timer that never ran missed its
+///   beat as surely as a monotonic one that overshot, without parsing
+///   any calendar expression.
+///
+/// The worst offender (highest overrun, never-fired counting as
+/// infinite) is named in the detail. OnCalendar timers that HAVE fired
+/// sit out — their schedule isn't readable and guessing one would
+/// invent misses.
 pub fn timers_stale_picks(
     timers: &[crate::platform::TimerRow],
     factor: f64,
@@ -1262,23 +1270,27 @@ pub fn timers_stale_picks(
     let mut worst: Option<(f64, &crate::platform::TimerRow)> = None;
     let mut count = 0usize;
     for t in timers {
-        let (Some(passed_words), Some(period)) = (&t.last.as_ref().map(|_| ()), t.period_secs)
-        else {
-            continue;
-        };
-        let _ = passed_words;
-        // the elapsed time: systemd's PASSED column is words; re-read from
-        // the row's last-trigger phrase
-        let Some(passed) = Some(parse_systemd_duration_secs(&t.passed)) else {
-            continue;
-        };
-        if period == 0 || (passed as f64) < period as f64 * factor {
+        // monotonic type: period known → compare elapsed vs factor×period
+        if let Some(period) = t.period_secs {
+            if period == 0 {
+                continue;
+            }
+            let passed = parse_systemd_duration_secs(&t.passed);
+            if (passed as f64) < period as f64 * factor {
+                continue;
+            }
+            count += 1;
+            let overdue = passed as f64 / period as f64;
+            if worst.is_none_or(|(w, _)| overdue > w) {
+                worst = Some((overdue, t));
+            }
             continue;
         }
-        count += 1;
-        let overdue = passed as f64 / period as f64;
-        if worst.is_none_or(|(w, _)| overdue > w) {
-            worst = Some((overdue, t));
+        // no period: only the never-fired case is judgeable
+        if t.last.is_none() {
+            count += 1;
+            // never-fired outranks any finite overrun unconditionally
+            worst = Some((f64::INFINITY, t));
         }
     }
     let over = count > 0;
@@ -1291,24 +1303,32 @@ pub fn timers_stale_picks(
         3,
     );
     if edge == AlertEdge::Fire {
-        let mut out_detail = format!(
+        let mut detail = format!(
             "{count} timer(s) missed their beat (last run over {factor:.1}× period)"
         );
-        if let Some((times, t)) = worst {
-            out_detail.push_str(&format!(
-                " — worst: {} last ran {} ago ({:.1}× period)",
-                t.unit, t.passed, times
-            ));
+        match worst {
+            Some((times, t)) if times.is_finite() => {
+                detail.push_str(&format!(
+                    " — worst: {} last ran {} ({:.1}× period)",
+                    t.unit,
+                    t.passed.trim_end_matches(" ago"),
+                    times
+                ));
+            }
+            Some((_, t)) => {
+                detail.push_str(&format!(
+                    " — worst: {} has NEVER fired (unit enabled, no trigger on record)",
+                    t.unit
+                ));
+            }
+            None => {}
         }
-        vec![(
-            "system".to_string(),
-            out_detail,
-            false,
-        )]
+        vec![("system".to_string(), detail, false)]
     } else {
         Vec::new()
     }
 }
+
 
 /// One machine-wide alert edge: `(name, detail, is_recovery)` — name is
 /// always `"system"` (the machine has no pid); recoveries read
@@ -4744,6 +4764,63 @@ mod tests {
         );
         assert_eq!(rec.len(), 1, "{rec:?}");
         assert!(rec[0].2, "{rec:?}");
+    }
+
+    #[test]
+    fn timers_stale_covers_period_and_never_fired_halves() {
+        let timer = |unit: &str, passed: &str, period: Option<u64>| crate::platform::TimerRow {
+            unit: unit.to_string(),
+            next: String::new(),
+            left: String::new(),
+            last: Some("Thu 2026-11-19 00:00:01 CST".into()),
+            passed: passed.to_string(),
+            activates: unit.to_string(),
+            period_secs: period,
+        };
+        let never = crate::platform::TimerRow {
+            unit: "broken.timer".into(),
+            next: String::new(),
+            left: String::new(),
+            last: None,
+            passed: String::new(),
+            activates: "broken.service".into(),
+            period_secs: None,
+        };
+        let timers = vec![
+            timer("logrotate.timer", "16h ago", Some(3600)), // 16× its 1h period
+            timer("ok.timer", "1min ago", Some(3600)),       // under the line
+            never,                                           // never fired: infinitely stale
+        ];
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES - 1 {
+            assert!(
+                timers_stale_picks(&timers, 2.0, &mut state).is_empty(),
+                "no fire before the window completes"
+            );
+        }
+        let picks = timers_stale_picks(&timers, 2.0, &mut state);
+        assert_eq!(picks.len(), 1, "{picks:?}");
+        let detail = &picks[0].1;
+        assert!(detail.contains("2 timer(s) missed their beat"), "{}", detail);
+        assert!(
+            detail.contains("worst: broken.timer has NEVER fired"),
+            "the never-fired timer is the worst (infinite overrun): {}",
+            detail
+        );
+        // the OnCalendar timer that HAS fired sits out (its schedule isn't
+        // readable — guessing a miss would invent one)
+        // (implied by the count: ok.timer has a period and is under the line)
+
+        // an OnCalendar-type timer that HAS fired (no period) sits out —
+        // its schedule isn't readable and guessing a miss would invent one
+        let fired_once = timer("cal.timer", "16h ago", None);
+        let mut state = SysAlertState::default();
+        for _ in 0..ALERT_CYCLES + 2 {
+            assert!(
+                timers_stale_picks(std::slice::from_ref(&fired_once), 2.0, &mut state).is_empty(),
+                "fired OnCalendar timer without period stays silent"
+            );
+        }
     }
 
     #[test]
