@@ -794,6 +794,12 @@ fn fleet_machine_armed(cli: &cli::Cli) -> bool {
 }
 
 fn reject_fleet_per_process_alerts(cli: &cli::Cli) {
+    if cli.alert_timers_stale.is_some() {
+        eprintln!(
+            "--alert-timers-stale judges timers via the local systemd; the fleet snapshot doesn't carry timer data — run it per host"
+        );
+        std::process::exit(4);
+    }
     let per_process = cli.alert_cpu.is_some()
         || cli.alert_mem.is_some()
         || cli.alert_fd.is_some()
@@ -4652,6 +4658,7 @@ fn main() {
         eprintln!("--record records the whole process table under --watch; drop the targets (filter later, e.g. with --recent or in the CSV itself)");
         std::process::exit(4);
     }
+
     // --top pairs with the machine-readable formats (the ranked rows are
     // the same shape as the full table's); --csv/--markdown/--report-html
     // remain mutually exclusive among themselves
@@ -4674,6 +4681,12 @@ fn main() {
     }
     if cli.count.is_some() && cli.top.is_none() {
         eprintln!("--count sizes the --top listing; add --top METRIC");
+        std::process::exit(4);
+    }
+    if let Some(name) = one_shot_listing_name(&cli).filter(|_| cli.watch.is_some()) {
+        eprintln!(
+            "{name} is a one-shot listing — --watch would be silently ignored; drop --watch"
+        );
         std::process::exit(4);
     }
     if cli.watch.is_some() && cli.csv
@@ -7363,6 +7376,26 @@ fn main() {
     std::process::exit(overall_exit(&reports, platform.name()));
 }
 
+fn one_shot_listing_name(cli: &cli::Cli) -> Option<&'static str> {
+    [
+        (cli.zombies, "--zombies"),
+        (cli.deleted, "--deleted"),
+        (cli.dstate, "--dstate"),
+        (cli.locks, "--locks"),
+        (cli.doctor, "--doctor"),
+        (cli.timers, "--timers"),
+        (cli.services, "--services"),
+        (cli.failed, "--services --failed"),
+        (cli.unit.is_some(), "-u UNIT"),
+        (cli.baseline.is_some(), "--baseline FILE"),
+        (cli.baseline_save.is_some(), "--baseline-save FILE"),
+    ]
+    .into_iter()
+    .find(|(armed, _)| *armed)
+    .map(|(_, name)| name)
+}
+
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -8753,6 +8786,25 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             ("b".to_string(), Ok((Vec::new(), Some(sample(50.0))))),
         ];
         assert!(fleet_outliers(&results, 1.0).is_empty());
+    }
+
+    #[test]
+    fn one_shot_listings_reject_watch_by_name() {
+        let named = |args: &[&str]| {
+            let cli = cli::Cli::parse_from(
+                std::iter::once("witr").chain(args.iter().copied()).collect::<Vec<_>>(),
+            );
+            one_shot_listing_name(&cli)
+        };
+        assert_eq!(named(&["--zombies"]), Some("--zombies"));
+        assert_eq!(named(&["--timers"]), Some("--timers"));
+        assert_eq!(named(&["-u", "nginx.service"]), Some("-u UNIT"));
+        assert_eq!(named(&["--baseline", "b.json"]), Some("--baseline FILE"));
+        // a plain run (or a watch run of plain listing) names nothing
+        assert_eq!(named(&[]), None);
+        assert_eq!(named(&["--watch", "5"]), None);
+        // the machine sentinels are not listings
+        assert_eq!(named(&["--alert-load", "4"]), None);
     }
 
     #[test]
