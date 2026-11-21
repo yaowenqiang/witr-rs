@@ -5775,65 +5775,124 @@ fn main() {
     // --timers: the systemd timers patrol list — next/last elapse per
     // timer, the "该跑没跑" visibility (a timer that never fired shows
     // last = n/a).
+    // --timers: the systemd timers patrol list. One-shot by default;
+    // --watch refreshes the TEXT view in place (machine-readable formats
+    // stay one-shot, their consumers own their cadence — the --sys rule).
     if cli.timers {
-        let Some(rows) = platform::get().list_timers() else {
-            eprintln!("--timers: no systemd to ask");
+        let machine_readable = cli.json || cli.csv || cli.markdown;
+        if cli.watch.is_some() && machine_readable {
+            eprintln!("machine-readable --timers is one-shot; drop --watch or the format flag");
             std::process::exit(4);
-        };
-        if cli.json {
-            let doc = serde_json::json!({
-                "schema_version": SCHEMA_VERSION,
-                "generated_at": util::now_unix(),
-                "timer_count": rows.len(),
-                "timers": rows,
-            });
-            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
-        } else if cli.csv {
-            write_out("unit,next,left,last,passed,activates\n");
-            for r in &rows {
-                write_out(&format!(
-                    "{},{},{},{},{},{}\n",
-                    render::csv_field(&r.unit),
-                    render::csv_field(&r.next),
-                    render::csv_field(&r.left),
-                    render::csv_field(r.last.as_deref().unwrap_or("")),
-                    render::csv_field(&r.passed),
-                    render::csv_field(&r.activates),
-                ));
+        }
+        let render_rows = |rows: &[crate::platform::TimerRow],
+                           painter: &render::Painter|
+         -> String {
+            if cli.json {
+                let doc = serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "generated_at": util::now_unix(),
+                    "timer_count": rows.len(),
+                    "timers": rows,
+                });
+                return serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
             }
-        } else if cli.markdown {
-            write_out("| UNIT | NEXT | LEFT | LAST | PASSED | ACTIVATES |\n|---|---|---|---|---|---|\n");
-            for r in &rows {
-                write_out(&format!(
-                    "| {} | {} | {} | {} | {} | {} |\n",
-                    r.unit,
-                    r.next,
-                    r.left,
-                    r.last.as_deref().unwrap_or("n/a"),
-                    r.passed,
-                    r.activates
-                ));
+            if cli.csv {
+                let mut out = String::from("unit,next,left,last,passed,activates\n");
+                for r in rows {
+                    out.push_str(&format!(
+                        "{},{},{},{},{},{}\n",
+                        render::csv_field(&r.unit),
+                        render::csv_field(&r.next),
+                        render::csv_field(&r.left),
+                        render::csv_field(r.last.as_deref().unwrap_or("")),
+                        render::csv_field(&r.passed),
+                        render::csv_field(&r.activates),
+                    ));
+                }
+                return out;
             }
-        } else {
-            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
-            let painter = &painter;
-            write_out(&format!(
-                "{:<24}  {:<26}  {:>8}  {:<26}  {:>10}  {}",
-                "UNIT", "NEXT", "LEFT", "LAST", "PASSED", "ACTIVATES"
+            if cli.markdown {
+                let mut out = String::from(
+                    "| UNIT | NEXT | LEFT | LAST | PASSED | ACTIVATES |\n|---|---|---|---|---|---|\n",
+                );
+                for r in rows {
+                    out.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} |\n",
+                        r.unit,
+                        r.next,
+                        r.left,
+                        r.last.as_deref().unwrap_or("n/a"),
+                        r.passed,
+                        r.activates
+                    ));
+                }
+                return out;
+            }
+            let mut out = String::new();
+            out.push_str(&format!(
+                "{:<24}  {:<26}  {:>8}  {:<26}  {:>10}  {}\n",
+                painter.bold("UNIT"),
+                painter.bold("NEXT"),
+                painter.bold("LEFT"),
+                painter.bold("LAST"),
+                painter.bold("PASSED"),
+                painter.bold("ACTIVATES")
             ));
-            write_out("");
-            for r in &rows {
+            for r in rows {
                 let last = match &r.last {
                     Some(l) => l.clone(),
                     None => painter.yellow("never fired"),
                 };
-                write_out(&format!(
-                    "{:<24}  {:<26}  {:>8}  {:<26}  {:>10}  {}",
-                    r.unit, r.next, r.left, last, r.passed, r.activates
+                out.push_str(&format!(
+                    "{:<24}  {:<26}  {:<26}  {:>8}  {:>10}  {}\n",
+                    r.unit,
+                    r.next,
+                    r.left,
+                    last,
+                    r.passed,
+                    r.activates
                 ));
             }
+            out
+        };
+        match cli.watch {
+            Some(secs) => {
+                let interval = secs.max(1);
+                install_sigint_flag();
+                let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+                let mut ticks = 0u64;
+                loop {
+                    let Some(rows) = platform::get().list_timers() else {
+                        eprintln!("--timers: no systemd to ask");
+                        std::process::exit(4);
+                    };
+                    if !cli.quiet {
+                        write_out("\x1b[2J\x1b[1;1H");
+                        let now = util::fmt_time(util::now_unix());
+                        write_out(&format!(
+                            "witr-rs timers · every {interval}s · {now} · Ctrl-C to stop"
+                        ));
+                    }
+                    write_out(&render_rows(&rows, &painter));
+                    ticks += 1;
+                    if cli.times.is_some_and(|n| ticks >= n.max(1)) {
+                        std::process::exit(0);
+                    }
+                    if !sleep_interruptible(interval) {
+                        std::process::exit(130);
+                    }
+                }
+            }
+            None => {
+                let Some(rows) = platform::get().list_timers() else {
+                    eprintln!("--timers: no systemd to ask");
+                    std::process::exit(4);
+                };
+                let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+                write_out(&render_rows(&rows, &painter));
+                std::process::exit(0);
+            }
         }
-        std::process::exit(0);
     }
 
     // -u UNIT: a systemd unit's report — status line, main pid, restart
@@ -7377,13 +7436,16 @@ fn main() {
 }
 
 fn one_shot_listing_name(cli: &cli::Cli) -> Option<&'static str> {
+    // --timers is exempt when watching: its text view supports --watch
+    // refresh; the machine-readable forms stay one-shot
+    let timers_text_refresh = cli.timers && cli.watch.is_some();
     [
         (cli.zombies, "--zombies"),
         (cli.deleted, "--deleted"),
         (cli.dstate, "--dstate"),
         (cli.locks, "--locks"),
         (cli.doctor, "--doctor"),
-        (cli.timers, "--timers"),
+        (cli.timers && !timers_text_refresh, "--timers"),
         (cli.services, "--services"),
         (cli.failed, "--services --failed"),
         (cli.unit.is_some(), "-u UNIT"),
