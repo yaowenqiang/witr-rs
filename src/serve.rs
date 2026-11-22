@@ -2069,21 +2069,22 @@ mod tests {
         let platform = crate::platform::get();
         let out = scrape(platform.as_ref(), None, &mut crate::history::SysAlertState::default());
         assert!(out.contains("witr_process_count "));
-        // the zombie waterline rides the process table every platform
-        // lists, so it emits unconditionally — armed sentinel or not
-        assert!(
-            out.contains("witr_machine_zombie_count 0\n") || out.contains("witr_machine_zombie_count 1\n")
-                || out.contains("witr_machine_zombie_count 2\n"),
-            "zombie gauge always emits: {out}"
-        );
+        // the waterlines ride the process table every platform lists, so
+        // they emit unconditionally — armed sentinel or not. The counts
+        // parse as non-negative integers but aren't bounded: a loaded CI
+        // runner carries transient zombies from its own processes, and
+        // this test used to race exactly that window.
+        let gauge = |name: &str| {
+            out.lines()
+                .find_map(|l| {
+                    l.strip_prefix(name)
+                        .map(|v| v.trim().parse::<u64>().ok())
+                })
+                .flatten()
+        };
+        assert!(gauge("witr_machine_zombie_count ").is_some(), "{out}");
         // the D-state waterline likewise (D on Linux, U on macOS)
-        assert!(
-            out.contains("witr_machine_dstate_count 0\n")
-                || out.contains("witr_machine_dstate_count 1\n")
-                || out.contains("witr_machine_dstate_count 2\n")
-                || out.contains("witr_machine_dstate_count 3\n"),
-            "dstate gauge always emits: {out}"
-        );
+        assert!(gauge("witr_machine_dstate_count ").is_some(), "{out}");
         // net counters ship as a matched rx/tx pair, labeled per interface
         let has_rx = out.contains("witr_machine_net_rx_bytes_total ");
         let has_tx = out.contains("witr_machine_net_tx_bytes_total ");
