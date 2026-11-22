@@ -408,6 +408,7 @@ fn export_set(procs: &[Process], n: usize) -> Vec<&Process> {
 /// sampled fresh with the table. Cumulative NIC counters (not rates —
 /// the watcher diffs them across ticks) and the mount sweep ride along
 /// so net/drop/disk/disk-eta work remotely too.
+#[allow(clippy::too_many_arguments)] // one field per snapshot key
 pub(crate) fn system_snapshot(
     stats: &crate::platform::SystemStats,
     nics: &[crate::platform::NicCounters],
@@ -415,6 +416,10 @@ pub(crate) fn system_snapshot(
     proc_count: usize,
     zombie_count: usize,
     failed_units: &[String],
+    // (unit, cgroup bytes), biggest first — the far host's own service
+    // sweep; the fleet --alert-service-mem sentinel and the cockpit's
+    // services line read it here
+    service_mems: &[(String, u64)],
     deleted_files: &[crate::platform::DeletedFile],
 ) -> serde_json::Value {
     let pct = |u: Option<u64>, t: Option<u64>| match (u, t) {
@@ -463,6 +468,14 @@ pub(crate) fn system_snapshot(
         // sentinel and fleet --sys read it here instead of assuming blindness;
         // servers predating the field leave it empty (an honest "nothing seen")
         "failed_units": failed_units,
+        // the far host's own service cgroup memory, biggest first — the
+        // fleet --alert-service-mem sentinel's input and the --sys
+        // services line's raw list (servers predating the field parse to
+        // an empty list — an honest "nothing seen")
+        "service_mems": service_mems
+            .iter()
+            .map(|(unit, mem)| serde_json::json!({"unit": unit, "mem_bytes": mem}))
+            .collect::<Vec<_>>(),
         // whole-GPU readings ride inside stats — the fleet --alert-gpu-
         // mem-pct sentinel and the cockpit's gpu row read them here
         "gpus": stats
@@ -1457,6 +1470,15 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                     // failed-units sentinel reads the far host's own list
                     // (the same sweep the /metrics gauge pays per scrape)
                     let failed = platform.failed_units().unwrap_or_default();
+                    // one service sweep per refresh — the fleet service-
+                    // memory sentinel reads the far host's own cgroup
+                    // counters (the same sweep /metrics pays per scrape)
+                    let mut service_mems: Vec<(String, u64)> =
+                        crate::platform::enumerate_services()
+                            .iter()
+                            .filter_map(|s| s.mem_current.map(|m| (s.name.clone(), m)))
+                            .collect();
+                    service_mems.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
                     let deleted = platform.deleted_files();
                     let system = stats.map(|s| {
                         system_snapshot(
@@ -1466,6 +1488,7 @@ pub fn run(addr: &str, fds_enabled: bool, token: Option<&str>) -> std::io::Resul
                             procs.len(),
                             zombies,
                             &failed,
+                            &service_mems,
                             &deleted,
                         )
                     });

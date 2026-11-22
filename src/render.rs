@@ -1780,6 +1780,12 @@ pub struct SysFrame {
     pub zombies: usize,
     pub dstates: usize,
     pub failed_units: Vec<String>,
+    /// Top service cgroup memory: (unit, bytes), biggest first — the
+    /// "which unit is eating the box" line, shown only when nonempty
+    /// (zero dead width). Local frames carry the live sweep; fleet frames
+    /// carry the snapshot's pairs (servers predating the field stay
+    /// empty, an honest "nothing seen").
+    pub service_mems: Vec<(String, u64)>,
     /// Open-but-deleted files (the df-full-du-disagrees answer) — the
     /// line shows only when the total is nonzero. Fleet frames carry the
     /// snapshot's top holders + total; local frames carry the walk.
@@ -1937,6 +1943,27 @@ pub fn render_sys(frame: &SysFrame, p: &Painter) -> String {
                 "failed {}{}",
                 named.join(", "),
                 if frame.failed_units.len() > named.len() { "…" } else { "" }
+            ))
+        );
+    }
+
+    // service cgroup memory — the "which unit is eating the box" line,
+    // biggest few first; dim because informative, not alarming
+    if !frame.service_mems.is_empty() {
+        let named: Vec<String> = frame
+            .service_mems
+            .iter()
+            .take(3)
+            .map(|(u, b)| format!("{u} {}", crate::util::fmt_bytes(*b)))
+            .collect();
+        let more = frame.service_mems.len() - named.len();
+        let _ = writeln!(
+            out,
+            "{}",
+            p.dim(&format!(
+                "services {}{}",
+                named.join(", "),
+                if more > 0 { format!(" +{more}") } else { String::new() }
             ))
         );
     }
@@ -2210,6 +2237,22 @@ fn sys_flat_cells(frame: &SysFrame) -> Vec<(String, String)> {
         (
             "FAILED_UNITS".into(),
             frame.failed_units.len().to_string(),
+        ),
+        (
+            "SERVICE_TOP_UNIT".into(),
+            frame
+                .service_mems
+                .first()
+                .map(|(u, _)| u.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "SERVICE_TOP_MEM_MB".into(),
+            frame
+                .service_mems
+                .first()
+                .map(|(_, b)| (b / 1024 / 1024).to_string())
+                .unwrap_or_default(),
         ),
         ("NET_RX_MBPS".into(), f(Some(frame.net_rx_total()), 2)),
         ("NET_TX_MBPS".into(), f(Some(frame.net_tx_total()), 2)),
@@ -4299,6 +4342,7 @@ mod tests {
             zombies: 2,
             dstates: 1,
             failed_units: vec!["ipmi.service".into(), "lightdm.service".into(), "plymouth-quit.service".into()],
+            service_mems: vec![("leaky.service".into(), 768 * 1024 * 1024)],
             deleted_files: vec![crate::platform::DeletedFile {
                 pid: 900,
                 name: "rsyslogd".into(),
@@ -4321,6 +4365,10 @@ mod tests {
             text.contains("failed ipmi.service, lightdm.service, plymouth-quit.service"),
             "{text}"
         );
+        // the services line: cgroup memory, biggest few, dim (informative)
+        assert!(text.contains("services leaky.service 768.0M"), "{text}");
+        // the services line: cgroup memory, biggest few, dim (informative)
+        assert!(text.contains("services leaky.service 768.0M"), "{text}");
         assert!(text.contains("disk  /"), "fullest mount first: {text}");
         assert!(text.contains("net   eth0"));
         assert!(text.contains("temp  acpitz 54°C"));
@@ -4358,6 +4406,8 @@ mod tests {
         assert!(row.starts_with("37.2,6000,10000,16000,512,4096,0.42,0.35,0.30,214,"));
         assert!(row.contains("97.7"), "disk used pct: {row}");
         assert!(row.contains("87.4"), "busiest device busy pct: {row}");
+        // the service pairs land in the flat cells: top unit + its MB
+        assert!(row.contains(",leaky.service,768,"), "service cells: {row}");
         assert!(row.ends_with(",54.0,acpitz,12.5"), "temp/psi tail: {row}");
 
         let md = render_sys_markdown(&frame);
@@ -4408,6 +4458,7 @@ mod tests {
             zombies: 0,
             dstates: 0,
             failed_units: Vec::new(),
+            service_mems: Vec::new(),
             deleted_files: Vec::new(),
             deleted_total_mb: 0,
         };

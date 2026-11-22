@@ -596,6 +596,10 @@ struct FleetSample {
     /// local sweep could never see. Empty from servers predating the
     /// field (an honest "nothing seen").
     failed_units: Vec<String>,
+    /// The far host's own service cgroup memory, (unit, bytes) biggest
+    /// first — the fleet --alert-service-mem sentinel's input and the
+    /// fleet --sys services line. Empty from servers predating the field.
+    service_mems: Vec<(String, u64)>,
     /// Held-deleted space total + the biggest holders, per the far host's
     /// own walk — the fleet --alert-deleted-gb sentinel's input.
     deleted_reclaimable_mb: u64,
@@ -648,6 +652,20 @@ fn parse_system_snapshot(doc: &serde_json::Value) -> Option<FleetSample> {
         .map(|arr| {
             arr.iter()
                 .filter_map(|u| u.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let service_mems = s
+        .get("service_mems")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    Some((
+                        m.get("unit")?.as_str()?.to_string(),
+                        m.get("mem_bytes")?.as_u64()?,
+                    ))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -745,6 +763,7 @@ fn parse_system_snapshot(doc: &serde_json::Value) -> Option<FleetSample> {
         net,
         nics,
         failed_units,
+        service_mems,
         deleted_reclaimable_mb,
         deleted_files,
         mounts,
@@ -927,10 +946,10 @@ fn fleet_alert_picks(
         // its own systemctl per refresh) — the sentinel judges it here
         failed_limit: cli.alert_failed_units,
         failed_units: sample.failed_units.clone(),
-        // service cgroups stay on the far host — the snapshot doesn't
-        // carry them (yet), so the sentinel can't judge from here
-        service_mem_limit: None,
-        service_mems: Vec::new(),
+        // the far host's service cgroup memory rides the snapshot (v0.78
+        // peers) — the sentinel judges it here like every machine reading
+        service_mem_limit: cli.alert_service_mem,
+        service_mems: sample.service_mems.clone(),
         repeat: cli.alert_repeat,
     };
     history::system_alert_picks(&sample.stats, st, &limits, interval)
@@ -1573,6 +1592,14 @@ fn sys_frame(
     let zombies = state_count(procs, &["Z"]);
     let dstates = state_count(procs, &["D", "U"]);
     let failed_units = platform.failed_units().unwrap_or_default();
+    // one service sweep per frame — the failed-units sweep already pays
+    // this cost class; biggest few only, the line names three
+    let mut service_mems: Vec<(String, u64)> = crate::platform::enumerate_services()
+        .iter()
+        .filter_map(|s| s.mem_current.map(|m| (s.name.clone(), m)))
+        .collect();
+    service_mems.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+    service_mems.truncate(5);
     let deleted_files = platform.deleted_files();
     let deleted_total_mb = deleted_files.iter().map(|d| d.size_mb).sum();
     let mounts = platform.mount_usage();
@@ -1606,6 +1633,7 @@ fn sys_frame(
         zombies,
         dstates,
         failed_units,
+        service_mems,
         deleted_files,
         deleted_total_mb,
     }
@@ -1656,6 +1684,9 @@ fn fleet_sys_frame(
         // the far host's own failed-unit list rides the snapshot — the
         // red line renders per host like every other reading here
         failed_units: sample.failed_units.clone(),
+        // service cgroups ride the snapshot too (v0.78 peers); older
+        // servers leave it empty — an honest "nothing seen"
+        service_mems: sample.service_mems.clone(),
         deleted_files: sample.deleted_files.clone(),
         deleted_total_mb: sample.deleted_reclaimable_mb,
     }
@@ -1982,8 +2013,13 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
     } else {
         Vec::new()
     };
-    let services = if cli.alert_service_mem.is_some() {
-        crate::platform::enumerate_services()
+    let service_mems = if cli.alert_service_mem.is_some() {
+        let mut pairs: Vec<(String, u64)> = crate::platform::enumerate_services()
+            .iter()
+            .filter_map(|s| s.mem_current.map(|m| (s.name.clone(), m)))
+            .collect();
+        pairs.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+        pairs
     } else {
         Vec::new()
     };
@@ -1996,7 +2032,7 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         zombie_count,
         dstate_count,
         &failed_units,
-        &services,
+        &service_mems,
         net_rate,
         drop_rate,
         retrans_rate,
@@ -2459,9 +2495,10 @@ fn machine_check_lines(
     zombie_count: usize,
     dstate_count: usize,
     failed_units: &[String],
-    // the service sweep, only fetched when `alert_service_mem` is armed —
-    // the service-memory sentinel's input (Linux cgroup bytes per unit)
-    services: &[crate::model::Service],
+    // (unit, cgroup bytes) pairs, only fetched when `alert_service_mem` is
+    // armed — the service-memory sentinel's input; the local --check maps
+    // its live sweep to pairs, the fleet --check reads the snapshot's
+    service_mems: &[(String, u64)],
     net_rate: Option<f64>,
     drop_rate: Option<f64>,
     retrans_rate: Option<f64>,
@@ -2668,10 +2705,10 @@ fn machine_check_lines(
         }
     }
     if let Some(limit) = cli.alert_service_mem {
-        let mut over: Vec<(String, u64)> = services
+        let mut over: Vec<(String, u64)> = service_mems
             .iter()
-            .filter_map(|s| s.mem_current.map(|m| (s.name.clone(), m)))
             .filter(|(_, b)| *b > limit * 1024 * 1024)
+            .cloned()
             .collect();
         over.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
         if !over.is_empty() {
@@ -2740,9 +2777,9 @@ fn run_check_fleet(bases: &[String], cli: &cli::Cli) -> i32 {
                     // the snapshot carries the far host's own failed-unit
                     // list — the check judges it here
                     &sample.failed_units,
-                    // service cgroups stay on the far host; the snapshot
-                    // doesn't carry them, so the sentinel can't judge here
-                    &[],
+                    // the snapshot carries the far host's own service
+                    // cgroup memory — the sentinel judges it here
+                    &sample.service_mems,
                     net_rate,
                     drop_rate,
                     retrans_rate,
@@ -8382,17 +8419,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             4,
             &failed,
             // service-memory sentinel inputs (the sweep when armed)
-            &[
-                crate::model::Service {
-                    manager: "systemd".into(),
-                    mem_current: Some(768 * 1024 * 1024),
-                    cpu_time_us: None,
-                    name: "leaky.service".into(),
-                    state: "active/running".into(),
-                    desc: String::new(),
-                    pid: None,
-                },
-            ],
+            &[("leaky.service".to_string(), 768 * 1024 * 1024)],
             None,
             None,
             None,
@@ -8603,6 +8630,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         };
         let sample = FleetSample {
             failed_units: vec!["ipmi.service".into()],
+            service_mems: vec![("leaky.service".into(), 768 * 1024 * 1024)],
             deleted_reclaimable_mb: 0,
             deleted_files: Vec::new(),
             stats: crate::platform::SystemStats {
@@ -8639,6 +8667,11 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         // the far host's own failed-unit list rides the snapshot — the
         // red line renders per host
         assert_eq!(frame.failed_units, vec!["ipmi.service"]);
+        // service cgroup memory rides too — the cockpit's services line
+        assert_eq!(
+            frame.service_mems,
+            vec![("leaky.service".to_string(), 768 * 1024 * 1024)]
+        );
         // 2 MB arriving on eth0 over ~60 ms → a real rx rate on the next
         // sweep
         std::thread::sleep(std::time::Duration::from_millis(60));
@@ -8655,6 +8688,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                 stats: crate::platform::SystemStats::default(),
                 nics: Vec::new(),
                 failed_units: Vec::new(),
+                service_mems: Vec::new(),
                 deleted_reclaimable_mb: 0,
                 deleted_files: Vec::new(),
                 net: None,
@@ -8830,6 +8864,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         let doc = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "system": crate::serve::system_snapshot(&stats, &nics, &mounts, 42, 3, &["ipmi.service".to_string(), "lightdm.service".to_string()],
+                &[("leaky.service".to_string(), 768 * 1024 * 1024)],
                 &[crate::platform::DeletedFile {
                     pid: 900,
                     name: "rsyslogd".into(),
@@ -8839,6 +8874,11 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             "processes": [],
         });
         let sample = parse_system_snapshot(&doc).expect("the system key parses");
+        // the service sweep round-trips (unit, bytes), sorted server-side
+        assert_eq!(
+            sample.service_mems,
+            vec![("leaky.service".to_string(), 768 * 1024 * 1024)]
+        );
         let s = &sample.stats;
         assert_eq!(s.load1, Some(7.25));
         assert_eq!(s.mem_used_mb, Some(8000));
@@ -8908,6 +8948,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             },
             nics: Vec::new(),
             failed_units: Vec::new(),
+            service_mems: Vec::new(),
             deleted_reclaimable_mb: 0,
             deleted_files: Vec::new(),
             net: None,
@@ -8937,6 +8978,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                         },
                         nics: Vec::new(),
                         failed_units: Vec::new(),
+                        service_mems: Vec::new(),
                         deleted_reclaimable_mb: 0,
                         deleted_files: Vec::new(),
                         net: None,
@@ -8973,6 +9015,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             },
             nics: Vec::new(),
             failed_units: Vec::new(),
+            service_mems: Vec::new(),
             deleted_reclaimable_mb: 0,
             deleted_files: Vec::new(),
             net: None,
@@ -9031,6 +9074,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                         stats: crate::platform::SystemStats::default(),
                         nics: Vec::new(),
                         failed_units: Vec::new(),
+                        service_mems: Vec::new(),
                         deleted_reclaimable_mb: 0,
                         deleted_files: Vec::new(),
                         net: None,
@@ -9099,6 +9143,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             },
             nics: Vec::new(),
             failed_units: Vec::new(),
+            service_mems: Vec::new(),
             deleted_reclaimable_mb: 6 * 1024,
             deleted_files: vec![crate::platform::DeletedFile {
                 pid: 900,
@@ -9148,6 +9193,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             stats: crate::platform::SystemStats::default(),
             nics: Vec::new(),
             failed_units: vec!["ipmi.service".into(), "lightdm.service".into()],
+            service_mems: Vec::new(),
             deleted_reclaimable_mb: 6 * 1024,
             deleted_files: vec![crate::platform::DeletedFile {
                 pid: 900,
@@ -9199,6 +9245,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             },
             nics: Vec::new(),
             failed_units: Vec::new(),
+            service_mems: Vec::new(),
             deleted_reclaimable_mb: 0,
             deleted_files: Vec::new(),
             net: None,
