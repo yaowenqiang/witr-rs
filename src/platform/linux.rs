@@ -330,6 +330,47 @@ fn parse_vmstat_oom(text: &str) -> Option<u64> {
     })
 }
 
+/// Service cgroup resources: walk /sys/fs/cgroup/system.slice/*.service
+/// and read memory.current + cpu.stat's usage_usec per unit — pure file
+/// reads, no systemd CLI (the slice directory name IS the unit name).
+/// Only cgroup v2; empty on v1 or when nothing is populated.
+pub fn service_cgroup_resources() -> std::collections::HashMap<String, (u64, u64)> {
+    let mut out = std::collections::HashMap::new();
+    let root = std::path::Path::new("/sys/fs/cgroup/system.slice");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(unit) = fname.to_str() else {
+            continue;
+        };
+        if !unit.ends_with(".service") {
+            continue;
+        }
+        let mem = std::fs::read_to_string(entry.path().join("memory.current"))
+            .ok()
+            .and_then(|t| t.trim().parse::<u64>().ok());
+        let cpu = std::fs::read_to_string(entry.path().join("cpu.stat"))
+            .ok()
+            .and_then(|t| parse_cgroup_cpu_stat(&t));
+        if let (Some(m), Some(c)) = (mem, cpu) {
+            out.insert(unit.to_string(), (m, c));
+        }
+    }
+    out
+}
+
+/// `cpu.stat`'s cumulative `usage_usec` line — the first line in practice,
+/// matched by key so field reordering can't break it. `None` when the
+/// file has no usable usage_usec.
+fn parse_cgroup_cpu_stat(text: &str) -> Option<u64> {
+    text.lines().find_map(|l| {
+        l.strip_prefix("usage_usec")
+            .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+    })
+}
+
 /// The deleted-but-held walk (Linux): every /proc/<pid>/fd link whose
 /// target ends in " (deleted)" stats through to the inode for a real
 /// size, deduped by (device, inode) — two processes holding the same
@@ -2186,6 +2227,20 @@ fn classify_cgroup(path: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cgroup_cpu_stat_takes_the_usage_line() {
+        let stat = "usage_usec 19476239407\nuser_usec 123\nsystem_usec 456\nnr_periods 7\n";
+        assert_eq!(parse_cgroup_cpu_stat(stat), Some(19_476_239_407));
+        // a reordered file still matches by key
+        let reordered = "nr_periods 9\nnr_bursts 0\nusage_usec 42\n";
+        assert_eq!(parse_cgroup_cpu_stat(reordered), Some(42));
+        assert_eq!(parse_cgroup_cpu_stat("nr_periods 9\n"), None);
+        assert_eq!(parse_cgroup_cpu_stat(""), None);
+        // a usage_usec without a number doesn't shadow a later good line
+        assert_eq!(parse_cgroup_cpu_stat("usage_usec \nusage_usec 5\n"), Some(5));
+    }
+
+
     use super::*;
 
     #[test]

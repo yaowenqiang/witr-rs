@@ -219,6 +219,13 @@ pub struct Service {
     pub desc: String,    // unit description / service display name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<Pid>,
+    /// cgroup memory.current (bytes) — Linux systemd services only; None
+    /// elsewhere or when the slice isn't populated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_current: Option<u64>,
+    /// cgroup cpu.stat usage_usec (cumulative, µs) — same platform scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_time_us: Option<u64>,
 }
 
 impl Container {

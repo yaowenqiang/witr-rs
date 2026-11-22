@@ -6020,8 +6020,11 @@ fn service_state_style(s: &crate::model::Service) -> Style {
     }
 }
 
-/// The Services table: Name | Manager | State | PID | Description, with
-/// the sort key shown in each header (n:Name, m:Manager, s:State, p:PID).
+/// The Services table: Name | Manager | State | PID | Mem | CPU-time |
+/// Description, with the sort key shown in each header (n:Name, m:Manager,
+/// s:State, p:PID). Mem/CPU-time are the unit's cgroup counters (Linux
+/// systemd only — "-" elsewhere), the "which unit is eating the box"
+/// columns the process table gets for free.
 fn services_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<'_>) {
     let cols = [
         ("n", "Name", ServiceSort::Name),
@@ -6052,6 +6055,16 @@ fn services_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<
                 Cell::from(s.manager.clone()),
                 Cell::from(s.state.clone()).style(service_state_style(s)),
                 Cell::from(s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
+                Cell::from(
+                    s.mem_current
+                        .map(crate::util::fmt_bytes)
+                        .unwrap_or_else(|| "-".into()),
+                ),
+                Cell::from(
+                    s.cpu_time_us
+                        .map(|us| crate::util::fmt_age((us / 1_000_000) as i64))
+                        .unwrap_or_else(|| "-".into()),
+                ),
                 Cell::from(s.desc.clone()),
             ])
         })
@@ -6061,6 +6074,8 @@ fn services_table(app: &mut TuiApp, area: ratatui::prelude::Rect, f: &mut Frame<
         Constraint::Length(9),
         Constraint::Length(16),
         Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(10),
         Constraint::Min(24),
     ];
     let table = Table::new(rows, widths)
@@ -9826,6 +9841,8 @@ mod tests {
             state: "failed".into(),
             desc: "Light Display Manager".into(),
             pid: None,
+            mem_current: None,
+            cpu_time_us: None,
         }];
         app.table_state.select(Some(0));
         app.open_service_detail();

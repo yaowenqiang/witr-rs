@@ -132,7 +132,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **D 态速查（`--dstate`）**：`witr-rs --dstate` 列出卡在 uninterruptible wait（Linux state D / macOS state U——同一种等待的两种拼法）的进程——列 PID / USER / NAME / ST / AGE（最老优先）——存储或 NFS 挂起时 CPU 看着空闲、load 却顶天，成排 D 态就是现场；`--alert-dstate` 盯水位，这个列名单。`--json` 出版本化信封（`dstate_count` + `dstates`），`--csv` / `--markdown` 同样支持；**发现即退出码 1**，干净 0——`witr-rs --dstate || alert` 同样是巡检探针。
 
-**服务单元总览（`--services`）**：不进界面，直接列出服务管理器当前的单元——列 MANAGER / NAME / STATE / PID / DESCRIPTION（Linux systemd / macOS launchd / Windows SCM），运行中的（有主 pid）排前面。TUI Services 页（6）的 CLI 孪生：`--json` 出版本化信封（`service_count` + `services`），`--csv` / `--markdown` 同样支持——"这台机器上跑着哪些服务、活没活着"一条命令。
+**服务单元总览（`--services`）**：不进界面，直接列出服务管理器当前的单元——列 MANAGER / NAME / STATE / PID / MEM / CPU-TIME / DESCRIPTION（Linux systemd / macOS launchd / Windows SCM），运行中的（有主 pid）排前面。MEM 与 CPU-TIME 是单元 cgroup 的 `memory.current` 与 `cpu.stat` usage_usec（Linux systemd 独有，其余平台为 "-"）——「哪个单元在吃这台机器」不用翻进程表：`--services --csv | sort -t, -k5 -rn` 直接按内存排。TUI Services 页（6）的 CLI 孪生：`--json` 出版本化信封（`service_count` + `services`），`--csv` / `--markdown` 同样支持——"这台机器上跑着哪些服务、活没活着"一条命令。
 
 **漂移看门狗（`--diff-auto`）**：`witr-rs --watch 30 --diff-auto 30`——常驻观察时每 N 秒在内存里自动拍一帧快照并与上一帧对比，有变化才打印 `== drift · N new / M gone / K restarted / J changed ==` 加着色变化行。`--alert-port` 盯指定端口的边缘，`--diff-auto` 盯全表的漂移——"这半小时机器上多了什么"不用人去跑 `--diff`，watchdog 自己会喊。需要 `--watch`；配 **`--json`** 时每次漂移检查输出一个带版本信封的 drift 帧（`summary: {new, gone, restarted, changed, listen_new, listen_gone, total}` + `entries`，与 `--diff --json` 同构——`| jq '.summary'` 直接盯计数），无变化的检查不产生输出。快照不落盘，纯内存对比，零磁盘写入。
 
@@ -219,7 +219,7 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **Locks 页**：文件锁 + 打开文件视图（Linux 读 `/proc/locks`，macOS 从 `lsof` 提取锁标志并辅以锁文件名启发式）；`a` 在 锁视图 ↔ 全部打开文件 之间切换（打开文件视图空搜索时截断显示前 100 行，搜索即放开），选中行按 `Enter` 直接跳到持锁进程的详情页。
 
-**Services 页（6）**：服务管理器的单元视图（Linux systemd / macOS launchd / Windows SCM）——列 Name / Manager / State / PID / Description，运行中的排前面，`n/m/s/p` 排序，`/` 按 名称/管理器/状态/描述 过滤；按 `Enter` 跳到该单元主进程的详情页（launchd 单元经 plist 探测找回程序身份）。CLI 孪生是 `--services`。
+**Services 页（6）**：服务管理器的单元视图（Linux systemd / macOS launchd / Windows SCM）——列 Name / Manager / State / PID / Mem / CPU-time / Description（Mem 与 CPU-time 为单元 cgroup 计数器，Linux systemd 独有），运行中的排前面，`n/m/s/p` 排序，`/` 按 名称/管理器/状态/描述 过滤；按 `Enter` 跳到该单元主进程的详情页（launchd 单元经 plist 探测找回程序身份）。CLI 孪生是 `--services`。
 
 **CLI 预置进 TUI（`-i`）**：`witr-rs -i --pid 1234` / `witr-rs -i nginx` / `witr-rs -i --port 8080` / `witr-rs -c web -i` / `witr-rs -i --file /var/log/x.log` — 打开 TUI 并直接落到对应标签页与过滤条件上（name 预填搜索词、pid 选中行、port/file/container 跳到对应页并预填过滤器）。每种类型取第一个目标，多余的会在状态栏提示；无终端时退出码 4。
 

@@ -835,7 +835,23 @@ pub fn sort_services(svcs: &mut [crate::model::Service]) {
     });
 }
 
-/// `--services` text table: MANAGER / NAME / STATE / PID / DESCRIPTION.
+/// Service MEM cell: cgroup memory.current ("7.0M") or "-" when the
+/// platform doesn't expose it.
+fn svc_mem(s: &crate::model::Service) -> String {
+    s.mem_current.map(crate::util::fmt_bytes).unwrap_or_else(|| "-".into())
+}
+
+/// Service CPU-TIME cell: cumulative cgroup usage_usec ("5h 24m") or "-".
+fn svc_cpu(s: &crate::model::Service) -> String {
+    s.cpu_time_us
+        .map(|us| crate::util::fmt_age((us / 1_000_000) as i64))
+        .unwrap_or_else(|| "-".into())
+}
+
+/// `--services` text table: MANAGER / NAME / STATE / PID / MEM / CPU-TIME /
+/// DESCRIPTION. MEM and CPU-TIME come from the service's cgroup (Linux
+/// systemd) and stay "-" elsewhere — they're the "which unit is eating the
+/// box" column the process table gets for free.
 pub fn render_services(svcs: &[crate::model::Service], p: &Painter) -> String {
     if svcs.is_empty() {
         return "no services reported (is a service manager running?)\n".to_string();
@@ -854,40 +870,49 @@ pub fn render_services(svcs: &[crate::model::Service], p: &Painter) -> String {
         .max()
         .unwrap_or(3)
         .max(3);
+    let mem_w = svcs.iter().map(|s| svc_mem(s).len()).max().unwrap_or(3).max(3);
+    let cpu_w = svcs.iter().map(|s| svc_cpu(s).len()).max().unwrap_or(8).max(8);
     let mut out = String::new();
     let mgr_h = "MANAGER";
     let name_h = "NAME";
     let state_h = "STATE";
     let pid_h = "PID";
+    let mem_h = "MEM";
+    let cpu_h = "CPU-TIME";
     let desc_h = "DESCRIPTION";
     let _ = writeln!(
         out,
-        "{mgr_h:<mgr_w$}  {name_h:<name_w$}  {state_h:<state_w$}  {pid_h:>pid_w$}  {desc_h}"
+        "{mgr_h:<mgr_w$}  {name_h:<name_w$}  {state_h:<state_w$}  {pid_h:>pid_w$}  {mem_h:>mem_w$}  {cpu_h:>cpu_w$}  {desc_h}"
     );
     for s in svcs {
         let _ = writeln!(
             out,
-            "{:<mgr_w$}  {:<name_w$}  {:<state_w$}  {:>pid_w$}  {}",
+            "{:<mgr_w$}  {:<name_w$}  {:<state_w$}  {:>pid_w$}  {:>mem_w$}  {:>cpu_w$}  {}",
             s.manager,
             s.name,
             p.dim(&s.state),
             s.pid.map(|pid| pid.to_string()).unwrap_or_else(|| "-".into()),
+            svc_mem(s),
+            svc_cpu(s),
             s.desc,
         );
     }
     out
 }
 
-/// `--services --csv`: one row per unit (empty pid = not running).
+/// `--services --csv`: one row per unit (empty pid = not running; empty
+/// mem/cpu = the platform doesn't expose the cgroup counters).
 pub fn render_services_csv(svcs: &[crate::model::Service]) -> String {
-    let mut out = String::from("manager,name,state,pid,desc\n");
+    let mut out = String::from("manager,name,state,pid,mem_bytes,cpu_time_us,desc\n");
     for s in svcs {
         out.push_str(&format!(
-            "{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{}\n",
             csv_field(&s.manager),
             csv_field(&s.name),
             csv_field(&s.state),
             s.pid.map(|p| p.to_string()).unwrap_or_default(),
+            s.mem_current.map(|v| v.to_string()).unwrap_or_default(),
+            s.cpu_time_us.map(|v| v.to_string()).unwrap_or_default(),
             csv_field(&s.desc),
         ));
     }
@@ -897,16 +922,18 @@ pub fn render_services_csv(svcs: &[crate::model::Service]) -> String {
 /// `--services --markdown`: the same rows pasted into docs and issues.
 pub fn render_services_markdown(svcs: &[crate::model::Service]) -> String {
     let mut out = String::from(
-        "| MANAGER | NAME | STATE | PID | DESCRIPTION |\n|---|---|---|---|---|\n",
+        "| MANAGER | NAME | STATE | PID | MEM | CPU-TIME | DESCRIPTION |\n|---|---|---|---|---|---|---|\n",
     );
     for s in svcs {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} |",
             s.manager,
             s.name,
             s.state,
             s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            svc_mem(s),
+            svc_cpu(s),
             s.desc,
         );
     }
@@ -3546,6 +3573,8 @@ mod tests {
                 state: state.into(),
                 desc: desc.into(),
                 pid,
+                mem_current: None,
+                cpu_time_us: None,
             }
         };
         let mut svcs = vec![
@@ -3569,20 +3598,33 @@ mod tests {
         assert!(table.contains("nginx.service"), "{table}");
         assert!(table.lines().nth(1).unwrap().contains("web server"));
 
-        let csv = render_services_csv(&svcs);
+        // resource cells: "-" until the cgroup counters are merged in
+        assert!(table.contains("MEM") && table.contains("CPU-TIME"), "{table}");
+        let cells: Vec<&str> = table.lines().nth(1).unwrap().split_whitespace().collect();
+        assert_eq!(&cells[4..6], &["-", "-"], "{table}");
+        let mut with_res = svcs.clone();
+        with_res[0].mem_current = Some(7 * 1024 * 1024);
+        with_res[0].cpu_time_us = Some(194 * 1_000_000_000_000 / 1_000); // ~19.4G us
+        let res_table = render_services(&with_res, &p);
+        assert!(res_table.contains("7.0M"), "{res_table}");
+        let csv = render_services_csv(&with_res);
         let lines: Vec<&str> = csv.lines().collect();
-        assert_eq!(lines[0], "manager,name,state,pid,desc");
-        assert_eq!(lines[1], "systemd,nginx.service,active/running,7,web server");
-        // not running: empty pid field
+        assert_eq!(lines[0], "manager,name,state,pid,mem_bytes,cpu_time_us,desc");
+        assert_eq!(
+            lines[1],
+            "systemd,nginx.service,active/running,7,7340032,194000000000,web server"
+        );
+        // not running: empty pid and resource fields
         assert!(
             csv.lines()
-                .any(|l| l == "systemd,alpha.service,failed,,broken"),
+                .any(|l| l == "systemd,alpha.service,failed,,,,broken"),
             "{csv}"
         );
 
-        let md = render_services_markdown(&svcs);
-        assert!(md.starts_with("| MANAGER | NAME | STATE | PID | DESCRIPTION |"));
+        let md = render_services_markdown(&with_res);
+        assert!(md.starts_with("| MANAGER | NAME | STATE | PID | MEM | CPU-TIME | DESCRIPTION |"));
         assert!(md.contains("| 7 |"), "{md}");
+        assert!(md.contains("| 7.0M |"), "{md}");
     }
 
     fn sock(

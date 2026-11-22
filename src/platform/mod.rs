@@ -347,14 +347,47 @@ pub struct Capabilities {
 /// missing or failing manager yields an empty list — the tab shows its
 /// "not available" note.
 pub fn enumerate_services() -> Vec<Service> {
+    let mut out = {
+        #[cfg(target_os = "linux")]
+        {
+            systemd_services()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            launchd_services()
+        }
+        #[cfg(windows)]
+        {
+            scm_services()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            Vec::new()
+        }
+    };
+    let resources = service_cgroup_resources();
+    for svc in &mut out {
+        if let Some((mem, cpu)) = resources.get(&svc.name) {
+            svc.mem_current = Some(*mem);
+            svc.cpu_time_us = Some(*cpu);
+        }
+    }
+    out
+}
+
+/// Per-service cgroup resources — (memory.current bytes, cpu usage_usec)
+/// keyed by unit name. The Services page's MEM/CPU-TIME columns and the
+/// --alert-service-mem sentinel's input. Linux cgroup v2 only; empty
+/// elsewhere — the same "nvidia-smi pattern" as container_pressure.
+pub fn service_cgroup_resources() -> std::collections::HashMap<String, (u64, u64)> {
     #[cfg(target_os = "linux")]
-    return systemd_services();
-    #[cfg(target_os = "macos")]
-    return launchd_services();
-    #[cfg(windows)]
-    return scm_services();
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    return Vec::new();
+    {
+        linux::service_cgroup_resources()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::collections::HashMap::new()
+    }
 }
 
 /// Main pid of a service whose listing didn't carry one (systemd resolves
@@ -404,6 +437,8 @@ pub fn parse_systemctl_units(text: &str) -> Vec<Service> {
             let desc = parts.collect::<Vec<_>>().join(" ");
             (unit.ends_with(".service")).then(|| Service {
                 manager: "systemd".into(),
+                mem_current: None,
+                cpu_time_us: None,
                 name: unit,
                 state: if active == "active" {
                     format!("active/{sub}")
@@ -820,6 +855,8 @@ pub fn parse_launchctl_list(text: &str) -> Vec<Service> {
             let label = parts.next()?;
             (!label.is_empty()).then(|| Service {
                 manager: "launchd".into(),
+                mem_current: None,
+                cpu_time_us: None,
                 name: label.to_string(),
                 state: if pid.is_some() {
                     "running".into()
@@ -868,6 +905,8 @@ pub fn parse_scm_services(text: &str) -> Vec<Service> {
             let name = get("Name").to_string();
             (!name.is_empty()).then(|| Service {
                 manager: "scm".into(),
+                mem_current: None,
+                cpu_time_us: None,
                 state: get("State").to_string(),
                 name,
                 desc: get("DisplayName").to_string(),
@@ -1212,6 +1251,7 @@ pub trait Platform {
     fn deleted_files(&self) -> Vec<DeletedFile> {
         Vec::new()
     }
+
 
     /// All sockets whose local port equals `port` (any proto), with owning
     /// pid where resolvable.
