@@ -593,6 +593,34 @@ fn scrape(platform: &dyn Platform, fds: Option<&HashMap<Pid, u64>>, trends: &mut
         out.push_str("# TYPE witr_machine_failed_units gauge\n");
         out.push_str(&format!("witr_machine_failed_units {}\n", units.len()));
     }
+    // the service-memory sentinel's raw input — one service sweep per
+    // scrape (the same cost class as the failed-units sweep). Only units
+    // with readable cgroup counters emit series, so platforms without
+    // systemd cgroups leave both families out entirely.
+    let services = crate::platform::enumerate_services();
+    let svc_mems: Vec<(&str, u64)> = services
+        .iter()
+        .filter_map(|s| s.mem_current.map(|m| (s.name.as_str(), m)))
+        .collect();
+    if !svc_mems.is_empty() {
+        out.push_str("# HELP witr_service_memory_bytes Systemd service cgroup memory (memory.current)\n");
+        out.push_str("# TYPE witr_service_memory_bytes gauge\n");
+        for (unit, mem) in &svc_mems {
+            out.push_str(&format!("witr_service_memory_bytes{{unit=\"{unit}\"}} {mem}\n"));
+        }
+        let svc_cpus: Vec<(&str, u64)> = services
+            .iter()
+            .filter_map(|s| s.cpu_time_us.map(|c| (s.name.as_str(), c)))
+            .collect();
+        out.push_str("# HELP witr_service_cpu_time_seconds_total Systemd service cgroup CPU time (cpu.stat usage_usec)\n");
+        out.push_str("# TYPE witr_service_cpu_time_seconds_total counter\n");
+        for (unit, us) in &svc_cpus {
+            let secs = *us as f64 / 1_000_000.0;
+            out.push_str(&format!(
+                "witr_service_cpu_time_seconds_total{{unit=\"{unit}\"}} {secs}\n"
+            ));
+        }
+    }
     out.push_str("# HELP witr_rss_total_mb Sum of resident memory (MB) across visible processes\n");
     out.push_str("# TYPE witr_rss_total_mb gauge\n");
     out.push_str(&format!("witr_rss_total_mb {rss_total}\n"));
@@ -1991,6 +2019,26 @@ mod tests {
             .unwrap();
         let v: f64 = mem_line.rsplit(' ').next().unwrap().parse().unwrap();
         assert!(v > 0.0 && v < 2.0, "{mem_line}");
+    }
+
+    #[test]
+    fn scrape_exports_service_cgroup_series_when_readable() {
+        let platform = crate::platform::get();
+        let out = scrape(platform.as_ref(), None, &mut crate::history::SysAlertState::default());
+        // the series family appears exactly when the platform can read
+        // service cgroups (Linux systemd) — elsewhere it's absent, not zero
+        let readable = crate::platform::enumerate_services()
+            .iter()
+            .any(|s| s.mem_current.is_some());
+        assert_eq!(out.contains("witr_service_memory_bytes"), readable);
+        assert_eq!(out.contains("witr_service_cpu_time_seconds_total"), readable);
+        if readable {
+            assert!(out.contains("# TYPE witr_service_memory_bytes gauge"), "{out}");
+            assert!(
+                out.contains("# TYPE witr_service_cpu_time_seconds_total counter"),
+                "{out}"
+            );
+        }
     }
 
     #[test]

@@ -927,6 +927,10 @@ fn fleet_alert_picks(
         // its own systemctl per refresh) — the sentinel judges it here
         failed_limit: cli.alert_failed_units,
         failed_units: sample.failed_units.clone(),
+        // service cgroups stay on the far host — the snapshot doesn't
+        // carry them (yet), so the sentinel can't judge from here
+        service_mem_limit: None,
+        service_mems: Vec::new(),
         repeat: cli.alert_repeat,
     };
     history::system_alert_picks(&sample.stats, st, &limits, interval)
@@ -1978,6 +1982,11 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
     } else {
         Vec::new()
     };
+    let services = if cli.alert_service_mem.is_some() {
+        crate::platform::enumerate_services()
+    } else {
+        Vec::new()
+    };
     let mut machine_lines = machine_check_lines(
         cli,
         &stats,
@@ -1987,6 +1996,7 @@ fn run_check_once(platform: &dyn Platform, cli: &cli::Cli) -> i32 {
         zombie_count,
         dstate_count,
         &failed_units,
+        &services,
         net_rate,
         drop_rate,
         retrans_rate,
@@ -2449,6 +2459,9 @@ fn machine_check_lines(
     zombie_count: usize,
     dstate_count: usize,
     failed_units: &[String],
+    // the service sweep, only fetched when `alert_service_mem` is armed —
+    // the service-memory sentinel's input (Linux cgroup bytes per unit)
+    services: &[crate::model::Service],
     net_rate: Option<f64>,
     drop_rate: Option<f64>,
     retrans_rate: Option<f64>,
@@ -2654,6 +2667,27 @@ fn machine_check_lines(
             ));
         }
     }
+    if let Some(limit) = cli.alert_service_mem {
+        let mut over: Vec<(String, u64)> = services
+            .iter()
+            .filter_map(|s| s.mem_current.map(|m| (s.name.clone(), m)))
+            .filter(|(_, b)| *b > limit * 1024 * 1024)
+            .collect();
+        over.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+        if !over.is_empty() {
+            let named: Vec<String> = over
+                .iter()
+                .take(3)
+                .map(|(u, b)| format!("{u} {}", crate::util::fmt_bytes(*b)))
+                .collect();
+            out.push(format!(
+                "{} service(s) above {limit} MB — {}{}",
+                over.len(),
+                named.join(", "),
+                if over.len() > named.len() { "…" } else { "" }
+            ));
+        }
+    }
     out
 }
 
@@ -2706,6 +2740,9 @@ fn run_check_fleet(bases: &[String], cli: &cli::Cli) -> i32 {
                     // the snapshot carries the far host's own failed-unit
                     // list — the check judges it here
                     &sample.failed_units,
+                    // service cgroups stay on the far host; the snapshot
+                    // doesn't carry them, so the sentinel can't judge here
+                    &[],
                     net_rate,
                     drop_rate,
                     retrans_rate,
@@ -6907,6 +6944,14 @@ fn main() {
                             } else {
                                 (Vec::new(), 0)
                             };
+                        let service_mems = if cli.alert_service_mem.is_some() {
+                            crate::platform::enumerate_services()
+                                .iter()
+                                .filter_map(|s| s.mem_current.map(|m| (s.name.clone(), m)))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         let limits = history::SysAlertLimits {
                             load: cli.alert_load,
                             mem_pct: cli.alert_mem_pct,
@@ -6945,6 +6990,8 @@ fn main() {
                             } else {
                                 Vec::new()
                             },
+                            service_mem_limit: cli.alert_service_mem,
+                            service_mems,
                             repeat: cli.alert_repeat,
                         };
                         let mut sys_picks = history::system_alert_picks(
@@ -8279,6 +8326,8 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             "75",
             "--alert-deleted-gb",
             "2",
+            "--alert-service-mem",
+            "512",
         ]);
         let stats = crate::platform::SystemStats {
             temp: Some(("acpitz".into(), 85.0)),
@@ -8332,12 +8381,24 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             7,
             4,
             &failed,
+            // service-memory sentinel inputs (the sweep when armed)
+            &[
+                crate::model::Service {
+                    manager: "systemd".into(),
+                    mem_current: Some(768 * 1024 * 1024),
+                    cpu_time_us: None,
+                    name: "leaky.service".into(),
+                    state: "active/running".into(),
+                    desc: String::new(),
+                    pid: None,
+                },
+            ],
             None,
             None,
             None,
             None,
         );
-        assert_eq!(lines.len(), 8, "{lines:?}");
+        assert_eq!(lines.len(), 9, "{lines:?}");
         assert!(
             lines
                 .iter()
@@ -8384,6 +8445,12 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             }),
             "{lines:?}"
         );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("1 service(s) above 512 MB — leaky.service 768.0M")),
+            "{lines:?}"
+        );
         // under every line → nothing to report
         let quiet = crate::platform::SystemStats::default();
         assert!(
@@ -8395,6 +8462,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                 0,
                 0,
                 0,
+                &[],
                 &[],
                 None,
                 None,

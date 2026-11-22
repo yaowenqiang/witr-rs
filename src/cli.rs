@@ -1110,6 +1110,16 @@ pub struct Cli {
     pub alert_failed_units: Option<u64>,
 
     #[arg(
+        long = "alert-service-mem",
+        value_name = "MB",
+        help = t(
+            "服务内存哨兵：任一 systemd 服务的 cgroup 内存（memory.current）连续 5 次采样超过该 MB 数即触发，详情按占用点名单元——进程阈值（--alert-mem）盯单个进程，服务级把一个单元的全部进程算在一起，内存泄漏的服务在这里现形。Linux systemd 独有（服务 cgroup 不可读的平台不武装）。TUI、--watch 和 --check",
+            "Service-memory sentinel: fire when any systemd service's cgroup memory (memory.current) exceeds this many MB for 5 consecutive samples, the detail naming units by usage — process thresholds (--alert-mem) watch single processes, the service level sums a unit's whole tree, so a leaking service surfaces here. Linux systemd only (platforms that can't read service cgroups leave it disarmed). TUI, --watch and --check"
+        )
+    )]
+    pub alert_service_mem: Option<u64>,
+
+    #[arg(
         long = "alert-net",
         value_name = "MB/S",
         help = t(

@@ -449,6 +449,8 @@ struct TuiApp {
     alert_dstate: Option<u64>,
     /// --alert-failed-units: failed systemd units threshold
     alert_failed_units: Option<u64>,
+    /// --alert-service-mem: service cgroup memory threshold (MB)
+    alert_service_mem: Option<u64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
     alert_net: Option<u64>,
     /// --alert-psi: PSI "full" stall percent threshold (Linux only)
@@ -725,6 +727,8 @@ pub struct Seed {
     pub alert_container_mem_pct: Option<u64>,
     /// --alert-failed-units: failed systemd units threshold
     pub alert_failed_units: Option<u64>,
+    /// --alert-service-mem: service cgroup memory threshold (MB)
+    pub alert_service_mem: Option<u64>,
     /// --alert-net: machine-wide rx+tx throughput threshold (MB/s)
     pub alert_net: Option<u64>,
     /// --alert-psi: PSI "full" stall percent threshold (Linux only)
@@ -814,6 +818,7 @@ impl Clone for Seed {
             alert_container_cpu: self.alert_container_cpu,
             alert_container_mem_pct: self.alert_container_mem_pct,
             alert_failed_units: self.alert_failed_units,
+            alert_service_mem: self.alert_service_mem,
             alert_net: self.alert_net,
             alert_psi: self.alert_psi,
             alert_mem_avail_mb: self.alert_mem_avail_mb,
@@ -921,6 +926,7 @@ impl Seed {
         self.alert_zombies = cli.alert_zombies;
         self.alert_dstate = cli.alert_dstate;
         self.alert_failed_units = cli.alert_failed_units;
+        self.alert_service_mem = cli.alert_service_mem;
         self.alert_container_cpu = cli.alert_container_cpu;
         self.alert_container_mem_pct = cli.alert_container_mem_pct;
         self.alert_net = cli.alert_net;
@@ -1081,6 +1087,7 @@ impl TuiApp {
             alert_zombies: seed.alert_zombies,
             alert_dstate: seed.alert_dstate,
             alert_failed_units: seed.alert_failed_units,
+            alert_service_mem: seed.alert_service_mem,
             alert_net: seed.alert_net,
             alert_psi: seed.alert_psi,
             alert_mem_avail_mb: seed.alert_mem_avail_mb,
@@ -1394,6 +1401,7 @@ impl TuiApp {
         self.alert_zombies = seed.alert_zombies;
         self.alert_dstate = seed.alert_dstate;
         self.alert_failed_units = seed.alert_failed_units;
+        self.alert_service_mem = seed.alert_service_mem;
         self.alert_container_cpu = seed.alert_container_cpu;
         self.alert_container_mem_pct = seed.alert_container_mem_pct;
         self.alert_net = seed.alert_net;
@@ -1586,6 +1594,7 @@ impl TuiApp {
                     || self.alert_zombies.is_some()
                     || self.alert_dstate.is_some()
                     || self.alert_failed_units.is_some()
+                    || self.alert_service_mem.is_some()
                     || self.alert_net.is_some()
                     || self.alert_psi.is_some()
                     || self.alert_mem_avail_mb.is_some()
@@ -1700,6 +1709,15 @@ impl TuiApp {
                         failed_limit: self.alert_failed_units,
                         failed_units: if self.alert_failed_units.is_some() {
                             self.platform.failed_units().unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        },
+                        service_mem_limit: self.alert_service_mem,
+                        service_mems: if self.alert_service_mem.is_some() {
+                            crate::platform::enumerate_services()
+                                .iter()
+                                .filter_map(|s| s.mem_current.map(|m| (s.name.clone(), m)))
+                                .collect()
                         } else {
                             Vec::new()
                         },
@@ -11221,6 +11239,7 @@ mod tests {
                 alert_net_per_proc: None,
                 alert_deviation: None,
                 alert_port: Vec::new(),
+                alert_service_mem: None,
                 alert_repeat: None,
                 alert_load: None,
                 alert_mem_pct: None,

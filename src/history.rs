@@ -568,6 +568,9 @@ pub struct SysAlertState {
     pub failed_streak: u32,
     pub failed_firing: bool,
     pub failed_fired_secs: u32,
+    pub service_mem_streak: u32,
+    pub service_mem_firing: bool,
+    pub service_mem_fired_secs: u32,
 }
 
 /// The armed machine-wide alert thresholds plus the inputs they compare
@@ -685,6 +688,17 @@ pub struct SysAlertLimits {
     pub failed_limit: Option<u64>,
     /// This sample's failed unit names (the detail names the first few).
     pub failed_units: Vec<String>,
+    /// --alert-service-mem: fire when any systemd service's cgroup
+    /// memory exceeds this many MB — the service-level twin of the
+    /// per-process memory threshold: one unit's whole process tree sums
+    /// into one number, so a leaking service surfaces even when no
+    /// single process trips. Disarmed when None; `service_mems` is only
+    /// fetched when armed (one service sweep per tick). Linux systemd
+    /// only — platforms that can't read service cgroups stay disarmed.
+    pub service_mem_limit: Option<u64>,
+    /// This sample's (unit, cgroup bytes) pairs, biggest first is not
+    /// required — the judge sorts.
+    pub service_mems: Vec<(String, u64)>,
     pub repeat: Option<u64>,
 }
 
@@ -1644,6 +1658,8 @@ pub fn system_alert_picks(
         dstate_count,
         failed_limit,
         failed_units,
+        service_mem_limit,
+        service_mems,
         repeat: repeat_secs,
     } = limits;
     let load_limit = *load_limit;
@@ -1676,6 +1692,8 @@ pub fn system_alert_picks(
     let dstate_count = *dstate_count;
     let failed_limit = *failed_limit;
     let failed_units = failed_units.as_slice();
+    let service_mem_limit = *service_mem_limit;
+    let service_mems = service_mems.as_slice();
     let repeat_secs = *repeat_secs;
     let mut out = Vec::new();
     if let Some(limit) = load_limit {
@@ -2380,6 +2398,47 @@ pub fn system_alert_picks(
             out.push((
                 "system".to_string(),
                 format!("failed unit count back under {limit}"),
+                true,
+            ));
+        }
+    }
+    if let Some(limit) = service_mem_limit {
+        // biggest offenders first; the detail names up to three
+        let mut over: Vec<(String, u64)> = service_mems
+            .iter()
+            .filter(|(_, b)| *b > limit * 1024 * 1024)
+            .cloned()
+            .collect();
+        over.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+        let edge = alert_cycle_repeat(
+            &mut state.service_mem_streak,
+            &mut state.service_mem_firing,
+            !over.is_empty(),
+            &mut state.service_mem_fired_secs,
+            repeat_secs,
+            interval_secs,
+        );
+        if edge == AlertEdge::Fire {
+            let named: Vec<String> = over
+                .iter()
+                .take(3)
+                .map(|(u, b)| format!("{u} {}", crate::util::fmt_bytes(*b)))
+                .collect();
+            out.push((
+                "system".to_string(),
+                format!(
+                    "{} service(s) above {limit} MB for {}s — {}{}",
+                    over.len(),
+                    ALERT_CYCLES as u64 * interval_secs.max(1),
+                    named.join(", "),
+                    if over.len() > named.len() { "…" } else { "" }
+                ),
+                false,
+            ));
+        } else if edge == AlertEdge::Recover {
+            out.push((
+                "system".to_string(),
+                format!("service memory back under {limit} MB"),
                 true,
             ));
         }
@@ -3677,6 +3736,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -3756,6 +3817,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -3830,6 +3893,118 @@ mod tests {
     }
 
     #[test]
+    fn system_alert_service_mem_fires_latches_and_recovers() {
+        // one unit over the line, one under — the judge sorts and names
+        let mems = |a: u64, b: u64| {
+            vec![
+                ("leaky.service".to_string(), a),
+                ("quiet.service".to_string(), b),
+            ]
+        };
+        let limits = |mems: Vec<(String, u64)>| SysAlertLimits {
+            load: None,
+            mem_pct: None,
+            count: None,
+            proc_count: 0,
+            mounts: Vec::new(),
+            disk_pct: None,
+            net_limit: None,
+            net_rate: None,
+            psi_limit: None,
+            mem_avail_floor: None,
+            swap_pct_limit: None,
+            retrans_limit: None,
+            retrans_rate: None,
+            drop_limit: None,
+            drop_rate: None,
+            oom_limit: None,
+            oom_kills: None,
+            disk_eta_hours: None,
+            mem_eta_hours: None,
+            inodes_limit: None,
+            gpu_mem_pct_limit: None,
+            gpus: Vec::new(),
+            deleted_gb_limit: None,
+            deleted_files: Vec::new(),
+            deleted_total_mb: 0,
+            disk_busy_limit: None,
+            temp_limit: None,
+            zombie_limit: None,
+            zombie_count: 0,
+            dstate_limit: None,
+            dstate_count: 0,
+            failed_limit: None,
+            failed_units: Vec::new(),
+            service_mem_limit: Some(512),
+            service_mems: mems,
+            repeat: None,
+        };
+        let quiet = crate::platform::SystemStats::default();
+        let mut state = SysAlertState::default();
+        // below the line → silent through the whole streak
+        for _ in 0..ALERT_CYCLES {
+            let picks = system_alert_picks(
+                &quiet,
+                &mut state,
+                &limits(mems(256 * 1024 * 1024, 100 * 1024 * 1024)),
+                3,
+            );
+            assert!(picks.is_empty(), "{picks:?}");
+        }
+        // 5th sample over the line → fire, naming units biggest-first
+        let mut fires = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            fires = system_alert_picks(
+                &quiet,
+                &mut state,
+                &limits(mems(768 * 1024 * 1024, 600 * 1024 * 1024)),
+                3,
+            );
+        }
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert!(fires[0].1.contains("2 service(s) above 512 MB"), "{fires:?}");
+        assert!(
+            fires[0].1.contains("leaky.service 768.0M")
+                && fires[0].1.contains("quiet.service 600.0M")
+                && fires[0].1.find("leaky.service").unwrap()
+                    < fires[0].1.find("quiet.service").unwrap(),
+            "{fires:?}"
+        );
+        // latched: still over → no repeat firing
+        assert!(
+            system_alert_picks(
+                &quiet,
+                &mut state,
+                &limits(mems(800 * 1024 * 1024, 600 * 1024 * 1024)),
+                3,
+            )
+            .is_empty()
+        );
+        // back under → one recovery edge
+        let recovers = system_alert_picks(
+            &quiet,
+            &mut state,
+            &limits(mems(100 * 1024 * 1024, 100 * 1024 * 1024)),
+            3,
+        );
+        assert_eq!(recovers.len(), 1, "{recovers:?}");
+        assert!(recovers[0].2, "recovery rides the recovery flag");
+        assert!(recovers[0].1.contains("back under 512 MB"), "{recovers:?}");
+        // and the cycle can re-arm
+        let mut again = Vec::new();
+        for _ in 0..ALERT_CYCLES {
+            again = system_alert_picks(
+                &quiet,
+                &mut state,
+                &limits(mems(900 * 1024 * 1024, 100 * 1024 * 1024)),
+                3,
+            );
+        }
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert!(again[0].1.contains("1 service(s) above 512 MB"), "{again:?}");
+    }
+
+    #[test]
     fn system_alerts_fire_on_retrans_and_drop_rates() {
         let stats = crate::platform::SystemStats {
             retrans_segs: Some(9999),
@@ -3851,6 +4026,8 @@ mod tests {
             retrans_rate,
             drop_limit: drop.map(|v| v as f64),
             drop_rate,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -4052,6 +4229,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -4118,6 +4297,8 @@ mod tests {
                 retrans_rate: None,
                 drop_limit: None,
                 drop_rate: None,
+                service_mem_limit: None,
+                service_mems: Vec::new(),
                 repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -4195,6 +4376,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -4266,6 +4449,8 @@ mod tests {
             drop_rate: None,
             oom_limit: oom,
             oom_kills: Some(kills),
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -4398,6 +4583,8 @@ mod tests {
                 retrans_rate: None,
                 drop_limit: None,
                 drop_rate: None,
+                service_mem_limit: None,
+                service_mems: Vec::new(),
                 repeat: None,
                 disk_busy_limit: None,
                 temp_limit: None,
@@ -4496,6 +4683,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -4601,6 +4790,8 @@ mod tests {
                 retrans_rate: None,
                 drop_limit: None,
                 drop_rate: None,
+                service_mem_limit: None,
+                service_mems: Vec::new(),
                 repeat: None,
                 disk_busy_limit: None,
                 temp_limit: None,
@@ -4707,6 +4898,8 @@ mod tests {
             deleted_gb_limit: None,
             deleted_files: Vec::new(),
             deleted_total_mb: 0,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -4844,6 +5037,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -4973,6 +5168,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -5056,6 +5253,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: busy_limit,
             temp_limit: None,
@@ -5138,6 +5337,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit,
@@ -5205,6 +5406,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -5279,6 +5482,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -5360,6 +5565,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,
@@ -5567,6 +5774,8 @@ mod tests {
             retrans_rate: None,
             drop_limit: None,
             drop_rate: None,
+            service_mem_limit: None,
+            service_mems: Vec::new(),
             repeat: None,
             disk_busy_limit: None,
             temp_limit: None,

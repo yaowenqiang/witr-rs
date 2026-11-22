@@ -2475,6 +2475,13 @@ pub fn grafana_dashboard() -> serde_json::Value {
             ("MemAvailable", "witr_machine_mem_eta_hours"),
         ],
     );
+    add(
+        "Service memory (top 5 units)",
+        0, 85, 24, 8,
+        "bytes",
+        None,
+        &[("{{unit}}", "topk(5, witr_service_memory_bytes)")],
+    );
 
     serde_json::json!({
         "id": null,
@@ -2661,6 +2668,14 @@ pub fn alert_rules_yaml() -> String {
             "warning",
             "Systemd units failed",
             "{{ $value | humanize }} unit(s) sitting failed for 5m — a failed unit stays failed until someone runs reset-failed; `systemctl --failed` on the host lists them.",
+        ),
+        (
+            "WitrServiceMemHigh",
+            "witr_service_memory_bytes > 536870912",
+            "10m",
+            "warning",
+            "Systemd service above 512 MB",
+            "{{ $labels.unit }} has held {{ $value | humanize }}B of cgroup memory for 10m — the unit's whole process tree summed; a leak here survives per-process thresholds.",
         ),
         (
             "WitrContainerCpuHigh",
@@ -4451,6 +4466,7 @@ mod tests {
             "witr_machine_oom_kills_total",
             "witr_machine_dstate_count",
             "witr_machine_failed_units",
+            "witr_service_memory_bytes",
             "witr_machine_fs_inode_used_percent",
             "witr_machine_gpu_memory_total_bytes",
             "witr_machine_deleted_reclaimable_bytes",
