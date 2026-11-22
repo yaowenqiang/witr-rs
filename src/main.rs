@@ -3674,6 +3674,9 @@ pub(crate) struct ProcSample {
     pub(crate) pid: Pid,
     pub(crate) name: String,
     pub(crate) cpu: Option<f64>,
+    /// Resident memory in MB (the CSV column; the JSONL envelope's
+    /// rss_kb converts) — the --agg board's footprint stats.
+    pub(crate) rss_mb: Option<f64>,
 }
 
 /// The per-process rows of a record file (either format). Empty when the
@@ -3687,7 +3690,7 @@ pub(crate) fn parse_record_processes(text: &str) -> Vec<ProcSample> {
             let header: Vec<&str> = first.split(',').collect();
             let col = |name: &str| header.iter().position(|c| *c == name);
             if let (Some(t), Some(pid)) = (col("timestamp"), col("pid")) {
-                let (name, cpu) = (col("name"), col("cpu_pct"));
+                let (name, cpu, rss) = (col("name"), col("cpu_pct"), col("rss_mb"));
                 for line in lines {
                     let f: Vec<&str> = line.split(',').collect();
                     if f.len() <= t.max(pid) || f[pid] == "_system" {
@@ -3710,6 +3713,9 @@ pub(crate) fn parse_record_processes(text: &str) -> Vec<ProcSample> {
                             .map(|s| s.to_string())
                             .unwrap_or_default(),
                         cpu: cpu
+                            .and_then(|i| f.get(i))
+                            .and_then(|v| v.trim().parse().ok()),
+                        rss_mb: rss
                             .and_then(|i| f.get(i))
                             .and_then(|v| v.trim().parse().ok()),
                     });
@@ -3742,12 +3748,124 @@ pub(crate) fn parse_record_processes(text: &str) -> Vec<ProcSample> {
                         .and_then(|x| x.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    cpu: p.get("cpu_pct").and_then(|x| x.as_f64()),
+                    cpu: p
+                        .get("cpu_pct")
+                        .and_then(|x| x.as_f64())
+                        // the envelope serializes Process, whose field is
+                        // `cpu` — accept both spellings
+                        .or_else(|| p.get("cpu").and_then(|x| x.as_f64())),
+                    // the envelope's rss is in KB, the CSV column in MB
+                    rss_mb: p
+                        .get("mem_kb")
+                        .and_then(|x| x.as_f64())
+                        .map(|kb| kb / 1024.0)
+                        .or_else(|| p.get("rss_mb").and_then(|x| x.as_f64())),
                 });
             }
         }
     }
     out
+}
+
+/// One `--agg` row: a (pid, name) identity's window-wide stats. The
+/// identity — not the pid alone — is the key: the same pid number serving
+/// a different program mid-recording is a different row, and a program
+/// that exited partway still gets its fair share of the integral.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct RecordAgg {
+    pub(crate) name: String,
+    pub(crate) pid: Pid,
+    /// How many recorded ticks carried this identity — a process that
+    /// lived 2 minutes inside a 1-hour recording shows 120, not 0.
+    pub(crate) samples: usize,
+    /// Mean CPU% over the samples that carried a reading.
+    pub(crate) cpu_avg: Option<f64>,
+    /// Peak CPU% — the burst the average hides.
+    pub(crate) cpu_peak: Option<f64>,
+    /// CPU-seconds: cpu_pct integrated over the window by the recording's
+    /// median sample spacing (100% for one interval = one core-second).
+    /// The honest "who ate the most CPU" rank — a process that hogged
+    /// 90% for 5 minutes outranks one idling at 3% for an hour.
+    pub(crate) cpu_seconds: Option<f64>,
+    /// Mean resident MB over the samples that carried a reading.
+    pub(crate) rss_avg_mb: Option<f64>,
+    /// Peak resident MB — the footprint the sum can't show.
+    pub(crate) rss_peak_mb: Option<f64>,
+}
+
+/// Fold a recording's per-tick process rows into window aggregates,
+/// ranked best-first by `metric` (cpu by integrated CPU-time, mem by
+/// peak RSS) and truncated to `count`.
+pub(crate) fn aggregate_record(
+    samples: &[ProcSample],
+    metric: crate::cli::TopMetric,
+    count: usize,
+) -> Vec<RecordAgg> {
+    #[derive(Default)]
+    struct Acc {
+        cpu_seen: Vec<f64>,
+        rss_seen: Vec<f64>,
+    }
+    let mut groups: std::collections::BTreeMap<(Pid, String), Acc> =
+        std::collections::BTreeMap::new();
+    for s in samples {
+        let acc = groups.entry((s.pid, s.name.clone())).or_default();
+        if let Some(c) = s.cpu {
+            acc.cpu_seen.push(c);
+        }
+        if let Some(r) = s.rss_mb {
+            acc.rss_seen.push(r);
+        }
+    }
+    // the window's tick spacing: median gap between the recording's
+    // distinct timestamps — one number for every row, robust to a
+    // dropped tick
+    let mut stamps: Vec<i64> = samples.iter().map(|s| s.at).collect();
+    stamps.sort_unstable();
+    stamps.dedup();
+    let mut gaps: Vec<f64> = stamps.windows(2).map(|w| (w[1] - w[0]) as f64).collect();
+    gaps.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let dt = match gaps.len() {
+        0 => 0.0,
+        n => gaps[n / 2],
+    };
+    let cpu_time = |acc: &Acc| {
+        (!acc.cpu_seen.is_empty() && dt > 0.0)
+            .then(|| acc.cpu_seen.iter().sum::<f64>() / 100.0 * dt)
+    };
+    let mut rows: Vec<RecordAgg> = groups
+        .into_iter()
+        .map(|((pid, name), acc)| {
+            let mean = |v: &[f64]| {
+                (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+            };
+            RecordAgg {
+                name,
+                pid,
+                samples: acc.cpu_seen.len().max(acc.rss_seen.len()),
+                cpu_avg: mean(&acc.cpu_seen),
+                cpu_peak: acc.cpu_seen.iter().cloned().reduce(f64::max),
+                cpu_seconds: cpu_time(&acc),
+                rss_avg_mb: mean(&acc.rss_seen),
+                rss_peak_mb: acc.rss_seen.iter().cloned().reduce(f64::max),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        let key = |r: &RecordAgg| match metric {
+            crate::cli::TopMetric::Mem => r.rss_peak_mb.unwrap_or(f64::NEG_INFINITY),
+            // everything else ranks by integrated CPU-time — the window
+            // question is "who spent the core", not "who idled highest"
+            _ => r.cpu_seconds.unwrap_or(f64::NEG_INFINITY),
+        };
+        key(b)
+            .partial_cmp(&key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
+    rows.truncate(count.max(1));
+    rows
 }
 
 /// The cpu% heat color: dark at zero, blue as it wakes up, yellow when
@@ -5177,6 +5295,74 @@ fn main() {
         write_out(&format!(
             "Prometheus alert rules written → {path} ({n} rules — drop it in rule_files and reload Prometheus)"
         ));
+        std::process::exit(0);
+    }
+
+    // --agg FILE: fold a --record sample file into one window board —
+    // "who ate the most CPU over the past hour", answered from data that
+    // already exists. A no-target standalone like --export-grafana.
+    if let Some(path) = &cli.agg {
+        if !specs.is_empty() || cli.interactive {
+            eprintln!("--agg aggregates a record file; drop the targets or -i");
+            std::process::exit(4);
+        }
+        if cli.watch.is_some() {
+            eprintln!("--agg is one-shot; drop --watch");
+            std::process::exit(4);
+        }
+        if !matches!(
+            cli.top.unwrap_or(cli::TopMetric::Cpu),
+            cli::TopMetric::Cpu | cli::TopMetric::Mem
+        ) {
+            eprintln!(
+                "--agg ranks by --top cpu (integrated CPU-time) or --top mem (peak RSS); the recording carries no other metric"
+            );
+            std::process::exit(4);
+        }
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("--agg {path}: {e}");
+                std::process::exit(5);
+            }
+        };
+        let samples = parse_record_processes(&text);
+        if samples.is_empty() {
+            eprintln!(
+                "--agg {path}: no process rows (is this a --record file? .csv or .jsonl)"
+            );
+            std::process::exit(5);
+        }
+        let metric = cli.top.unwrap_or(cli::TopMetric::Cpu);
+        let rows = aggregate_record(
+            &samples,
+            metric,
+            cli.count.unwrap_or(15),
+        );
+        if cli.json {
+            let window = samples.iter().map(|s| s.at).reduce(|a, b| a.max(b));
+            let from = samples.iter().map(|s| s.at).reduce(|a, b| a.min(b));
+            let ticks = samples.iter().map(|s| s.at).collect::<std::collections::BTreeSet<_>>().len();
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "source": path,
+                "window": {"from": from, "to": window, "ticks": ticks},
+                "ranked_by": match metric {
+                    cli::TopMetric::Mem => "rss_peak_mb",
+                    _ => "cpu_seconds",
+                },
+                "rows": rows,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if cli.csv {
+            write_out(&render::render_record_agg_csv(&rows));
+        } else if cli.markdown {
+            write_out(&render::render_record_agg_markdown(&rows));
+        } else {
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            write_out(&render::render_record_agg(&rows, &painter));
+        }
         std::process::exit(0);
     }
 
@@ -7786,12 +7972,113 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
     }
 
     #[test]
+    fn aggregate_record_ranks_by_integrated_cpu_and_peak_rss() {
+        let s = |at: i64, pid: i32, name: &str, cpu: Option<f64>, rss: Option<f64>| ProcSample {
+            at,
+            pid,
+            name: name.into(),
+            cpu,
+            rss_mb: rss,
+        };
+        // ticks 10s apart; hog bursts 90% for three ticks then vanishes;
+        // idler sits at 2% for all four
+        let samples = vec![
+            s(0, 1, "hog", Some(90.0), Some(500.0)),
+            s(10, 1, "hog", Some(90.0), Some(510.0)),
+            s(20, 1, "hog", Some(90.0), Some(520.0)),
+            s(0, 2, "idler", Some(2.0), Some(80.0)),
+            s(10, 2, "idler", Some(2.0), Some(80.0)),
+            s(20, 2, "idler", Some(2.0), Some(80.0)),
+            s(30, 2, "idler", Some(2.0), Some(80.0)),
+            // the same pid serving another program mid-recording: its own
+            // row, not a corruption of hog's numbers
+            s(30, 1, "next-tenant", Some(50.0), Some(30.0)),
+            // a reading-less row still counts the identity
+            s(30, 3, "quiet", None, Some(64.0)),
+        ];
+        let rows = aggregate_record(&samples, crate::cli::TopMetric::Cpu, 10);
+        assert_eq!(rows.len(), 4);
+        // hog: 3×90% over 10s gaps = 27 CPU-seconds — beats idler's 8
+        assert_eq!(rows[0].name, "hog");
+        assert_eq!(rows[0].samples, 3);
+        assert_eq!(rows[0].cpu_avg, Some(90.0));
+        assert_eq!(rows[0].cpu_peak, Some(90.0));
+        assert!((rows[0].cpu_seconds.unwrap() - 27.0).abs() < 1e-9, "{rows:?}");
+        assert_eq!((rows[0].rss_peak_mb.unwrap() * 10.0).round(), 5200.0);
+        // idler sat at 2% for four ticks: (2×4)/100 × 10s = 0.8 CPU-seconds
+        assert_eq!(rows[1].name, "next-tenant");
+        assert!((rows[1].cpu_seconds.unwrap() - 5.0).abs() < 1e-9, "{rows:?}");
+        assert_eq!(rows[2].name, "idler");
+        assert!((rows[2].cpu_seconds.unwrap() - 0.8).abs() < 1e-9, "{rows:?}");
+        assert_eq!(rows[3].name, "quiet");
+        assert_eq!(rows[3].cpu_seconds, None);
+        assert_eq!(rows[3].rss_peak_mb, Some(64.0));
+
+        // mem ranking goes by peak RSS, not CPU
+        let rows = aggregate_record(&samples, crate::cli::TopMetric::Mem, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "hog");
+        assert_eq!(rows[1].name, "idler");
+
+        // --count truncates after ranking
+        let rows = aggregate_record(&samples, crate::cli::TopMetric::Cpu, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "hog");
+
+        // the board renders and the machine formats carry raw numbers
+        let rows = aggregate_record(&samples, crate::cli::TopMetric::Cpu, 10);
+        let p = render::Painter::new(false);
+        let text = render::render_record_agg(&rows, &p);
+        assert!(text.contains("SAMPLES") && text.contains("CPU-TIME"), "{text}");
+        assert!(text.contains("hog") && text.contains("27s"), "{text}");
+        let csv = render::render_record_agg_csv(&rows);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "name,pid,samples,cpu_avg_pct,cpu_peak_pct,cpu_seconds,rss_avg_mb,rss_peak_mb"
+        );
+        assert!(lines[1].starts_with("hog,1,3,90.00,90.00,27.00,510.00,520.00"), "{csv}");
+        let md = render::render_record_agg_markdown(&rows);
+        assert!(md.starts_with("| NAME | PID | SAMPLES |"), "{md}");
+        // empty recording → the note, not a panic
+        assert!(render::render_record_agg(&[], &p).contains("no process rows"));
+    }
+
+    #[test]
+    fn record_process_parser_carries_rss_in_both_formats() {
+        // CSV: the rss_mb column rides along (older files with the same
+        // header parse identically — the column is order-tolerant)
+        let csv = "timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_pct,sys_procs,sys_net_bps
+1700000000,3,root,worker,42.5,100.5,,,,0.5,10,2,0.0
+1700000000,_system,,,.0,.0,,,,0.5,10,2,0.0
+1700000005,3,worker,,46.0,101.0,,,,0.5,10,2,0.0
+";
+        let s = parse_record_processes(csv);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].rss_mb, Some(100.5));
+        assert_eq!(s[1].rss_mb, Some(101.0));
+
+        // JSONL: the envelope's rss is KB in, MB out; `cpu` (the Process
+        // field) and `cpu_pct` (the CSV twin) both parse
+        let jsonl = "{\"schema_version\":1,\"generated_at\":1700000000,\"processes\":[{\"pid\":9,\"name\":\"beacon\",\"cpu\":12.5,\"mem_kb\":20480}]}
+{\"schema_version\":1,\"generated_at\":1700000005,\"processes\":[{\"pid\":9,\"name\":\"beacon\",\"cpu_pct\":13.0,\"mem_kb\":21504}]}
+";
+        let s = parse_record_processes(jsonl);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].cpu, Some(12.5));
+        assert_eq!(s[0].rss_mb, Some(20.0));
+        assert_eq!(s[1].cpu, Some(13.0));
+        assert_eq!(s[1].rss_mb, Some(21.0));
+    }
+
+    #[test]
     fn proc_heatmap_names_the_burst_process() {
         let sample = |at: i64, pid: i32, name: &str, cpu: f64| ProcSample {
             at,
             pid,
             name: name.into(),
             cpu: Some(cpu),
+            rss_mb: None,
         };
         let samples = vec![
             sample(100, 1, "idle", 1.0),

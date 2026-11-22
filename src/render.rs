@@ -1009,6 +1009,130 @@ pub fn render_top_by_user(
     out
 }
 
+/// The `--agg` board: one row per (pid, identity) across a recording's
+/// window — samples seen, CPU mean/peak/integral, RSS mean/peak. The
+/// integral is the honest rank: a process that hogged 90% for five
+/// minutes outranks one idling at 3% for an hour.
+pub fn render_record_agg(
+    rows: &[crate::RecordAgg],
+    p: &Painter,
+) -> String {
+    if rows.is_empty() {
+        return "no process rows in this recording\n".to_string();
+    }
+    let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).clamp(4, 40);
+    let pid_w = rows.iter().map(|r| r.pid.to_string().len()).max().unwrap_or(3).max(3);
+    let samp_w = rows.iter().map(|r| r.samples.to_string().len()).max().unwrap_or(7).max(7);
+    let cpu_w = rows
+        .iter()
+        .map(|r| agg_cell_cpu(r).len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let time_w = rows
+        .iter()
+        .map(|r| agg_cell_time(r).len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let rss_w = rows
+        .iter()
+        .map(|r| agg_cell_rss(r).len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<name_w$}  {:>pid_w$}  {:>samp_w$}  {:>cpu_w$}  {:>time_w$}  {:>rss_w$}",
+        "NAME", "PID", "SAMPLES", "CPU% AVG/PEAK", "CPU-TIME", "RSS AVG/PEAK",
+    );
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "{:<name_w$}  {:>pid_w$}  {:>samp_w$}  {:>cpu_w$}  {:>time_w$}  {:>rss_w$}",
+            p.bold(&r.name),
+            r.pid,
+            r.samples,
+            agg_cell_cpu(r),
+            agg_cell_time(r),
+            agg_cell_rss(r),
+        );
+    }
+    out
+}
+
+/// "12.4 / 45.0" — the mean and the burst side by side; "-" when the
+/// recording never carried a reading.
+fn agg_cell_cpu(r: &crate::RecordAgg) -> String {
+    match (r.cpu_avg, r.cpu_peak) {
+        (Some(a), Some(pk)) => format!("{a:.1} / {pk:.1}"),
+        (a, pk) => format!(
+            "{} / {}",
+            a.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
+            pk.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into())
+        ),
+    }
+}
+
+/// Integrated CPU-seconds, human-scaled ("42s", "5.2m", "1.3h").
+fn agg_cell_time(r: &crate::RecordAgg) -> String {
+    match r.cpu_seconds {
+        None => "-".into(),
+        Some(s) if s < 60.0 => format!("{s:.0}s"),
+        Some(s) if s < 3600.0 => format!("{:.1}m", s / 60.0),
+        Some(s) => format!("{:.1}h", s / 3600.0),
+    }
+}
+
+/// "12.3M / 45.6M" — the footprint's average and peak.
+fn agg_cell_rss(r: &crate::RecordAgg) -> String {
+    match (r.rss_avg_mb, r.rss_peak_mb) {
+        (Some(a), Some(pk)) => format!("{a:.1} / {pk:.1}M"),
+        _ => "-".into(),
+    }
+}
+
+/// `--agg --csv`: raw numbers, machine consumers sort their own way.
+pub fn render_record_agg_csv(rows: &[crate::RecordAgg]) -> String {
+    let mut out = String::from("name,pid,samples,cpu_avg_pct,cpu_peak_pct,cpu_seconds,rss_avg_mb,rss_peak_mb\n");
+    for r in rows {
+        let f = |v: Option<f64>| v.map(|x| format!("{x:.2}")).unwrap_or_default();
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            csv_field(&r.name),
+            r.pid,
+            r.samples,
+            f(r.cpu_avg),
+            f(r.cpu_peak),
+            f(r.cpu_seconds),
+            f(r.rss_avg_mb),
+            f(r.rss_peak_mb),
+        ));
+    }
+    out
+}
+
+/// `--agg --markdown`: the same rows pasted into docs and issues.
+pub fn render_record_agg_markdown(rows: &[crate::RecordAgg]) -> String {
+    let mut out = String::from(
+        "| NAME | PID | SAMPLES | CPU% AVG/PEAK | CPU-TIME | RSS AVG/PEAK |\n|---|---|---|---|---|---|\n",
+    );
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} |",
+            r.name.replace('|', "\\|"),
+            r.pid,
+            r.samples,
+            agg_cell_cpu(r),
+            agg_cell_time(r),
+            agg_cell_rss(r),
+        );
+    }
+    out
+}
+
 /// `--top --by-user --csv`: raw values, machine consumers sort their own way.
 pub fn render_top_by_user_csv(rows: &[UserBoardRow]) -> String {
     let mut out = String::from("host,user,value,procs,top_command\n");

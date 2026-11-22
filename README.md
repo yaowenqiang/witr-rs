@@ -20,6 +20,8 @@ Rust 实现的 [pranshuparmar/witr](https://github.com/pranshuparmar/witr)（Go�
 
 **FD 趋势 + 泄漏嫌疑（详情页）**：同款逻辑盯文件描述符——打开详情页期间每次刷新采样一次 fd 数（Linux 读 `/proc/<pid>/fd`，macOS 走 libproc `proc_pidinfo` 原生查询——微秒级系统调用，无子进程，Windows 退化为全表句柄扫描——同样只在详情页打开时付出），显示 `Open fds (N)` 历史图；窗口内增长 ≥64 个且 ≥70% 单调上升时标黄色"疑似 fd 泄漏"——socket-per-request 却不关闭的服务一眼现形。
 
+**录制聚合榜（`--agg FILE`）**：`--record` 采下的样本文件（.csv 或 .jsonl）聚合成一张窗口榜——每 (pid, 程序身份) 一行，列 SAMPLES（窗口内携带该身份的采样拍数）/ CPU% AVG/PEAK / CPU-TIME（按录制的中位采样间隔把 cpu% 积分成 CPU 秒——中途退出的进程不吃亏，"用 90% 跑了 5 分钟"的进程稳赢"闲置 3% 跑了一小时"的）/ RSS AVG/PEAK——"过去一小时谁吃了最多的 CPU"这种回看问题一条命令答完。`--top cpu|mem` 选排名指标（cpu 按累计 CPU 时间、mem 按 RSS 峰值），`--count` 截行数，`--csv`（原始数值）/ `--markdown` / `--json`（带窗口起止与拍数）同样支持。无目标独立操作；与目标 / `-i` / `--watch` 组合按名拒绝
+
 **线程趋势 + 泄漏嫌疑（详情页）**：fd 历史图的同款孪生盯内核线程数。线程数随整表采样（Linux `/proc/<pid>/stat` 的 nlwp、Windows ToolHelp 线程快照、macOS 一条 `ps -axo pid=,nlwp=` 扫描——三平台齐备），详情页显示 `Threads (N)` 历史图；窗口内增长 ≥16 个且 ≥70% 采样段单调上升时标黄色"疑似线程泄漏"——每次请求 spawn 线程却不回收的服务在这里现形。配套 **`--top threads`** 榜与 **`--alert-threads N`** 阈值告警、`thr>N` 数值过滤。
 
 **详情页磁盘 I/O 历史图**：读/写速率两条块字符图（各标注窗口峰值速率），来自与 IO 列同一套跨平台累计字节差值（Linux `/proc/<pid>/io`、macOS `proc_pid_rusage`、Windows PowerShell `IO_COUNTERS`）。
