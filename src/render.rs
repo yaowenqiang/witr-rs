@@ -848,6 +848,212 @@ fn svc_cpu(s: &crate::model::Service) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
+/// One `--top --by-user` row: the user's summed metric, how many
+/// processes contributed, and the single biggest contributor — the
+/// "which user is eating the box" rollup of the process board.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UserBoardRow {
+    /// Set on a fleet board (--remote): the host this (host, user) pair
+    /// belongs to. The same user on two machines is two rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// The owner, or "-" when the listing couldn't attribute one.
+    pub user: String,
+    /// The metric rolled up: summed over the user's measurable processes,
+    /// except `age` (non-additive) which takes the oldest process.
+    pub value: f64,
+    /// How many processes carried a measurable value into the rollup.
+    pub procs: usize,
+    /// Command line of the biggest single contributor — the face of the
+    /// sum ("root: 12G total, and it's the pg_basebackup").
+    pub top_command: String,
+}
+
+/// Roll the `--top` board up by owner: every process the metric can
+/// measure sums into its user's row (per host on a fleet), the biggest
+/// single contributor names the row, rank by value desc, keep `count`.
+/// Age is non-additive so it takes the max instead of a meaningless sum.
+pub fn rank_by_user(
+    procs: &[Process],
+    metric: crate::cli::TopMetric,
+    count: usize,
+    fds: Option<&std::collections::HashMap<crate::model::Pid, u64>>,
+    rates: Option<&crate::history::History>,
+    conns: Option<&std::collections::HashMap<crate::model::Pid, u64>>,
+) -> Vec<UserBoardRow> {
+    let now = crate::util::now_unix();
+    #[derive(Default)]
+    struct Acc {
+        value: f64,
+        procs: usize,
+        top_value: f64,
+        top_command: String,
+    }
+    let mut groups: std::collections::BTreeMap<(Option<String>, String), Acc> =
+        std::collections::BTreeMap::new();
+    for pr in procs {
+        let Some(v) = top_value(pr, metric, fds, rates, conns, now) else {
+            continue;
+        };
+        let key = (pr.host.clone(), pr.user.clone().unwrap_or_else(|| "-".into()));
+        let acc = groups.entry(key).or_insert_with(|| Acc {
+            top_command: pr.command_line(),
+            ..Default::default()
+        });
+        acc.procs += 1;
+        match metric {
+            // a lifetime can only max, not sum
+            crate::cli::TopMetric::Age => {
+                if v > acc.value {
+                    acc.value = v;
+                }
+                if v > acc.top_value {
+                    acc.top_value = v;
+                    acc.top_command = pr.command_line();
+                }
+            }
+            _ => {
+                acc.value += v;
+                if v > acc.top_value {
+                    acc.top_value = v;
+                    acc.top_command = pr.command_line();
+                }
+            }
+        }
+    }
+    let mut rows: Vec<UserBoardRow> = groups
+        .into_iter()
+        .map(|((host, user), acc)| UserBoardRow {
+            host,
+            user,
+            value: acc.value,
+            procs: acc.procs,
+            top_command: acc.top_command,
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.value
+            .partial_cmp(&a.value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.user.cmp(&b.user))
+    });
+    rows.truncate(count.max(1));
+    rows
+}
+
+/// The value cell, human-formatted exactly like the process board's.
+fn user_value_cell(metric: crate::cli::TopMetric, v: f64) -> String {
+    match metric {
+        crate::cli::TopMetric::Cpu | crate::cli::TopMetric::Gpu => format!("{v:.1}"),
+        crate::cli::TopMetric::Mem
+        | crate::cli::TopMetric::Io
+        | crate::cli::TopMetric::Swap
+        | crate::cli::TopMetric::GpuMem => crate::util::fmt_bytes(v as u64),
+        crate::cli::TopMetric::IoRate | crate::cli::TopMetric::Net => {
+            format!("{}/s", crate::util::fmt_bytes(v as u64))
+        }
+        crate::cli::TopMetric::Age => fmt_age(v as i64),
+        _ => format!("{}", v as u64),
+    }
+}
+
+/// `--top --by-user` text table: USER / <metric> / PROCS / TOP PROC.
+pub fn render_top_by_user(
+    rows: &[UserBoardRow],
+    metric: crate::cli::TopMetric,
+    p: &Painter,
+) -> String {
+    if rows.is_empty() {
+        return "no measurable processes for this metric\n".to_string();
+    }
+    let fleet = rows.iter().any(|r| r.host.is_some());
+    let user_w = rows.iter().map(|r| r.user.len()).max().unwrap_or(4).max(4);
+    let val_w = rows
+        .iter()
+        .map(|r| user_value_cell(metric, r.value).len())
+        .max()
+        .unwrap_or(metric.header().len())
+        .max(metric.header().len());
+    let procs_w = rows
+        .iter()
+        .map(|r| r.procs.to_string().len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let mut out = String::new();
+    let mut header = String::new();
+    if fleet {
+        header.push_str(&format!("{:<6}  ", "HOST"));
+    }
+    header.push_str(&format!(
+        "{:<user_w$}  {:>val_w$}  {:>procs_w$}  TOP PROC",
+        "USER",
+        metric.header(),
+        "PROCS",
+    ));
+    let _ = writeln!(out, "{header}");
+    for r in rows {
+        let mut line = String::new();
+        if fleet {
+            line.push_str(&format!("{:<6}  ", r.host.clone().unwrap_or_else(|| "-".into())));
+        }
+        line.push_str(&format!(
+            "{:<user_w$}  {:>val_w$}  {:>procs_w$}  {}",
+            p.bold(&r.user),
+            user_value_cell(metric, r.value),
+            r.procs,
+            r.top_command,
+        ));
+        let _ = writeln!(out, "{line}");
+    }
+    out
+}
+
+/// `--top --by-user --csv`: raw values, machine consumers sort their own way.
+pub fn render_top_by_user_csv(rows: &[UserBoardRow]) -> String {
+    let mut out = String::from("host,user,value,procs,top_command\n");
+    for r in rows {
+        out.push_str(&format!(
+            "{},{},{},{},{}\n",
+            csv_field(r.host.as_deref().unwrap_or_default()),
+            csv_field(&r.user),
+            r.value,
+            r.procs,
+            csv_field(&r.top_command),
+        ));
+    }
+    out
+}
+
+/// `--top --by-user --markdown`: the same rows pasted into docs and issues.
+pub fn render_top_by_user_markdown(
+    rows: &[UserBoardRow],
+    metric: crate::cli::TopMetric,
+) -> String {
+    let fleet = rows.iter().any(|r| r.host.is_some());
+    let mut out = String::from(if fleet {
+        "| HOST | USER | VALUE | PROCS | TOP PROC |\n|---|---|---|---|---|\n"
+    } else {
+        "| USER | VALUE | PROCS | TOP PROC |\n|---|---|---|---|\n"
+    });
+    for r in rows {
+        let host_cell = if fleet {
+            format!("{} | ", r.host.clone().unwrap_or_else(|| "-".into()))
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            out,
+            "| {host_cell}{} | {} | {} | {} |",
+            r.user,
+            user_value_cell(metric, r.value),
+            r.procs,
+            r.top_command.replace('|', "\\|"),
+        );
+    }
+    out
+}
+
 /// `--services` text table: MANAGER / NAME / STATE / PID / MEM / CPU-TIME /
 /// DESCRIPTION. MEM and CPU-TIME come from the service's cgroup (Linux
 /// systemd) and stay "-" elsewhere — they're the "which unit is eating the
@@ -1390,6 +1596,45 @@ pub fn render_markdown(procs: &[Process]) -> String {
 /// Processes the metric can't measure (foreign-user fd counts, no io
 /// counters off Linux) drop out rather than rank as zero. `rates` carries
 /// the sampler's per-pid I/O rates (bytes/s) for `--top io-rate`.
+/// The measurable value of one process for one --top metric — the
+/// ranking vocabulary shared by the process board, the --by-user rollup
+/// and the fleet variants. `None` when the metric can't measure the
+/// process (no io counters off Linux, foreign-user fd counts) — it drops
+/// out rather than ranking as zero.
+pub fn top_value(
+    pr: &Process,
+    metric: crate::cli::TopMetric,
+    fds: Option<&std::collections::HashMap<crate::model::Pid, u64>>,
+    rates: Option<&crate::history::History>,
+    conns: Option<&std::collections::HashMap<crate::model::Pid, u64>>,
+    now: i64,
+) -> Option<f64> {
+    match metric {
+        crate::cli::TopMetric::Cpu => pr.cpu,
+        // KB in the table, bytes on the board — the cell renders through
+        // fmt_bytes, so the value arrives pre-scaled (a KB value fed
+        // straight in used to read 1024× small)
+        crate::cli::TopMetric::Mem => pr.mem_kb.map(|kb| kb as f64 * 1024.0),
+        crate::cli::TopMetric::Fd => fds.and_then(|m| m.get(&pr.pid)).map(|&n| n as f64),
+        crate::cli::TopMetric::Io => {
+            let r = pr.io_read_bytes.unwrap_or(0);
+            let w = pr.io_write_bytes.unwrap_or(0);
+            (pr.io_read_bytes.is_some() || pr.io_write_bytes.is_some()).then_some((r + w) as f64)
+        }
+        crate::cli::TopMetric::IoRate => rates
+            .and_then(|h| h.io_rate_of(pr.pid))
+            .map(|(r, w)| r + w),
+        // age in seconds — desc order puts the oldest first
+        crate::cli::TopMetric::Age => pr.started.map(|t| (now.saturating_sub(t)) as f64),
+        crate::cli::TopMetric::Gpu => pr.gpu_sm_pct.map(|v| v as f64),
+        crate::cli::TopMetric::Threads => pr.threads.map(|n| n as f64),
+        crate::cli::TopMetric::Conn => conns.and_then(|m| m.get(&pr.pid)).map(|&n| n as f64),
+        crate::cli::TopMetric::Net => rates.and_then(|h| h.net_rate_of(pr.pid)),
+        crate::cli::TopMetric::GpuMem => pr.gpu_mem_mb.map(|mb| mb as f64),
+        crate::cli::TopMetric::Swap => pr.swap_kb.map(|kb| kb as f64 * 1024.0),
+    }
+}
+
 pub fn render_top(
     procs: &[Process],
     metric: crate::cli::TopMetric,
@@ -1402,31 +1647,7 @@ pub fn render_top(
     let now = crate::util::now_unix();
     let mut ranked: Vec<(f64, &Process)> = procs
         .iter()
-        .filter_map(|pr| {
-            let v = match metric {
-                crate::cli::TopMetric::Cpu => pr.cpu,
-                crate::cli::TopMetric::Mem => pr.mem_kb.map(|kb| kb as f64),
-                crate::cli::TopMetric::Fd => fds.and_then(|m| m.get(&pr.pid)).map(|&n| n as f64),
-                crate::cli::TopMetric::Io => {
-                    let r = pr.io_read_bytes.unwrap_or(0);
-                    let w = pr.io_write_bytes.unwrap_or(0);
-                    (pr.io_read_bytes.is_some() || pr.io_write_bytes.is_some())
-                        .then_some((r + w) as f64)
-                }
-                crate::cli::TopMetric::IoRate => rates
-                    .and_then(|h| h.io_rate_of(pr.pid))
-                    .map(|(r, w)| r + w),
-                // age in seconds — desc order puts the oldest first
-                crate::cli::TopMetric::Age => pr.started.map(|t| (now.saturating_sub(t)) as f64),
-                crate::cli::TopMetric::Gpu => pr.gpu_sm_pct.map(|v| v as f64),
-                crate::cli::TopMetric::Threads => pr.threads.map(|n| n as f64),
-                crate::cli::TopMetric::Conn => conns.and_then(|m| m.get(&pr.pid)).map(|&n| n as f64),
-                crate::cli::TopMetric::Net => rates.and_then(|h| h.net_rate_of(pr.pid)),
-                crate::cli::TopMetric::GpuMem => pr.gpu_mem_mb.map(|mb| mb as f64),
-                crate::cli::TopMetric::Swap => pr.swap_kb.map(|kb| kb as f64),
-            }?;
-            Some((v, pr))
-        })
+        .filter_map(|pr| top_value(pr, metric, fds, rates, conns, now).map(|v| (v, pr)))
         .collect();
     ranked.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
@@ -3827,6 +4048,72 @@ mod tests {
         assert!(html.contains("width:100%"), "max-cpu row gets a full bar");
         assert!(html.contains("Top CPU"));
         assert!(html.contains("1 processes"));
+    }
+
+    #[test]
+    fn top_mem_reads_bytes_and_the_user_board_rolls_up() {
+        // mem_kb is KB in the table; the board renders through fmt_bytes,
+        // so the value arrives pre-scaled (a KB number fed straight in
+        // used to read 1024× small)
+        let mk = |pid: i32, user: Option<&str>, mem_kb: Option<u64>, name: &str| Process {
+            pid,
+            name: name.into(),
+            user: user.map(|u| u.into()),
+            mem_kb,
+            ..Default::default()
+        };
+        let root_big = mk(1, Some("root"), Some(307_200), "pg_basebackup"); // 300M
+        let root_small = mk(2, Some("root"), Some(102_400), "sshd"); // 100M
+        let web = mk(3, Some("web"), Some(51_200), "nginx"); // 50M
+        let p = Painter::new(false);
+        let out = render_top(
+            &[root_big.clone(), root_small.clone(), web.clone()],
+            crate::cli::TopMetric::Mem,
+            10,
+            None,
+            None,
+            None,
+            &p,
+        );
+        assert!(out.contains("300.0M"), "{out}");
+
+        // --by-user: root's two processes sum to 400M and the row names
+        // the biggest single contributor
+        let rows = rank_by_user(
+            &[root_big.clone(), root_small, web],
+            crate::cli::TopMetric::Mem,
+            10,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].user, "root");
+        assert_eq!(rows[0].value, 400.0 * 1024.0 * 1024.0);
+        assert_eq!(rows[0].procs, 2);
+        assert!(rows[0].top_command.contains("pg_basebackup"), "{rows:?}");
+        assert_eq!(rows[1].user, "web");
+        let board = render_top_by_user(&rows, crate::cli::TopMetric::Mem, &p);
+        assert!(board.contains("400.0M") && board.contains("PROCS"), "{board}");
+
+        // --by-user --csv keeps raw bytes and no host column on a local board
+        let csv = render_top_by_user_csv(&rows);
+        assert!(csv.lines().nth(1).unwrap().starts_with(",root,419430400,"), "{csv}");
+
+        // markdown: no HOST column on a local board
+        let md = render_top_by_user_markdown(&rows, crate::cli::TopMetric::Mem);
+        assert!(md.starts_with("| USER | VALUE | PROCS | TOP PROC |"), "{md}");
+
+        // age is non-additive: the row takes the oldest process, not a sum
+        let now = crate::util::now_unix();
+        let mut a = mk(4, Some("root"), None, "young");
+        let mut b = mk(5, Some("root"), None, "old");
+        a.started = Some(now - 100);
+        b.started = Some(now - 500);
+        let ages = rank_by_user(&[a, b], crate::cli::TopMetric::Age, 10, None, None, None);
+        assert_eq!(ages.len(), 1);
+        assert!((ages[0].value - 500.0).abs() < 2.0, "{ages:?}");
+        assert!(ages[0].top_command.contains("old"), "{ages:?}");
     }
 
     #[test]

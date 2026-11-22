@@ -601,6 +601,15 @@ pub struct Cli {
     pub count: Option<usize>,
 
     #[arg(
+        long,
+        help = t(
+            "把 --top 榜按用户聚合：每个用户一行（该用户全部进程的指标求和；Age 这类非可加指标取最大），按值排名——多租户机器上“哪个用户在吃这台机器”一目了然。列 USER / 值 / PROCS / 最大贡献进程；--remote 舰队按 (主机, 用户) 聚合。只搭配 --top 使用",
+            "Aggregate the --top board by user: one row per user (the metric summed over their processes; non-additive metrics like age take the max), ranked by value — which user is eating the box on a shared host. Columns USER / value / PROCS / top contributor; --remote fleets aggregate per (host, user). Use with --top only"
+        )
+    )]
+    pub by_user: bool,
+
+    #[arg(
         long = "by-name",
         help = t(
             "按程序身份（名字 + 用户）聚合整张进程表：实例数 / ΣCPU / Σ内存 / Σ累计 CPU 时间——回答“8 个 node 进程一共吃了多少”。属于无目标操作；可搭配 --csv / --markdown / --json / --watch",

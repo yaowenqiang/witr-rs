@@ -1073,6 +1073,19 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
             // the machine-readable formats draw the exact board as rows:
             // json keeps the versioned envelope (host rides every row),
             // csv/markdown mirror the local twins' shapes
+            if cli.by_user {
+                let rows = render::rank_by_user(&procs, metric, count, None, None, None);
+                if cli.json {
+                    return json_user_envelope(&rows);
+                }
+                if cli.csv {
+                    return render::render_top_by_user_csv(&rows);
+                }
+                if cli.markdown {
+                    return render::render_top_by_user_markdown(&rows, metric);
+                }
+                return render::render_top_by_user(&rows, metric, &painter);
+            }
             if cli.json {
                 return json_envelope(&fleet_ranked(&procs, metric, count));
             }
@@ -1650,6 +1663,18 @@ pub(crate) fn json_envelope(procs: &[Process]) -> String {
         "generated_at": util::now_unix(),
         "process_count": procs.len(),
         "processes": procs,
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
+}
+
+/// `--top --by-user --json`: the same versioned envelope shape over the
+/// user rollup — `users` in place of `processes`.
+pub(crate) fn json_user_envelope(rows: &[render::UserBoardRow]) -> String {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": util::now_unix(),
+        "user_count": rows.len(),
+        "users": rows,
     });
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
 }
@@ -4683,6 +4708,10 @@ fn main() {
         eprintln!("--count sizes the --top listing; add --top METRIC");
         std::process::exit(4);
     }
+    if cli.by_user && cli.top.is_none() {
+        eprintln!("--by-user rolls up a --top board; add --top METRIC");
+        std::process::exit(4);
+    }
     if let Some(name) = one_shot_listing_name(&cli).filter(|_| cli.watch.is_some()) {
         eprintln!(
             "{name} is a one-shot listing — --watch would be silently ignored; drop --watch"
@@ -6175,15 +6204,35 @@ fn main() {
                     interval,
                     now
                 ));
-                write_out(&render::render_top(
-                    &procs,
-                    metric,
-                    count,
-                    fds.as_ref(),
-                    Some(&hist),
-                    conns.as_ref(),
-                    &painter,
-                ));
+                if cli.by_user {
+                    let rows = render::rank_by_user(
+                        &procs,
+                        metric,
+                        count,
+                        fds.as_ref(),
+                        Some(&hist),
+                        conns.as_ref(),
+                    );
+                    if cli.json {
+                        write_out(&json_user_envelope(&rows));
+                    } else if cli.csv {
+                        write_out(&render::render_top_by_user_csv(&rows));
+                    } else if cli.markdown {
+                        write_out(&render::render_top_by_user_markdown(&rows, metric));
+                    } else {
+                        write_out(&render::render_top_by_user(&rows, metric, &painter));
+                    }
+                } else {
+                    write_out(&render::render_top(
+                        &procs,
+                        metric,
+                        count,
+                        fds.as_ref(),
+                        Some(&hist),
+                        conns.as_ref(),
+                        &painter,
+                    ));
+                }
                 ticks += 1;
                 if cli.times.is_some_and(|n| ticks >= n.max(1)) {
                     std::process::exit(0);
@@ -6262,7 +6311,25 @@ fn main() {
             } else {
                 None
             };
-            if cli.json {
+            if cli.by_user {
+                let rows = render::rank_by_user(
+                    &procs,
+                    metric,
+                    count,
+                    fds.as_ref(),
+                    rates.as_ref(),
+                    conns.as_ref(),
+                );
+                if cli.json {
+                    write_out(&json_user_envelope(&rows));
+                } else if cli.csv {
+                    write_out(&render::render_top_by_user_csv(&rows));
+                } else if cli.markdown {
+                    write_out(&render::render_top_by_user_markdown(&rows, metric));
+                } else {
+                    write_out(&render::render_top_by_user(&rows, metric, &painter));
+                }
+            } else if cli.json {
                 let ranked =
                     top_procs(&procs, metric, count, fds.as_ref(), rates.as_ref(), conns.as_ref());
                 write_out(&json_envelope(&ranked));
