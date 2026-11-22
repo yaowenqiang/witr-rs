@@ -1172,6 +1172,120 @@ fn remote_mode(bases: &[String], cli: &cli::Cli, no_color: bool) {
         }
     }
 
+    // --services across the fleet: every peer's unit list merged into one
+    // table, running units first, HOST column when more than one peer is
+    // in play. --failed intersects each peer's own failed-unit list from
+    // the snapshot (a peer predating it honestly reports "nothing seen").
+    if cli.services {
+        if cli.watch.is_some() && (cli.json || cli.csv || cli.markdown) {
+            eprintln!("machine-readable --services is one-shot; drop --watch or the format flag");
+            std::process::exit(4);
+        }
+        let multi = bases.len() > 1;
+        // one sweep: per-peer unit table (+ the snapshot's failed list
+        // when --failed asks) merged, running units first
+        let sweep = |failed_lists: &mut HashMap<String, Vec<String>>,
+                     failed_peers: &mut usize|
+         -> Vec<crate::model::Service> {
+            if cli.failed {
+                for base in bases {
+                    match fetch_fleet(base) {
+                        Ok((_, Some(sample))) => {
+                            failed_lists.insert(base.clone(), sample.failed_units);
+                        }
+                        _ => {
+                            failed_lists.insert(base.clone(), Vec::new());
+                        }
+                    }
+                }
+            }
+            let mut svcs: Vec<crate::model::Service> = Vec::new();
+            for base in bases {
+                let label = crate::util::display_host(base);
+                match fetch_fleet_services(base) {
+                    Ok(mut table) => {
+                        if multi {
+                            for s in table.iter_mut() {
+                                s.host = Some(label.clone());
+                            }
+                        }
+                        if cli.failed {
+                            let failed: std::collections::HashSet<&str> = failed_lists
+                                .get(base)
+                                .map(|l| l.iter().map(String::as_str).collect())
+                                .unwrap_or_default();
+                            table.retain(|s| failed.contains(s.name.as_str()));
+                        }
+                        svcs.extend(table);
+                    }
+                    Err(e) => {
+                        *failed_peers += 1;
+                        eprintln!("⚠ --remote {base}: {e}");
+                    }
+                }
+            }
+            render::sort_services(&mut svcs);
+            svcs
+        };
+        let mut failed_peers = 0usize;
+        let mut failed_lists: HashMap<String, Vec<String>> = HashMap::new();
+        if cli.watch.is_some() {
+            // the fleet family's text refresh: clear, header, re-merge
+            let interval = cli.watch.unwrap_or(3).max(1);
+            install_sigint_flag();
+            let mut ticks = 0u64;
+            loop {
+                let svcs = sweep(&mut failed_lists, &mut failed_peers);
+                if !cli.quiet {
+                    write_out("\x1b[2J\x1b[1;1H");
+                    let now = util::fmt_time(util::now_unix());
+                    write_out(&format!(
+                        "witr-rs fleet services · {} host(s) · every {interval}s · {now} · Ctrl-C to stop",
+                        bases.len()
+                    ));
+                }
+                let painter =
+                    render::Painter::new(!no_color && std::io::stdout().is_terminal());
+                write_out(&render::render_services(&svcs, &painter));
+                ticks += 1;
+                if cli.times.is_some_and(|n| ticks >= n.max(1)) {
+                    return;
+                }
+                if !sleep_interruptible(interval) {
+                    return;
+                }
+            }
+        }
+        let svcs = sweep(&mut failed_lists, &mut failed_peers);
+        if cli.json {
+            let doc = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": util::now_unix(),
+                "service_count": svcs.len(),
+                "services": svcs,
+            });
+            write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        } else if cli.csv {
+            write_out(&render::render_services_csv(&svcs));
+        } else if cli.markdown {
+            write_out(&render::render_services_markdown(&svcs));
+        } else {
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            let mut body = render::render_services(&svcs, &painter);
+            if multi {
+                // the fleet banner the other fleet surfaces carry
+                let heads: Vec<String> =
+                    bases.iter().map(|b| crate::util::display_host(b)).collect();
+                body.push_str(&format!("\n{} host(s) · {}\n", bases.len(), heads.join(" · ")));
+            }
+            write_out(&body);
+        }
+        if failed_peers == bases.len() {
+            std::process::exit(5);
+        }
+        std::process::exit(0);
+    }
+
     // --sys across the fleet: every peer's machine dashboard in one sweep —
     // the machine snapshot already rides the /api/ps envelope, so this is
     // pure rendering. `--watch` turns it into the estate's cockpit.
@@ -1571,6 +1685,21 @@ fn top_procs(
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(count.max(1));
     ranked.into_iter().map(|(_, p)| p.clone()).collect()
+}
+
+/// One peer's /api/services table — the fleet --services merge's input.
+/// The snapshot's service_mems pairs would cover the mem column, but the
+/// full unit list (state, desc, pid) only lives on this endpoint.
+fn fetch_fleet_services(base: &str) -> Result<Vec<crate::model::Service>, String> {
+    let url = format!("{}/api/services", base.trim_end_matches('/'));
+    let body = util::http_get(&url)?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("response is not JSON: {e}"))?;
+    let svcs = doc
+        .get("services")
+        .and_then(|v| serde_json::from_value::<Vec<crate::model::Service>>(v.clone()).ok())
+        .ok_or_else(|| "envelope has no parseable services table".to_string())?;
+    Ok(svcs)
 }
 
 /// Versioned JSON envelope for whole-table outputs (`--json` listing and
@@ -4732,7 +4861,11 @@ fn main() {
                 || cli.by_name
                 || cli.pids_only
                 || cli.wait.is_some()
-                || (cli.watch.is_some() && flag != "--sys")
+                || (cli.watch.is_some()
+                    && flag != "--sys"
+                    // the fleet --services form refreshes under --watch
+                    // like every fleet surface; the local listing is one-shot
+                    && !(flag == "--services" && !cli.remote.is_empty()))
                 || cli.follow
                 || cli.audit.is_some()
                 || cli.kill
@@ -4786,7 +4919,12 @@ fn main() {
         eprintln!("--by-user rolls up a --top board; add --top METRIC");
         std::process::exit(4);
     }
-    if let Some(name) = one_shot_listing_name(&cli).filter(|_| cli.watch.is_some()) {
+    if let Some(name) = one_shot_listing_name(&cli)
+        .filter(|_| cli.watch.is_some())
+        // the fleet --services form refreshes under --watch like the
+        // other fleet surfaces; only the local listing is one-shot
+        .filter(|_| cli.remote.is_empty())
+    {
         eprintln!(
             "{name} is a one-shot listing — --watch would be silently ignored; drop --watch"
         );

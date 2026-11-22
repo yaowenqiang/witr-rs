@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub type Pid = i32;
 
@@ -211,7 +211,9 @@ pub struct ContainerDeviceIo {
 /// or a Windows service (SCM). The Services tab lists these; `pid` links a
 /// running unit into the process tables (systemd resolves MainPID lazily,
 /// on Enter).
-#[derive(Debug, Clone, Serialize)]
+// Deserialize feeds the fleet --services merge (peers' /api/services
+// tables arrive as JSON and gain their owning host here)
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Service {
     pub manager: String, // systemd / launchd / scm
     pub name: String,    // unit name / launchd label / service name
@@ -226,6 +228,12 @@ pub struct Service {
     /// cgroup cpu.stat usage_usec (cumulative, µs) — same platform scope.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_time_us: Option<u64>,
+    /// The fleet label (bare host:port) this unit came from — set by the
+    /// fleet --services merge when more than one peer is in play. Local
+    /// runs and single-host remote leave it None, exactly like
+    /// [`Process::host`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 impl Container {

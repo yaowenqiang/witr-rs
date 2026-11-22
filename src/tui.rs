@@ -9861,6 +9861,7 @@ mod tests {
             pid: None,
             mem_current: None,
             cpu_time_us: None,
+            host: None,
         }];
         app.table_state.select(Some(0));
         app.open_service_detail();

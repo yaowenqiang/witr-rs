@@ -1062,6 +1062,10 @@ pub fn render_services(svcs: &[crate::model::Service], p: &Painter) -> String {
     if svcs.is_empty() {
         return "no services reported (is a service manager running?)\n".to_string();
     }
+    // a fleet board (--remote over several peers) opens with a HOST
+    // column — the same unit on two machines is two rows and needs
+    // saying which machine owns each
+    let fleet = svcs.iter().any(|s| s.host.is_some());
     let mgr_w = svcs.iter().map(|s| s.manager.len()).max().unwrap_or(7).max(7);
     let name_w = svcs
         .iter()
@@ -1078,6 +1082,12 @@ pub fn render_services(svcs: &[crate::model::Service], p: &Painter) -> String {
         .max(3);
     let mem_w = svcs.iter().map(|s| svc_mem(s).len()).max().unwrap_or(3).max(3);
     let cpu_w = svcs.iter().map(|s| svc_cpu(s).len()).max().unwrap_or(8).max(8);
+    let host_w = svcs
+        .iter()
+        .map(|s| s.host.as_deref().map(str::len).unwrap_or(1))
+        .max()
+        .unwrap_or(4)
+        .max(4);
     let mut out = String::new();
     let mgr_h = "MANAGER";
     let name_h = "NAME";
@@ -1086,14 +1096,24 @@ pub fn render_services(svcs: &[crate::model::Service], p: &Painter) -> String {
     let mem_h = "MEM";
     let cpu_h = "CPU-TIME";
     let desc_h = "DESCRIPTION";
+    let host_prefix = if fleet {
+        format!("{:<host_w$}  ", "HOST")
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         out,
-        "{mgr_h:<mgr_w$}  {name_h:<name_w$}  {state_h:<state_w$}  {pid_h:>pid_w$}  {mem_h:>mem_w$}  {cpu_h:>cpu_w$}  {desc_h}"
+        "{host_prefix}{mgr_h:<mgr_w$}  {name_h:<name_w$}  {state_h:<state_w$}  {pid_h:>pid_w$}  {mem_h:>mem_w$}  {cpu_h:>cpu_w$}  {desc_h}"
     );
     for s in svcs {
+        let host_cell = if fleet {
+            format!("{:<host_w$}  ", s.host.clone().unwrap_or_else(|| "-".into()))
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "{:<mgr_w$}  {:<name_w$}  {:<state_w$}  {:>pid_w$}  {:>mem_w$}  {:>cpu_w$}  {}",
+            "{host_cell}{:<mgr_w$}  {:<name_w$}  {:<state_w$}  {:>pid_w$}  {:>mem_w$}  {:>cpu_w$}  {}",
             s.manager,
             s.name,
             p.dim(&s.state),
@@ -1109,8 +1129,16 @@ pub fn render_services(svcs: &[crate::model::Service], p: &Painter) -> String {
 /// `--services --csv`: one row per unit (empty pid = not running; empty
 /// mem/cpu = the platform doesn't expose the cgroup counters).
 pub fn render_services_csv(svcs: &[crate::model::Service]) -> String {
-    let mut out = String::from("manager,name,state,pid,mem_bytes,cpu_time_us,desc\n");
+    let fleet = svcs.iter().any(|s| s.host.is_some());
+    let mut out = String::from(if fleet {
+        "host,manager,name,state,pid,mem_bytes,cpu_time_us,desc\n"
+    } else {
+        "manager,name,state,pid,mem_bytes,cpu_time_us,desc\n"
+    });
     for s in svcs {
+        if fleet {
+            out.push_str(&format!("{},", csv_field(s.host.as_deref().unwrap_or_default())));
+        }
         out.push_str(&format!(
             "{},{},{},{},{},{},{}\n",
             csv_field(&s.manager),
@@ -1127,13 +1155,21 @@ pub fn render_services_csv(svcs: &[crate::model::Service]) -> String {
 
 /// `--services --markdown`: the same rows pasted into docs and issues.
 pub fn render_services_markdown(svcs: &[crate::model::Service]) -> String {
-    let mut out = String::from(
-        "| MANAGER | NAME | STATE | PID | MEM | CPU-TIME | DESCRIPTION |\n|---|---|---|---|---|---|---|\n",
-    );
+    let fleet = svcs.iter().any(|s| s.host.is_some());
+    let mut out = String::from(if fleet {
+        "| HOST | MANAGER | NAME | STATE | PID | MEM | CPU-TIME | DESCRIPTION |\n|---|---|---|---|---|---|---|---|\n"
+    } else {
+        "| MANAGER | NAME | STATE | PID | MEM | CPU-TIME | DESCRIPTION |\n|---|---|---|---|---|---|---|\n"
+    });
     for s in svcs {
+        let host_cell = if fleet {
+            format!("{} | ", s.host.clone().unwrap_or_else(|| "-".into()))
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} |",
+            "| {host_cell}{} | {} | {} | {} | {} | {} | {} |",
             s.manager,
             s.name,
             s.state,
@@ -3854,6 +3890,7 @@ mod tests {
                 pid,
                 mem_current: None,
                 cpu_time_us: None,
+                host: None,
             }
         };
         let mut svcs = vec![
@@ -3904,6 +3941,49 @@ mod tests {
         assert!(md.starts_with("| MANAGER | NAME | STATE | PID | MEM | CPU-TIME | DESCRIPTION |"));
         assert!(md.contains("| 7 |"), "{md}");
         assert!(md.contains("| 7.0M |"), "{md}");
+
+        // fleet form: host-tagged rows open the HOST column in all three
+        // formats; a local table never grows it
+        let mut fleet_rows = with_res.clone();
+        for (i, r) in fleet_rows.iter_mut().enumerate() {
+            r.host = Some(format!("host{i}"));
+        }
+        let ftext = render_services(&fleet_rows, &p);
+        assert!(ftext.contains("HOST"), "{ftext}");
+        assert!(ftext.contains("host0"), "{ftext}");
+        assert!(!table.contains("HOST"), "local table stays host-less: {table}");
+        let fcsv = render_services_csv(&fleet_rows);
+        assert!(fcsv.starts_with("host,manager,name,state,pid,mem_bytes,cpu_time_us,desc"), "{fcsv}");
+        let fmd = render_services_markdown(&fleet_rows);
+        assert!(fmd.starts_with("| HOST | MANAGER |"), "{fmd}");
+    }
+
+    #[test]
+    fn service_deserializes_from_the_fleet_envelope() {
+        // the fleet --services merge feeds peers' /api/services rows
+        // through serde: machine fields ride, absent Option fields read
+        // None, and host stays unset until the merge tags it
+        let row = serde_json::json!({
+            "manager": "systemd",
+            "name": "nginx.service",
+            "state": "active/running",
+            "desc": "web server",
+            "pid": 7,
+            "mem_current": 7340032,
+            "cpu_time_us": 19476239407u64,
+        });
+        let s: crate::model::Service = serde_json::from_value(row).unwrap();
+        assert_eq!(s.name, "nginx.service");
+        assert_eq!(s.pid, Some(7));
+        assert_eq!(s.mem_current, Some(7_340_032));
+        assert_eq!(s.cpu_time_us, Some(19_476_239_407));
+        assert_eq!(s.host, None);
+        // an old peer without the resource fields still parses
+        let bare = serde_json::json!({
+            "manager": "systemd", "name": "a.service", "state": "failed", "desc": "",
+        });
+        let s: crate::model::Service = serde_json::from_value(bare).unwrap();
+        assert_eq!((s.pid, s.mem_current, s.host), (None, None, None));
     }
 
     fn sock(
@@ -4158,6 +4238,9 @@ mod tests {
         let csv = render_top_by_user_csv(&rows);
         assert!(csv.lines().nth(1).unwrap().starts_with(",root,419430400,"), "{csv}");
 
+        // markdown: no HOST column on a local board
+        let md = render_top_by_user_markdown(&rows, crate::cli::TopMetric::Mem);
+        assert!(md.starts_with("| USER | VALUE | PROCS | TOP PROC |"), "{md}");
         // markdown: no HOST column on a local board
         let md = render_top_by_user_markdown(&rows, crate::cli::TopMetric::Mem);
         assert!(md.starts_with("| USER | VALUE | PROCS | TOP PROC |"), "{md}");

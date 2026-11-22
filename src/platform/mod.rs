@@ -439,6 +439,7 @@ pub fn parse_systemctl_units(text: &str) -> Vec<Service> {
                 manager: "systemd".into(),
                 mem_current: None,
                 cpu_time_us: None,
+                host: None,
                 name: unit,
                 state: if active == "active" {
                     format!("active/{sub}")
@@ -857,6 +858,7 @@ pub fn parse_launchctl_list(text: &str) -> Vec<Service> {
                 manager: "launchd".into(),
                 mem_current: None,
                 cpu_time_us: None,
+                host: None,
                 name: label.to_string(),
                 state: if pid.is_some() {
                     "running".into()
@@ -907,6 +909,7 @@ pub fn parse_scm_services(text: &str) -> Vec<Service> {
                 manager: "scm".into(),
                 mem_current: None,
                 cpu_time_us: None,
+                host: None,
                 state: get("State").to_string(),
                 name,
                 desc: get("DisplayName").to_string(),

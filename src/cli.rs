@@ -648,8 +648,8 @@ pub struct Cli {
     #[arg(
         long,
         help = t(
-            "列出服务管理器当前的单元（Linux systemd / macOS launchd / Windows SCM 服务）：管理器 / 名称 / 状态 / 主 pid / 描述。Services 页（6）的 CLI 孪生。属于无目标操作；--csv / --markdown / --json 同样支持",
-            "List the service manager's current units (Linux systemd / macOS launchd / Windows SCM services): manager / name / state / main pid / description. The Services tab's (6) CLI twin. A no-target operation; --csv / --markdown / --json work too"
+            "列出服务管理器当前的单元（Linux systemd / macOS launchd / Windows SCM 服务）：管理器 / 名称 / 状态 / 主 pid / 描述。Services 页（6）的 CLI 孪生。属于无目标操作；--csv / --markdown / --json 同样支持。--remote 舰队形态合并各 peer 的单元表(多主机时 HOST 列点名归属;--failed 对照各主机快照里的失败清单;--watch 刷新文本板)",
+            "List the service manager's current units (Linux systemd / macOS launchd / Windows SCM services): manager / name / state / main pid / description. The Services tab's (6) CLI twin. A no-target operation; --csv / --markdown / --json work too. Over --remote the peers' unit tables merge into one fleet board (HOST column when more than one peer answers; --failed intersects each host's own failed-unit list from the snapshot; --watch refreshes the text board)"
         )
     )]
     pub services: bool,
