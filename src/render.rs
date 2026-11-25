@@ -1093,6 +1093,109 @@ fn agg_cell_rss(r: &crate::RecordAgg) -> String {
     }
 }
 
+/// The `--agg --by-user` board: one row per owner across the window.
+/// RSS sums the user's processes per tick (simultaneous footprint, not
+/// a sum of peaks); CPU-TIME is the integral every member identity owes.
+pub fn render_user_agg(rows: &[crate::UserAgg], p: &Painter) -> String {
+    if rows.is_empty() {
+        return "no process rows in this recording\n".to_string();
+    }
+    let user_w = rows
+        .iter()
+        .map(|r| r.user.len())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 24);
+    let samp_w = rows
+        .iter()
+        .map(|r| r.samples.to_string().len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let cpu_w = rows.iter().map(|r| agg_cell_cpu_u(r).len()).max().unwrap_or(8).max(8);
+    let time_w = rows.iter().map(|r| agg_cell_time_u(r).len()).max().unwrap_or(8).max(8);
+    let rss_w = rows.iter().map(|r| agg_cell_rss_u(r).len()).max().unwrap_or(8).max(8);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<user_w$}  {:>samp_w$}  {:>cpu_w$}  {:>time_w$}  {:>rss_w$}",
+        "USER", "TICKS", "CPU% AVG/PEAK", "CPU-TIME", "RSS AVG/PEAK",
+    );
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "{:<user_w$}  {:>samp_w$}  {:>cpu_w$}  {:>time_w$}  {:>rss_w$}",
+            p.bold(&r.user),
+            r.samples,
+            agg_cell_cpu_u(r),
+            agg_cell_time_u(r),
+            agg_cell_rss_u(r),
+        );
+    }
+    out
+}
+
+fn agg_cell_cpu_u(r: &crate::UserAgg) -> String {
+    match (r.cpu_avg, r.cpu_peak) {
+        (Some(a), Some(pk)) => format!("{a:.1} / {pk:.1}"),
+        _ => "- / -".into(),
+    }
+}
+
+fn agg_cell_time_u(r: &crate::UserAgg) -> String {
+    match r.cpu_seconds {
+        None => "-".into(),
+        Some(s) if s < 60.0 => format!("{s:.0}s"),
+        Some(s) if s < 3600.0 => format!("{:.1}m", s / 60.0),
+        Some(s) => format!("{:.1}h", s / 3600.0),
+    }
+}
+
+fn agg_cell_rss_u(r: &crate::UserAgg) -> String {
+    match (r.rss_avg_mb, r.rss_peak_mb) {
+        (Some(a), Some(pk)) => format!("{a:.1} / {pk:.1}M"),
+        _ => "-".into(),
+    }
+}
+
+/// `--agg --by-user --csv`: raw numbers per user.
+pub fn render_user_agg_csv(rows: &[crate::UserAgg]) -> String {
+    let mut out = String::from("user,ticks,cpu_avg_pct,cpu_peak_pct,cpu_seconds,rss_avg_mb,rss_peak_mb\n");
+    for r in rows {
+        let f = |v: Option<f64>| v.map(|x| format!("{x:.2}")).unwrap_or_default();
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{}\n",
+            csv_field(&r.user),
+            r.samples,
+            f(r.cpu_avg),
+            f(r.cpu_peak),
+            f(r.cpu_seconds),
+            f(r.rss_avg_mb),
+            f(r.rss_peak_mb),
+        ));
+    }
+    out
+}
+
+/// `--agg --by-user --markdown`.
+pub fn render_user_agg_markdown(rows: &[crate::UserAgg]) -> String {
+    let mut out = String::from(
+        "| USER | TICKS | CPU% AVG/PEAK | CPU-TIME | RSS AVG/PEAK |\n|---|---|---|---|---|\n",
+    );
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} |",
+            r.user.replace('|', "\\|"),
+            r.samples,
+            agg_cell_cpu_u(r),
+            agg_cell_time_u(r),
+            agg_cell_rss_u(r),
+        );
+    }
+    out
+}
+
 /// `--agg --csv`: raw numbers, machine consumers sort their own way.
 pub fn render_record_agg_csv(rows: &[crate::RecordAgg]) -> String {
     let mut out = String::from("name,pid,samples,cpu_avg_pct,cpu_peak_pct,cpu_seconds,rss_avg_mb,rss_peak_mb\n");

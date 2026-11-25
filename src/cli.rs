@@ -603,8 +603,8 @@ pub struct Cli {
     #[arg(
         long,
         help = t(
-            "把 --top 榜按用户聚合：每个用户一行（该用户全部进程的指标求和；Age 这类非可加指标取最大），按值排名——多租户机器上“哪个用户在吃这台机器”一目了然。列 USER / 值 / PROCS / 最大贡献进程；--remote 舰队按 (主机, 用户) 聚合。只搭配 --top 使用",
-            "Aggregate the --top board by user: one row per user (the metric summed over their processes; non-additive metrics like age take the max), ranked by value — which user is eating the box on a shared host. Columns USER / value / PROCS / top contributor; --remote fleets aggregate per (host, user). Use with --top only"
+            "把 --top 榜按用户聚合：每个用户一行（该用户全部进程的指标求和；Age 这类非可加指标取最大），按值排名——多租户机器上“哪个用户在吃这台机器”一目了然。列 USER / 值 / PROCS / 最大贡献进程；--remote 舰队按 (主机, 用户) 聚合。搭配 --top 使用；--agg FILE --by-user 则把录制按用户上卷（逐拍求和，RSS 读作同时驻留足迹）",
+            "Aggregate the --top board by user: one row per user (the metric summed over their processes; non-additive metrics like age take the max), ranked by value — which user is eating the box on a shared host. Columns USER / value / PROCS / top contributor; --remote fleets aggregate per (host, user). Pairs with --top; --agg FILE --by-user rolls a recording up by owner instead (per-tick sums, RSS read as the simultaneous footprint)"
         )
     )]
     pub by_user: bool,
