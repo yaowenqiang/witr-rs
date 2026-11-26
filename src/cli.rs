@@ -1376,8 +1376,8 @@ pub struct Cli {
         long,
         value_name = "FILE",
         help = t(
-            "把 --record 产出的样本文件（.csv 或 .jsonl）聚合成一张窗口榜：每 (pid, 程序身份) 一行——采样数 / CPU 均值与峰值 / 窗口内累计 CPU 时间（按采样间隔积分，中途退出的进程不吃亏）/ RSS 均值与峰值，回答\"这一小时里谁吃了最多的 CPU\"这种回看问题。--top cpu|mem 选排名指标（cpu 按累计 CPU 时间、mem 按 RSS 峰值），--count 截行数，--csv / --markdown / --json 同样支持。属于无目标操作",
-            "Aggregate a --record sample file (.csv or .jsonl) into one window board: one row per (pid, program identity) — samples seen / CPU mean and peak / CPU-time integrated over the window (by sample spacing, so a process that exited mid-window loses nothing) / RSS mean and peak — the look-back answer to \"who ate the most CPU over the past hour\". --top cpu|mem picks the ranking metric (cpu by integrated CPU-time, mem by peak RSS), --count caps rows, --csv / --markdown / --json work too. A no-target operation"
+            "把 --record 产出的样本文件（.csv 或 .jsonl）聚合成一张窗口榜：每 (pid, 程序身份) 一行——采样数 / CPU 均值与峰值 / 窗口内累计 CPU 时间（按采样间隔积分，中途退出的进程不吃亏）/ RSS 均值与峰值，回答\"这一小时里谁吃了最多的 CPU\"这种回看问题。--top cpu|mem|io 选排名指标（cpu 按累计 CPU 时间、mem 按 RSS 峰值、io 按累计搬运字节——CSV 直接带速率列（新旧列名都认），JSONL 信封的累计计数按身份差分成速率），--count 截行数，--csv / --markdown / --json 同样支持。属于无目标操作",
+            "Aggregate a --record sample file (.csv or .jsonl) into one window board: one row per (pid, program identity) — samples seen / CPU mean and peak / CPU-time integrated over the window (by sample spacing, so a process that exited mid-window loses nothing) / RSS mean and peak — the look-back answer to \"who ate the most CPU over the past hour\". --top cpu|mem|io picks the ranking metric (cpu by integrated CPU-time, mem by peak RSS, io by bytes moved — the CSV carries rate columns under both historical spellings, the JSONL envelope's cumulative counters diff into rates per identity), --count caps rows, --csv / --markdown / --json work too. A no-target operation"
         )
     )]
     pub agg: Option<String>,

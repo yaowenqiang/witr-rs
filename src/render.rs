@@ -1041,25 +1041,44 @@ pub fn render_record_agg(
         .max()
         .unwrap_or(8)
         .max(8);
+    let iopk_w = rows.iter().map(|r| agg_cell_io_peak(r).len()).max().unwrap_or(7).max(7);
+    let iotot_w = rows.iter().map(|r| agg_cell_io_total(r).len()).max().unwrap_or(8).max(8);
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<name_w$}  {:>pid_w$}  {:>samp_w$}  {:>cpu_w$}  {:>time_w$}  {:>rss_w$}",
-        "NAME", "PID", "SAMPLES", "CPU% AVG/PEAK", "CPU-TIME", "RSS AVG/PEAK",
+        "{:<name_w$}  {:>pid_w$}  {:>samp_w$}  {:>cpu_w$}  {:>time_w$}  {:>rss_w$}  {:>iopk_w$}  {:>iotot_w$}",
+        "NAME", "PID", "SAMPLES", "CPU% AVG/PEAK", "CPU-TIME", "RSS AVG/PEAK", "IO PEAK", "IO TOTAL",
     );
     for r in rows {
         let _ = writeln!(
             out,
-            "{:<name_w$}  {:>pid_w$}  {:>samp_w$}  {:>cpu_w$}  {:>time_w$}  {:>rss_w$}",
+            "{:<name_w$}  {:>pid_w$}  {:>samp_w$}  {:>cpu_w$}  {:>time_w$}  {:>rss_w$}  {:>iopk_w$}  {:>iotot_w$}",
             p.bold(&r.name),
             r.pid,
             r.samples,
             agg_cell_cpu(r),
             agg_cell_time(r),
             agg_cell_rss(r),
+            agg_cell_io_peak(r),
+            agg_cell_io_total(r),
         );
     }
     out
+}
+
+/// Peak instantaneous throughput ("12.5M/s"), "-" when the recording
+/// carried no io rates (files before the io columns).
+fn agg_cell_io_peak(r: &crate::RecordAgg) -> String {
+    r.io_peak_bps
+        .map(|v| format!("{}/s", crate::util::fmt_bytes(v as u64)))
+        .unwrap_or_else(|| "-".into())
+}
+
+/// Integrated bytes moved over the window ("4.2G").
+fn agg_cell_io_total(r: &crate::RecordAgg) -> String {
+    r.io_total_bytes
+        .map(|v| crate::util::fmt_bytes(v as u64))
+        .unwrap_or_else(|| "-".into())
 }
 
 /// "12.4 / 45.0" — the mean and the burst side by side; "-" when the
@@ -1115,24 +1134,40 @@ pub fn render_user_agg(rows: &[crate::UserAgg], p: &Painter) -> String {
     let cpu_w = rows.iter().map(|r| agg_cell_cpu_u(r).len()).max().unwrap_or(8).max(8);
     let time_w = rows.iter().map(|r| agg_cell_time_u(r).len()).max().unwrap_or(8).max(8);
     let rss_w = rows.iter().map(|r| agg_cell_rss_u(r).len()).max().unwrap_or(8).max(8);
+    let iopk_w = rows.iter().map(|r| agg_cell_io_peak_u(r).len()).max().unwrap_or(7).max(7);
+    let iotot_w = rows.iter().map(|r| agg_cell_io_total_u(r).len()).max().unwrap_or(8).max(8);
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<user_w$}  {:>samp_w$}  {:>cpu_w$}  {:>time_w$}  {:>rss_w$}",
-        "USER", "TICKS", "CPU% AVG/PEAK", "CPU-TIME", "RSS AVG/PEAK",
+        "{:<user_w$}  {:>samp_w$}  {:>cpu_w$}  {:>time_w$}  {:>rss_w$}  {:>iopk_w$}  {:>iotot_w$}",
+        "USER", "TICKS", "CPU% AVG/PEAK", "CPU-TIME", "RSS AVG/PEAK", "IO PEAK", "IO TOTAL",
     );
     for r in rows {
         let _ = writeln!(
             out,
-            "{:<user_w$}  {:>samp_w$}  {:>cpu_w$}  {:>time_w$}  {:>rss_w$}",
+            "{:<user_w$}  {:>samp_w$}  {:>cpu_w$}  {:>time_w$}  {:>rss_w$}  {:>iopk_w$}  {:>iotot_w$}",
             p.bold(&r.user),
             r.samples,
             agg_cell_cpu_u(r),
             agg_cell_time_u(r),
             agg_cell_rss_u(r),
+            agg_cell_io_peak_u(r),
+            agg_cell_io_total_u(r),
         );
     }
     out
+}
+
+fn agg_cell_io_peak_u(r: &crate::UserAgg) -> String {
+    r.io_peak_bps
+        .map(|v| format!("{}/s", crate::util::fmt_bytes(v as u64)))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn agg_cell_io_total_u(r: &crate::UserAgg) -> String {
+    r.io_total_bytes
+        .map(|v| crate::util::fmt_bytes(v as u64))
+        .unwrap_or_else(|| "-".into())
 }
 
 fn agg_cell_cpu_u(r: &crate::UserAgg) -> String {
@@ -1160,11 +1195,13 @@ fn agg_cell_rss_u(r: &crate::UserAgg) -> String {
 
 /// `--agg --by-user --csv`: raw numbers per user.
 pub fn render_user_agg_csv(rows: &[crate::UserAgg]) -> String {
-    let mut out = String::from("user,ticks,cpu_avg_pct,cpu_peak_pct,cpu_seconds,rss_avg_mb,rss_peak_mb\n");
+    let mut out = String::from(
+        "user,ticks,cpu_avg_pct,cpu_peak_pct,cpu_seconds,rss_avg_mb,rss_peak_mb,io_peak_bps,io_total_bytes\n",
+    );
     for r in rows {
         let f = |v: Option<f64>| v.map(|x| format!("{x:.2}")).unwrap_or_default();
         out.push_str(&format!(
-            "{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{}\n",
             csv_field(&r.user),
             r.samples,
             f(r.cpu_avg),
@@ -1172,6 +1209,8 @@ pub fn render_user_agg_csv(rows: &[crate::UserAgg]) -> String {
             f(r.cpu_seconds),
             f(r.rss_avg_mb),
             f(r.rss_peak_mb),
+            f(r.io_peak_bps),
+            f(r.io_total_bytes),
         ));
     }
     out
@@ -1180,17 +1219,19 @@ pub fn render_user_agg_csv(rows: &[crate::UserAgg]) -> String {
 /// `--agg --by-user --markdown`.
 pub fn render_user_agg_markdown(rows: &[crate::UserAgg]) -> String {
     let mut out = String::from(
-        "| USER | TICKS | CPU% AVG/PEAK | CPU-TIME | RSS AVG/PEAK |\n|---|---|---|---|---|\n",
+        "| USER | TICKS | CPU% AVG/PEAK | CPU-TIME | RSS AVG/PEAK | IO PEAK | IO TOTAL |\n|---|---|---|---|---|---|---|\n",
     );
     for r in rows {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} |",
             r.user.replace('|', "\\|"),
             r.samples,
             agg_cell_cpu_u(r),
             agg_cell_time_u(r),
             agg_cell_rss_u(r),
+            agg_cell_io_peak_u(r),
+            agg_cell_io_total_u(r),
         );
     }
     out
@@ -1198,11 +1239,13 @@ pub fn render_user_agg_markdown(rows: &[crate::UserAgg]) -> String {
 
 /// `--agg --csv`: raw numbers, machine consumers sort their own way.
 pub fn render_record_agg_csv(rows: &[crate::RecordAgg]) -> String {
-    let mut out = String::from("name,pid,samples,cpu_avg_pct,cpu_peak_pct,cpu_seconds,rss_avg_mb,rss_peak_mb\n");
+    let mut out = String::from(
+        "name,pid,samples,cpu_avg_pct,cpu_peak_pct,cpu_seconds,rss_avg_mb,rss_peak_mb,io_peak_bps,io_total_bytes\n",
+    );
     for r in rows {
         let f = |v: Option<f64>| v.map(|x| format!("{x:.2}")).unwrap_or_default();
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{}\n",
             csv_field(&r.name),
             r.pid,
             r.samples,
@@ -1211,6 +1254,8 @@ pub fn render_record_agg_csv(rows: &[crate::RecordAgg]) -> String {
             f(r.cpu_seconds),
             f(r.rss_avg_mb),
             f(r.rss_peak_mb),
+            f(r.io_peak_bps),
+            f(r.io_total_bytes),
         ));
     }
     out
@@ -1219,18 +1264,20 @@ pub fn render_record_agg_csv(rows: &[crate::RecordAgg]) -> String {
 /// `--agg --markdown`: the same rows pasted into docs and issues.
 pub fn render_record_agg_markdown(rows: &[crate::RecordAgg]) -> String {
     let mut out = String::from(
-        "| NAME | PID | SAMPLES | CPU% AVG/PEAK | CPU-TIME | RSS AVG/PEAK |\n|---|---|---|---|---|---|\n",
+        "| NAME | PID | SAMPLES | CPU% AVG/PEAK | CPU-TIME | RSS AVG/PEAK | IO PEAK | IO TOTAL |\n|---|---|---|---|---|---|---|---|\n",
     );
     for r in rows {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
             r.name.replace('|', "\\|"),
             r.pid,
             r.samples,
             agg_cell_cpu(r),
             agg_cell_time(r),
             agg_cell_rss(r),
+            agg_cell_io_peak(r),
+            agg_cell_io_total(r),
         );
     }
     out

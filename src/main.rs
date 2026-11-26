@@ -3680,6 +3680,10 @@ pub(crate) struct ProcSample {
     /// The owning user (the CSV column / the envelope's user field) —
     /// the --agg --by-user rollup's key.
     pub(crate) user: Option<String>,
+    /// Disk throughput (read + write, bytes/s). The CSV carries rates
+    /// directly; the JSONL envelope carries cumulative counters, which
+    /// the parser diffs per identity into rates (exact row spacing).
+    pub(crate) io_bps: Option<f64>,
 }
 
 /// The per-process rows of a record file (either format). Empty when the
@@ -3695,6 +3699,10 @@ pub(crate) fn parse_record_processes(text: &str) -> Vec<ProcSample> {
             if let (Some(t), Some(pid)) = (col("timestamp"), col("pid")) {
                 let (name, cpu, rss, user) =
                     (col("name"), col("cpu_pct"), col("rss_mb"), col("user"));
+                // the rate columns were renamed once (io_rbps → io_read_bps);
+                // the header is matched by name, so accept both
+                let io_r = col("io_read_bps").or_else(|| col("io_rbps"));
+                let io_w = col("io_write_bps").or_else(|| col("io_wbps"));
                 for line in lines {
                     let f: Vec<&str> = line.split(',').collect();
                     if f.len() <= t.max(pid) || f[pid] == "_system" {
@@ -3726,13 +3734,32 @@ pub(crate) fn parse_record_processes(text: &str) -> Vec<ProcSample> {
                             .and_then(|i| f.get(i))
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty()),
+                        io_bps: {
+                            let r = io_r
+                                .and_then(|i| f.get(i))
+                                .and_then(|v| v.trim().parse::<f64>().ok());
+                            let w = io_w
+                                .and_then(|i| f.get(i))
+                                .and_then(|v| v.trim().parse::<f64>().ok());
+                            match (r, w) {
+                                (Some(r), Some(w)) => Some(r + w),
+                                (Some(r), None) => Some(r),
+                                (None, Some(w)) => Some(w),
+                                (None, None) => None,
+                            }
+                        },
                     });
                 }
             }
         }
     }
     if out.is_empty() {
-        // JSONL: the processes array rides every envelope
+        // JSONL: the processes array rides every envelope. The envelope's
+        // io fields are cumulative counters — diffed per identity as the
+        // file plays back, so the aggregator sees bytes/s like the CSV's
+        // rate columns (the row spacing is exact, not the median guess)
+        let mut io_prev: std::collections::HashMap<(Pid, String), (i64, u64, u64)> =
+            std::collections::HashMap::new();
         for line in text.lines() {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
@@ -3748,14 +3775,15 @@ pub(crate) fn parse_record_processes(text: &str) -> Vec<ProcSample> {
                 if pid < 0 {
                     continue;
                 }
+                let name = p
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 out.push(ProcSample {
                     at,
                     pid: pid as Pid,
-                    name: p
-                        .get("name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
+                    name: name.clone(),
                     cpu: p
                         .get("cpu_pct")
                         .and_then(|x| x.as_f64())
@@ -3772,6 +3800,27 @@ pub(crate) fn parse_record_processes(text: &str) -> Vec<ProcSample> {
                         .get("user")
                         .and_then(|x| x.as_str())
                         .map(|s| s.to_string()),
+                    io_bps: {
+                        let r = p.get("io_read_bytes").and_then(|x| x.as_u64());
+                        let w = p.get("io_write_bytes").and_then(|x| x.as_u64());
+                        match (r, w) {
+                            (Some(r), Some(w)) => {
+                                let key = (pid as Pid, name.clone());
+                                let rate = io_prev
+                                    .get(&key)
+                                    .filter(|(last_at, _, _)| at > *last_at)
+                                    .map(|(last_at, last_r, last_w)| {
+                                        let dt = (at - *last_at) as f64;
+                                        let dr = r.saturating_sub(*last_r) as f64;
+                                        let dw = w.saturating_sub(*last_w) as f64;
+                                        (dr + dw) / dt
+                                    });
+                                io_prev.insert(key, (at, r, w));
+                                rate
+                            }
+                            _ => None,
+                        }
+                    },
                 });
             }
         }
@@ -3803,6 +3852,11 @@ pub(crate) struct RecordAgg {
     pub(crate) rss_avg_mb: Option<f64>,
     /// Peak resident MB — the footprint the sum can't show.
     pub(crate) rss_peak_mb: Option<f64>,
+    /// Peak instantaneous disk throughput (read + write, bytes/s).
+    pub(crate) io_peak_bps: Option<f64>,
+    /// Total bytes moved, integrated over the window (rates × the tick
+    /// spacing) — "this identity pushed 4 GB through the disk".
+    pub(crate) io_total_bytes: Option<f64>,
 }
 
 /// Fold a recording's per-tick process rows into window aggregates,
@@ -3817,9 +3871,16 @@ pub(crate) fn aggregate_record(
     struct Acc {
         cpu_seen: Vec<f64>,
         rss_seen: Vec<f64>,
+        io_peak: f64,
+        io_total: f64,
+        io_seen: bool,
     }
     let mut groups: std::collections::BTreeMap<(Pid, String), Acc> =
         std::collections::BTreeMap::new();
+    // the window's tick spacing: median gap between the recording's
+    // distinct timestamps — one number for every row (the io integral
+    // needs it before the loop), robust to a dropped tick
+    let dt = record_median_dt(samples);
     for s in samples {
         let acc = groups.entry((s.pid, s.name.clone())).or_default();
         if let Some(c) = s.cpu {
@@ -3828,11 +3889,12 @@ pub(crate) fn aggregate_record(
         if let Some(r) = s.rss_mb {
             acc.rss_seen.push(r);
         }
+        if let Some(bps) = s.io_bps {
+            acc.io_seen = true;
+            acc.io_peak = acc.io_peak.max(bps);
+            acc.io_total += bps * dt;
+        }
     }
-    // the window's tick spacing: median gap between the recording's
-    // distinct timestamps — one number for every row, robust to a
-    // dropped tick
-    let dt = record_median_dt(samples);
     let cpu_time = |acc: &Acc| {
         (!acc.cpu_seen.is_empty() && dt > 0.0)
             .then(|| acc.cpu_seen.iter().sum::<f64>() / 100.0 * dt)
@@ -3852,12 +3914,17 @@ pub(crate) fn aggregate_record(
                 cpu_seconds: cpu_time(&acc),
                 rss_avg_mb: mean(&acc.rss_seen),
                 rss_peak_mb: acc.rss_seen.iter().cloned().reduce(f64::max),
+                io_peak_bps: acc.io_seen.then_some(acc.io_peak),
+                io_total_bytes: (acc.io_seen && dt > 0.0).then_some(acc.io_total),
             }
         })
         .collect();
     rows.sort_by(|a, b| {
         let key = |r: &RecordAgg| match metric {
             crate::cli::TopMetric::Mem => r.rss_peak_mb.unwrap_or(f64::NEG_INFINITY),
+            // --top io ranks by bytes moved — the window question "who
+            // hammered the disk"
+            crate::cli::TopMetric::Io => r.io_total_bytes.unwrap_or(f64::NEG_INFINITY),
             // everything else ranks by integrated CPU-time — the window
             // question is "who spent the core", not "who idled highest"
             _ => r.cpu_seconds.unwrap_or(f64::NEG_INFINITY),
@@ -3908,6 +3975,12 @@ pub(crate) struct UserAgg {
     /// footprint, not a sum of peaks.
     pub(crate) rss_avg_mb: Option<f64>,
     pub(crate) rss_peak_mb: Option<f64>,
+    /// Peak instantaneous disk throughput (read + write bytes/s) across
+    /// the user's processes — the spike the averages hide.
+    pub(crate) io_peak_bps: Option<f64>,
+    /// Total bytes the user's processes moved, integrated over the
+    /// window (rates × tick spacing).
+    pub(crate) io_total_bytes: Option<f64>,
 }
 
 /// Fold a recording into per-user window aggregates, ranked best-first
@@ -3924,6 +3997,8 @@ pub(crate) fn aggregate_record_by_user(
         cpu_per_tick: std::collections::BTreeMap<i64, f64>,
         cpu_seconds: f64,
         rss_per_tick: std::collections::BTreeMap<i64, f64>,
+        io_per_tick: std::collections::BTreeMap<i64, f64>,
+        io_total: f64,
     }
     let dt = record_median_dt(samples);
     let mut groups: std::collections::BTreeMap<String, Acc> =
@@ -3939,6 +4014,10 @@ pub(crate) fn aggregate_record_by_user(
         if let Some(r) = s.rss_mb {
             *acc.rss_per_tick.entry(s.at).or_default() += r;
         }
+        if let Some(bps) = s.io_bps {
+            *acc.io_per_tick.entry(s.at).or_default() += bps;
+            acc.io_total += bps * dt;
+        }
     }
     let mut rows: Vec<UserAgg> = groups
         .into_iter()
@@ -3948,6 +4027,7 @@ pub(crate) fn aggregate_record_by_user(
             let mean = |v: &[f64]| {
                 (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
             };
+            let io_vals: Vec<f64> = acc.io_per_tick.values().cloned().collect();
             UserAgg {
                 samples: acc.ticks.len(),
                 cpu_avg: mean(&cpu_vals),
@@ -3955,6 +4035,10 @@ pub(crate) fn aggregate_record_by_user(
                 cpu_seconds: (dt > 0.0).then_some(acc.cpu_seconds),
                 rss_avg_mb: mean(&rss_vals),
                 rss_peak_mb: rss_vals.iter().cloned().reduce(f64::max),
+                // no io readings at all → absent, not a zero total
+                io_peak_bps: io_vals.iter().cloned().reduce(f64::max),
+                io_total_bytes: (!acc.io_per_tick.is_empty() && dt > 0.0)
+                    .then_some(acc.io_total),
                 user,
             }
         })
@@ -3962,6 +4046,7 @@ pub(crate) fn aggregate_record_by_user(
     rows.sort_by(|a, b| {
         let key = |r: &UserAgg| match metric {
             crate::cli::TopMetric::Mem => r.rss_peak_mb.unwrap_or(f64::NEG_INFINITY),
+            crate::cli::TopMetric::Io => r.io_total_bytes.unwrap_or(f64::NEG_INFINITY),
             _ => r.cpu_seconds.unwrap_or(f64::NEG_INFINITY),
         };
         key(b)
@@ -5417,10 +5502,10 @@ fn main() {
         }
         if !matches!(
             cli.top.unwrap_or(cli::TopMetric::Cpu),
-            cli::TopMetric::Cpu | cli::TopMetric::Mem
+            cli::TopMetric::Cpu | cli::TopMetric::Mem | cli::TopMetric::Io
         ) {
             eprintln!(
-                "--agg ranks by --top cpu (integrated CPU-time) or --top mem (peak RSS); the recording carries no other metric"
+                "--agg ranks by --top cpu (integrated CPU-time), --top mem (peak RSS) or --top io (bytes moved); the recording carries no other metric"
             );
             std::process::exit(4);
         }
@@ -5450,6 +5535,7 @@ fn main() {
             .len();
         let ranked_by = match metric {
             cli::TopMetric::Mem => "rss_peak_mb",
+            cli::TopMetric::Io => "io_total_bytes",
             _ => "cpu_seconds",
         };
         if cli.by_user {
@@ -8112,6 +8198,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                 cpu,
                 rss_mb: rss,
                 user: None,
+                io_bps: None,
             };
         // ticks 10s apart; hog bursts 90% for three ticks then vanishes;
         // idler sits at 2% for all four
@@ -8168,7 +8255,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(
             lines[0],
-            "name,pid,samples,cpu_avg_pct,cpu_peak_pct,cpu_seconds,rss_avg_mb,rss_peak_mb"
+            "name,pid,samples,cpu_avg_pct,cpu_peak_pct,cpu_seconds,rss_avg_mb,rss_peak_mb,io_peak_bps,io_total_bytes"
         );
         assert!(lines[1].starts_with("hog,1,3,90.00,90.00,27.00,510.00,520.00"), "{csv}");
         let md = render::render_record_agg_markdown(&rows);
@@ -8187,6 +8274,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
                 cpu,
                 rss_mb: rss,
                 user: user.map(|u| u.into()),
+                io_bps: None,
             };
         let samples = vec![
             // alice runs two processes: 90% + 10% at t0, both 200M
@@ -8234,6 +8322,108 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         let md = render::render_user_agg_markdown(&rows);
         assert!(md.starts_with("| USER | TICKS |"), "{md}");
         assert!(render::render_user_agg(&[], &p).contains("no process rows"));
+
+        // io rides the user rollup too: alice's two processes both write,
+        // the tick sum doubles; bob carries no readings → absent cells
+        let io_samples = vec![
+            ProcSample { at: 0, pid: 1, name: "a".into(), cpu: None, rss_mb: None, user: Some("alice".into()), io_bps: Some(1_000_000.0) },
+            ProcSample { at: 0, pid: 2, name: "b".into(), cpu: None, rss_mb: None, user: Some("alice".into()), io_bps: Some(3_000_000.0) },
+            ProcSample { at: 0, pid: 3, name: "c".into(), cpu: None, rss_mb: None, user: Some("bob".into()), io_bps: None },
+            ProcSample { at: 10, pid: 1, name: "a".into(), cpu: None, rss_mb: None, user: Some("alice".into()), io_bps: Some(2_000_000.0) },
+        ];
+        let rows = aggregate_record_by_user(&io_samples, crate::cli::TopMetric::Io, 5);
+        assert_eq!(rows[0].user, "alice");
+        assert_eq!(rows[0].io_peak_bps, Some(4_000_000.0), "the t0 tick sums both processes");
+        assert!((rows[0].io_total_bytes.unwrap() - 60_000_000.0).abs() < 1.0, "{rows:?}");
+        assert_eq!(rows[1].user, "bob");
+        assert_eq!(rows[1].io_total_bytes, None, "no readings reads as absent, not zero");
+    }
+
+    #[test]
+    fn record_parser_normalizes_io_rates_from_both_formats() {
+        // CSV: rates ride directly; both historical column spellings match
+        for header in [
+            "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps,gpu_sm,sys_load1",
+            "timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1",
+        ] {
+            let csv = format!(
+                "{header}\n1700000000,3,root,writer,42.5,100.5,5000000,2000000,0,0.5\n"
+            );
+            let s = parse_record_processes(&csv);
+            assert_eq!(s.len(), 1, "{header}");
+            assert_eq!(s[0].io_bps, Some(7_000_000.0), "{header}");
+        }
+        // rows without io readings stay None
+        let csv = "timestamp,pid,user,name,cpu_pct,rss_mb,io_read_bps,io_write_bps\n1700000000,3,root,idler,1.0,10.0,,\n";
+        let s = parse_record_processes(csv);
+        assert_eq!(s[0].io_bps, None);
+
+        // JSONL: cumulative counters diff into rates at exact row spacing
+        let jsonl = "{\"schema_version\":1,\"generated_at\":100,\"processes\":[{\"pid\":9,\"name\":\"w\",\"io_read_bytes\":1000,\"io_write_bytes\":0}]}
+{\"schema_version\":1,\"generated_at\":110,\"processes\":[{\"pid\":9,\"name\":\"w\",\"io_read_bytes\":6000,\"io_write_bytes\":4000}]}
+{\"schema_version\":1,\"generated_at\":120,\"processes\":[{\"pid\":9,\"name\":\"w\",\"io_read_bytes\":8000,\"io_write_bytes\":6000}]}
+";
+        let s = parse_record_processes(jsonl);
+        assert_eq!(s.len(), 3);
+        // first sighting has no previous → no rate; then 9kB total over
+        // 10s, then 4kB total over 10s
+        assert_eq!(s[0].io_bps, None);
+        assert_eq!(s[1].io_bps, Some(900.0));
+        assert_eq!(s[2].io_bps, Some(400.0));
+        // a new identity (same pid number, other program) starts fresh
+        let jsonl = "{\"schema_version\":1,\"generated_at\":100,\"processes\":[{\"pid\":9,\"name\":\"w\",\"io_read_bytes\":1000,\"io_write_bytes\":0}]}
+{\"schema_version\":1,\"generated_at\":110,\"processes\":[{\"pid\":9,\"name\":\"next\",\"io_read_bytes\":1000,\"io_write_bytes\":0}]}
+";
+        let s = parse_record_processes(jsonl);
+        assert_eq!(s[1].io_bps, None, "the recycled pid starts its own series");
+    }
+
+    #[test]
+    fn aggregate_record_ranks_io_by_bytes_moved() {
+        let s = |at: i64, pid: i32, name: &str, io: Option<f64>| ProcSample {
+            at,
+            pid,
+            name: name.into(),
+            cpu: None,
+            rss_mb: None,
+            user: None,
+            io_bps: io,
+        };
+        // hammer: 10 MB/s for 3 ticks; drizzler: 1 MB/s for 6 ticks
+        let samples = vec![
+            s(0, 1, "hammer", Some(10_000_000.0)),
+            s(10, 1, "hammer", Some(10_000_000.0)),
+            s(20, 1, "hammer", Some(10_000_000.0)),
+            s(0, 2, "drizzler", Some(1_000_000.0)),
+            s(10, 2, "drizzler", Some(1_000_000.0)),
+            s(20, 2, "drizzler", Some(1_000_000.0)),
+            s(30, 2, "drizzler", Some(1_000_000.0)),
+            s(40, 2, "drizzler", Some(1_000_000.0)),
+            s(50, 2, "drizzler", Some(1_000_000.0)),
+            s(60, 2, "drizzler", Some(1_000_000.0)),
+        ];
+        let rows = aggregate_record(&samples, crate::cli::TopMetric::Io, 10);
+        // hammer moved 300 MB total despite fewer ticks — the integral
+        // ranks it first, its 10M/s peak also beats the drizzle
+        assert_eq!(rows[0].name, "hammer");
+        assert!((rows[0].io_total_bytes.unwrap() - 300_000_000.0).abs() < 1.0, "{rows:?}");
+        assert_eq!(rows[0].io_peak_bps, Some(10_000_000.0));
+        assert_eq!(rows[1].name, "drizzler");
+        // 7 ticks × 1M/s × 10s spacing = 70 MB
+        assert!((rows[1].io_total_bytes.unwrap() - 70_000_000.0).abs() < 1.0, "{rows:?}");
+
+        // no io readings → the cells read "-", not zero
+        let quiet = vec![s(0, 5, "quiet", None)];
+        let rows = aggregate_record(&quiet, crate::cli::TopMetric::Io, 5);
+        assert_eq!(rows[0].io_total_bytes, None);
+        assert_eq!(rows[0].io_peak_bps, None);
+        let p = render::Painter::new(false);
+        let text = render::render_record_agg(&rows, &p);
+        assert!(text.contains("IO PEAK") && text.contains("IO TOTAL"), "{text}");
+        let csv = render::render_record_agg_csv(&rows);
+        let mut lines = csv.lines();
+        assert!(lines.next().unwrap().ends_with("io_peak_bps,io_total_bytes"), "{csv}");
+        assert!(lines.next().unwrap().ends_with(",,,"), "empty io cells: {csv}");
     }
 
     #[test]
@@ -8274,6 +8464,7 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
             cpu: Some(cpu),
             rss_mb: None,
             user: None,
+            io_bps: None,
         };
         let samples = vec![
             sample(100, 1, "idle", 1.0),
