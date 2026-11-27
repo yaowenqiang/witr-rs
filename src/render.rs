@@ -1237,6 +1237,85 @@ pub fn render_user_agg_markdown(rows: &[crate::UserAgg]) -> String {
     out
 }
 
+/// The `--agg --check` report: every excursion the sentinel replay
+/// found, chronological. Episodes that never filled the arming window
+/// say so — a spike the live watchdog would have slept through is still
+/// worth seeing, but it must not read like an alert.
+pub fn render_replay_check(episodes: &[crate::ReplayEpisode], p: &Painter) -> String {
+    if episodes.is_empty() {
+        return "clean — no sentinel crossed its line in this recording\n".to_string();
+    }
+    let mut out = String::new();
+    for e in episodes {
+        // units follow the sentinel: eta reads in hours, net's peak is
+        // stored MB/s, mem a percent, the rest plain counts
+        let value = if e.sentinel == "mem-eta" {
+            format!("{:.1}h", e.peak)
+        } else if e.sentinel == "net" {
+            format!("{:.1}MB/s", e.peak)
+        } else if e.sentinel == "mem-pct" {
+            format!("{:.1}%", e.peak)
+        } else {
+            format!("{:.0}", e.peak)
+        };
+        let span = format!(
+            "{} → {} ({} ticks)",
+            fmt_time(e.start),
+            fmt_time(e.end),
+            e.ticks,
+        );
+        let fate = match e.fire {
+            Some(fire) => format!("watchdog fires {}", fmt_time(fire)),
+            None => format!(
+                "never fired (under the {}-sample arming window)",
+                crate::history::ALERT_CYCLES
+            ),
+        };
+        let line = format!("⚠ {} — over {span} · {fate} — peak {value}", e.sentinel);
+        let _ = writeln!(out, "{}", p.red(&line));
+    }
+    out
+}
+
+/// `--agg --check --csv`: one row per episode, raw stamps.
+pub fn render_replay_check_csv(episodes: &[crate::ReplayEpisode]) -> String {
+    let mut out = String::from("sentinel,start,fire,end,ticks,peak\n");
+    for e in episodes {
+        let fire = e.fire.map(|f| f.to_string()).unwrap_or_default();
+        out.push_str(&format!(
+            "{},{},{},{},{},{:.2}\n",
+            csv_field(&e.sentinel),
+            e.start,
+            fire,
+            e.end,
+            e.ticks,
+            e.peak,
+        ));
+    }
+    out
+}
+
+/// `--agg --check --markdown`.
+pub fn render_replay_check_markdown(episodes: &[crate::ReplayEpisode]) -> String {
+    let mut out = String::from(
+        "| SENTINEL | START | FIRED | END | TICKS | PEAK |\n|---|---|---|---|---|---|\n",
+    );
+    for e in episodes {
+        let fire = e.fire.map(fmt_time).unwrap_or_else(|| "-".into());
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {:.2} |",
+            e.sentinel,
+            fmt_time(e.start),
+            fire,
+            fmt_time(e.end),
+            e.ticks,
+            e.peak,
+        );
+    }
+    out
+}
+
 /// `--agg --csv`: raw numbers, machine consumers sort their own way.
 pub fn render_record_agg_csv(rows: &[crate::RecordAgg]) -> String {
     let mut out = String::from(

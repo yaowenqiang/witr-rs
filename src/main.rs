@@ -3689,6 +3689,223 @@ pub(crate) struct ProcSample {
 /// The per-process rows of a record file (either format). Empty when the
 /// recording carried no process rows — the caller notes the heatmap as
 /// skipped instead of failing the whole plot.
+/// One excursion the replay found: a sentinel over its threshold across
+/// consecutive recorded ticks.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ReplayEpisode {
+    pub(crate) sentinel: String,
+    /// First tick over the line (unix secs).
+    pub(crate) start: i64,
+    /// When the live watchdog would have fired: the 5th over-tick
+    /// (start + 4 spacings). `None` when the excursion ended before the
+    /// arming window filled — a spike that never became an alert.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fire: Option<i64>,
+    /// Last tick over the line.
+    pub(crate) end: i64,
+    pub(crate) ticks: usize,
+    /// The most severe reading inside the window (max everywhere except
+    /// the eta sentinel, where lower is worse).
+    pub(crate) peak: f64,
+}
+
+/// Per-sentinel episode state: opens on the first over-tick, accumulates
+/// the extreme, closes (and hands back the episode) on the first
+/// under-tick.
+#[derive(Default)]
+struct EpisodeTrack {
+    open: bool,
+    start: i64,
+    end: i64,
+    ticks: usize,
+    peak: f64,
+    /// Lower-is-worse (the eta countdown).
+    min_mode: bool,
+}
+
+impl EpisodeTrack {
+    fn new(min_mode: bool) -> Self {
+        EpisodeTrack { min_mode, ..Default::default() }
+    }
+
+    fn worse(&self, a: f64, b: f64) -> f64 {
+        if self.min_mode {
+            a.min(b)
+        } else {
+            a.max(b)
+        }
+    }
+
+    /// Feed one tick; `Some` when this tick closed an excursion (the
+    /// fire estimate rides the sweep's tick spacing).
+    fn feed(&mut self, at: i64, over: bool, value: f64, dt: f64) -> Option<ReplayEpisode> {
+        if over {
+            if !self.open {
+                self.open = true;
+                self.start = at;
+                self.ticks = 0;
+                self.peak = value;
+            }
+            self.end = at;
+            self.ticks += 1;
+            self.peak = self.worse(self.peak, value);
+            None
+        } else {
+            self.close(dt)
+        }
+    }
+
+    fn close(&mut self, dt: f64) -> Option<ReplayEpisode> {
+        if !self.open {
+            return None;
+        }
+        self.open = false;
+        let fire = (self.ticks >= history::ALERT_CYCLES as usize && dt > 0.0)
+            .then(|| self.start + (history::ALERT_CYCLES as i64 - 1) * dt as i64);
+        Some(ReplayEpisode {
+            sentinel: String::new(),
+            start: self.start,
+            fire,
+            end: self.end,
+            ticks: self.ticks,
+            peak: self.peak,
+        })
+    }
+}
+
+/// Judge the machine sentinels the recording actually carries, tick by
+/// tick — "what would the watchdog have shouted last night", answered
+/// from data that already exists. Returns the episodes (first-over to
+/// last-over per excursion, with the live watchdog's fire estimate) and
+/// the armed sentinel names the recording can't judge (no mount sweep,
+/// no PSI, no counters in the file) — named, not silent.
+pub(crate) fn replay_check(
+    points: &[SysPoint],
+    cli: &cli::Cli,
+) -> (Vec<ReplayEpisode>, Vec<&'static str>) {
+    let mut stamps: Vec<i64> = points.iter().map(|p| p.at).collect();
+    stamps.sort_unstable();
+    stamps.dedup();
+    let dt = median_dt(&stamps);
+    let mut etas = EpisodeTrack::new(true);
+    let mut loads = EpisodeTrack::new(false);
+    let mut mems = EpisodeTrack::new(false);
+    let mut counts = EpisodeTrack::new(false);
+    let mut nets = EpisodeTrack::new(false);
+    let mut zombies = EpisodeTrack::new(false);
+    let mut dstates = EpisodeTrack::new(false);
+    let mut failed = EpisodeTrack::new(false);
+    // which armed sentinels never saw a usable reading
+    let mut eta_seen = false;
+    let mut net_seen = false;
+    let mut out: Vec<ReplayEpisode> = Vec::new();
+    // the macro keeps the per-sentinel pushes uniform without fighting
+    // the borrow checker over a shared closure
+    macro_rules! push_episode {
+        ($name:expr, $track:expr, $feed:expr) => {
+            if let Some(mut e) = $feed {
+                e.sentinel = $name.to_string();
+                out.push(e);
+            }
+        };
+    }
+    for p in points {
+        if let Some(limit) = cli.alert_load {
+            if let Some(v) = p.load1 {
+                push_episode!("load", loads, loads.feed(p.at, v > limit, v, dt));
+            }
+        }
+        if let Some(limit) = cli.alert_mem_pct {
+            // the csv's blank cells read 0 — a recording from a platform
+            // without the reading simply never trips
+            let v = p.mem_pct.unwrap_or(0.0);
+            push_episode!("mem-pct", mems, mems.feed(p.at, v > limit as f64, v, dt));
+        }
+        if let Some(limit) = cli.alert_count {
+            push_episode!(
+                "procs",
+                counts,
+                counts.feed(p.at, p.procs > limit as usize, p.procs as f64, dt)
+            );
+        }
+        // the recorder writes bytes/s; the threshold is MB/s
+        if let Some(limit) = cli.alert_net {
+            if let Some(bps) = p.net_bps {
+                net_seen = true;
+                let mbps = bps / 1_048_576.0;
+                push_episode!("net", nets, nets.feed(p.at, mbps > limit as f64, mbps, dt));
+            }
+        }
+        if let Some(limit) = cli.alert_zombies {
+            push_episode!(
+                "zombies",
+                zombies,
+                zombies.feed(p.at, p.zombies > limit as usize, p.zombies as f64, dt)
+            );
+        }
+        if let Some(limit) = cli.alert_dstate {
+            push_episode!(
+                "dstates",
+                dstates,
+                dstates.feed(p.at, p.dstates > limit as usize, p.dstates as f64, dt)
+            );
+        }
+        if let Some(limit) = cli.alert_failed_units {
+            push_episode!(
+                "failed-units",
+                failed,
+                failed.feed(p.at, p.failed_units > limit as usize, p.failed_units as f64, dt)
+            );
+        }
+        if let Some(limit) = cli.alert_mem_eta {
+            // the eta column exists only when the recording watch computed
+            // the trend (~10 minutes of samples before it trusts)
+            if let Some(h) = p.mem_eta_hours {
+                eta_seen = true;
+                push_episode!("mem-eta", etas, etas.feed(p.at, h < limit, h, dt));
+            }
+        }
+    }
+    push_episode!("load", loads, loads.close(dt));
+    push_episode!("mem-pct", mems, mems.close(dt));
+    push_episode!("procs", counts, counts.close(dt));
+    push_episode!("net", nets, nets.close(dt));
+    push_episode!("zombies", zombies, zombies.close(dt));
+    push_episode!("dstates", dstates, dstates.close(dt));
+    push_episode!("failed-units", failed, failed.close(dt));
+    push_episode!("mem-eta", etas, etas.close(dt));
+    out.sort_by_key(|e| e.start);
+    let mut not_judgeable: Vec<&'static str> = Vec::new();
+    // net needs at least one rate reading (the first tick never has one);
+    // eta needs the source watch to have computed the trend
+    if cli.alert_net.is_some() && !net_seen {
+        not_judgeable.push("--alert-net");
+    }
+    if cli.alert_mem_eta.is_some() && !eta_seen {
+        not_judgeable.push("--alert-mem-eta");
+    }
+    // structurally absent columns: the record file never carries mounts,
+    // PSI, TCP counters, OOM marks, temperatures, GPUs or held-deleted
+    for (armed, name) in [
+        (cli.alert_disk.is_some(), "--alert-disk"),
+        (cli.alert_inodes.is_some(), "--alert-inodes"),
+        (cli.alert_disk_busy.is_some(), "--alert-disk-busy"),
+        (cli.alert_disk_eta.is_some(), "--alert-disk-eta"),
+        (cli.alert_psi.is_some(), "--alert-psi"),
+        (cli.alert_retrans.is_some(), "--alert-retrans"),
+        (cli.alert_nic_drop.is_some(), "--alert-nic-drop"),
+        (cli.alert_oom.is_some(), "--alert-oom"),
+        (cli.alert_temp.is_some(), "--alert-temp"),
+        (cli.alert_gpu_mem_pct.is_some(), "--alert-gpu-mem-pct"),
+        (cli.alert_deleted_gb.is_some(), "--alert-deleted-gb"),
+    ] {
+        if armed {
+            not_judgeable.push(name);
+        }
+    }
+    (out, not_judgeable)
+}
+
 pub(crate) fn parse_record_processes(text: &str) -> Vec<ProcSample> {
     let mut out = Vec::new();
     let mut lines = text.lines().peekable();
@@ -3946,6 +4163,12 @@ pub(crate) fn record_median_dt(samples: &[ProcSample]) -> f64 {
     let mut stamps: Vec<i64> = samples.iter().map(|s| s.at).collect();
     stamps.sort_unstable();
     stamps.dedup();
+    median_dt(&stamps)
+}
+
+/// Median gap between sorted distinct timestamps — the tick spacing both
+/// aggregators and the sentinel replay integrate against.
+pub(crate) fn median_dt(stamps: &[i64]) -> f64 {
     let mut gaps: Vec<f64> = stamps.windows(2).map(|w| (w[1] - w[0]) as f64).collect();
     gaps.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     match gaps.len() {
@@ -5500,6 +5723,10 @@ fn main() {
             eprintln!("--agg is one-shot; drop --watch");
             std::process::exit(4);
         }
+        if cli.by_user && cli.check {
+            eprintln!("--agg --check replays the sentinels over the recording; --by-user rolls the board instead — pick one");
+            std::process::exit(4);
+        }
         if !matches!(
             cli.top.unwrap_or(cli::TopMetric::Cpu),
             cli::TopMetric::Cpu | cli::TopMetric::Mem | cli::TopMetric::Io
@@ -5516,6 +5743,65 @@ fn main() {
                 std::process::exit(5);
             }
         };
+        // --agg --check: the sentinel replay — walk the machine samples
+        // and report every excursion, with the fire estimate. The
+        // per-process thresholds can't replay (the recording's process
+        // rows carry no history-window state), the machine ones can.
+        if cli.check {
+            let any_armed = [
+                cli.alert_load.is_some(),
+                cli.alert_mem_pct.is_some(),
+                cli.alert_count.is_some(),
+                cli.alert_net.is_some(),
+                cli.alert_zombies.is_some(),
+                cli.alert_dstate.is_some(),
+                cli.alert_failed_units.is_some(),
+                cli.alert_mem_eta.is_some(),
+            ]
+            .into_iter()
+            .any(|a| a);
+            if !any_armed {
+                eprintln!(
+                    "--agg --check replays the machine sentinels: --alert-load/--alert-mem-pct/--alert-count/--alert-net/--alert-zombies/--alert-dstate/--alert-failed-units/--alert-mem-eta judge the recording's _system rows; the other --alert-* sentinels have no column in a record file and can't replay"
+                );
+                std::process::exit(4);
+            }
+            let points = match parse_record_system(&text) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("--agg {path}: {e}");
+                    std::process::exit(5);
+                }
+            };
+            let (episodes, not_judgeable) = replay_check(&points, &cli);
+            if cli.json {
+                let doc = serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "generated_at": util::now_unix(),
+                    "source": path,
+                    "ticks": points.len(),
+                    "episodes": episodes,
+                    "not_judgeable": not_judgeable,
+                });
+                write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+            } else if cli.csv {
+                write_out(&render::render_replay_check_csv(&episodes));
+            } else if cli.markdown {
+                write_out(&render::render_replay_check_markdown(&episodes));
+            } else {
+                let painter =
+                    render::Painter::new(!no_color && std::io::stdout().is_terminal());
+                write_out(&render::render_replay_check(&episodes, &painter));
+            }
+            if !not_judgeable.is_empty() {
+                eprintln!(
+                    "· armed but not judgeable from this recording: {} (the file carries no such column)",
+                    not_judgeable.join(", ")
+                );
+            }
+            std::process::exit(if episodes.is_empty() { 0 } else { 1 });
+        }
+
         let samples = parse_record_processes(&text);
         if samples.is_empty() {
             eprintln!(
@@ -8337,6 +8623,141 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         assert!((rows[0].io_total_bytes.unwrap() - 60_000_000.0).abs() < 1.0, "{rows:?}");
         assert_eq!(rows[1].user, "bob");
         assert_eq!(rows[1].io_total_bytes, None, "no readings reads as absent, not zero");
+    }
+
+    #[test]
+    fn replay_check_walks_excursions_with_fire_estimates() {
+        let cli = |args: &[&str]| cli::Cli::parse_from(["witr"].iter().chain(args.iter()).copied());
+        // load 1.0 baseline; two excursions — 90 ticks (fires) and 3
+        // ticks (under the arming window)
+        let mut rows = vec![
+            "timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_pct,sys_procs,sys_net_bps".to_string(),
+        ];
+        for i in 0..200 {
+            let (load, net) = if (20..110).contains(&i) {
+                (7.0, "")
+            } else if (150..153).contains(&i) {
+                (6.0, "")
+            } else {
+                (1.0, "")
+            };
+            rows.push(format!(
+                "{},_system,,,.0,.0,,,,{load},40.0,82,{net},0,0,3,",
+                1_766_000_000 + i * 10
+            ));
+        }
+        let points = parse_record_system(&rows.join("\n")).unwrap();
+        let c = cli(&["--agg", "x", "--check", "--alert-load", "4"]);
+        let (episodes, not_judgeable) = replay_check(&points, &c);
+        assert_eq!(episodes.len(), 2, "{episodes:?}");
+        assert!(not_judgeable.is_empty());
+        // the long excursion: start ts(20), fire ts(24) — 4 spacings after
+        assert_eq!(episodes[0].start, 1_766_000_200);
+        assert_eq!(episodes[0].fire, Some(1_766_000_240));
+        assert_eq!(episodes[0].end, 1_766_001_090);
+        assert_eq!(episodes[0].ticks, 90);
+        assert_eq!(episodes[0].peak, 7.0);
+        assert_eq!(episodes[0].sentinel, "load");
+        // the spike: 3 ticks, no fire estimate
+        assert_eq!(episodes[1].ticks, 3);
+        assert_eq!(episodes[1].fire, None, "{:?}", episodes[1]);
+
+        // a second sentinel rides its own episodes; peaks track per window
+        let c = cli(&["--agg", "x", "--check", "--alert-mem-pct", "90"]);
+        let mut rows = vec![
+            "timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_pct,sys_procs,sys_net_bps".to_string(),
+        ];
+        for i in 0..60 {
+            let mem = if (10..40).contains(&i) { 95.0 } else { 40.0 };
+            rows.push(format!(
+                "{},_system,,,.0,.0,,,,1.0,{mem},82,,0,0,3,",
+                1_766_000_000 + i * 10
+            ));
+        }
+        let points = parse_record_system(&rows.join("\n")).unwrap();
+        let (episodes, _) = replay_check(&points, &c);
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].ticks, 30);
+        assert_eq!(episodes[0].peak, 95.0);
+
+        // eta counts down — the worse value is the LOWER one
+        let c = cli(&["--agg", "x", "--check", "--alert-mem-eta", "5"]);
+        let mut rows = vec![
+            "timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_pct,sys_procs,sys_net_bps,sys_zombies,sys_dstates,sys_failed_units,sys_mem_eta_hours".to_string(),
+        ];
+        for i in 0..30 {
+            let eta = if (5..15).contains(&i) { 2.0 } else { 9.0 };
+            rows.push(format!(
+                "{},_system,,,.0,.0,,,,1.0,40.0,82,,0,0,3,{eta}",
+                1_766_000_000 + i * 10
+            ));
+        }
+        let points = parse_record_system(&rows.join("\n")).unwrap();
+        let (episodes, _) = replay_check(&points, &c);
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].peak, 2.0, "lower eta is the worse reading");
+
+        // armed but structurally absent → named, not silent
+        let c = cli(&["--agg", "x", "--check", "--alert-disk", "90", "--alert-psi", "50"]);
+        let (episodes, not_judgeable) = replay_check(&points, &c);
+        assert!(episodes.is_empty());
+        assert_eq!(not_judgeable, vec!["--alert-disk", "--alert-psi"]);
+
+        // net's recorded bytes/s convert against the MB/s threshold
+        let c = cli(&["--agg", "x", "--check", "--alert-net", "100"]);
+        let mut rows = vec![
+            "timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_pct,sys_procs,sys_net_bps".to_string(),
+        ];
+        for i in 0..10 {
+            let bps = if (3..6).contains(&i) { 200.0 * 1_048_576.0 } else { 1048576.0 };
+            rows.push(format!(
+                "{},_system,,,.0,.0,,,,1.0,40.0,82,{bps},0,0,3,",
+                1_766_000_000 + i * 10
+            ));
+        }
+        let points = parse_record_system(&rows.join("\n")).unwrap();
+        let (episodes, _) = replay_check(&points, &c);
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].ticks, 3);
+        assert!((episodes[0].peak - 200.0).abs() < 1e-9, "{:?}", episodes[0]);
+
+        // renders: the fired line names the watchdog moment, the spike
+        // says it never fired
+        let p = render::Painter::new(false);
+        let c = cli(&["--agg", "x", "--check", "--alert-load", "4"]);
+        let points = parse_record_system(&parse_points_fixture()).unwrap();
+        let (episodes, _) = replay_check(&points, &c);
+        let text = render::render_replay_check(&episodes, &p);
+        assert!(text.contains("watchdog fires"), "{text}");
+        assert!(text.contains("never fired"), "{text}");
+        assert!(text.contains("peak 7"), "{text}");
+        let csv = render::render_replay_check_csv(&episodes);
+        assert!(csv.starts_with("sentinel,start,fire,end,ticks,peak\n"), "{csv}");
+        let md = render::render_replay_check_markdown(&episodes);
+        assert!(md.starts_with("| SENTINEL | START | FIRED |"), "{md}");
+        assert!(render::render_replay_check(&[], &p).contains("clean"));
+    }
+
+    fn parse_points_fixture() -> String {
+        let mut rows = vec![
+            "timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_pct,sys_procs,sys_net_bps".to_string(),
+        ];
+        for i in 0..40 {
+            // a long excursion that fires, plus a 3-tick spike that
+            // never fills the arming window
+            let load = if (5..20).contains(&i) {
+                7.0
+            } else if (30..33).contains(&i) {
+                6.0
+            } else {
+                1.0
+            };
+            rows.push(format!(
+                "{},_system,,,.0,.0,,,,{load},40.0,82,,0,0,3,",
+                1_766_000_000 + i * 10
+            ));
+        }
+        rows.join("\n")
     }
 
     #[test]
