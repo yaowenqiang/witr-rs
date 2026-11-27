@@ -4020,6 +4020,123 @@ pub(crate) fn machine_window(points: &[SysPoint]) -> MachineWindow {
     }
 }
 
+/// One `--agg --compare` row: an identity's (or user's) window stats on
+/// both sides. `None` on a side means the identity only exists in the
+/// other window — status says which.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct DiffRow {
+    /// Program name (or user under --by-user) — pids don't survive
+    /// across windows, so the name is the comparison key.
+    pub(crate) key: String,
+    /// "new" (only in this window), "gone" (only in the base), "" both.
+    pub(crate) status: &'static str,
+    /// This window's tick count (the base's rides its own cell values).
+    pub(crate) ticks: usize,
+    pub(crate) cpu_seconds: (Option<f64>, Option<f64>),
+    pub(crate) rss_peak_mb: (Option<f64>, Option<f64>),
+    pub(crate) io_total_bytes: (Option<f64>, Option<f64>),
+}
+
+/// Rank key: |Δ| of the chosen metric, missing side counting as zero —
+/// an identity that appeared or vanished moved by its whole value.
+fn diff_delta(row: &DiffRow, metric: crate::cli::TopMetric) -> f64 {
+    let (a, b) = match metric {
+        crate::cli::TopMetric::Mem => row.rss_peak_mb,
+        crate::cli::TopMetric::Io => row.io_total_bytes,
+        _ => row.cpu_seconds,
+    };
+    (b.unwrap_or(0.0) - a.unwrap_or(0.0)).abs()
+}
+
+/// One side of a compare join: (ticks, cpu seconds, rss peak MB, io total bytes).
+type SideWindow = (usize, Option<f64>, Option<f64>, Option<f64>);
+
+fn join_diff(
+    base: Vec<(String, SideWindow)>,
+    other: Vec<(String, SideWindow)>,
+    metric: crate::cli::TopMetric,
+    count: usize,
+) -> Vec<DiffRow> {
+    let mut rows: Vec<DiffRow> = Vec::new();
+    let mut base: std::collections::BTreeMap<String, SideWindow> =
+        base.into_iter().collect();
+    for (key, (ticks, cpu, rss, io)) in other {
+        let old = base.remove(&key);
+        let status = if old.is_some() { "" } else { "new" };
+        let (_, bc, br, bi) = old.unwrap_or((0, None, None, None));
+        rows.push(DiffRow {
+            key,
+            status,
+            ticks,
+            cpu_seconds: (bc, cpu),
+            rss_peak_mb: (br, rss),
+            io_total_bytes: (bi, io),
+        });
+    }
+    // whatever remains in the base vanished
+    for (key, (bt, bc, br, bi)) in base {
+        rows.push(DiffRow {
+            key,
+            status: "gone",
+            ticks: bt,
+            cpu_seconds: (bc, None),
+            rss_peak_mb: (br, None),
+            io_total_bytes: (bi, None),
+        });
+    }
+    rows.sort_by(|a, b| {
+        diff_delta(b, metric)
+            .partial_cmp(&diff_delta(a, metric))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    rows.truncate(count.max(1));
+    rows
+}
+
+/// Per-identity windows on both sides (the two recordings fold through
+/// the same aggregator the boards use — the diff only joins).
+pub(crate) fn diff_identities(
+    base: &[ProcSample],
+    other: &[ProcSample],
+    metric: crate::cli::TopMetric,
+    count: usize,
+) -> Vec<DiffRow> {
+    let fold = |samples: &[ProcSample]| {
+        aggregate_record(samples, crate::cli::TopMetric::Cpu, usize::MAX)
+            .into_iter()
+            .map(|r| {
+                (
+                    r.name,
+                    (r.samples, r.cpu_seconds, r.rss_peak_mb, r.io_total_bytes),
+                )
+            })
+            .collect()
+    };
+    join_diff(fold(base), fold(other), metric, count)
+}
+
+/// Per-user windows on both sides (--compare --by-user).
+pub(crate) fn diff_users(
+    base: &[ProcSample],
+    other: &[ProcSample],
+    metric: crate::cli::TopMetric,
+    count: usize,
+) -> Vec<DiffRow> {
+    let fold = |samples: &[ProcSample]| {
+        aggregate_record_by_user(samples, crate::cli::TopMetric::Cpu, usize::MAX)
+            .into_iter()
+            .map(|r| {
+                (
+                    r.user,
+                    (r.samples, r.cpu_seconds, r.rss_peak_mb, r.io_total_bytes),
+                )
+            })
+            .collect()
+    };
+    join_diff(fold(base), fold(other), metric, count)
+}
+
 pub(crate) fn parse_record_processes(text: &str) -> Vec<ProcSample> {
     let mut out = Vec::new();
     let mut lines = text.lines().peekable();
@@ -5564,6 +5681,10 @@ fn main() {
         eprintln!("--by-user rolls up a --top board or an --agg recording; add one");
         std::process::exit(4);
     }
+    if cli.compare.is_some() && cli.agg.is_none() {
+        eprintln!("--compare contrasts two recordings; give this window with --agg FILE");
+        std::process::exit(4);
+    }
     if let Some(name) = one_shot_listing_name(&cli)
         .filter(|_| cli.watch.is_some())
         // the fleet --services form refreshes under --watch like the
@@ -5840,11 +5961,22 @@ fn main() {
         // the --agg surface has three boards (process rollup, user
         // rollup, sentinel replay, machine window) — composing two asks
         // for two answers in one run, so each pairing refuses by name
+        // --top is the rank/delta-metric selector for the agg and compare
+        // boards, not a board of its own — it only clashes with the
+        // boards that carry no rank
+        if cli.top.is_some() && (cli.check || cli.sys) {
+            eprintln!(
+                "--top picks the rank metric for the agg/compare boards; --check and --sys carry no rank — drop one"
+            );
+            std::process::exit(4);
+        }
+        // --by-user shapes the compare fold, so it only stands against
+        // the other boards
         let boards = [
-            (cli.by_user, "--by-user"),
+            (cli.by_user && cli.compare.is_none(), "--by-user"),
             (cli.check, "--check"),
             (cli.sys, "--sys"),
-            (cli.top.is_some(), "--top METRIC"),
+            (cli.compare.is_some(), "--compare FILE"),
         ];
         let armed: Vec<&str> = boards
             .iter()
@@ -5969,6 +6101,55 @@ fn main() {
                 "--agg {path}: no process rows (is this a --record file? .csv or .jsonl)"
             );
             std::process::exit(5);
+        }
+        // --agg --compare FILE: two windows face to face — the same
+        // fold both boards use, then a join by program name (or user)
+        if let Some(other_path) = &cli.compare {
+            let other_text = match std::fs::read_to_string(other_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("--compare {other_path}: {e}");
+                    std::process::exit(5);
+                }
+            };
+            let other = parse_record_processes(&other_text);
+            if other.is_empty() {
+                eprintln!(
+                    "--compare {other_path}: no process rows (is this a --record file?)"
+                );
+                std::process::exit(5);
+            }
+            let metric = cli.top.unwrap_or(cli::TopMetric::Cpu);
+            // (base, this): the --compare file is the base, the --agg
+            // file is the window being judged
+            let rows = if cli.by_user {
+                diff_users(&other, &samples, metric, cli.count.unwrap_or(15))
+            } else {
+                diff_identities(&other, &samples, metric, cli.count.unwrap_or(15))
+            };
+            let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
+            if cli.json {
+                let doc = serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "generated_at": util::now_unix(),
+                    "base": path,
+                    "compare": other_path,
+                    "ranked_by_delta_of": match metric {
+                        cli::TopMetric::Mem => "rss_peak_mb",
+                        cli::TopMetric::Io => "io_total_bytes",
+                        _ => "cpu_seconds",
+                    },
+                    "rows": rows,
+                });
+                write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+            } else if cli.csv {
+                write_out(&render::render_compare_csv(&rows));
+            } else if cli.markdown {
+                write_out(&render::render_compare_markdown(&rows));
+            } else {
+                write_out(&render::render_compare(&rows, &painter));
+            }
+            std::process::exit(0);
         }
         let metric = cli.top.unwrap_or(cli::TopMetric::Cpu);
         let painter = render::Painter::new(!no_color && std::io::stdout().is_terminal());
@@ -8784,6 +8965,91 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         assert!((rows[0].io_total_bytes.unwrap() - 60_000_000.0).abs() < 1.0, "{rows:?}");
         assert_eq!(rows[1].user, "bob");
         assert_eq!(rows[1].io_total_bytes, None, "no readings reads as absent, not zero");
+    }
+
+    #[test]
+    fn compare_joins_identities_and_ranks_by_absolute_delta() {
+        let s = |at: i64, pid: i32, name: &str, user: Option<&str>, cpu: Option<f64>,
+                 rss: Option<f64>, io: Option<f64>| ProcSample {
+            at,
+            pid,
+            name: name.into(),
+            cpu,
+            rss_mb: rss,
+            user: user.map(|u| u.into()),
+            io_bps: io,
+        };
+        // base: oldjob busy, idler idling
+        let base: Vec<ProcSample> = (0..6)
+            .map(|i| {
+                [
+                    s(i * 10, 1, "oldjob", Some("root"), Some(50.0), Some(200.0), None),
+                    s(i * 10, 2, "idler", Some("www"), Some(2.0), Some(80.0), None),
+                ]
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect();
+        // this window: oldjob gone, hog arrived hammering io, idler halved
+        let this: Vec<ProcSample> = (0..6)
+            .map(|i| {
+                [
+                    s(i * 10, 9, "hog", Some("root"), Some(90.0), Some(512.0), Some(1_000_000.0)),
+                    s(i * 10, 2, "idler", Some("www"), Some(1.0), Some(80.0), None),
+                ]
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect();
+        // (base, this): the --compare file is the base
+        let rows = diff_identities(&base, &this, crate::cli::TopMetric::Cpu, 10);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        // hog: |Δcpu| = 9.0m... cpu 90% × 6 ticks × 10s = 54s — the
+        // biggest absolute delta ranks first, NEW badge on
+        assert_eq!(rows[0].key, "hog");
+        assert_eq!(rows[0].status, "new");
+        assert_eq!(rows[0].cpu_seconds, (None, Some(54.0)));
+        assert_eq!(rows[0].rss_peak_mb, (None, Some(512.0)));
+        // oldjob vanished: 50% × 60s of window = 30 CPU-seconds
+        assert_eq!(rows[1].key, "oldjob");
+        assert_eq!(rows[1].status, "gone");
+        assert_eq!(rows[1].cpu_seconds, (Some(30.0), None));
+        // idler: 1.2s → 0.6s, smallest delta last
+        assert_eq!(rows[2].key, "idler");
+        assert_eq!(rows[2].status, "");
+        assert_eq!(rows[2].cpu_seconds, (Some(1.2), Some(0.6)));
+
+        // --top io ranks by the io delta instead: hog's series is the
+        // only one carrying rates, so the order flips only among ties —
+        // hog still first but by its io delta now
+        let rows = diff_identities(&base, &this, crate::cli::TopMetric::Io, 10);
+        assert_eq!(rows[0].key, "hog");
+        assert!((rows[0].io_total_bytes.1.unwrap() - 60_000_000.0).abs() < 1.0, "{rows:?}");
+
+        // the user rollup joins by owner: root gains hog and loses
+        // oldjob (net positive), www halves
+        let rows = diff_users(&base, &this, crate::cli::TopMetric::Cpu, 10);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].key, "root");
+        assert_eq!(rows[0].cpu_seconds.0, Some(30.0));
+        assert_eq!(rows[0].cpu_seconds.1, Some(54.0));
+        assert_eq!(rows[1].key, "www");
+
+        // renders: badges, arrows, flat csv
+        let rows = diff_identities(&base, &this, crate::cli::TopMetric::Cpu, 10);
+        let p = render::Painter::new(false);
+        let text = render::render_compare(&rows, &p);
+        assert!(text.contains("[NEW]") && text.contains("[GONE]"), "{text}");
+        assert!(text.contains("54s → -") || text.contains("- → 54s"), "{text}");
+        let csv = render::render_compare_csv(&rows);
+        let mut lines = csv.lines();
+        assert!(lines.next().unwrap().starts_with("key,status,ticks,cpu_seconds_base,"), "{csv}");
+        assert!(lines.next().unwrap().starts_with("hog,new,"), "{csv}");
+        let md = render::render_compare_markdown(&rows);
+        assert!(md.starts_with("| NAME | STATUS |"), "{md}");
+        assert!(render::render_compare(&[], &p).contains("nothing to compare"));
     }
 
     #[test]

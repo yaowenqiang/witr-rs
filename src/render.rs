@@ -1453,6 +1453,118 @@ pub fn render_machine_window_markdown(w: &crate::MachineWindow) -> String {
     out
 }
 
+/// A compare cell: "base → this" with "-" standing in for a side the
+/// identity doesn't exist on.
+fn diff_cell(pair: (Option<f64>, Option<f64>), fmt: &dyn Fn(f64) -> String) -> String {
+    let side = |v: Option<f64>| v.map(fmt).unwrap_or_else(|| "-".into());
+    format!("{} → {}", side(pair.0), side(pair.1))
+}
+
+fn diff_cell_cpu(pair: (Option<f64>, Option<f64>)) -> String {
+    diff_cell(pair, &|s| {
+        if s < 60.0 {
+            format!("{s:.0}s")
+        } else if s < 3600.0 {
+            format!("{:.1}m", s / 60.0)
+        } else {
+            format!("{:.1}h", s / 3600.0)
+        }
+    })
+}
+
+fn diff_cell_mb(pair: (Option<f64>, Option<f64>)) -> String {
+    diff_cell(pair, &|mb| format!("{mb:.0}M"))
+}
+
+fn diff_cell_io(pair: (Option<f64>, Option<f64>)) -> String {
+    diff_cell(pair, &|b| crate::util::fmt_bytes(b as u64))
+}
+
+/// The `--agg --compare` board: two windows side by side, |Δ|-ranked,
+/// NEW and GONE named instead of implied by dashes.
+pub fn render_compare(rows: &[crate::DiffRow], p: &Painter) -> String {
+    if rows.is_empty() {
+        return "nothing to compare — one of the recordings had no process rows\n".to_string();
+    }
+    let key_w = rows
+        .iter()
+        .map(|r| r.key.len() + if r.status.is_empty() { 0 } else { 6 })
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 40);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<key_w$}  {:>5}  {:>15}  {:>13}  {:>13}",
+        "NAME", "TICKS", "CPU-TIME", "RSS PEAK", "IO TOTAL",
+    );
+    for r in rows {
+        let label = if r.status.is_empty() {
+            p.bold(&r.key).to_string()
+        } else {
+            let tag = if r.status == "new" {
+                p.green(&format!("[{}]", r.status.to_uppercase()))
+            } else {
+                p.red(&format!("[{}]", r.status.to_uppercase()))
+            };
+            format!("{} {}", r.key, tag)
+        };
+        let _ = writeln!(
+            out,
+            "{:<key_w$}  {:>5}  {:>15}  {:>13}  {:>13}",
+            label,
+            r.ticks,
+            diff_cell_cpu(r.cpu_seconds),
+            diff_cell_mb(r.rss_peak_mb),
+            diff_cell_io(r.io_total_bytes),
+        );
+    }
+    out
+}
+
+/// `--agg --compare --csv`: both sides flat, consumers diff their own way.
+pub fn render_compare_csv(rows: &[crate::DiffRow]) -> String {
+    let mut out = String::from(
+        "key,status,ticks,cpu_seconds_base,cpu_seconds,rss_peak_mb_base,rss_peak_mb,io_total_bytes_base,io_total_bytes\n",
+    );
+    for r in rows {
+        let f = |v: Option<f64>| v.map(|x| format!("{x:.2}")).unwrap_or_default();
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            csv_field(&r.key),
+            r.status,
+            r.ticks,
+            f(r.cpu_seconds.0),
+            f(r.cpu_seconds.1),
+            f(r.rss_peak_mb.0),
+            f(r.rss_peak_mb.1),
+            f(r.io_total_bytes.0),
+            f(r.io_total_bytes.1),
+        ));
+    }
+    out
+}
+
+/// `--agg --compare --markdown`.
+pub fn render_compare_markdown(rows: &[crate::DiffRow]) -> String {
+    let mut out = String::from(
+        "| NAME | STATUS | TICKS | CPU-TIME | RSS PEAK | IO TOTAL |\n|---|---|---|---|---|---|\n",
+    );
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} |",
+            r.key.replace('|', "\\|"),
+            if r.status.is_empty() { "-" } else { r.status },
+            r.ticks,
+            diff_cell_cpu(r.cpu_seconds),
+            diff_cell_mb(r.rss_peak_mb),
+            diff_cell_io(r.io_total_bytes),
+        );
+    }
+    out
+}
+
 /// `--agg --check --csv`: one row per episode, raw stamps.
 pub fn render_replay_check_csv(episodes: &[crate::ReplayEpisode]) -> String {
     let mut out = String::from("sentinel,start,fire,end,ticks,peak\n");

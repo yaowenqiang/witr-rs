@@ -1383,6 +1383,16 @@ pub struct Cli {
     pub agg: Option<String>,
 
     #[arg(
+        long,
+        value_name = "FILE",
+        help = t(
+            "与 --agg 搭配对比两个录制窗口：--agg THIS-WEEK.csv --compare LAST-WEEK.csv——逐身份差分（跨窗口 pid 无意义，重启即换，折叠到程序名），列 STATUS（NEW / GONE）/ 三列 基线 → 本窗（CPU-TIME / RSS 峰值 / IO 总量），按 |Δ| 降序——\"这周比上周谁变了\"。--by-user 换成按用户差分，--top cpu|mem|io 选差分指标，--count 截行",
+            "Pairs with --agg to compare two recording windows: --agg THIS-WEEK.csv --compare LAST-WEEK.csv — a per-identity diff (pids mean nothing across windows, restarts renumber them, so rows fold by program name), columns STATUS (NEW / GONE) plus three base → this-window cells (CPU-TIME / RSS peak / IO total), ranked by |Δ| — \"who changed since last week\". --by-user diffs by owner instead, --top cpu|mem|io picks the delta metric, --count caps rows"
+        )
+    )]
+    pub compare: Option<String>,
+
+    #[arg(
         long = "on-exit",
         value_name = "CMD",
         help = t(
