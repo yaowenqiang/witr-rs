@@ -3906,6 +3906,120 @@ pub(crate) fn replay_check(
     (out, not_judgeable)
 }
 
+/// One machine's window profile: every `_system` metric folded to
+/// mean/peak, with integrals where they mean something (net bytes moved)
+/// and waterline summaries (how many ticks carried zombies). The
+/// `--agg FILE --sys` board — "what did this machine's hour look like".
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct MachineWindow {
+    pub(crate) ticks: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) from: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) to: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cpu_avg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cpu_peak: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mem_pct_avg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mem_pct_peak: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) load1_avg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) load1_peak: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) procs_avg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) procs_peak: Option<f64>,
+    /// Mean and peak machine-wide throughput; the total is the window
+    /// integral (rates × tick spacing) — "this hour moved 22 GB".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) net_avg_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) net_peak_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) net_total_bytes: Option<f64>,
+    /// Waterlines: the worst count and how many ticks carried any.
+    pub(crate) zombies_peak: usize,
+    pub(crate) zombies_ticks: usize,
+    pub(crate) dstates_peak: usize,
+    pub(crate) dstates_ticks: usize,
+    pub(crate) failed_peak: usize,
+    /// The eta countdown's worst (lowest) reading — None when the source
+    /// watch never computed a trend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mem_eta_worst_hours: Option<f64>,
+}
+
+pub(crate) fn machine_window(points: &[SysPoint]) -> MachineWindow {
+    let mean = |v: &[f64]| {
+        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+    };
+    let mut cpus = Vec::new();
+    let mut mems = Vec::new();
+    let mut loads = Vec::new();
+    let mut procs = Vec::new();
+    let mut nets = Vec::new();
+    let (mut z_peak, mut z_ticks) = (0usize, 0usize);
+    let (mut d_peak, mut d_ticks) = (0usize, 0usize);
+    let mut f_peak = 0usize;
+    let mut eta_worst: Option<f64> = None;
+    for p in points {
+        if let Some(v) = p.cpu {
+            cpus.push(v);
+        }
+        if let Some(v) = p.mem_pct {
+            mems.push(v);
+        }
+        if let Some(v) = p.load1 {
+            loads.push(v);
+        }
+        procs.push(p.procs as f64);
+        if let Some(v) = p.net_bps {
+            nets.push(v);
+        }
+        z_peak = z_peak.max(p.zombies);
+        z_ticks += (p.zombies > 0) as usize;
+        d_peak = d_peak.max(p.dstates);
+        d_ticks += (p.dstates > 0) as usize;
+        f_peak = f_peak.max(p.failed_units);
+        eta_worst = match (eta_worst, p.mem_eta_hours) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (None, b) => b,
+            (a, None) => a,
+        };
+    }
+    let mut stamps: Vec<i64> = points.iter().map(|p| p.at).collect();
+    stamps.sort_unstable();
+    stamps.dedup();
+    let dt = median_dt(&stamps);
+    let net_total = (!nets.is_empty() && dt > 0.0).then(|| nets.iter().sum::<f64>() * dt);
+    MachineWindow {
+        ticks: stamps.len(),
+        from: stamps.first().cloned(),
+        to: stamps.last().cloned(),
+        cpu_avg: mean(&cpus),
+        cpu_peak: cpus.iter().cloned().reduce(f64::max),
+        mem_pct_avg: mean(&mems),
+        mem_pct_peak: mems.iter().cloned().reduce(f64::max),
+        load1_avg: mean(&loads),
+        load1_peak: loads.iter().cloned().reduce(f64::max),
+        procs_avg: mean(&procs),
+        procs_peak: procs.iter().cloned().reduce(f64::max),
+        net_avg_bps: mean(&nets),
+        net_peak_bps: nets.iter().cloned().reduce(f64::max),
+        net_total_bytes: net_total,
+        zombies_peak: z_peak,
+        zombies_ticks: z_ticks,
+        dstates_peak: d_peak,
+        dstates_ticks: d_ticks,
+        failed_peak: f_peak,
+        mem_eta_worst_hours: eta_worst,
+    }
+}
+
 pub(crate) fn parse_record_processes(text: &str) -> Vec<ProcSample> {
     let mut out = Vec::new();
     let mut lines = text.lines().peekable();
@@ -5723,8 +5837,25 @@ fn main() {
             eprintln!("--agg is one-shot; drop --watch");
             std::process::exit(4);
         }
-        if cli.by_user && cli.check {
-            eprintln!("--agg --check replays the sentinels over the recording; --by-user rolls the board instead — pick one");
+        // the --agg surface has three boards (process rollup, user
+        // rollup, sentinel replay, machine window) — composing two asks
+        // for two answers in one run, so each pairing refuses by name
+        let boards = [
+            (cli.by_user, "--by-user"),
+            (cli.check, "--check"),
+            (cli.sys, "--sys"),
+            (cli.top.is_some(), "--top METRIC"),
+        ];
+        let armed: Vec<&str> = boards
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, name)| *name)
+            .collect();
+        if armed.len() > 1 {
+            eprintln!(
+                "--agg renders one board per run; {} together don't compose — pick one",
+                armed.join(" + ")
+            );
             std::process::exit(4);
         }
         if !matches!(
@@ -5800,6 +5931,36 @@ fn main() {
                 );
             }
             std::process::exit(if episodes.is_empty() { 0 } else { 1 });
+        }
+        // --agg --sys: the machine window profile — the _system rows
+        // folded to mean/peak/integral, "what did this hour look like"
+        if cli.sys {
+            let points = match parse_record_system(&text) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("--agg {path}: {e}");
+                    std::process::exit(5);
+                }
+            };
+            let w = machine_window(&points);
+            if cli.json {
+                let doc = serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "generated_at": util::now_unix(),
+                    "source": path,
+                    "window": w,
+                });
+                write_out(&serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+            } else if cli.csv {
+                write_out(&render::render_machine_window_csv(&w));
+            } else if cli.markdown {
+                write_out(&render::render_machine_window_markdown(&w));
+            } else {
+                let painter =
+                    render::Painter::new(!no_color && std::io::stdout().is_terminal());
+                write_out(&render::render_machine_window(&w, &painter));
+            }
+            std::process::exit(0);
         }
 
         let samples = parse_record_processes(&text);
@@ -8623,6 +8784,58 @@ timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_
         assert!((rows[0].io_total_bytes.unwrap() - 60_000_000.0).abs() < 1.0, "{rows:?}");
         assert_eq!(rows[1].user, "bob");
         assert_eq!(rows[1].io_total_bytes, None, "no readings reads as absent, not zero");
+    }
+
+    #[test]
+    fn machine_window_folds_means_peaks_and_integrals() {
+        let mut rows = vec![
+            "timestamp,pid,user,name,cpu_pct,rss_mb,io_rbps,io_wbps,gpu_sm,sys_load1,sys_mem_pct,sys_procs,sys_net_bps,sys_zombies,sys_dstates,sys_failed_units,sys_mem_eta_hours".to_string(),
+        ];
+        // 30 ticks 10s apart: half at 40% cpu / 3.0 load / 1MB/s, half
+        // double; zombies appear in 3 ticks; eta dips once
+        for i in 0..30 {
+            let busy = i < 15;
+            let (cpu, load, net, eta) = if busy {
+                (40.0, 3.0, 1_048_576.0, 8.0)
+            } else {
+                (80.0, 6.0, 2_048_576.0, if i == 20 { 4.0 } else { 8.0 })
+            };
+            let z = if (5..8).contains(&i) { 2 } else { 0 };
+            rows.push(format!(
+                "{},_system,,,{cpu},.0,,,,{load},50.0,82,{net},{z},0,3,{eta}",
+                1_766_000_000 + i * 10
+            ));
+        }
+        let points = parse_record_system(&rows.join("\n")).unwrap();
+        let w = machine_window(&points);
+        assert_eq!(w.ticks, 30);
+        assert_eq!(w.from, Some(1_766_000_000));
+        assert_eq!(w.to, Some(1_766_000_290));
+        assert_eq!(w.cpu_avg, Some(60.0));
+        assert_eq!(w.cpu_peak, Some(80.0));
+        assert_eq!(w.load1_avg, Some(4.5));
+        assert_eq!(w.load1_peak, Some(6.0));
+        assert_eq!(w.net_peak_bps, Some(2_048_576.0), "2 MB/s is the busy phase's rate");
+        // mean 1548576 B/s × 30 ticks × 10s spacing = 464572800 bytes
+        assert_eq!(w.net_total_bytes, Some(464_572_800.0), "{w:?}");
+        assert_eq!(w.zombies_peak, 2);
+        assert_eq!(w.zombies_ticks, 3);
+        assert_eq!(w.failed_peak, 3);
+        assert_eq!(w.mem_eta_worst_hours, Some(4.0), "the dip is the worst");
+
+        let p = render::Painter::new(false);
+        let text = render::render_machine_window(&w, &p);
+        assert!(text.contains("machine window · 30 ticks"), "{text}");
+        assert!(text.contains("60.0") && text.contains("443.1M moved"), "{text}");
+        assert!(text.contains("3 tick(s) nonzero"), "{text}");
+        assert!(!text.contains("no trend"), "{text}");
+        let csv = render::render_machine_window_csv(&w);
+        let head = csv.lines().next().unwrap();
+        assert!(head.starts_with("ticks,from,to,cpu_avg"), "{csv}");
+        assert_eq!(csv.lines().count(), 2, "one flat row: {csv}");
+        let md = render::render_machine_window_markdown(&w);
+        assert!(md.starts_with("| METRIC | AVG | PEAK |"), "{md}");
+        assert!(md.contains("443.1M moved"), "{md}");
     }
 
     #[test]

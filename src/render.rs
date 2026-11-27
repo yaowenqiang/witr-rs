@@ -1277,6 +1277,182 @@ pub fn render_replay_check(episodes: &[crate::ReplayEpisode], p: &Painter) -> St
     out
 }
 
+/// The `--agg --sys` board: one row per metric, mean/peak/integral —
+/// "what did this machine's hour look like" in one screen.
+pub fn render_machine_window(w: &crate::MachineWindow, p: &Painter) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "machine window · {} ticks{}{}",
+        w.ticks,
+        w.from.map(|f| format!(" · from {}", fmt_time(f))).unwrap_or_default(),
+        w.to.map(|t| format!(" · to {}", fmt_time(t))).unwrap_or_default(),
+    );
+    let pair = |a: Option<f64>, unit: &str, digits: usize| match a {
+        Some(v) => format!("{v:.digits$}{unit}"),
+        None => "-".into(),
+    };
+    let mut row = |p: &Painter, name: &str, avg: String, peak: String, extra: &str| {
+        let _ = writeln!(
+            out,
+            "{}  {:>9}  {:>9}  {}",
+            p.bold(name),
+            avg,
+            peak,
+            extra
+        );
+    };
+    row(
+        p,
+        "cpu%",
+        pair(w.cpu_avg, "", 1),
+        pair(w.cpu_peak, "", 1),
+        "",
+    );
+    row(
+        p,
+        "mem%",
+        pair(w.mem_pct_avg, "", 1),
+        pair(w.mem_pct_peak, "", 1),
+        "",
+    );
+    row(
+        p,
+        "load1",
+        pair(w.load1_avg, "", 2),
+        pair(w.load1_peak, "", 2),
+        "",
+    );
+    row(
+        p,
+        "net",
+        pair(w.net_avg_bps.map(|b| b / 1_048_576.0), "MB/s", 1),
+        pair(w.net_peak_bps.map(|b| b / 1_048_576.0), "MB/s", 1),
+        &w.net_total_bytes
+            .map(|b| format!("{} moved", crate::util::fmt_bytes(b as u64)))
+            .unwrap_or_default(),
+    );
+    row(
+        p,
+        "procs",
+        pair(w.procs_avg, "", 0),
+        pair(w.procs_peak, "", 0),
+        "",
+    );
+    row(
+        p,
+        "zombies",
+        "-".into(),
+        w.zombies_peak.to_string(),
+        &format!("{} tick(s) nonzero", w.zombies_ticks),
+    );
+    row(
+        p,
+        "dstates",
+        "-".into(),
+        w.dstates_peak.to_string(),
+        &format!("{} tick(s) nonzero", w.dstates_ticks),
+    );
+    row(
+        p,
+        "failed-units",
+        "-".into(),
+        w.failed_peak.to_string(),
+        "peak",
+    );
+    let eta = w
+        .mem_eta_worst_hours
+        .map(|h| format!("{h:.1}h"))
+        .unwrap_or_else(|| "no trend in recording".into());
+    row(p, "mem-eta", "-".into(), eta, "worst");
+    out
+}
+
+/// `--agg --sys --csv`: the flat machine profile, one row.
+pub fn render_machine_window_csv(w: &crate::MachineWindow) -> String {
+    let f = |v: Option<f64>| v.map(|x| format!("{x:.2}")).unwrap_or_default();
+    format!(
+        "ticks,from,to,cpu_avg,cpu_peak,mem_pct_avg,mem_pct_peak,load1_avg,load1_peak,\
+         net_avg_bps,net_peak_bps,net_total_bytes,procs_avg,procs_peak,zombies_peak,zombies_ticks,\
+         dstates_peak,dstates_ticks,failed_peak,mem_eta_worst_hours\n{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+        w.ticks,
+        w.from.map(|v| v.to_string()).unwrap_or_default(),
+        w.to.map(|v| v.to_string()).unwrap_or_default(),
+        f(w.cpu_avg),
+        f(w.cpu_peak),
+        f(w.mem_pct_avg),
+        f(w.mem_pct_peak),
+        f(w.load1_avg),
+        f(w.load1_peak),
+        f(w.net_avg_bps),
+        f(w.net_peak_bps),
+        f(w.net_total_bytes),
+        f(w.procs_avg),
+        f(w.procs_peak),
+        w.zombies_peak,
+        w.zombies_ticks,
+        w.dstates_peak,
+        w.dstates_ticks,
+        w.failed_peak,
+        f(w.mem_eta_worst_hours),
+    )
+}
+
+/// `--agg --sys --markdown`.
+pub fn render_machine_window_markdown(w: &crate::MachineWindow) -> String {
+    let mut out = String::from(
+        "| METRIC | AVG | PEAK | NOTE |\n|---|---|---|---|\n",
+    );
+    let cell = |v: Option<f64>, unit: &str| {
+        v.map(|x| format!("{x:.1}{unit}"))
+            .unwrap_or_else(|| "-".into())
+    };
+    let _ = writeln!(
+        out,
+        "| cpu% | {} | {} | |",
+        cell(w.cpu_avg, ""),
+        cell(w.cpu_peak, "")
+    );
+    let _ = writeln!(
+        out,
+        "| mem% | {} | {} | |",
+        cell(w.mem_pct_avg, ""),
+        cell(w.mem_pct_peak, "")
+    );
+    let _ = writeln!(
+        out,
+        "| load1 | {} | {} | |",
+        cell(w.load1_avg, ""),
+        cell(w.load1_peak, "")
+    );
+    let _ = writeln!(
+        out,
+        "| net | {} | {} | {} |",
+        cell(w.net_avg_bps.map(|b| b / 1_048_576.0), "MB/s"),
+        cell(w.net_peak_bps.map(|b| b / 1_048_576.0), "MB/s"),
+        w.net_total_bytes
+            .map(|b| format!("{} moved", crate::util::fmt_bytes(b as u64)))
+            .unwrap_or_default(),
+    );
+    let _ = writeln!(
+        out,
+        "| procs | {} | {} | |",
+        cell(w.procs_avg, ""),
+        cell(w.procs_peak, "")
+    );
+    let _ = writeln!(out, "| zombies | - | {} | {} tick(s) nonzero |", w.zombies_peak, w.zombies_ticks);
+    let _ = writeln!(out, "| dstates | - | {} | {} tick(s) nonzero |", w.dstates_peak, w.dstates_ticks);
+    let _ = writeln!(out, "| failed-units | - | {} | peak |", w.failed_peak);
+    let _ = writeln!(
+        out,
+        "| mem-eta | - | {} | worst |",
+        w.mem_eta_worst_hours
+            .map(|h| format!("{h:.1}h"))
+            .unwrap_or_else(|| "no trend".into())
+    );
+    out
+}
+
 /// `--agg --check --csv`: one row per episode, raw stamps.
 pub fn render_replay_check_csv(episodes: &[crate::ReplayEpisode]) -> String {
     let mut out = String::from("sentinel,start,fire,end,ticks,peak\n");
